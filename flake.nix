@@ -80,7 +80,12 @@
             check-merge-conflicts.enable = true;
             forbid-new-submodules.enable = true;
             check-json.enable = true;
-            lychee.enable = true;
+            lychee = {
+              enable = true;
+              # The studies are research notes full of external links that fail for network
+              # reasons; they are not documentation this project maintains.
+              excludes = ["^docs/studies/"];
+            };
             comrak = {
               enable = true;
               files = "^impl/";
