@@ -110,6 +110,11 @@ pub struct ConnectOptions {
     /// Overrides the awareness clock the server advertises. `None` — the default — uses the
     /// server's values, so both sides of the session measure awareness the same way.
     pub keepalive: Option<KeepaliveConfig>,
+    /// The awareness state to publish as soon as the session is seated, published **verbatim**:
+    /// its anchors are not checked against this replica and not converted from offsets, which
+    /// is what a caller that already holds anchored state — a reconnect, say — needs. The
+    /// caller is therefore responsible for the replica holding the documents it names; until it
+    /// does, peers resolve nothing. [`ConnectOptions::with_awareness`] sets this.
     pub initial_awareness: AwarenessState,
 }
 
@@ -207,6 +212,11 @@ impl ConnectOptions {
         self
     }
 
+    /// Publishes `awareness` verbatim when the session is seated, anchors and all —
+    /// [`SyncEngine::set_awareness`](crate::SyncEngine::set_awareness) is the path that anchors
+    /// offsets against this replica and withholds what it cannot anchor. Use this one to resume
+    /// previously published anchors; the replica has to hold the documents they name for a peer
+    /// to resolve them (`spec/PROTOCOL.md` §8.1).
     #[must_use]
     pub fn with_awareness(mut self, awareness: AwarenessState) -> Self {
         self.initial_awareness = awareness;
