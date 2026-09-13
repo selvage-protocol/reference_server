@@ -501,6 +501,66 @@ async fn a_sender_publishes_no_selection_it_cannot_anchor() {
     );
 }
 
+/// `item` names an element, and an element lives in one text. An anchor naming an element
+/// that exists — but in another document — is not a position in the document the state names:
+/// §8.1 requires the receiver to verify the resolved branch, and that check is the only thing
+/// that catches this, because a `tname`-less anchor carries no other evidence about where its
+/// element lives.
+#[tokio::test]
+async fn an_item_living_in_another_text_shows_no_selection() {
+    let harness = Harness::start(WAIT).await;
+    let (host, room, _guest) =
+        seeded(&harness, "abc").await.expect("a seeded room");
+    host.open(OTHER)
+        .await
+        .expect("the host opens a second document");
+    host.insert(OTHER, 0, "xy")
+        .await
+        .expect("the host writes the other document");
+    let writer = writer_id(&host).expect("the host's replica has a client id");
+
+    // Clock 3 is the first character of the *other* document: `src/main.rs` is three code
+    // units of the same client, so its own elements stop at clock 2.
+    let anchor = format!(r#"{{"item":{{"client":{writer},"clock":3}},"assoc":0}}"#);
+    let (raw, _) = raw_peer(&harness, &room, &caret_state(&anchor))
+        .await
+        .expect("the hand-built peer publishes");
+
+    let seen = wait_for_state(&host, "Cleo").await;
+    assert_eq!(seen.path(), Some(PATH));
+    assert_eq!(
+        seen.selection(),
+        None,
+        "an element in another text is not a position in this one"
+    );
+    drop(raw);
+}
+
+/// An element that no longer exists is not an unresolvable anchor: §8.1 makes the surviving
+/// boundary a success, so the peer keeps its cursor rather than blinking out because someone
+/// deleted the character it was sitting on.
+#[tokio::test]
+async fn an_anchor_naming_a_deleted_element_points_at_the_boundary() {
+    let harness = Harness::start(WAIT).await;
+    let (host, _room, guest) =
+        seeded(&harness, "abcdef").await.expect("a seeded room");
+
+    guest
+        .set_selection(PATH, SelectionOffsets::caret(3))
+        .await
+        .expect("the guest puts its caret on `d`");
+    let published = wait_for_caret(&host, "Bob", SelectionOffsets::caret(3)).await;
+    let anchors = published.anchors().cloned().expect("the anchors arrived");
+
+    host.delete(PATH, 3, 2)
+        .await
+        .expect("the host deletes the `de` the caret names");
+    assert_eq!(host.text(PATH).await.expect("the text"), "abcf");
+
+    let after = wait_for_caret(&host, "Bob", SelectionOffsets::caret(3)).await;
+    assert_eq!(after.anchors(), Some(&anchors), "nothing was republished");
+}
+
 /// The exact shape a yjs peer puts on the wire for a position inside a root type: `tname`
 /// naming the type *and* `item` naming the element in it. `yrs` collapses the two and emits
 /// `item` alone, so this pair only ever arrives from the other implementation — and treating
