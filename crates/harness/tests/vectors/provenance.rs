@@ -11,10 +11,10 @@
 //! which is the check that the state the vectors describe is the state on the wire.
 
 use yrs::encoding::read::Cursor;
-use yrs::encoding::write::Write as _;
 use yrs::sync::protocol::{Message as YMessage, SyncMessage};
 use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+use yrs::sync::Awareness;
 use yrs::{
     ClientID, Doc, GetString, OffsetKind, Options, ReadTxn, StateVector, Text,
     Transact,
@@ -44,12 +44,6 @@ fn hex(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-fn bytes(hex: &str) -> Vec<u8> {
-    hex.split_whitespace()
-        .filter_map(|byte| u8::from_str_radix(byte, 16).ok())
-        .collect()
-}
-
 fn frame(message: &YMessage) -> Vec<u8> {
     let mut encoder = EncoderV1::new();
     message.encode(&mut encoder);
@@ -73,18 +67,16 @@ fn vector(id: &str) -> Result<Vector, Failure> {
         .ok_or_else(|| format!("no vector {id}").into())
 }
 
-/// The awareness frame this implementation encodes for one client: the client ids, their
-/// clocks and the JSON state, exactly as `yrs` writes it.
-fn awareness(client_id: u64, clock: u64, state: &str) -> Vec<u8> {
-    let mut payload = EncoderV1::new();
-    payload.write_var(1u64);
-    payload.write_var(client_id);
-    payload.write_var(clock);
-    payload.write_string(state);
-    let mut out = EncoderV1::new();
-    out.write_var(1u64); // MSG_AWARENESS
-    out.write_buf(payload.to_vec());
-    out.to_vec()
+/// One awareness frame, as this implementation's encoder writes it: publish `state` on
+/// `awareness` and take the update that produces. The harness builds its frames the same way
+/// (`tests/awareness.rs`), which is what makes the vector's bytes reproducible.
+fn encoded(
+    awareness: &mut Awareness,
+    state: &str,
+) -> Result<Vec<u8>, Failure> {
+    awareness.set_local_state_raw(state);
+    let update = awareness.update()?;
+    Ok(frame(&YMessage::Awareness(update)))
 }
 
 #[test]
@@ -182,38 +174,66 @@ fn the_sync_frames_are_the_ones_a_fixed_replica_produces() {
 fn the_awareness_frames_are_the_ones_this_implementation_encodes() {
     let held = vector(VECTOR_AWARENESS).expect("vector 010 loads");
     let sent = sent_frames(&held);
-    assert_eq!(sent.len(), 2, "vector 010 sends two binary frames");
+    assert_eq!(sent.len(), 3, "vector 010 sends three binary frames");
 
-    // A selection endpoint is a CRDT anchor, never an offset (§8.1). The vector carries one
-    // of each encoding on purpose: the host's caret has no element to name, which is what the
-    // `tname` form is for, and the guest's names an element.
-    let tname = format!(r#"{{"tname":"{PATH}","assoc":0}}"#);
-    let item = r#"{"item":{"client":9,"clock":4},"assoc":0}"#.to_string();
+    // A selection endpoint is a CRDT anchor, never an offset (§8.1). Three shapes appear on
+    // purpose, because a receiver has to accept all three: the yjs shape, which names the
+    // scope beside the element; the element alone, which is what `yrs` publishes for a
+    // position inside a root type; and the scope alone, the only encoding that exists for a
+    // position with no element to name.
+    let yjs = format!(
+        r#"{{"path":"{PATH}","selection":{{"anchor":{{"tname":"{PATH}","item":{{"client":9,"clock":4}},"assoc":0}},"head":{{"tname":"{PATH}","item":{{"client":9,"clock":4}},"assoc":0}}}}}}"#
+    );
+    let scope_only = format!(
+        r#"{{"path":"{PATH}","selection":{{"anchor":{{"tname":"{PATH}","assoc":0}},"head":{{"tname":"{PATH}","assoc":0}}}}}}"#
+    );
+    let element_only = format!(
+        r#"{{"path":"{PATH}","selection":{{"anchor":{{"item":{{"client":9,"clock":4}},"assoc":0}},"head":{{"item":{{"client":9,"clock":4}},"assoc":0}}}}}}"#
+    );
 
-    for (index, (client, anchor)) in
-        [(5_u64, &tname), (9, &item)].into_iter().enumerate()
-    {
-        let state = format!(
-            r#"{{"path":"{PATH}","selection":{{"anchor":{anchor},"head":{anchor}}}}}"#
-        );
+    // Two clients, each on the awareness clock `yrs` gives it: the host publishes twice, so
+    // its second frame has the newer clock that a later state must carry.
+    let mut host = Awareness::new(fixed(5));
+    let mut guest = Awareness::new(fixed(9));
+    let frames = [
+        (
+            5,
+            1,
+            encoded(&mut host, &yjs).expect("the host's first frame"),
+            &yjs,
+        ),
+        (
+            5,
+            2,
+            encoded(&mut host, &scope_only).expect("the host's second frame"),
+            &scope_only,
+        ),
+        (
+            9,
+            1,
+            encoded(&mut guest, &element_only).expect("the guest's frame"),
+            &element_only,
+        ),
+    ];
+
+    for (index, (client, clock, bytes, state)) in frames.iter().enumerate() {
         assert_eq!(
-            hex(&awareness(client, 1, &state)),
+            hex(bytes),
             sent[index],
-            "the awareness frame of client {client}"
+            "the awareness frame of client {client} at clock {clock}"
         );
 
         // And it decodes back to exactly that state, which is what the vector asserts.
-        let raw = bytes(&sent[index]);
-        let mut decoder = DecoderV1::new(Cursor::new(&raw));
+        let mut decoder = DecoderV1::new(Cursor::new(bytes));
         let Ok(YMessage::Awareness(read_back)) = YMessage::decode(&mut decoder)
         else {
             panic!("the frame is not an awareness update");
         };
         let entry = read_back
             .clients
-            .get(&ClientID::new(client))
+            .get(&ClientID::new(*client))
             .expect("the client is in the update");
-        assert_eq!(entry.clock, 1);
-        assert_eq!(entry.json.as_ref(), state);
+        assert_eq!(u64::from(entry.clock), *clock);
+        assert_eq!(entry.json.as_ref(), *state);
     }
 }
