@@ -133,8 +133,9 @@ impl Shared {
         live.session.leave(self).await;
         // The registry held a sender for this peer too; `leave` dropped it, so this is
         // the last one and the writer loop can finish.
-        drop(live.wire.tx);
-        let _ = live.wire.writer.await;
+        let Wire { tx, mut writer, .. } = live.wire;
+        drop(tx);
+        join_writer(&mut writer).await;
     }
 }
 
@@ -154,6 +155,14 @@ impl Wire {
             tx,
             writer: tokio::spawn(write_outbound(sink, rx)),
         }
+    }
+}
+
+/// Waits for a writer task, unless the turn loop already observed it finish: a
+/// `JoinHandle` whose output the loop has taken panics when it is polled again.
+async fn join_writer(writer: &mut JoinHandle<()>) {
+    if !writer.is_finished() {
+        let _ = writer.await;
     }
 }
 

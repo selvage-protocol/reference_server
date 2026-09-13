@@ -8,14 +8,15 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use selvage_harness::{
-    EngineEvent, Error, Harness, Role, Selection, wait_for, wait_for_event,
+    EngineEvent, Error, Harness, Role, Selection, WAIT, wait_for,
+    wait_for_event,
 };
 use selvage_protocol as proto;
 use selvage_protocol::{close, code, event, method};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -86,6 +87,176 @@ async fn next_binary(ws: &mut Raw) -> Result<Vec<u8>, Failure> {
             }
         }
     }
+}
+
+// --- a WebSocket client written by hand -----------------------------------------
+//
+// A library client cannot write the HTTP upgrade and the first frame in one go, and
+// cannot watch the socket close. These tests can, so they speak the protocol over a
+// plain TCP socket.
+/// One frame as it appeared on the wire.
+struct Frame {
+    opcode: u8,
+    payload: Vec<u8>,
+}
+
+impl Frame {
+    /// The close code, for a close frame.
+    fn close_code(&self) -> Option<u16> {
+        let bytes: [u8; 2] = self.payload.get(..2)?.try_into().ok()?;
+        Some(u16::from_be_bytes(bytes))
+    }
+
+    /// The payload as text, for a text frame.
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.payload).into_owned()
+    }
+}
+
+/// A WebSocket connection the test drives byte by byte.
+struct RawSocket {
+    stream: TcpStream,
+}
+
+impl RawSocket {
+    /// Performs the upgrade by hand, writing `extra` — frames the client already has —
+    /// in the same write as the request head.
+    async fn open(
+        harness: &Harness,
+        target: &str,
+        extra: &[u8],
+    ) -> Result<Self, Failure> {
+        let addr = harness.ws_base().trim_start_matches("ws://").to_string();
+        let mut stream = TcpStream::connect(&addr).await?;
+        let mut request = format!(
+            "GET {target} HTTP/1.1\r\nhost: {addr}\r\nupgrade: websocket\r\n\
+             connection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             sec-websocket-version: 13\r\n\r\n"
+        )
+        .into_bytes();
+        request.extend_from_slice(extra);
+        stream.write_all(&request).await?;
+        let head = read_http_head(&mut stream).await?;
+        if !head.starts_with("HTTP/1.1 101") {
+            return Err(format!("the upgrade was refused: {head}").into());
+        }
+        Ok(Self { stream })
+    }
+
+    /// Sends one masked frame, as a client must.
+    async fn send(
+        &mut self,
+        opcode: u8,
+        payload: &[u8],
+    ) -> Result<(), Failure> {
+        let frame = client_frame(opcode, payload)?;
+        self.stream.write_all(&frame).await?;
+        Ok(())
+    }
+
+    /// Sends a text frame carrying JSON.
+    async fn send_json(&mut self, value: &Value) -> Result<(), Failure> {
+        self.send(0x1, value.to_string().as_bytes()).await
+    }
+
+    /// Sends `session.hello` with these params.
+    async fn hello(&mut self, params: &Value) -> Result<(), Failure> {
+        self.send_json(&serde_json::json!({
+            "v": proto::WIRE_VERSION,
+            "id": 1,
+            "method": method::SESSION_HELLO,
+            "params": params,
+        }))
+        .await
+    }
+
+    /// Reads frames until a text frame arrives, returning its JSON.
+    async fn next_json(&mut self) -> Result<Value, Failure> {
+        let frame = read_matching(&mut self.stream, 0x1).await?;
+        Ok(serde_json::from_str(&frame.text())?)
+    }
+    /// Reads frames until the server closes, returning the close frame.
+    async fn read_to_close(&mut self) -> Result<Frame, Failure> {
+        read_matching(&mut self.stream, 0x8).await
+    }
+
+    /// Reads until the peer closes the socket, so the connection is gone for good.
+    async fn read_to_eof(&mut self) -> Result<(), Failure> {
+        let mut scratch = [0u8; 64];
+        while self.stream.read(&mut scratch).await? > 0 {}
+        Ok(())
+    }
+}
+
+/// The payload length of a frame, reading the extended form when the short one says to.
+async fn frame_length(
+    stream: &mut TcpStream,
+    short: u8,
+) -> Result<u64, Failure> {
+    match short {
+        126 => {
+            let mut ext = [0u8; 2];
+            stream.read_exact(&mut ext).await?;
+            Ok(u64::from(u16::from_be_bytes(ext)))
+        }
+        127 => {
+            let mut ext = [0u8; 8];
+            stream.read_exact(&mut ext).await?;
+            Ok(u64::from_be_bytes(ext))
+        }
+        length => Ok(u64::from(length)),
+    }
+}
+
+/// Reads one frame off the socket.
+async fn read_frame(stream: &mut TcpStream) -> Result<Frame, Failure> {
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await?;
+    let opcode = header[0] & 0x0f;
+    let length = frame_length(stream, header[1] & 0x7f).await?;
+    let mut payload = vec![0u8; usize::try_from(length)?];
+    stream.read_exact(&mut payload).await?;
+    Ok(Frame { opcode, payload })
+}
+
+/// Reads frames until one has this opcode.
+async fn read_matching(
+    stream: &mut TcpStream,
+    opcode: u8,
+) -> Result<Frame, Failure> {
+    loop {
+        let frame = read_frame(stream).await?;
+        if frame.opcode == opcode {
+            return Ok(frame);
+        }
+    }
+}
+
+/// One masked client frame.
+fn client_frame(opcode: u8, payload: &[u8]) -> Result<Vec<u8>, Failure> {
+    let mask = [0x21, 0x42, 0x63, 0x84];
+    let length = u8::try_from(payload.len())
+        .map_err(|_| "a client frame payload under 126 bytes")?;
+    let mut frame = vec![0x80 | opcode, 0x80 | length];
+    frame.extend_from_slice(&mask);
+    frame.extend(
+        payload
+            .iter()
+            .zip(mask.iter().cycle())
+            .map(|(byte, key)| byte ^ key),
+    );
+    Ok(frame)
+}
+
+/// Reads an HTTP response head, returning it as text.
+async fn read_http_head(stream: &mut TcpStream) -> Result<String, Failure> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await?;
+        head.push(byte[0]);
+    }
+    Ok(String::from_utf8(head)?)
 }
 
 async fn open(ws: &mut Raw, id: u64, path: &str) -> Result<(), Failure> {
@@ -416,6 +587,46 @@ async fn the_room_dies_when_the_host_does_not_come_back() {
         guest.text(PATH).await.is_err(),
         "the server should have closed the abandoned guest's connection"
     );
+}
+
+/// The room dies with a guest still connected: the server closes that guest, and the
+/// connection task ends having written its own close frame. Ending it must not panic —
+/// the harness fails this test if any task panics while it runs, so waiting for the
+/// socket to close for good is the assertion that matters.
+#[tokio::test]
+async fn a_guest_left_in_a_dead_room_is_closed_cleanly() {
+    let harness = Harness::start(Duration::from_millis(300)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let target = format!(
+        "{}?room={}&token={}",
+        proto::ENDPOINT_PATH,
+        proto::percent_encode(&room.id),
+        proto::percent_encode(&room.token)
+    );
+    let mut guest = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the upgrade succeeds");
+    guest
+        .hello(&serde_json::json!({"display_name": "Raw guest"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        guest.next_json().await.expect("room.joined")["event"],
+        event::ROOM_JOINED
+    );
+
+    host.disconnect().await.expect("the host leaves");
+    let closing = timeout(WAIT, guest.read_to_close())
+        .await
+        .expect("the room dies within its grace period")
+        .expect("the server sends a close frame");
+    assert_eq!(closing.close_code(), Some(close::ROOM_GONE));
+    // The socket closes for good once the connection task is done, which is the point
+    // after which nothing it did can still be running.
+    timeout(WAIT, guest.read_to_eof())
+        .await
+        .expect("the server closes the socket")
+        .expect("a clean close");
 }
 
 #[tokio::test]
