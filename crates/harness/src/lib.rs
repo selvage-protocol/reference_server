@@ -295,8 +295,30 @@ impl Harness {
 /// # Panics
 ///
 /// Panics when `label` never becomes true within [`WAIT`].
-pub async fn wait_for<F, Fut, T>(label: &str, mut check: F) -> T
+pub async fn wait_for<F, Fut, T>(label: &str, check: F) -> T
 where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    wait_for_described(label, || async { String::new() }, check).await
+}
+
+/// [`wait_for`], plus a closure that describes what was seen when the wait runs out.
+///
+/// The whole point of a bounded wait is that its failure says what the state was instead of
+/// only what it was expected to be, and on this side the state is behind an `async` call.
+///
+/// # Panics
+///
+/// Panics when `label` never becomes true within [`WAIT`], printing what `describe` saw.
+pub async fn wait_for_described<F, Fut, T, D, DFut>(
+    label: &str,
+    mut describe: D,
+    mut check: F,
+) -> T
+where
+    D: FnMut() -> DFut,
+    DFut: Future<Output = String>,
     F: FnMut() -> Fut,
     Fut: Future<Output = Option<T>>,
 {
@@ -307,10 +329,19 @@ where
         }
         assert!(
             start.elapsed() < WAIT,
-            "timed out after {WAIT:?} waiting for {label}"
+            "timed out after {WAIT:?} waiting for {label}{}",
+            as_suffix(&describe().await)
         );
         sleep(Duration::from_millis(5)).await;
     }
+}
+
+/// What a [`wait_for_described`] failure appends, when the caller had anything to say.
+fn as_suffix(observed: &str) -> String {
+    if observed.is_empty() {
+        return String::new();
+    }
+    format!("; observed {observed}")
 }
 
 /// Waits until both engines hold identical text for `path`, then returns it.
@@ -323,11 +354,17 @@ pub async fn wait_for_convergence(
     b: &SyncEngine,
     path: &str,
 ) -> String {
-    wait_for(&format!("replicas to converge on {path}"), || async {
-        let (left, right) =
-            (a.text(path).await.ok()?, b.text(path).await.ok()?);
-        (left == right).then_some(left)
-    })
+    wait_for_described(
+        &format!("replicas to converge on {path}"),
+        || async {
+            format!("{:?} and {:?}", a.text(path).await, b.text(path).await)
+        },
+        || async {
+            let (left, right) =
+                (a.text(path).await.ok()?, b.text(path).await.ok()?);
+            (left == right).then_some(left)
+        },
+    )
     .await
 }
 
@@ -340,14 +377,18 @@ pub async fn wait_for_peer(
     engine: &SyncEngine,
     display_name: &str,
 ) -> PeerInfo {
-    wait_for(&format!("peer {display_name} to appear"), || async {
-        engine
-            .peers()
-            .await
-            .ok()?
-            .into_iter()
-            .find(|peer| peer.display_name == display_name)
-    })
+    wait_for_described(
+        &format!("peer {display_name} to appear"),
+        || async { format!("{:?}", engine.peers().await) },
+        || async {
+            engine
+                .peers()
+                .await
+                .ok()?
+                .into_iter()
+                .find(|peer| peer.display_name == display_name)
+        },
+    )
     .await
 }
 
@@ -360,14 +401,18 @@ pub async fn wait_for_presence(
     engine: &SyncEngine,
     display_name: &str,
 ) -> Presence {
-    wait_for(&format!("presence from {display_name}"), || async {
-        engine
-            .presence()
-            .await
-            .ok()?
-            .into_iter()
-            .find(|presence| presence.display_name() == Some(display_name))
-    })
+    wait_for_described(
+        &format!("presence from {display_name}"),
+        || async { format!("{:?}", engine.presence().await) },
+        || async {
+            engine
+                .presence()
+                .await
+                .ok()?
+                .into_iter()
+                .find(|presence| presence.display_name() == Some(display_name))
+        },
+    )
     .await
 }
 
