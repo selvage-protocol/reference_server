@@ -137,15 +137,29 @@ async fn send_document(ws: &mut Raw, update: &[u8]) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Joins `room` by hand as Cleo and publishes exactly `state`, then goes quiet.
+/// Joins `room` by hand as `name` and publishes exactly `state`, then goes quiet.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a hand-built peer is a name and a state; the test names both"
+)]
+async fn raw_peer_named(
+    harness: &Harness,
+    room: &Room,
+    name: &str,
+    state: &str,
+) -> Result<(Raw, Awareness), Failure> {
+    let (mut ws, mut awareness) = raw_join(harness, room, name).await?;
+    publish_state(&mut ws, &mut awareness, state).await?;
+    Ok((ws, awareness))
+}
+
+/// The same, as Cleo.
 async fn raw_peer(
     harness: &Harness,
     room: &Room,
     state: &str,
 ) -> Result<(Raw, Awareness), Failure> {
-    let (mut ws, mut awareness) = raw_join(harness, room, "Cleo").await?;
-    publish_state(&mut ws, &mut awareness, state).await?;
-    Ok((ws, awareness))
+    raw_peer_named(harness, room, "Cleo", state).await
 }
 
 /// Joins `room` by hand as `name`, brings the document `update` as a sync frame and then
@@ -833,6 +847,36 @@ async fn a_yjs_anchor_carrying_both_tname_and_item_resolves() {
     drop(raw);
 }
 
+/// §8.1: a member a receiver cannot read costs only the selection, never the path. An `assoc`
+/// that is not a number is not an `assoc` — and the state it sits in still names a document.
+/// The whole-state parse this used to do lost the path too; the TypeScript receiver kept it.
+#[tokio::test]
+async fn an_unreadable_anchor_costs_the_selection_and_not_the_path() {
+    let harness = Harness::start(WAIT).await;
+    let (host, room, _guest) =
+        seeded(&harness, "abc").await.expect("a seeded room");
+
+    let anchor = format!(r#"{{"tname":"{PATH}","assoc":"after"}}"#);
+    let (raw, _) = raw_peer(&harness, &room, &caret_state(&anchor))
+        .await
+        .expect("the hand-built peer publishes");
+
+    let seen = wait_for_state(&host, "Cleo").await;
+    assert_eq!(seen.path(), Some(PATH), "the path is readable and survives");
+    assert_eq!(seen.anchors(), None, "the anchor is not");
+    drop(raw);
+
+    // The contrast, and what "unreadable" means here: a number is an `assoc` whatever its
+    // precision, normalised by sign, so this one resolves rather than being thrown away.
+    let anchor = format!(r#"{{"tname":"{PATH}","assoc":-1.5}}"#);
+    let (raw, _) = raw_peer_named(&harness, &room, "Dan", &caret_state(&anchor))
+        .await
+        .expect("the hand-built peer publishes");
+    let seen = wait_for_caret(&host, "Dan", SelectionOffsets::caret(0)).await;
+    assert_eq!(seen.anchors().map(|s| s.anchor.assoc), Some(-1));
+    drop(raw);
+}
+
 /// The scope is still checked when an element sits beside it: a `tname` naming another
 /// document is a mismatch even though the `item` next to it would have resolved on its own.
 #[tokio::test]
@@ -881,3 +925,4 @@ async fn unknown_keys_are_ignored_and_the_selection_still_resolves() {
     assert_eq!(seen.path(), Some(PATH));
     drop(raw);
 }
+

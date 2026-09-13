@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use yrs::block::ClientID;
 use yrs::{Assoc, ID, IndexScope, StickyIndex};
@@ -14,12 +15,45 @@ pub use selvage_protocol::PeerInfo;
 /// y-protocols treats the awareness payload as opaque, so this shape is ours: a
 /// document path plus a selection within it. Identity (the display name) deliberately
 /// does *not* travel here — it lives in the session layer.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Reading it is deliberately tolerant, in two stages: the path is taken from any string
+/// member, and the selection only if it parses (`spec/PROTOCOL.md` §8.1). An anchor a receiver
+/// cannot read costs the selection and never the path — a state whose selection is unreadable
+/// still says which document it is about.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct AwarenessState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<Selection>,
+}
+
+impl<'de> Deserialize<'de> for AwarenessState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The members as they arrive: nothing here is required, and nothing is typed.
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            path: Option<serde_json::Value>,
+            #[serde(default)]
+            selection: Option<serde_json::Value>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(Self {
+            path: raw.path.and_then(|value| match value {
+                serde_json::Value::String(path) => Some(path),
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::Array(_)
+                | serde_json::Value::Object(_) => None,
+            }),
+            selection: raw
+                .selection
+                .and_then(|value| serde_json::from_value(value).ok()),
+        })
+    }
 }
 
 /// A CRDT element, named by the client that wrote it and that client's clock.
@@ -65,9 +99,19 @@ pub struct Anchor {
     /// A nested type. Selvage documents are root texts, so this is never produced.
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub nested: Option<ItemId>,
-    /// `0` for the element after the position, `-1` for the one before.
-    #[serde(default)]
+    /// `0` for the element after the position, `-1` for the one before. Any JSON number is an
+    /// `assoc`, normalised by sign (§8.1); anything else is not one, and fails this member.
+    #[serde(default, deserialize_with = "assoc_of")]
     pub assoc: i64,
+}
+
+/// Reads `assoc` as a number, whatever its precision, and normalises it by sign.
+fn assoc_of<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let Some(number) = value.as_f64() else {
+        return Err(de::Error::custom(format!("`{value}` is not an assoc")));
+    };
+    Ok(if number < 0.0 { -1 } else { 0 })
 }
 
 impl Anchor {
