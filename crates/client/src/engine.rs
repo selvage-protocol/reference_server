@@ -20,8 +20,12 @@ use tokio_tungstenite::tungstenite::Message;
 use selvage_protocol as proto;
 use selvage_protocol::{event, method};
 use yrs::block::ClientID;
-use yrs::sync::protocol::{DefaultProtocol, Protocol as YProtocol};
+use yrs::encoding::read::Cursor;
+use yrs::sync::protocol::{
+    DefaultProtocol, MessageReader, Protocol as YProtocol,
+};
 use yrs::sync::{Awareness, Message as YMessage, SyncMessage};
+use yrs::updates::decoder::DecoderV1;
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{Doc, GetString, ReadTxn, Text as YText, Transact};
 
@@ -724,6 +728,7 @@ impl EngineTask {
     /// Handles one y-protocols frame. Decoding, applying and the replies are all done
     /// by `yrs`'s reference protocol implementation.
     fn handle_binary(&mut self, frame: &[u8]) {
+        let kinds = kinds_in(frame);
         let Ok(replies) = DefaultProtocol.handle(&mut self.awareness, frame)
         else {
             // A payload we cannot decode is a peer bug; keep serving the session.
@@ -732,9 +737,21 @@ impl EngineTask {
         for reply in replies {
             self.enqueue(Message::binary(encode_y_message(&reply)));
         }
-        let _ = self.events.send(EngineEvent::PresenceChanged {
-            presence: self.presence(),
-        });
+        // A cursor move is not a text change: an adapter must not re-reconcile every
+        // buffer because somebody else's caret moved.
+        if kinds.has(FrameKinds::TEXT) {
+            self.notify_documents();
+        }
+        if kinds.has(FrameKinds::AWARENESS) {
+            let _ = self.events.send(EngineEvent::PresenceChanged {
+                presence: self.presence(),
+            });
+        }
+    }
+
+    /// Tells the adapter that the documents this client has open may have changed, because
+    /// a frame carried text.
+    fn notify_documents(&self) {
         for path in self.open_documents.clone() {
             let _ = self.events.send(EngineEvent::DocumentChanged { path });
         }
@@ -874,6 +891,50 @@ fn peer_from(params: Option<&serde_json::Value>) -> Option<PeerInfo> {
     let given = params?;
     let value = given.get("peer").unwrap_or(given);
     serde_json::from_value(value.clone()).ok()
+}
+
+/// What a binary frame told this session about, one bit per kind: a frame may hold several
+/// concatenated y-protocols messages, so it can be more than one thing at once.
+#[derive(Debug, Default, Clone, Copy)]
+struct FrameKinds(u8);
+
+impl FrameKinds {
+    /// A message that can change the document text: a sync update, or a sync step 2.
+    const TEXT: u8 = 1;
+    /// A message that can change awareness: a state update, or a query.
+    const AWARENESS: u8 = 2;
+
+    const fn has(self, kind: u8) -> bool {
+        self.0 & kind != 0
+    }
+
+    const fn add(self, kind: u8) -> Self {
+        Self(self.0 | kind)
+    }
+}
+
+/// Reads the message types out of a frame. A frame that cannot be read reports neither
+/// kind; the protocol handler rejects it too, so nothing is lost.
+fn kinds_in(frame: &[u8]) -> FrameKinds {
+    let mut kinds = FrameKinds::default();
+    let mut decoder = DecoderV1::new(Cursor::new(frame));
+    for message in MessageReader::new(&mut decoder) {
+        kinds = match message {
+            Ok(YMessage::Sync(
+                SyncMessage::SyncStep2(_) | SyncMessage::Update(_),
+            )) => kinds.add(FrameKinds::TEXT),
+            Ok(YMessage::Awareness(_) | YMessage::AwarenessQuery) => {
+                kinds.add(FrameKinds::AWARENESS)
+            }
+            Ok(
+                YMessage::Sync(SyncMessage::SyncStep1(_))
+                | YMessage::Auth(_)
+                | YMessage::Custom(..),
+            )
+            | Err(_) => kinds,
+        };
+    }
+    kinds
 }
 
 fn encode_y_message(message: &YMessage) -> Vec<u8> {

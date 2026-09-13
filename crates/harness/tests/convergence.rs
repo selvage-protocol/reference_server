@@ -10,10 +10,28 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use selvage_harness::{
-    EditorAdapter, Harness, PeerInfo, Presence, Role, Selection, SyncEngine,
-    drive_editor, wait_for, wait_for_convergence, wait_for_peer,
+    EditorAdapter, EngineEvent, Harness, PeerInfo, Presence, Role, Selection,
+    SyncEngine, WAIT, drive_editor, wait_for, wait_for_convergence,
+    wait_for_peer,
 };
 use selvage_protocol as proto;
+use tokio::sync::broadcast::Receiver;
+use tokio::time::timeout;
+
+/// Waits for the next presence change, so that events queued behind it are still readable
+/// from the same subscription.
+async fn wait_for_presence(
+    events: &mut Receiver<EngineEvent>,
+) -> Result<EngineEvent, Failure> {
+    loop {
+        let received = timeout(WAIT, events.recv())
+            .await
+            .map_err(|_| "an event")??;
+        if matches!(received, EngineEvent::PresenceChanged { .. }) {
+            return Ok(received);
+        }
+    }
+}
 
 const PATH: &str = "src/main.rs";
 const SEED: &str = "fn main() {\n    println!(\"hello\");\n}\n";
@@ -267,4 +285,34 @@ async fn the_editor_adapter_seam_carries_remote_edits() {
         .await;
     assert_eq!(mirrored, "not shipped\n");
     driver.abort();
+}
+
+/// A cursor move is awareness, not a text change. An adapter that re-reconciled every open
+/// buffer on every remote caret move would do real work for nothing, so the two kinds of
+/// frame are told apart.
+#[tokio::test]
+async fn a_cursor_move_is_not_a_document_change() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+    host.open(PATH).await.expect("the host opens the document");
+    guest
+        .open(PATH)
+        .await
+        .expect("the guest opens the document");
+
+    let mut events = host.subscribe();
+    guest
+        .set_selection(PATH, Selection::caret(2))
+        .await
+        .expect("the guest moves its cursor");
+
+    // The frame that carried the cursor is the one under test; everything the engine
+    // reports for it is queued before it yields back to this test.
+    wait_for_presence(&mut events)
+        .await
+        .expect("the guest's cursor to arrive");
+    if let Ok(EngineEvent::DocumentChanged { path }) = events.try_recv() {
+        panic!("an awareness frame reported a document change: {path}");
+    }
 }
