@@ -810,6 +810,45 @@ async fn a_connection_that_mints_a_room_is_seated_as_its_host() {
         code::HOST_PRESENT
     );
 }
+
+/// A request the server refuses is an error at the caller, and local state only ever
+/// reflects what the server accepted: a refused document is not one this client thinks
+/// it has open.
+#[tokio::test]
+async fn a_refused_request_fails_and_leaves_local_state_alone() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+
+    // The server rejects an empty path with `bad_params`.
+    let refused = host
+        .open("")
+        .await
+        .expect_err("the server refuses an empty path");
+    let Error::Protocol { code, .. } = refused else {
+        panic!("expected bad_params, got {refused}");
+    };
+    assert_eq!(code, code::BAD_PARAMS);
+    assert!(
+        host.open_documents().await.unwrap().is_empty(),
+        "the refusal must not leave a document open locally"
+    );
+    assert!(host.documents().await.unwrap().is_empty());
+
+    // An accepted request is reflected locally, and the peer is told.
+    host.open(PATH).await.expect("the host opens a document");
+    assert!(
+        host.open_documents()
+            .await
+            .unwrap()
+            .contains(&PATH.to_string())
+    );
+    wait_for("the guest to hear about the document", || async {
+        let documents = guest.documents().await.ok()?;
+        documents.contains(&PATH.to_string()).then_some(())
+    })
+    .await;
+}
 async fn http_get(url: &str) -> Result<String, Failure> {
     let address = url.trim_start_matches("http://");
     let (host, path) = address.split_once('/').ok_or("the URL has no path")?;

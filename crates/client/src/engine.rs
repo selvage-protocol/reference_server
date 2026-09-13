@@ -253,6 +253,7 @@ fn spawn(start: EngineStart, session: &SessionInfo) -> Channel {
             .map(|peer| (peer.peer_id.clone(), peer.clone()))
             .collect(),
         request_id: 1,
+        pending: HashMap::new(),
         local_state: start.local_state,
         queued: VecDeque::new(),
         paused: false,
@@ -285,6 +286,47 @@ async fn session(task: &mut EngineTask, renew: &mut Interval) -> bool {
     }
 }
 
+/// A request that has gone out and is waiting for its answer. The answer either fails the
+/// request or is accepted, and acceptance is what moves local state.
+enum Pending {
+    Open {
+        path: String,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    Close {
+        path: String,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+}
+
+impl Pending {
+    /// The session method this request calls.
+    const fn method(&self) -> &'static str {
+        match self {
+            Self::Open { .. } => method::DOC_OPEN,
+            Self::Close { .. } => method::DOC_CLOSE,
+        }
+    }
+
+    /// The params this request carries. They come from the same fields acceptance reads,
+    /// so the request and its meaning cannot drift apart.
+    fn params(&self) -> serde_json::Value {
+        let path = match self {
+            Self::Open { path, .. } | Self::Close { path, .. } => path,
+        };
+        serde_json::json!({ "path": path })
+    }
+
+    /// Answers the caller. The response is what carries the outcome, so this is called
+    /// once the server has spoken — or once it never will.
+    fn answer(self, outcome: Result<(), Error>) {
+        let reply = match self {
+            Self::Open { reply, .. } | Self::Close { reply, .. } => reply,
+        };
+        let _ = reply.send(outcome);
+    }
+}
+
 struct EngineTask {
     sink: Sink,
     stream: Stream,
@@ -299,6 +341,8 @@ struct EngineTask {
     open_documents: Vec<String>,
     peers: HashMap<String, PeerInfo>,
     request_id: u64,
+    /// Requests the server has not answered yet, by request id.
+    pending: HashMap<u64, Pending>,
     /// The JSON published for the local client, replayed on every renewal.
     local_state: Option<String>,
     /// Frames produced while outbound is paused, flushed on resume. Text frames carry
@@ -325,6 +369,8 @@ impl EngineTask {
         if !session(&mut self, &mut renew).await {
             self.disconnect();
         }
+        // Whatever is still outstanding can never be answered now.
+        self.fail_pending();
     }
 
     /// One turn of the session: waits on commands, the awareness clock and the socket,
@@ -400,26 +446,19 @@ impl EngineTask {
         true
     }
 
+    /// Asks the server to open a document. Local state moves when it agrees.
     fn open(&mut self, path: &str, reply: oneshot::Sender<Result<(), Error>>) {
-        if self.open_documents.iter().all(|p| p != path) {
-            self.open_documents.push(path.to_string());
-        }
-        self.doc().get_or_insert_text(path);
-        let result =
-            self.request(method::DOC_OPEN, serde_json::json!({ "path": path }));
-        let _ = reply.send(result);
-        let _ = self.events.send(EngineEvent::DocumentsChanged {
-            documents: self.documents.clone(),
+        self.request(Pending::Open {
+            path: path.to_string(),
+            reply,
         });
     }
 
+    /// Asks the server to close a document. Local state moves when it agrees.
     fn close(&mut self, path: &str, reply: oneshot::Sender<Result<(), Error>>) {
-        self.open_documents.retain(|p| p != path);
-        let result = self
-            .request(method::DOC_CLOSE, serde_json::json!({ "path": path }));
-        let _ = reply.send(result);
-        let _ = self.events.send(EngineEvent::DocumentsChanged {
-            documents: self.documents.clone(),
+        self.request(Pending::Close {
+            path: path.to_string(),
+            reply,
         });
     }
 
@@ -581,16 +620,80 @@ impl EngineTask {
 
     // --- wire ----------------------------------------------------------------
 
-    fn request(
-        &mut self,
-        method_name: &str,
-        params: serde_json::Value,
-    ) -> Result<(), Error> {
+    /// Sends a request and keeps its caller waiting: the response with this id answers
+    /// it, and the session ending answers it with `Error::Closed`.
+    fn request(&mut self, pending: Pending) {
         self.request_id = self.request_id.wrapping_add(1);
+        let id = self.request_id;
         let msg =
-            proto::ClientMessage::new(self.request_id, method_name, params);
-        self.enqueue(Message::text(msg.to_text()?));
+            proto::ClientMessage::new(id, pending.method(), pending.params());
+        match msg.to_text() {
+            Ok(text) => {
+                self.pending.insert(id, pending);
+                self.enqueue(Message::text(text));
+            }
+            Err(e) => {
+                // Nothing went out, so there is nothing to wait for.
+                pending.answer(Err(Error::Json(e)));
+            }
+        }
+    }
+
+    /// Answers the caller of a request the server has now answered.
+    fn resolve(&mut self, id: u64, msg: &proto::ServerMessage) {
+        let Some(pending) = self.pending.remove(&id) else {
+            return;
+        };
+        let outcome = msg.error.as_ref().map_or_else(
+            || self.accept(&pending, msg.result.as_ref()),
+            |error| {
+                Err(Error::Protocol {
+                    code: error.code.clone(),
+                    message: error.message.clone(),
+                })
+            },
+        );
+        pending.answer(outcome);
+    }
+
+    /// Moves local state to what the server accepted. The room's open-document set comes
+    /// from the response, and this client's own holds follow from its own request.
+    fn accept(
+        &mut self,
+        pending: &Pending,
+        result: Option<&serde_json::Value>,
+    ) -> Result<(), Error> {
+        let body = result.cloned().unwrap_or_else(|| serde_json::json!({}));
+        let accepted: proto::DocSet = serde_json::from_value(body)?;
+        self.documents = accepted.documents;
+        match pending {
+            Pending::Open { path, .. } => self.hold(path),
+            Pending::Close { path, .. } => self.release(path),
+        }
+        let _ = self.events.send(EngineEvent::DocumentsChanged {
+            documents: self.documents.clone(),
+        });
         Ok(())
+    }
+
+    /// Adds a path to this client's own open set, and gives it the text to edit.
+    fn hold(&mut self, path: &str) {
+        if self.open_documents.iter().all(|p| p != path) {
+            self.open_documents.push(path.to_string());
+        }
+        self.doc().get_or_insert_text(path);
+    }
+
+    /// Removes a path from this client's own open set.
+    fn release(&mut self, path: &str) {
+        self.open_documents.retain(|p| p != path);
+    }
+
+    /// Fails every request still waiting: the session ended before the server answered.
+    fn fail_pending(&mut self) {
+        for (_, pending) in self.pending.drain() {
+            pending.answer(Err(Error::Closed));
+        }
     }
 
     fn publish_local_awareness(&mut self) -> Result<(), Error> {
@@ -641,6 +744,10 @@ impl EngineTask {
         let Ok(msg) = serde_json::from_str::<proto::ServerMessage>(text) else {
             return;
         };
+        if let Some(id) = msg.id {
+            self.resolve(id, &msg);
+            return;
+        }
         match msg.event.as_deref() {
             Some(event::PEER_JOINED) => self.peer_joined(msg.params.as_ref()),
             Some(event::PEER_LEFT) => self.peer_left(msg.params.as_ref()),
@@ -654,8 +761,29 @@ impl EngineTask {
                 self.host_attached(msg.params.as_ref());
             }
             Some(event::ROOM_GONE) => self.room_gone(msg.params.as_ref()),
+            Some(event::SESSION_ERROR) => {
+                self.session_error(msg.params.as_ref());
+            }
             _ => {}
         }
+    }
+
+    /// A fault the server could not attach to a request id. There is nobody to return it
+    /// to, so it goes to the adapter.
+    fn session_error(&self, params: Option<&serde_json::Value>) {
+        let code = params
+            .and_then(|p| p.get("code"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("error")
+            .to_string();
+        let message = params
+            .and_then(|p| p.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("the server reported a fault")
+            .to_string();
+        let _ = self
+            .events
+            .send(EngineEvent::SessionError { code, message });
     }
 
     fn peer_joined(&mut self, params: Option<&serde_json::Value>) {

@@ -33,6 +33,8 @@ pub enum EngineEvent {
     HostAttached { peer: PeerInfo },
     /// The room is gone. No further traffic will arrive on this session.
     RoomGone { reason: String },
+    /// The server reported a fault it could not attach to a request: `session.error`.
+    SessionError { code: String, message: String },
     /// The connection ended for another reason.
     Disconnected,
 }
@@ -47,6 +49,7 @@ pub trait EditorAdapter: Send + Sync + 'static {
     fn host_detached(&self, _grace_ms: u64) {}
     fn host_attached(&self, _peer: &PeerInfo) {}
     fn room_gone(&self, _reason: &str) {}
+    fn session_error(&self, _code: &str, _message: &str) {}
     fn disconnected(&self) {}
 }
 
@@ -118,6 +121,9 @@ async fn deliver(
         }
         EngineEvent::HostAttached { peer } => adapter.host_attached(&peer),
         EngineEvent::RoomGone { reason } => adapter.room_gone(&reason),
+        EngineEvent::SessionError { code, message } => {
+            adapter.session_error(&code, &message);
+        }
         EngineEvent::Disconnected => {
             adapter.disconnected();
             return false;
