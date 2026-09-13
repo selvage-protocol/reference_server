@@ -1,0 +1,132 @@
+{
+  "id": "010",
+  "title": "An awareness exchange: relayed verbatim, and attributed through the session layer",
+  "spec": "PROTOCOL.md#84-attributing-a-cursor-to-a-person",
+  "notes": "Awareness is peer to peer and the server relays it uninspected, so the first frame is asserted as exact bytes and the rest are decoded with the reference decoder: message type 1, one client, one clock, and the state the peer published. The state's shape (`path` plus `selection`) is this implementation's, and each selection endpoint is a CRDT anchor, never an offset (§8.1). Three anchor shapes appear on purpose, because a receiver has to accept all three: the yjs shape, which names the scope and the element together (`{\"tname\":…,\"item\":…}`), the element alone (`{\"item\":…}`), which is what the reference client publishes for a caret inside a root type, and the scope alone (`{\"tname\":…,\"assoc\":0}`), which is the only encoding that exists for a position with no element to name — a caret at the end of a text, or anywhere in an empty one. A receiver that insisted on one of the three would show no cursor whatever for a peer on the other library, which is the silent cross-implementation failure §8.1 exists to prevent. Because no index reaches the wire, this vector fixes no offset unit — a receiver recomputes the index against its own replica. Identity is not in the state: `awareness_client_id` on `PeerInfo` is what joins a cursor to a display name.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"awareness_client_id\":5,\"display_name\":\"Ada\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"awareness_client_id\":5,\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},\"token\":\"$token\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "open",
+      "conn": "guest",
+      "target": "/session?room=$room&token=$token"
+    },
+    {
+      "op": "send",
+      "conn": "guest",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"awareness_client_id\":9,\"display_name\":\"Bob\",\"role\":\"guest\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"room.joined\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[{\"awareness_client_id\":5,\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"}],\"room_id\":\"$room\",\"self\":{\"awareness_client_id\":9,\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"awareness_client_id\":9,\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "sendBinary",
+      "conn": "host",
+      "hex": "01 b9 01 01 05 01 b4 01 7b 22 70 61 74 68 22 3a 22 73 72 63 2f 6d 61 69 6e 2e 72 73 22 2c 22 73 65 6c 65 63 74 69 6f 6e 22 3a 7b 22 61 6e 63 68 6f 72 22 3a 7b 22 74 6e 61 6d 65 22 3a 22 73 72 63 2f 6d 61 69 6e 2e 72 73 22 2c 22 69 74 65 6d 22 3a 7b 22 63 6c 69 65 6e 74 22 3a 39 2c 22 63 6c 6f 63 6b 22 3a 34 7d 2c 22 61 73 73 6f 63 22 3a 30 7d 2c 22 68 65 61 64 22 3a 7b 22 74 6e 61 6d 65 22 3a 22 73 72 63 2f 6d 61 69 6e 2e 72 73 22 2c 22 69 74 65 6d 22 3a 7b 22 63 6c 69 65 6e 74 22 3a 39 2c 22 63 6c 6f 63 6b 22 3a 34 7d 2c 22 61 73 73 6f 63 22 3a 30 7d 7d 7d"
+    },
+    {
+      "op": "expectBinary",
+      "conn": "guest",
+      "hex": "01 b9 01 01 05 01 b4 01 7b 22 70 61 74 68 22 3a 22 73 72 63 2f 6d 61 69 6e 2e 72 73 22 2c 22 73 65 6c 65 63 74 69 6f 6e 22 3a 7b 22 61 6e 63 68 6f 72 22 3a 7b 22 74 6e 61 6d 65 22 3a 22 73 72 63 2f 6d 61 69 6e 2e 72 73 22 2c 22 69 74 65 6d 22 3a 7b 22 63 6c 69 65 6e 74 22 3a 39 2c 22 63 6c 6f 63 6b 22 3a 34 7d 2c 22 61 73 73 6f 63 22 3a 30 7d 2c 22 68 65 61 64 22 3a 7b 22 74 6e 61 6d 65 22 3a 22 73 72 63 2f 6d 61 69 6e 2e 72 73 22 2c 22 69 74 65 6d 22 3a 7b 22 63 6c 69 65 6e 74 22 3a 39 2c 22 63 6c 6f 63 6b 22 3a 34 7d 2c 22 61 73 73 6f 63 22 3a 30 7d 7d 7d"
+    },
+    {
+      "op": "sendBinary",
+      "conn": "host",
+      "hex": "01 7c 01 05 02 78 7b 22 70 61 74 68 22 3a 22 73 72 63 2f 6d 61 69 6e 2e 72 73 22 2c 22 73 65 6c 65 63 74 69 6f 6e 22 3a 7b 22 61 6e 63 68 6f 72 22 3a 7b 22 74 6e 61 6d 65 22 3a 22 73 72 63 2f 6d 61 69 6e 2e 72 73 22 2c 22 61 73 73 6f 63 22 3a 30 7d 2c 22 68 65 61 64 22 3a 7b 22 74 6e 61 6d 65 22 3a 22 73 72 63 2f 6d 61 69 6e 2e 72 73 22 2c 22 61 73 73 6f 63 22 3a 30 7d 7d 7d"
+    },
+    {
+      "op": "expectBinary",
+      "conn": "guest",
+      "frame": {
+        "message_type": 1,
+        "awareness": {
+          "clients": [
+            5
+          ],
+          "clock": 2,
+          "state": {
+            "path": "src/main.rs",
+            "selection": {
+              "anchor": {
+                "tname": "src/main.rs",
+                "assoc": 0
+              },
+              "head": {
+                "tname": "src/main.rs",
+                "assoc": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "op": "sendBinary",
+      "conn": "guest",
+      "hex": "01 8d 01 01 09 01 88 01 7b 22 70 61 74 68 22 3a 22 73 72 63 2f 6d 61 69 6e 2e 72 73 22 2c 22 73 65 6c 65 63 74 69 6f 6e 22 3a 7b 22 61 6e 63 68 6f 72 22 3a 7b 22 69 74 65 6d 22 3a 7b 22 63 6c 69 65 6e 74 22 3a 39 2c 22 63 6c 6f 63 6b 22 3a 34 7d 2c 22 61 73 73 6f 63 22 3a 30 7d 2c 22 68 65 61 64 22 3a 7b 22 69 74 65 6d 22 3a 7b 22 63 6c 69 65 6e 74 22 3a 39 2c 22 63 6c 6f 63 6b 22 3a 34 7d 2c 22 61 73 73 6f 63 22 3a 30 7d 7d 7d"
+    },
+    {
+      "op": "expectBinary",
+      "conn": "host",
+      "frame": {
+        "message_type": 1,
+        "awareness": {
+          "clients": [
+            9
+          ],
+          "clock": 1,
+          "state": {
+            "path": "src/main.rs",
+            "selection": {
+              "anchor": {
+                "item": {
+                  "client": 9,
+                  "clock": 4
+                },
+                "assoc": 0
+              },
+              "head": {
+                "item": {
+                  "client": 9,
+                  "clock": 4
+                },
+                "assoc": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "op": "close",
+      "conn": "host"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"peer.left\",\"params\":{\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    }
+  ],
+  "selvage": "selvage/1",
+  "canonical": "SJ-C/1"
+}

@@ -82,13 +82,12 @@
             check-json.enable = true;
             lychee = {
               enable = true;
-              # The studies are research notes full of external links that fail for network
-              # reasons; they are not documentation this project maintains.
-              excludes = ["^docs/studies/"];
             };
             comrak = {
               enable = true;
-              files = "^impl/";
+              # The README is prose this project maintains by hand; a formatter must not
+              # rewrite it.
+              excludes = ["^README\\.md$"];
             };
             ripsecrets.enable = true;
             typos.enable = true;
@@ -100,7 +99,7 @@
             check-symlinks.enable = true;
             trim-trailing-whitespace = {
               enable = true;
-              files = "^impl/";
+              excludes = ["^README\\.md$"];
             };
             shellcheck.enable = true;
 
@@ -109,21 +108,21 @@
               files = "\\.woodpecker/";
             };
 
-            rustfmt = mkHook "rustfmt" "nix build ./impl#checks.${system}.fmt --no-link --print-build-logs";
-            cargo-check = mkHook "cargo check" "nix build ./impl#checks.${system}.clippy --no-link --print-build-logs";
-            clippy = mkHook "clippy" "nix build ./impl#checks.${system}.clippy --no-link --print-build-logs";
-            audit = mkHook "audit" "${pkgs.cargo-audit}/bin/cargo-audit audit --file impl/Cargo.lock";
+            rustfmt = mkHook "rustfmt" "nix build .#checks.${system}.fmt --no-link --print-build-logs";
+            cargo-check = mkHook "cargo check" "nix build .#checks.${system}.clippy --no-link --print-build-logs";
+            clippy = mkHook "clippy" "nix build .#checks.${system}.clippy --no-link --print-build-logs";
+            audit = mkHook "audit" "${pkgs.cargo-audit}/bin/cargo-audit audit --file Cargo.lock";
 
             deny =
               mkHook
               "deny"
-              "${pkgs.cargo-deny}/bin/cargo-deny --manifest-path impl/Cargo.toml check";
-            tarpaulin = mkHook "tarpaulin" "nix build ./impl#checks.${system}.tarpaulin --no-link --print-build-logs";
+              "${pkgs.cargo-deny}/bin/cargo-deny --manifest-path Cargo.toml check";
+            tarpaulin = mkHook "tarpaulin" "nix build .#checks.${system}.tarpaulin --no-link --print-build-logs";
 
             cargo-nextest =
               mkHook
               "cargo nextest"
-              "nix build ./impl#checks.${system}.nextest --no-link --print-build-logs";
+              "nix build .#checks.${system}.nextest --no-link --print-build-logs";
           };
         };
         binCargoPath = ./crates/selvaged/Cargo.toml;
@@ -157,9 +156,9 @@
               inherit cargoArtifacts;
               partitions = 1;
               partitionType = "count";
-              # The vectors sit beside the spec, outside this Cargo workspace, so the sandbox
-              # — which receives only `impl/` — is handed them explicitly.
-              SELVAGE_VECTORS = ../spec/vectors;
+              # The vectors sit outside this Cargo workspace, so the sandbox — which receives
+              # only the workspace — is handed them explicitly.
+              SELVAGE_VECTORS = ./vectors;
             }
           );
 
@@ -167,7 +166,7 @@
             commonArgs
             // {
               inherit src cargoArtifacts;
-              SELVAGE_VECTORS = ../spec/vectors;
+              SELVAGE_VECTORS = ./vectors;
               pname = "${binName}-tarpaulin";
               buildPhaseCargoCommand = "cargo tarpaulin --fail-under 80";
               installPhase = "mkdir -p $out";

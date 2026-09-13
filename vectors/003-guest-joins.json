@@ -1,0 +1,60 @@
+{
+  "id": "003",
+  "title": "A guest joins with the invite URL and inherits the open-document set",
+  "spec": "PROTOCOL.md#61--62-roomcreated-and-roomjoined",
+  "notes": "The room and token are in the connection URL, not in `session.hello`. The joiner's `room.joined` carries the room's document set, no `token`, and the peers already present; the host is told `peer.joined`. Neither PeerInfo carries an awareness client id, because neither connection claimed one.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},\"token\":\"$token\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":2,\"method\":\"doc.open\",\"params\":{\"path\":\"src/main.rs\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":2,\"result\":{\"documents\":[\"src/main.rs\"]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"doc.opened\",\"params\":{\"documents\":[\"src/main.rs\"],\"path\":\"src/main.rs\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "open",
+      "conn": "guest",
+      "target": "/session?room=$room&token=$token"
+    },
+    {
+      "op": "send",
+      "conn": "guest",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"awareness_client_id\":99,\"display_name\":\"Bob\",\"role\":\"guest\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"room.joined\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[\"src/main.rs\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"}],\"room_id\":\"$room\",\"self\":{\"awareness_client_id\":99,\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"awareness_client_id\":99,\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+    }
+  ],
+  "selvage": "selvage/1",
+  "canonical": "SJ-C/1"
+}

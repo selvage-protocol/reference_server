@@ -1,0 +1,26 @@
+{
+  "id": "relative-position",
+  "title": "One document, one caret, and the anchor each library publishes for it",
+  "notes": "The crossing artifact: the same caret in the same document, written both ways. `yjs` names the scope and the element together (`tname` beside `item`); `yrs` names the element alone, because its `IndexScope` holds one or the other. §8.1 requires a receiver to accept both, and a receiver that accepts only its own library's shape renders no cursor for every peer on the other one — with nothing on the wire to say so. This file exists so that failure is a red test in both suites: the TypeScript suite rebuilds the `yjs` half from real `yjs` and resolves the `yrs` half, and the Rust suite rebuilds the `yrs` half from real `yrs` and resolves the `yjs` half, so each side consumes bytes the other library produced. It is not a replayable wire vector (those are the transcripts beside it, replayed by the harness), so it sits in a subdirectory of them rather than among them: what it fixes is the shape of one member, not the bytes of a frame. Both anchors denote the same offset 1 — the caret before the second character of `abc` — and both name the same element: the block `yjs` wrote for that document, at client 5, clock 1. The document's client id is fixed so its bytes are a constant; `document.update` is the v1 update exactly as `yjs` encoded it.",
+  "path": "src/main.rs",
+  "document": {
+    "client": 5,
+    "text": "abc",
+    "update": "0101050004010b7372632f6d61696e2e72730361626300"
+  },
+  "yjs": {
+    "anchor": {
+      "tname": "src/main.rs",
+      "item": { "client": 5, "clock": 1 },
+      "assoc": 0
+    },
+    "offset": 1
+  },
+  "yrs": {
+    "anchor": {
+      "item": { "client": 5, "clock": 1 },
+      "assoc": 0
+    },
+    "offset": 1
+  }
+}

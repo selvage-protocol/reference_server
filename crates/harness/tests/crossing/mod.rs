@@ -1,6 +1,6 @@
 //! One document, and the anchor each library publishes for the same caret in it.
 //!
-//! `spec/vectors/anchors/relative-position.json` is the artifact and its `notes` member is
+//! `vectors/anchors/relative-position.json` is the artifact and its `notes` member is
 //! where it is explained. What matters here is that each suite rebuilds *its own* half of it
 //! from the real library — this one from `yrs`, the TypeScript suite from `yjs` — so a fixture
 //! that has drifted from either library fails a test instead of quietly ceasing to mean
@@ -71,11 +71,12 @@ pub fn load() -> Result<Crossing, Failure> {
     Ok(serde_json::from_str(&bytes)?)
 }
 
-/// Where the anchors fixture lives: beside the spec, which the sandbox is handed separately.
+/// Where the anchors fixture lives: this repository's `vectors`, which the sandbox is handed
+/// separately.
 fn root() -> PathBuf {
-    // `impl/crates/harness` -> the repository's `spec/vectors`.
+    // `crates/harness` -> the repository's `vectors`.
     env::var_os("SELVAGE_VECTORS").map_or_else(
-        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../spec/vectors"),
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors"),
         PathBuf::from,
     )
 }

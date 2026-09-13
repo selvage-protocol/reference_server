@@ -1,9 +1,11 @@
-//! The conformance vector set: `spec/vectors/*.json`, replayed against the reference server.
+//! The conformance vector set: `vectors/*.json`, replayed against the reference server.
 //!
 //! Each vector is a transcript of real bytes, bound to a wire version and to the canonical
-//! form of `spec/CANONICAL.md`. `spec/README.md` says how to add one; `vectors/runner.rs`
-//! executes them. A vector that stops holding is a protocol change, deliberate or not, and
-//! this test is where it is noticed.
+//! form of `CANONICAL.md`. The vector set is canonical in the specification repository
+//! (`selvage-protocol/specification`) and vendored here by `scripts/sync-vectors.sh`; the
+//! specification's own `README.md` says how to add one and `runner.rs` executes them. A vector
+//! that stops holding is a protocol change, deliberate or not, and this test is where it is
+//! noticed.
 
 #[path = "vectors/provenance.rs"]
 mod provenance;

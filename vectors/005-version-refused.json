@@ -1,0 +1,83 @@
+{
+  "id": "005",
+  "title": "An incompatible or malformed version is refused, at the handshake and later",
+  "spec": "PROTOCOL.md#10-version-and-capability-negotiation",
+  "notes": "Three refusals, all `session.error` then a close with 4005: `selvage/2` at the handshake, a string that is not a version at all, and an otherwise seated connection that puts `selvage/2` on a later request. The first fault wins during the handshake: no room is minted, and the connection is closed.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "major",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "major",
+      "refused": true,
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Bad\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "major",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"unsupported_version\",\"message\":\"$_\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "major",
+      "code": 4005
+    },
+    {
+      "op": "open",
+      "conn": "malformed",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "malformed",
+      "refused": true,
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Bad\"},\"v\":\"selvage\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "malformed",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"unsupported_version\",\"message\":\"$_\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "malformed",
+      "code": 4005
+    },
+    {
+      "op": "open",
+      "conn": "late",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "late",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Late\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "late",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Late\",\"peer_id\":\"$late_peer\",\"role\":\"host\"},\"token\":\"$token\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "late",
+      "refused": true,
+      "text": "{\"id\":2,\"method\":\"doc.open\",\"params\":{\"path\":\"src/main.rs\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "late",
+      "text": "{\"error\":{\"code\":\"unsupported_version\",\"message\":\"$_\"},\"id\":2,\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "late",
+      "code": 4005
+    }
+  ],
+  "selvage": "selvage/1",
+  "canonical": "SJ-C/1"
+}

@@ -1,10 +1,10 @@
-//! Replays `spec/vectors/*.json` against a real server, and asserts the bytes.
+//! Replays `vectors/*.json` against a real server, and asserts the bytes.
 //!
 //! The vector set is the artifact; this module is what keeps it from rotting. Every step in
 //! a transcript is executed against a server the harness starts, and every frame the vector
 //! claims is compared twice: structurally, member by member, so a failure says which member
 //! was wrong; and then as whole bytes, because the vector is written in the canonical form
-//! of `spec/CANONICAL.md` and the reference server must produce exactly that.
+//! of `CANONICAL.md` and the reference server must produce exactly that.
 //!
 //! A vector may carry `$name` placeholders where the server mints a value — a room id, a
 //! token, a peer id. A placeholder binds the first time it is seen and must match every later
@@ -135,16 +135,16 @@ pub struct AwarenessSpec {
 
 type Raw = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// The vector directory: `SELVAGE_VECTORS` when the build supplies it, otherwise the repository's
-/// `spec/vectors` relative to this crate.
+/// The vector directory: `SELVAGE_VECTORS` when the build supplies it, otherwise this
+/// repository's `vectors`.
 ///
-/// The Nix build copies only `impl/` into the sandbox, so `impl/flake.nix` hands the directory in
-/// explicitly; from a checkout the relative path is correct.
+/// The Nix build copies only the Cargo workspace into the sandbox, so `flake.nix` hands the
+/// directory in explicitly; from a checkout the relative path is correct.
 #[must_use]
 pub fn root() -> PathBuf {
-    // `impl/crates/harness` -> the repository's `spec/vectors`.
+    // `crates/harness` -> the repository's `vectors`.
     env::var_os("SELVAGE_VECTORS").map_or_else(
-        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../spec/vectors"),
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors"),
         PathBuf::from,
     )
 }
@@ -418,7 +418,7 @@ fn expected_bytes(text: &str, matched: &[String]) -> Result<String, Failure> {
 /// Matches one vector value against one on the wire, binding placeholders as it goes.
 ///
 /// Objects must have the *same* member set in both directions: a version-locked vector is
-/// checking that no member has been silently added or renamed (`spec/CANONICAL.md` §3).
+/// checking that no member has been silently added or renamed (`CANONICAL.md` §3).
 #[expect(
     clippy::excessive_nesting,
     reason = "a recursive matcher over JSON; the nesting is the shape of the data"

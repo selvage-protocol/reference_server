@@ -1,0 +1,61 @@
+{
+  "id": "006",
+  "title": "A refused `doc.open` is an error response and leaves the connection open",
+  "spec": "PROTOCOL.md#docopen",
+  "notes": "A blank path, and a request with no `params` at all, are both `bad_params`: `path` is required and the connection survives both. The third request opens the document to show that it did. `error.message` is not stable, so the vectors bind it rather than assert it.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},\"token\":\"$token\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":2,\"method\":\"doc.open\",\"params\":{\"path\":\"  \"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"error\":{\"code\":\"bad_params\",\"message\":\"$_\"},\"id\":2,\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "refused": true,
+      "text": "{\"id\":3,\"method\":\"doc.open\",\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"error\":{\"code\":\"bad_params\",\"message\":\"$_\"},\"id\":3,\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":4,\"method\":\"doc.open\",\"params\":{\"path\":\"src/main.rs\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":4,\"result\":{\"documents\":[\"src/main.rs\"]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"doc.opened\",\"params\":{\"documents\":[\"src/main.rs\"],\"path\":\"src/main.rs\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    }
+  ],
+  "selvage": "selvage/1",
+  "canonical": "SJ-C/1"
+}
