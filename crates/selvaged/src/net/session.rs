@@ -182,11 +182,16 @@ fn capabilities() -> Vec<String> {
 }
 
 impl Applicant {
-    /// The role this connection claims, or the one its URL implies.
+    /// The role this connection is seated as. A connection that arrives without a room
+    /// mints that room, so it is its host whatever `session.hello` claims: honouring a
+    /// claimed `guest` would create a room with no host, whose real host would then be
+    /// refused it.
     const fn role(&self) -> proto::Role {
+        if self.hello.claims_host {
+            return proto::Role::Host;
+        }
         match self.hello.params.role {
             Some(role) => role,
-            None if self.hello.claims_host => proto::Role::Host,
             None => proto::Role::Guest,
         }
     }

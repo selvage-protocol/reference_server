@@ -765,6 +765,51 @@ async fn closing_a_document_leaves_the_peers_that_still_hold_it() {
     );
 }
 
+/// A connection with no room in its URL mints one, so it is that room's host whatever
+/// `session.hello` claims: a claimed `guest` role must not produce a hostless room, and
+/// the room must not then reject the host that made it.
+#[tokio::test]
+async fn a_connection_that_mints_a_room_is_seated_as_its_host() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut minter = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    minter
+        .hello(&serde_json::json!({
+            "display_name": "Minter",
+            "role": "guest",
+        }))
+        .await
+        .expect("says hello");
+    let created = minter.next_json().await.expect("room.created");
+    assert_eq!(created["event"], event::ROOM_CREATED);
+    assert_eq!(
+        created["params"]["self"]["role"], "host",
+        "the connection that minted the room hosts it"
+    );
+
+    // And the room really has a host: a second claim on the role is refused.
+    let target = format!(
+        "{}?room={}&token={}",
+        proto::ENDPOINT_PATH,
+        created["params"]["room_id"].as_str().unwrap(),
+        created["params"]["token"].as_str().unwrap()
+    );
+    let mut claimant = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the upgrade succeeds");
+    claimant
+        .hello(&serde_json::json!({
+            "display_name": "Claimant",
+            "role": "host",
+        }))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        claimant.next_json().await.expect("refusal")["params"]["code"],
+        code::HOST_PRESENT
+    );
+}
 async fn http_get(url: &str) -> Result<String, Failure> {
     let address = url.trim_start_matches("http://");
     let (host, path) = address.split_once('/').ok_or("the URL has no path")?;
