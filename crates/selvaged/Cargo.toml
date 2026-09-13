@@ -3,7 +3,10 @@ name = "selvaged"
 description = "Memory-only reference server for the Selvage Session Protocol"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# Source-available, not open source: see LICENSE. `license-file` rather than an SPDX
+# `license` because this crate is the one that does not share the workspace's.
+license-file = "LICENSE"
+publish = false
 repository.workspace = true
 
 [[bin]]
