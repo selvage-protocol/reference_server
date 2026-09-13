@@ -95,7 +95,7 @@ impl Invite {
 
 #[derive(Debug, Clone)]
 pub struct ConnectOptions {
-    /// `ws://host:port`, without the `/session` path.
+    /// Scheme and authority, without the `/session` path.
     pub base_url: String,
     pub display_name: String,
     /// Joining an existing room: its id.

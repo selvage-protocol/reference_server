@@ -380,7 +380,7 @@ pub fn parse_join_query(query: &str) -> JoinQuery {
 /// A connection URL split into the server base and the room/token it carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionUrl {
-    /// The `ws://host:port[/prefix]` part, without the endpoint path.
+    /// Scheme, authority and any path prefix — but not the endpoint path.
     pub base: String,
     pub join: JoinQuery,
 }
@@ -404,7 +404,7 @@ pub fn parse_session_url(url: &str) -> Option<SessionUrl> {
 
 /// Builds the WebSocket URL for a connection. Host connections omit room and token.
 ///
-/// `base` is the server base URL — `ws://host:port`, without the endpoint path. Pair
+/// `base` is the server base URL — scheme and authority, without the endpoint path. Pair
 /// with [`parse_session_url`] when the base has to come out of a URL again.
 #[must_use]
 pub fn session_url(
