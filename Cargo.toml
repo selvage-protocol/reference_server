@@ -7,6 +7,9 @@ members = [
     "crates/harness",
 ]
 
+[workspace.metadata.crane]
+name = "selvaged"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
