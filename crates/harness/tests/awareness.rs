@@ -12,8 +12,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use selvage_client::{ConnectOptions, Role, SyncEngine};
 use selvage_harness::{
-    Harness, Presence, Room, SelectionOffsets, ServerConfig, WAIT, wait_for,
-    wait_for_convergence, wait_for_described,
+    Anchor, Harness, Presence, Room, SelectionOffsets, ServerConfig, WAIT,
+    wait_for, wait_for_convergence, wait_for_described,
 };
 use selvage_protocol as proto;
 use selvage_protocol::{event, method};
@@ -22,9 +22,16 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
 
-use yrs::Doc;
+use yrs::sync::protocol::SyncMessage;
+use yrs::{
+    Assoc, ClientID, Doc, GetString, IndexedSequence, OffsetKind, Options, ReadTxn,
+    StateVector, Text, Transact,
+};
 use yrs::sync::{Awareness, Message as YMessage};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+
+#[path = "crossing/mod.rs"]
+mod crossing;
 
 const PATH: &str = "src/main.rs";
 const OTHER: &str = "src/other.rs";
@@ -78,11 +85,11 @@ async fn seeded(
     Ok((host, room, guest))
 }
 
-/// Joins `room` by hand as Cleo and publishes exactly `state`, then goes quiet.
-async fn raw_peer(
+/// Joins `room` by hand as `name`: a replica and an awareness of its own, seated as a peer.
+async fn raw_join(
     harness: &Harness,
     room: &Room,
-    state: &str,
+    name: &str,
 ) -> Result<(Raw, Awareness), Failure> {
     let url = proto::session_url(
         &harness.ws_base(),
@@ -90,15 +97,14 @@ async fn raw_peer(
         Some(&room.token),
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await?;
-    let mut awareness = Awareness::new(Doc::new());
-    awareness.set_local_state_raw(state);
+    let awareness = Awareness::new(Doc::new());
     ws.send(Message::text(
         serde_json::json!({
             "v": proto::WIRE_VERSION,
             "id": 1,
             "method": method::SESSION_HELLO,
             "params": {
-                "display_name": "Cleo",
+                "display_name": name,
                 // How the session layer attributes this cursor to a peer.
                 "awareness_client_id": awareness.client_id().get(),
             },
@@ -107,10 +113,57 @@ async fn raw_peer(
     ))
     .await?;
     wait_for_room_joined(&mut ws).await?;
+    Ok((ws, awareness))
+}
 
+/// Publishes `state` as this peer's awareness, exactly as `yrs` encodes it.
+async fn publish_state(
+    ws: &mut Raw,
+    awareness: &mut Awareness,
+    state: &str,
+) -> Result<(), Failure> {
+    awareness.set_local_state_raw(state);
     let mut encoder = EncoderV1::new();
     YMessage::Awareness(awareness.update()?).encode(&mut encoder);
     ws.send(Message::binary(encoder.to_vec())).await?;
+    Ok(())
+}
+
+/// Sends `update` as a document sync frame, which is what a peer that holds it sends (§7).
+async fn send_document(ws: &mut Raw, update: &[u8]) -> Result<(), Failure> {
+    let mut encoder = EncoderV1::new();
+    YMessage::Sync(SyncMessage::Update(update.to_vec())).encode(&mut encoder);
+    ws.send(Message::binary(encoder.to_vec())).await?;
+    Ok(())
+}
+
+/// Joins `room` by hand as Cleo and publishes exactly `state`, then goes quiet.
+async fn raw_peer(
+    harness: &Harness,
+    room: &Room,
+    state: &str,
+) -> Result<(Raw, Awareness), Failure> {
+    let (mut ws, mut awareness) = raw_join(harness, room, "Cleo").await?;
+    publish_state(&mut ws, &mut awareness, state).await?;
+    Ok((ws, awareness))
+}
+
+/// Joins `room` by hand as `name`, brings the document `update` as a sync frame and then
+/// publishes `state`: a peer that already holds the document, which is what the fixture is.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a hand-built peer is a name, a document and a state; the test names all three"
+)]
+async fn raw_peer_with_document(
+    harness: &Harness,
+    room: &Room,
+    name: &str,
+    update: &[u8],
+    state: &str,
+) -> Result<(Raw, Awareness), Failure> {
+    let (mut ws, mut awareness) = raw_join(harness, room, name).await?;
+    send_document(&mut ws, update).await?;
+    publish_state(&mut ws, &mut awareness, state).await?;
     Ok((ws, awareness))
 }
 
@@ -122,8 +175,13 @@ fn writer_id(engine: &SyncEngine) -> Option<u64> {
 
 /// A state whose two endpoints are both `anchor`, as a caret is.
 fn caret_state(anchor: &str) -> String {
+    caret_state_at(PATH, anchor)
+}
+
+/// The same, for a document the tests name themselves.
+fn caret_state_at(path: &str, anchor: &str) -> String {
     format!(
-        r#"{{"path":"{PATH}","selection":{{"anchor":{anchor},"head":{anchor}}}}}"#
+        r#"{{"path":"{path}","selection":{{"anchor":{anchor},"head":{anchor}}}}}"#
     )
 }
 
@@ -592,6 +650,162 @@ async fn a_selection_endpoint_extends_when_an_insert_lands_exactly_on_it() {
     assert_eq!(host.text(PATH).await.expect("the text"), "abcdeZZf");
     assert_eq!(after.selection(), Some(extended));
     assert_eq!(after.anchors(), before.anchors(), "nothing was republished");
+}
+
+/// A replica that speaks UTF-16 code units and has a client id the fixture fixes, so what it
+/// encodes is a constant.
+fn fixed(client_id: u64) -> Doc {
+    Doc::with_options(Options {
+        client_id: ClientID::new(client_id),
+        offset_kind: OffsetKind::Utf16,
+        ..Options::default()
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
+/// The `yrs` half of the fixture, rebuilt from `yrs` itself: a replica with the fixture's
+/// client id holding the fixture's text, the anchor `yrs` takes for that caret, and the bytes
+/// `yrs` encodes for the document. A change in any of the three fails here rather than leaving
+/// a fixture that no longer means what it says.
+#[test]
+fn the_yrs_half_of_the_fixture_is_what_yrs_encodes() {
+    let fixture = crossing::load().expect("the crossing fixture is readable");
+    let doc = fixed(fixture.document.client);
+    let text = doc.get_or_insert_text(fixture.path.clone());
+    {
+        let mut txn = doc.transact_mut();
+        text.insert(&mut txn, 0, &fixture.document.text);
+    }
+
+    let txn = doc.transact();
+    assert_eq!(
+        text.get_string(&txn),
+        fixture.document.text,
+        "the fixture's document holds the fixture's text"
+    );
+    let sticky = text
+        .sticky_index(&txn, fixture.yjs.offset, Assoc::After)
+        .expect("the caret is inside the text");
+    assert_eq!(
+        serde_json::to_value(Anchor::from_sticky(&sticky))
+            .expect("an anchor serialises"),
+        fixture.yrs.anchor,
+        "the element alone is what `yrs` publishes for this caret"
+    );
+    drop(txn);
+
+    assert_eq!(
+        hex(&doc
+            .transact_mut()
+            .encode_state_as_update_v1(&StateVector::default())),
+        fixture.document.update,
+        "and the document's bytes are the ones it encodes"
+    );
+}
+
+/// The crossing, in: a `yjs` peer's anchor, and the document it names, handed to this client
+/// as bytes from the other implementation. The anchor is the fixture's, unchanged, and the
+/// document arrives as the sync update `yjs` encoded for it.
+#[tokio::test]
+async fn a_real_yjs_anchor_resolves_in_this_client() {
+    let fixture = crossing::load().expect("the crossing fixture is readable");
+    let harness = Harness::start(WAIT).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    host.open(fixture.path.clone())
+        .await
+        .expect("the host opens the document");
+
+    let update = fixture.update().expect("the update is hex");
+    let state = caret_state_at(&fixture.path, &fixture.yjs.anchor.to_string());
+    let (raw, _) = raw_peer_with_document(&harness, &room, "Cleo", &update, &state)
+        .await
+        .expect("the peer brings the document and publishes its cursor");
+
+    let seen = wait_for_caret(
+        &host,
+        "Cleo",
+        SelectionOffsets::caret(fixture.yjs.offset),
+    )
+    .await;
+    assert_eq!(
+        host.text(fixture.path.clone()).await.expect("the text"),
+        fixture.document.text,
+        "the document is the one `yjs` encoded"
+    );
+    assert_eq!(
+        seen.anchors().and_then(|s| s.anchor.tname.as_deref()),
+        Some(fixture.path.as_str()),
+        "the scope `yjs` sends beside the element was checked, not discarded"
+    );
+    drop(raw);
+}
+
+/// The crossing, out: what this client publishes for that same caret, against the fixture's
+/// `yrs` half. Nothing else here asserts what leaves this client, which is why a one-way break
+/// in the shape had nowhere to show up from this side.
+#[tokio::test]
+async fn the_anchor_this_client_publishes_is_the_element_alone() {
+    let fixture = crossing::load().expect("the crossing fixture is readable");
+    let harness = Harness::start(WAIT).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let guest = harness.join(&room, "Bob").await.expect("a guest joins");
+    host.open(fixture.path.clone())
+        .await
+        .expect("the host opens the document");
+    guest
+        .open(fixture.path.clone())
+        .await
+        .expect("the guest opens the document");
+
+    let update = fixture.update().expect("the update is hex");
+    let state = caret_state_at(&fixture.path, &fixture.yjs.anchor.to_string());
+    let (raw, _) = raw_peer_with_document(&harness, &room, "Cleo", &update, &state)
+        .await
+        .expect("the peer brings the document and publishes its cursor");
+
+    // Both replicas have to hold the document before a caret in it means anything: an empty
+    // text is not the same thing as an absent one (§8.1's sender rule).
+    let arrived = wait_for("the fixture's document to reach both replicas", || async {
+        let on_host = host.text(fixture.path.clone()).await.ok()?;
+        let on_guest = guest.text(fixture.path.clone()).await.ok()?;
+        (on_host == fixture.document.text && on_guest == on_host)
+            .then_some(on_host)
+    })
+    .await;
+    assert_eq!(arrived, fixture.document.text);
+
+    // This replica now holds the element `yjs` wrote, so a caret at the same offset names the
+    // same element — and what a real peer receives for it is the fixture's `yrs` anchor.
+    host.set_selection(
+        fixture.path.clone(),
+        SelectionOffsets::caret(fixture.yrs.offset),
+    )
+    .await
+    .expect("the host takes the same caret");
+    let published = wait_for_caret(
+        &guest,
+        "Ada",
+        SelectionOffsets::caret(fixture.yrs.offset),
+    )
+    .await;
+    let anchor = published
+        .anchors()
+        .expect("the host published anchors")
+        .anchor
+        .clone();
+    assert_eq!(
+        serde_json::to_value(anchor).expect("an anchor serialises"),
+        fixture.yrs.anchor,
+        "the element alone, with no scope beside it, is what this client puts on the wire"
+    );
+    drop(raw);
 }
 
 /// The exact shape a yjs peer puts on the wire for a position inside a root type: `tname`
