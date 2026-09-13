@@ -1,5 +1,10 @@
 //! Wire types for the Selvage Session Protocol, wire version `selvage/1`.
 //!
+//! Every struct here declares its members in the canonical order of `spec/CANONICAL.md`
+//! §2.1 — ascending by member name — because `serde` writes them in declaration
+//! order and `spec/CANONICAL.md` fixes the bytes. Objects built with `serde_json::json!`
+//! are sorted by `serde_json`'s map, so they need no such care.
+//!
 //! This crate is deliberately free of I/O: it holds the JSON session envelope, the
 //! session-level vocabulary (methods, events, error codes, close codes) and the small
 //! amount of URL plumbing needed to mint and join a room. Document and awareness
@@ -108,28 +113,28 @@ impl Role {
 /// A participant as seen by the session layer. Identity is the display name only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerInfo {
-    pub peer_id: String,
-    pub display_name: String,
-    pub role: Role,
     /// Which y-protocols awareness client id this peer speaks with. Lets an editor
     /// adapter attribute a remote cursor without putting identity into awareness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub awareness_client_id: Option<u64>,
+    pub display_name: String,
+    pub peer_id: String,
+    pub role: Role,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Keepalive {
-    pub ping_interval_ms: u64,
-    pub awareness_renew_ms: u64,
     pub awareness_expire_ms: u64,
+    pub awareness_renew_ms: u64,
+    pub ping_interval_ms: u64,
 }
 
 impl Default for Keepalive {
     fn default() -> Self {
         Self {
-            ping_interval_ms: 30_000,
-            awareness_renew_ms: 15_000,
             awareness_expire_ms: 30_000,
+            awareness_renew_ms: 15_000,
+            ping_interval_ms: 30_000,
         }
     }
 }
@@ -141,24 +146,27 @@ pub struct ErrorObject {
 }
 
 /// A client -> server request. Unknown fields are ignored.
+///
+/// Members are declared in the canonical order of `spec/CANONICAL.md` §2.1 — ascending by
+/// name — because `serde` writes them in declaration order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientMessage {
-    pub v: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
     pub method: String,
     #[serde(default)]
     pub params: Value,
+    pub v: String,
 }
 
 impl ClientMessage {
     #[must_use]
     pub fn new(id: u64, method: &str, params: Value) -> Self {
         Self {
-            v: WIRE_VERSION.to_string(),
             id: Some(id),
             method: method.to_string(),
             params,
+            v: WIRE_VERSION.to_string(),
         }
     }
 
@@ -176,58 +184,60 @@ impl ClientMessage {
 
 /// A server -> client message. A response carries `id` and exactly one of
 /// `result`/`error`; an event carries `event`, `params` and no `id`.
+///
+/// Members are declared in the canonical order of `spec/CANONICAL.md` §2.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerMessage {
-    pub v: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<u64>,
+    pub error: Option<ErrorObject>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<ErrorObject>,
+    pub v: String,
 }
 
 impl ServerMessage {
     #[must_use]
     pub fn response(id: u64, result: Value) -> Self {
         Self {
-            v: WIRE_VERSION.to_string(),
-            id: Some(id),
+            error: None,
             event: None,
+            id: Some(id),
             params: None,
             result: Some(result),
-            error: None,
+            v: WIRE_VERSION.to_string(),
         }
     }
 
     #[must_use]
     pub fn error(id: u64, code: &str, message: impl Into<String>) -> Self {
         Self {
-            v: WIRE_VERSION.to_string(),
-            id: Some(id),
-            event: None,
-            params: None,
-            result: None,
             error: Some(ErrorObject {
                 code: code.to_string(),
                 message: message.into(),
             }),
+            event: None,
+            id: Some(id),
+            params: None,
+            result: None,
+            v: WIRE_VERSION.to_string(),
         }
     }
 
     #[must_use]
     pub fn event(name: &str, params: Value) -> Self {
         Self {
-            v: WIRE_VERSION.to_string(),
-            id: None,
+            error: None,
             event: Some(name.to_string()),
+            id: None,
             params: Some(params),
             result: None,
-            error: None,
+            v: WIRE_VERSION.to_string(),
         }
     }
 
@@ -246,36 +256,36 @@ impl ServerMessage {
 /// `session.hello` params — the client's half of the handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloParams {
-    pub display_name: String,
-    /// Defaults to host when the connection carried no room, guest otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<Role>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub awareness_client_id: Option<u64>,
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
+    pub display_name: String,
+    /// Defaults to host when the connection carried no room, guest otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
 }
 
 /// Result of `session.hello`: the server's half of the handshake. Sent as
 /// `room.created` (host, includes the token) or `room.joined` (guest).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionParams {
-    pub room_id: String,
-    /// Present only for the host that minted the room.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    #[serde(rename = "self")]
-    pub self_peer: PeerInfo,
-    #[serde(default)]
-    pub peers: Vec<PeerInfo>,
-    #[serde(default)]
-    pub documents: Vec<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
+    pub documents: Vec<String>,
+    #[serde(default)]
     pub keepalive: Keepalive,
+    #[serde(default)]
+    pub peers: Vec<PeerInfo>,
+    pub room_id: String,
+    #[serde(rename = "self")]
+    pub self_peer: PeerInfo,
+    /// Present only for the host that minted the room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// `doc.open` params.
@@ -300,10 +310,10 @@ pub struct PeerEvent {
 /// after the change, so every peer holds the same view of it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocEvent {
-    pub peer_id: String,
-    pub path: String,
     #[serde(default)]
     pub documents: Vec<String>,
+    pub path: String,
+    pub peer_id: String,
 }
 
 /// The result of `doc.open` / `doc.close`: the room's open-document set after the
@@ -317,34 +327,35 @@ pub struct DocSet {
 /// `room.gone` params.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomGoneParams {
-    pub room_id: String,
     pub reason: String,
+    pub room_id: String,
 }
 
-/// `GET /meta` response body.
+/// `GET /meta` response body. Members are in the canonical order of
+/// `spec/CANONICAL.md` §2.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
-    pub server: String,
-    pub wire_versions: Vec<String>,
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub keepalive: Keepalive,
     #[serde(default)]
     pub roles: Vec<String>,
+    pub server: String,
+    pub wire_versions: Vec<String>,
 }
 
 impl Meta {
     #[must_use]
     pub fn reference() -> Self {
         Self {
-            server: concat!("selvaged/", env!("CARGO_PKG_VERSION")).to_string(),
-            wire_versions: vec![WIRE_VERSION.to_string()],
             capabilities: CAPABILITIES
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
             keepalive: Keepalive::default(),
             roles: vec!["host".to_string(), "guest".to_string()],
+            server: concat!("selvaged/", env!("CARGO_PKG_VERSION")).to_string(),
+            wire_versions: vec![WIRE_VERSION.to_string()],
         }
     }
 }
@@ -510,13 +521,13 @@ mod tests {
         let text = req.to_text().unwrap();
         assert_eq!(
             text,
-            r#"{"v":"selvage/1","id":7,"method":"doc.open","params":{"path":"a.rs"}}"#
+            r#"{"id":7,"method":"doc.open","params":{"path":"a.rs"},"v":"selvage/1"}"#
         );
 
         let ok = ServerMessage::response(7, serde_json::json!({}))
             .to_text()
             .unwrap();
-        assert_eq!(ok, r#"{"v":"selvage/1","id":7,"result":{}}"#);
+        assert_eq!(ok, r#"{"id":7,"result":{},"v":"selvage/1"}"#);
 
         let err =
             ServerMessage::error(7, code::UNKNOWN_METHOD, "no such method")
@@ -524,7 +535,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             err,
-            r#"{"v":"selvage/1","id":7,"error":{"code":"unknown_method","message":"no such method"}}"#
+            r#"{"error":{"code":"unknown_method","message":"no such method"},"id":7,"v":"selvage/1"}"#
         );
 
         let ev =
@@ -533,7 +544,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             ev,
-            r#"{"v":"selvage/1","event":"peer.left","params":{"x":1}}"#
+            r#"{"event":"peer.left","params":{"x":1},"v":"selvage/1"}"#
         );
     }
 
