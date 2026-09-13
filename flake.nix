@@ -190,6 +190,7 @@
               cargo-deny
               cargo-tarpaulin
               bacon
+              nodejs_22
             ]
             ++ hooks.enabledPackages;
 
