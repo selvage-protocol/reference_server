@@ -1,0 +1,11 @@
+[jobs.coverage]
+command = [
+  "cargo",
+  "tarpaulin",
+  "--out",
+  "Lcov",
+  "--output-dir",
+  "target/coverage",
+  "--skip-clean",
+]
+watch = ["crates"]

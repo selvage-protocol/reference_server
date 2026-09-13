@@ -1,0 +1,2 @@
+[test_config]
+exclude-files = ["crates/selvaged/src/main.rs", "crates/harness/src/main.rs"]

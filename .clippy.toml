@@ -1,0 +1,12 @@
+lint-commented-code = true
+check-inconsistent-struct-field-initializers = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true
+max-fn-params-bools = 1
+excessive-nesting-threshold = 3
+max-struct-bools = 1
+too-many-arguments-threshold = 3
+too-many-lines-threshold = 80
+type-complexity-threshold = 150

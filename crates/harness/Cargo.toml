@@ -21,3 +21,6 @@ serde_json.workspace = true
 futures-util.workspace = true
 tokio-tungstenite.workspace = true
 yrs.workspace = true
+
+[lints]
+workspace = true
