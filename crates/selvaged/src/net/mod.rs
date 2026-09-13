@@ -360,7 +360,7 @@ async fn respond_plain(tcp: &mut TcpStream, head: &Head) -> io::Result<()> {
     if head.path != proto::META_PATH {
         return respond_status(tcp, Status::NotFound, NOT_FOUND).await;
     }
-    // Canonical (`spec/CANONICAL.md`), so that the negotiation body has the same bytes for
+    // Canonical (`CANONICAL.md`), so that the negotiation body has the same bytes for
     // every implementation.
     let meta = serde_json::to_string(&proto::Meta::reference())
         .map_err(io::Error::other)?;

@@ -14,7 +14,7 @@ name = "selvaged"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/dangostaking/selvage"
+repository = "https://github.com/selvage-protocol/reference_server"
 
 [workspace.lints.rust]
 unsafe_code      = "deny"

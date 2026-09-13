@@ -1,6 +1,6 @@
 //! Session layer: version negotiation, unknown methods, membership and the room
 //! lifecycle. The raw-WireSocket tests speak the protocol by hand, so the spec in
-//! `spec/PROTOCOL.md` is checked against the bytes on the wire rather than against the
+//! `PROTOCOL.md` is checked against the bytes on the wire rather than against the
 //! client library.
 
 use std::error::Error as StdError;

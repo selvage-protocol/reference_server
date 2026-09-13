@@ -1,8 +1,13 @@
 //! Wire types for the Selvage Session Protocol, wire version `selvage/1`.
 //!
-//! Every struct here declares its members in the canonical order of `spec/CANONICAL.md`
+//! The protocol itself — the prose of `PROTOCOL.md`, the byte rule of `CANONICAL.md` and the
+//! JSON Schema — lives in the specification repository
+//! (`github.com/selvage-protocol/specification`), which is its canonical source; this crate
+//! is one implementation of it.
+//!
+//! Every struct here declares its members in the canonical order of `CANONICAL.md`
 //! §2.1 — ascending by member name — because `serde` writes them in declaration
-//! order and `spec/CANONICAL.md` fixes the bytes. Objects built with `serde_json::json!`
+//! order and `CANONICAL.md` fixes the bytes. Objects built with `serde_json::json!`
 //! are sorted by `serde_json`'s map, so they need no such care.
 //!
 //! This crate is deliberately free of I/O: it holds the JSON session envelope, the
@@ -147,7 +152,7 @@ pub struct ErrorObject {
 
 /// A client -> server request. Unknown fields are ignored.
 ///
-/// Members are declared in the canonical order of `spec/CANONICAL.md` §2.1 — ascending by
+/// Members are declared in the canonical order of `CANONICAL.md` §2.1 — ascending by
 /// name — because `serde` writes them in declaration order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientMessage {
@@ -185,7 +190,7 @@ impl ClientMessage {
 /// A server -> client message. A response carries `id` and exactly one of
 /// `result`/`error`; an event carries `event`, `params` and no `id`.
 ///
-/// Members are declared in the canonical order of `spec/CANONICAL.md` §2.1.
+/// Members are declared in the canonical order of `CANONICAL.md` §2.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -332,7 +337,7 @@ pub struct RoomGoneParams {
 }
 
 /// `GET /meta` response body. Members are in the canonical order of
-/// `spec/CANONICAL.md` §2.1.
+/// `CANONICAL.md` §2.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub capabilities: Vec<String>,

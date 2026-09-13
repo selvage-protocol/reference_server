@@ -17,7 +17,7 @@ pub use selvage_protocol::PeerInfo;
 /// does *not* travel here — it lives in the session layer.
 ///
 /// Reading it is deliberately tolerant, in two stages: the path is taken from any string
-/// member, and the selection only if it parses (`spec/PROTOCOL.md` §8.1). An anchor a receiver
+/// member, and the selection only if it parses (`PROTOCOL.md` §8.1). An anchor a receiver
 /// cannot read costs the selection and never the path — a state whose selection is unreadable
 /// still says which document it is about.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -82,7 +82,7 @@ impl From<&ID> for ItemId {
 
 /// One endpoint of a selection: a CRDT anchor, never an offset.
 ///
-/// This is the JSON shape of a yjs `RelativePosition` (`spec/PROTOCOL.md` §8.1): a scope
+/// This is the JSON shape of a yjs `RelativePosition` (`PROTOCOL.md` §8.1): a scope
 /// (`tname` or `type`), an optional element within it, and the side of that position. It is
 /// deliberately *not* deserialised through `yrs::StickyIndex`'s own `Deserialize`, which
 /// rejects the unknown keys §8.1 requires a receiver to ignore.
@@ -194,7 +194,7 @@ pub struct Selection {
 /// A selection as an editor speaks it: two offsets into the document text.
 ///
 /// This is the `EditorAdapter` seam's unit, not the wire's — no offset ever reaches the wire
-/// (`spec/PROTOCOL.md` §8.1). It is UTF-16 code units, because that is the unit the anchor is
+/// (`PROTOCOL.md` §8.1). It is UTF-16 code units, because that is the unit the anchor is
 /// computed from and the unit `yjs` and VS Code both count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectionOffsets {

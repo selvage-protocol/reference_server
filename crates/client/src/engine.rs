@@ -150,7 +150,7 @@ async fn greet(
     url: &str,
 ) -> Result<(Sink, Stream, Awareness), Error> {
     // A text offset on this API is a UTF-16 code unit, the unit `yjs`, every editor's
-    // `offsetAt` and every peer on the wire use (spec/PROTOCOL.md §8.1). `yrs` defaults to
+    // `offsetAt` and every peer on the wire use (PROTOCOL.md §8.1). `yrs` defaults to
     // UTF-8 byte offsets, which would put a cursor after the first non-BMP character
     // somewhere else than every other implementation does.
     let doc = Doc::with_options(Options {
@@ -566,7 +566,7 @@ impl EngineTask {
     }
 
     /// Publishes this client's presence, turning the offsets the adapter speaks into the
-    /// anchors the wire carries (`spec/PROTOCOL.md` §8.1).
+    /// anchors the wire carries (`PROTOCOL.md` §8.1).
     fn set_local_awareness(
         &mut self,
         path: Option<String>,

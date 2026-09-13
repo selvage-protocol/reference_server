@@ -216,7 +216,7 @@ impl ConnectOptions {
     /// [`SyncEngine::set_awareness`](crate::SyncEngine::set_awareness) is the path that anchors
     /// offsets against this replica and withholds what it cannot anchor. Use this one to resume
     /// previously published anchors; the replica has to hold the documents they name for a peer
-    /// to resolve them (`spec/PROTOCOL.md` §8.1).
+    /// to resolve them (`PROTOCOL.md` §8.1).
     #[must_use]
     pub fn with_awareness(mut self, awareness: AwarenessState) -> Self {
         self.initial_awareness = awareness;

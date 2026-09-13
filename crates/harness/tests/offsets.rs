@@ -1,6 +1,6 @@
 //! The unit of a text offset, which the wire never says but every peer must agree on.
 //!
-//! `spec/PROTOCOL.md` §8.1 puts *no* offset on the wire — a selection travels as CRDT anchors —
+//! `PROTOCOL.md` §8.1 puts *no* offset on the wire — a selection travels as CRDT anchors —
 //! so the protocol fixes no unit, and an implementation fixes one at its editor-adapter seam
 //! instead. This client's seam, which `insert`, `delete` and `SelectionOffsets` all speak, is
 //! UTF-16 code units: that is what `yjs` counts, what every editor's `offsetAt` counts, and what

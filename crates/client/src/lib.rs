@@ -170,7 +170,7 @@ impl SyncEngine {
     /// Publishes this client's presence: document path plus selection.
     ///
     /// The offsets are anchored by the engine against this replica — the wire carries CRDT
-    /// anchors, never offsets (`spec/PROTOCOL.md` §8.1) — and a selection this replica cannot
+    /// anchors, never offsets (`PROTOCOL.md` §8.1) — and a selection this replica cannot
     /// anchor is withheld: the path is published with no `selection`. That is the case until
     /// the document named by `path` has arrived, and for any endpoint past the end of its
     /// text, so a caller that publishes before opening a document publishes no cursor rather
