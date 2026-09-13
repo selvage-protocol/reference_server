@@ -29,7 +29,9 @@ pub struct AwarenessState {
 }
 
 impl<'de> Deserialize<'de> for AwarenessState {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
         /// The members as they arrive: nothing here is required, and nothing is typed.
         #[derive(Deserialize)]
         struct Raw {
@@ -106,7 +108,9 @@ pub struct Anchor {
 }
 
 /// Reads `assoc` as a number, whatever its precision, and normalises it by sign.
-fn assoc_of<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
+fn assoc_of<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<i64, D::Error> {
     let value = serde_json::Value::deserialize(deserializer)?;
     let Some(number) = value.as_f64() else {
         return Err(de::Error::custom(format!("`{value}` is not an assoc")));

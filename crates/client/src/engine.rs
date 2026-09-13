@@ -591,7 +591,9 @@ impl EngineTask {
         selection: Option<SelectionOffsets>,
     ) -> AwarenessState {
         let anchored = match (path.as_deref(), selection) {
-            (Some(target), Some(offsets)) => self.anchor_selection(target, offsets),
+            (Some(target), Some(offsets)) => {
+                self.anchor_selection(target, offsets)
+            }
             _ => None,
         };
         AwarenessState {

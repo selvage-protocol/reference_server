@@ -66,8 +66,8 @@ impl Crossing {
 /// Reads the fixture.
 pub fn load() -> Result<Crossing, Failure> {
     let path = root().join("anchors/relative-position.json");
-    let bytes =
-        fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let bytes = fs::read_to_string(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(serde_json::from_str(&bytes)?)
 }
 

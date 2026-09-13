@@ -11,10 +11,10 @@
 //! which is the check that the state the vectors describe is the state on the wire.
 
 use yrs::encoding::read::Cursor;
+use yrs::sync::Awareness;
 use yrs::sync::protocol::{Message as YMessage, SyncMessage};
 use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-use yrs::sync::Awareness;
 use yrs::{
     ClientID, Doc, GetString, OffsetKind, Options, ReadTxn, StateVector, Text,
     Transact,
@@ -70,10 +70,7 @@ fn vector(id: &str) -> Result<Vector, Failure> {
 /// One awareness frame, as this implementation's encoder writes it: publish `state` on
 /// `awareness` and take the update that produces. The harness builds its frames the same way
 /// (`tests/awareness.rs`), which is what makes the vector's bytes reproducible.
-fn encoded(
-    awareness: &mut Awareness,
-    state: &str,
-) -> Result<Vec<u8>, Failure> {
+fn encoded(awareness: &mut Awareness, state: &str) -> Result<Vec<u8>, Failure> {
     awareness.set_local_state_raw(state);
     let update = awareness.update()?;
     Ok(frame(&YMessage::Awareness(update)))

@@ -23,12 +23,12 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
 
 use yrs::sync::protocol::SyncMessage;
-use yrs::{
-    Assoc, ClientID, Doc, GetString, IndexedSequence, OffsetKind, Options, ReadTxn,
-    StateVector, Text, Transact,
-};
 use yrs::sync::{Awareness, Message as YMessage};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+use yrs::{
+    Assoc, ClientID, Doc, GetString, IndexedSequence, OffsetKind, Options,
+    ReadTxn, StateVector, Text, Transact,
+};
 
 #[path = "crossing/mod.rs"]
 mod crossing;
@@ -219,15 +219,9 @@ async fn wait_for_caret(
         &format!("{name}'s cursor to resolve to {offsets:?}"),
         || describe_presence(observer, name),
         || async {
-            observer
-                .presence()
-                .await
-                .ok()?
-                .into_iter()
-                .find(|p| {
-                    p.display_name() == Some(name)
-                        && p.selection() == Some(offsets)
-                })
+            observer.presence().await.ok()?.into_iter().find(|p| {
+                p.display_name() == Some(name) && p.selection() == Some(offsets)
+            })
         },
     )
     .await
@@ -244,9 +238,7 @@ async fn wait_for_state(observer: &SyncEngine, name: &str) -> Presence {
                 .await
                 .ok()?
                 .into_iter()
-                .find(|p| {
-                    p.display_name() == Some(name) && p.state.is_some()
-                })
+                .find(|p| p.display_name() == Some(name) && p.state.is_some())
         },
     )
     .await
@@ -262,12 +254,9 @@ async fn wait_for_state_at(
         &format!("the state {name} published for {path}"),
         || describe_presence(observer, name),
         || async {
-            observer
-                .presence()
-                .await
-                .ok()?
-                .into_iter()
-                .find(|p| p.display_name() == Some(name) && p.path() == Some(path))
+            observer.presence().await.ok()?.into_iter().find(|p| {
+                p.display_name() == Some(name) && p.path() == Some(path)
+            })
         },
     )
     .await
@@ -543,7 +532,9 @@ async fn a_sender_publishes_no_selection_it_cannot_anchor() {
 
     // Opened, but nobody has written to it: this replica holds no `Y.Text` for the path, so
     // it cannot say where an offset in it is.
-    host.open(OTHER).await.expect("the host opens a second document");
+    host.open(OTHER)
+        .await
+        .expect("the host opens a second document");
     host.set_selection(OTHER, SelectionOffsets::caret(0))
         .await
         .expect("the host names the document");
@@ -593,7 +584,8 @@ async fn an_item_living_in_another_text_shows_no_selection() {
 
     // Clock 3 is the first character of the *other* document: `src/main.rs` is three code
     // units of the same client, so its own elements stop at clock 2.
-    let anchor = format!(r#"{{"item":{{"client":{writer},"clock":3}},"assoc":0}}"#);
+    let anchor =
+        format!(r#"{{"item":{{"client":{writer},"clock":3}},"assoc":0}}"#);
     let (raw, _) = raw_peer(&harness, &room, &caret_state(&anchor))
         .await
         .expect("the hand-built peer publishes");
@@ -621,7 +613,8 @@ async fn an_anchor_naming_a_deleted_element_points_at_the_boundary() {
         .set_selection(PATH, SelectionOffsets::caret(3))
         .await
         .expect("the guest puts its caret on `d`");
-    let published = wait_for_caret(&host, "Bob", SelectionOffsets::caret(3)).await;
+    let published =
+        wait_for_caret(&host, "Bob", SelectionOffsets::caret(3)).await;
     let anchors = published.anchors().cloned().expect("the anchors arrived");
 
     host.delete(PATH, 3, 2)
@@ -738,9 +731,10 @@ async fn a_real_yjs_anchor_resolves_in_this_client() {
 
     let update = fixture.update().expect("the update is hex");
     let state = caret_state_at(&fixture.path, &fixture.yjs.anchor.to_string());
-    let (raw, _) = raw_peer_with_document(&harness, &room, "Cleo", &update, &state)
-        .await
-        .expect("the peer brings the document and publishes its cursor");
+    let (raw, _) =
+        raw_peer_with_document(&harness, &room, "Cleo", &update, &state)
+            .await
+            .expect("the peer brings the document and publishes its cursor");
 
     let seen = wait_for_caret(
         &host,
@@ -780,19 +774,21 @@ async fn the_anchor_this_client_publishes_is_the_element_alone() {
 
     let update = fixture.update().expect("the update is hex");
     let state = caret_state_at(&fixture.path, &fixture.yjs.anchor.to_string());
-    let (raw, _) = raw_peer_with_document(&harness, &room, "Cleo", &update, &state)
-        .await
-        .expect("the peer brings the document and publishes its cursor");
+    let (raw, _) =
+        raw_peer_with_document(&harness, &room, "Cleo", &update, &state)
+            .await
+            .expect("the peer brings the document and publishes its cursor");
 
     // Both replicas have to hold the document before a caret in it means anything: an empty
     // text is not the same thing as an absent one (§8.1's sender rule).
-    let arrived = wait_for("the fixture's document to reach both replicas", || async {
-        let on_host = host.text(fixture.path.clone()).await.ok()?;
-        let on_guest = guest.text(fixture.path.clone()).await.ok()?;
-        (on_host == fixture.document.text && on_guest == on_host)
-            .then_some(on_host)
-    })
-    .await;
+    let arrived =
+        wait_for("the fixture's document to reach both replicas", || async {
+            let on_host = host.text(fixture.path.clone()).await.ok()?;
+            let on_guest = guest.text(fixture.path.clone()).await.ok()?;
+            (on_host == fixture.document.text && on_guest == on_host)
+                .then_some(on_host)
+        })
+        .await;
     assert_eq!(arrived, fixture.document.text);
 
     // This replica now holds the element `yjs` wrote, so a caret at the same offset names the
@@ -869,9 +865,10 @@ async fn an_unreadable_anchor_costs_the_selection_and_not_the_path() {
     // The contrast, and what "unreadable" means here: a number is an `assoc` whatever its
     // precision, normalised by sign, so this one resolves rather than being thrown away.
     let anchor = format!(r#"{{"tname":"{PATH}","assoc":-1.5}}"#);
-    let (raw, _) = raw_peer_named(&harness, &room, "Dan", &caret_state(&anchor))
-        .await
-        .expect("the hand-built peer publishes");
+    let (raw, _) =
+        raw_peer_named(&harness, &room, "Dan", &caret_state(&anchor))
+            .await
+            .expect("the hand-built peer publishes");
     let seen = wait_for_caret(&host, "Dan", SelectionOffsets::caret(0)).await;
     assert_eq!(seen.anchors().map(|s| s.anchor.assoc), Some(-1));
     drop(raw);
@@ -892,10 +889,12 @@ async fn every_assoc_is_normalised_by_sign_and_two_scopes_are_not_a_scope() {
         [("Cleo", "7", 0, 3), ("Dan", "-7", -1, 0)]
     {
         let anchor = format!(r#"{{"tname":"{PATH}","assoc":{assoc}}}"#);
-        let (raw, _) = raw_peer_named(&harness, &room, name, &caret_state(&anchor))
-            .await
-            .expect("the hand-built peer publishes");
-        let seen = wait_for_caret(&host, name, SelectionOffsets::caret(offsets)).await;
+        let (raw, _) =
+            raw_peer_named(&harness, &room, name, &caret_state(&anchor))
+                .await
+                .expect("the hand-built peer publishes");
+        let seen =
+            wait_for_caret(&host, name, SelectionOffsets::caret(offsets)).await;
         assert_eq!(
             seen.anchors().map(|s| s.anchor.assoc),
             Some(expected),
@@ -909,9 +908,10 @@ async fn every_assoc_is_normalised_by_sign_and_two_scopes_are_not_a_scope() {
     let anchor = format!(
         r#"{{"tname":"{PATH}","type":{{"client":1,"clock":0}},"assoc":0}}"#
     );
-    let (raw, _) = raw_peer_named(&harness, &room, "Eve", &caret_state(&anchor))
-        .await
-        .expect("the hand-built peer publishes");
+    let (raw, _) =
+        raw_peer_named(&harness, &room, "Eve", &caret_state(&anchor))
+            .await
+            .expect("the hand-built peer publishes");
     let seen = wait_for_state(&host, "Eve").await;
     assert_eq!(seen.path(), Some(PATH));
     assert_eq!(seen.selection(), None, "two scopes are not a scope");
@@ -999,4 +999,3 @@ async fn unknown_keys_are_ignored_and_the_selection_still_resolves() {
     assert_eq!(seen.path(), Some(PATH));
     drop(raw);
 }
-
