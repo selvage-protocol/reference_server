@@ -411,6 +411,7 @@ dependencies = [
  "selvage-client",
  "selvage-protocol",
  "selvaged",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",

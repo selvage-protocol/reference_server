@@ -19,6 +19,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 futures-util.workspace = true
+serde.workspace = true
 tokio-tungstenite.workspace = true
 yrs.workspace = true
 
