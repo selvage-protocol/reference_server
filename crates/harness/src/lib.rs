@@ -12,7 +12,8 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use selvaged::{Server, ServerConfig};
+use selvaged::Server;
+pub use selvaged::ServerConfig;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
@@ -155,15 +156,25 @@ impl Harness {
     /// # Panics
     ///
     /// Panics when the loopback port cannot be bound.
+    pub async fn start(room_grace: Duration) -> Self {
+        Self::start_with(ServerConfig {
+            room_grace,
+            ..ServerConfig::default()
+        })
+        .await
+    }
+
+    /// Starts a server with this configuration, for tests that need to move a clock or
+    /// shorten a timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the loopback port cannot be bound.
     #[expect(
         clippy::expect_used,
         reason = "the harness owns this loopback port; not binding it must fail the test"
     )]
-    pub async fn start(room_grace: Duration) -> Self {
-        let config = ServerConfig {
-            room_grace,
-            ..ServerConfig::default()
-        };
+    pub async fn start_with(config: ServerConfig) -> Self {
         let server =
             Server::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), config)
                 .await

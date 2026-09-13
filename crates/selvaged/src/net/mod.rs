@@ -20,7 +20,7 @@ use tokio::sync::mpsc::{
     UnboundedReceiver, UnboundedSender, unbounded_channel,
 };
 use tokio::task::JoinHandle;
-use tokio::time::{Interval, MissedTickBehavior, interval};
+use tokio::time::{Interval, MissedTickBehavior, interval, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
@@ -78,7 +78,13 @@ pub async fn serve(listener: TcpListener, shared: Shared) {
 impl Shared {
     /// Reads the request head and either answers it in place or upgrades to a session.
     async fn accept(self, mut tcp: TcpStream) -> io::Result<()> {
-        let Some(mut head) = read_http_head(&mut tcp).await? else {
+        // A half-sent head must not hold a connection open for ever.
+        let reading =
+            timeout(self.config.head_timeout, read_http_head(&mut tcp));
+        let Ok(request) = reading.await else {
+            return Ok(());
+        };
+        let Some(mut head) = request? else {
             return Ok(());
         };
         if !head.is_websocket_upgrade {

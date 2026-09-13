@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use selvage_harness::{
-    EngineEvent, Error, Harness, Role, Selection, WAIT, wait_for,
+    EngineEvent, Error, Harness, Role, Selection, ServerConfig, WAIT, wait_for,
     wait_for_event,
 };
 use selvage_protocol as proto;
@@ -900,6 +900,30 @@ async fn a_long_close_reason_is_cut_down_to_fit_a_control_frame() {
         "the reason still says what went wrong: {reason}"
     );
 }
+/// A connection that never finishes its HTTP request head is dropped: a client cannot hold
+/// a connection open by sending half a request and stopping.
+#[tokio::test]
+async fn a_half_written_request_head_is_dropped() {
+    let harness = Harness::start_with(ServerConfig {
+        head_timeout: Duration::from_millis(100),
+        ..ServerConfig::default()
+    })
+    .await;
+    let addr = harness.ws_base().trim_start_matches("ws://").to_string();
+    let mut stream = TcpStream::connect(&addr).await.expect("connects");
+    stream
+        .write_all(b"GET /session HTTP/1.1\r\nhost: localhost\r\n")
+        .await
+        .expect("writes half a head");
+
+    let mut scratch = [0u8; 16];
+    let read = timeout(WAIT, stream.read(&mut scratch))
+        .await
+        .expect("the server gives up on the head")
+        .expect("a read");
+    assert_eq!(read, 0, "the connection is closed, not held open");
+}
+
 async fn http_get(url: &str) -> Result<String, Failure> {
     let address = url.trim_start_matches("http://");
     let (host, path) = address.split_once('/').ok_or("the URL has no path")?;

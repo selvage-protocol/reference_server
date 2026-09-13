@@ -28,6 +28,9 @@ pub struct ServerConfig {
     pub ping_interval: Duration,
     /// How long a connection may stay silent before sending `session.hello`.
     pub hello_timeout: Duration,
+    /// How long a connection may take to send its HTTP request head. A client that never
+    /// finishes one is dropped rather than held open for ever.
+    pub head_timeout: Duration,
     /// Keepalive values advertised to clients.
     pub keepalive: Keepalive,
 }
@@ -38,6 +41,7 @@ impl Default for ServerConfig {
             room_grace: Duration::from_secs(30),
             ping_interval: Duration::from_secs(30),
             hello_timeout: Duration::from_secs(10),
+            head_timeout: Duration::from_secs(5),
             keepalive: Keepalive::default(),
         }
     }
