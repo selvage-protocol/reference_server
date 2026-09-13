@@ -98,17 +98,21 @@
               files = "\\.woodpecker/";
             };
 
-            rustfmt = mkHook "rustfmt" "nix build .#checks.${system}.fmt --no-link --print-build-logs";
-            cargo-check = mkHook "cargo check" "nix build .#checks.${system}.clippy --no-link --print-build-logs";
-            clippy = mkHook "clippy" "nix build .#checks.${system}.clippy --no-link --print-build-logs";
-            audit = mkHook "audit" "${pkgs.cargo-audit}/bin/cargo-audit audit";
-            deny = mkHook "deny" "${pkgs.cargo-deny}/bin/cargo-deny check";
-            tarpaulin = mkHook "tarpaulin" "nix build .#checks.${system}.tarpaulin --no-link --print-build-logs";
+            rustfmt = mkHook "rustfmt" "nix build ./impl#checks.${system}.fmt --no-link --print-build-logs";
+            cargo-check = mkHook "cargo check" "nix build ./impl#checks.${system}.clippy --no-link --print-build-logs";
+            clippy = mkHook "clippy" "nix build ./impl#checks.${system}.clippy --no-link --print-build-logs";
+            audit = mkHook "audit" "${pkgs.cargo-audit}/bin/cargo-audit audit --file impl/Cargo.lock";
+
+            deny =
+              mkHook
+              "deny"
+              "${pkgs.cargo-deny}/bin/cargo-deny --manifest-path impl/Cargo.toml check";
+            tarpaulin = mkHook "tarpaulin" "nix build ./impl#checks.${system}.tarpaulin --no-link --print-build-logs";
 
             cargo-nextest =
               mkHook
               "cargo nextest"
-              "nix build .#checks.${system}.nextest --no-link --print-build-logs";
+              "nix build ./impl#checks.${system}.nextest --no-link --print-build-logs";
           };
         };
         binCargoPath = ./crates/selvaged/Cargo.toml;
