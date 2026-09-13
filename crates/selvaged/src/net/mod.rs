@@ -37,6 +37,10 @@ use session::{Applicant, Session, handshake};
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const NOT_FOUND: &str = r#"{"error":"not found"}"#;
 
+/// RFC 6455 allows 125 bytes in a control-frame payload, and a close frame spends two of
+/// them on its status code.
+const MAX_CLOSE_REASON: usize = 123;
+
 /// A WebSocket session from a client, upgraded off a plain TCP stream.
 pub type SessionSocket =
     tokio_tungstenite::WebSocketStream<PrefixedStream<TcpStream>>;
@@ -248,9 +252,24 @@ fn frame_of_outbound(out: Outbound) -> Message {
         Outbound::Ping(b) => Message::Ping(b.into()),
         Outbound::Close(code, reason) => Message::Close(Some(CloseFrame {
             code: code.into(),
-            reason: reason.into(),
+            reason: truncate_reason(reason).into(),
         })),
     }
+}
+
+/// Cuts a close reason down to what a control frame can carry. Reasons are built from
+/// client input, and a client is owed the close code even when its own input cannot be
+/// quoted back in full.
+fn truncate_reason(mut reason: String) -> String {
+    if reason.len() <= MAX_CLOSE_REASON {
+        return reason;
+    }
+    let mut end = MAX_CLOSE_REASON;
+    while !reason.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    reason.truncate(end);
+    reason
 }
 
 // --- HTTP ---------------------------------------------------------------------

@@ -114,6 +114,12 @@ impl Frame {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.payload).into_owned()
     }
+
+    /// The reason of a close frame: everything after the two-byte status code.
+    fn reason(&self) -> Option<String> {
+        let rest = self.payload.get(2..)?;
+        Some(String::from_utf8_lossy(rest).into_owned())
+    }
 }
 
 /// A WebSocket connection the test drives byte by byte.
@@ -235,12 +241,21 @@ async fn read_matching(
     }
 }
 
-/// One masked client frame.
+/// One masked client frame, in whichever length form fits.
 fn client_frame(opcode: u8, payload: &[u8]) -> Result<Vec<u8>, Failure> {
+    /// The 7-bit length that means the real one follows in two more bytes.
+    const EXTENDED: u8 = 126;
     let mask = [0x21, 0x42, 0x63, 0x84];
-    let length = u8::try_from(payload.len())
-        .map_err(|_| "a client frame payload under 126 bytes")?;
-    let mut frame = vec![0x80 | opcode, 0x80 | length];
+    let length = u16::try_from(payload.len())
+        .map_err(|_| "a client frame payload under 64 KiB")?;
+    let mut frame = vec![0x80 | opcode];
+    match u8::try_from(length) {
+        Ok(short) if length < u16::from(EXTENDED) => frame.push(0x80 | short),
+        _ => {
+            frame.push(0x80 | EXTENDED);
+            frame.extend_from_slice(&length.to_be_bytes());
+        }
+    }
     frame.extend_from_slice(&mask);
     frame.extend(
         payload
@@ -848,6 +863,42 @@ async fn a_refused_request_fails_and_leaves_local_state_alone() {
         documents.contains(&PATH.to_string()).then_some(())
     })
     .await;
+}
+
+/// A close reason is control-frame payload: RFC 6455 allows 125 bytes, two of which the
+/// status code takes. A reason built from client input — here a two-thousand-byte wire
+/// version — has to be cut down, or a conforming client rejects the frame instead of
+/// learning the close code.
+#[tokio::test]
+async fn a_long_close_reason_is_cut_down_to_fit_a_control_frame() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    let version = format!("selvage/{}", "1".repeat(2000));
+    raw.send_json(&serde_json::json!({
+        "v": version,
+        "id": 1,
+        "method": method::SESSION_HELLO,
+        "params": {"display_name": "Long"},
+    }))
+    .await
+    .expect("says hello");
+
+    let refusal = raw.next_json().await.expect("the refusal");
+    assert_eq!(refusal["params"]["code"], code::UNSUPPORTED_VERSION);
+    let closing = raw.read_to_close().await.expect("a close frame");
+    assert_eq!(closing.close_code(), Some(close::UNSUPPORTED_VERSION));
+    let reason = closing.reason().expect("a reason");
+    assert!(
+        reason.len() <= 123,
+        "a close reason must fit a control frame, got {} bytes",
+        reason.len()
+    );
+    assert!(
+        reason.starts_with("unsupported wire version"),
+        "the reason still says what went wrong: {reason}"
+    );
 }
 async fn http_get(url: &str) -> Result<String, Failure> {
     let address = url.trim_start_matches("http://");
