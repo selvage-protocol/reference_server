@@ -877,6 +877,80 @@ async fn an_unreadable_anchor_costs_the_selection_and_not_the_path() {
     drop(raw);
 }
 
+/// The `assoc` values §8.1 says a receiver normalises, and the one shape it must reject, none
+/// of which may cost the state that carries it.
+#[tokio::test]
+async fn every_assoc_is_normalised_by_sign_and_two_scopes_are_not_a_scope() {
+    let harness = Harness::start(WAIT).await;
+    let (host, room, _guest) =
+        seeded(&harness, "abc").await.expect("a seeded room");
+
+    // Out of range: normalised by sign, and the scope-only anchor then means the end of the
+    // text or the start of it. Each peer is named apart, so a state still arriving from an
+    // earlier one cannot stand in for it.
+    for (name, assoc, expected, offsets) in
+        [("Cleo", "7", 0, 3), ("Dan", "-7", -1, 0)]
+    {
+        let anchor = format!(r#"{{"tname":"{PATH}","assoc":{assoc}}}"#);
+        let (raw, _) = raw_peer_named(&harness, &room, name, &caret_state(&anchor))
+            .await
+            .expect("the hand-built peer publishes");
+        let seen = wait_for_caret(&host, name, SelectionOffsets::caret(offsets)).await;
+        assert_eq!(
+            seen.anchors().map(|s| s.anchor.assoc),
+            Some(expected),
+            "assoc {assoc} normalises to {expected}"
+        );
+        drop(raw);
+    }
+
+    // Two scopes at once name two positions, so the anchor is malformed rather than resolved
+    // to whichever member the receiver happened to read first.
+    let anchor = format!(
+        r#"{{"tname":"{PATH}","type":{{"client":1,"clock":0}},"assoc":0}}"#
+    );
+    let (raw, _) = raw_peer_named(&harness, &room, "Eve", &caret_state(&anchor))
+        .await
+        .expect("the hand-built peer publishes");
+    let seen = wait_for_state(&host, "Eve").await;
+    assert_eq!(seen.path(), Some(PATH));
+    assert_eq!(seen.selection(), None, "two scopes are not a scope");
+    drop(raw);
+}
+
+/// A caret in an empty text has no element to name and no offset to drift, so it travels as
+/// the scope alone — and the text it names has to be *there*, which is what makes this
+/// publishable at all rather than the withheld selection of §8.1's sender rule.
+#[tokio::test]
+async fn a_caret_in_an_empty_text_travels_as_the_scope_alone() {
+    let harness = Harness::start(WAIT).await;
+    let (host, _room, guest) =
+        seeded(&harness, "abc").await.expect("a seeded room");
+
+    // The text stays, with nothing in it: an empty document is not an absent one. The host
+    // publishes, so its own replica is empty before it anchors; the guest resolves the anchor
+    // once the delete reaches it, which is why the wait is on the resolved offset.
+    host.delete(PATH, 0, 3)
+        .await
+        .expect("the host deletes the whole text");
+    assert_eq!(host.text(PATH).await.expect("the text"), "");
+    host.set_selection(PATH, SelectionOffsets::caret(0))
+        .await
+        .expect("the host puts its caret in the empty text");
+
+    let seen = wait_for_caret(&guest, "Ada", SelectionOffsets::caret(0)).await;
+    assert_eq!(
+        seen.anchors().map(|s| s.anchor.tname.as_deref()),
+        Some(Some(PATH)),
+        "the scope is the only encoding for a position with no element"
+    );
+    assert_eq!(
+        seen.anchors().and_then(|s| s.anchor.item.as_ref()),
+        None,
+        "and no element is invented to go with it"
+    );
+}
+
 /// The scope is still checked when an element sits beside it: a `tname` naming another
 /// document is a mismatch even though the `item` next to it would have resolved on its own.
 #[tokio::test]
