@@ -122,11 +122,16 @@ pub async fn connect(
     let local_state = serde_json::to_string(&options.initial_awareness)?;
     let (sink, mut stream, awareness) = greet(&options, &url).await?;
     let session = await_session(&mut stream, &options.base_url).await?;
+    // The server advertises the session's keepalive; a caller that did not override it
+    // runs on the server's clock, so both ends measure awareness the same way.
+    let keepalive = options
+        .keepalive
+        .unwrap_or_else(|| KeepaliveConfig::from(session.keepalive));
     let start = EngineStart {
         sink,
         stream,
         awareness,
-        keepalive: options.keepalive,
+        keepalive,
         local_state: Some(local_state),
     };
     Ok((spawn(start, &session), session))

@@ -7,20 +7,34 @@ use selvage_protocol as proto;
 use crate::Role;
 use crate::presence::AwarenessState;
 
-/// y-protocols defaults: renew every 15s, expire at 30s.
+/// The awareness clock this client runs: renew every `awareness_renew`, forget a remote
+/// state after `awareness_expire`.
+///
+/// The defaults are the y-protocols ones (15 s and 30 s). A client uses the values the
+/// server advertises in its reply to `session.hello` unless the caller overrides them with
+/// [`crate::ConnectOptions::with_keepalive`].
 #[derive(Debug, Clone, Copy)]
 pub struct KeepaliveConfig {
     pub awareness_renew: Duration,
     pub awareness_expire: Duration,
 }
 
+impl From<proto::Keepalive> for KeepaliveConfig {
+    fn from(advertised: proto::Keepalive) -> Self {
+        Self {
+            awareness_renew: Duration::from_millis(
+                advertised.awareness_renew_ms,
+            ),
+            awareness_expire: Duration::from_millis(
+                advertised.awareness_expire_ms,
+            ),
+        }
+    }
+}
+
 impl Default for KeepaliveConfig {
     fn default() -> Self {
-        let base = proto::Keepalive::default();
-        Self {
-            awareness_renew: Duration::from_millis(base.awareness_renew_ms),
-            awareness_expire: Duration::from_millis(base.awareness_expire_ms),
-        }
+        Self::from(proto::Keepalive::default())
     }
 }
 
@@ -93,7 +107,9 @@ pub struct ConnectOptions {
     pub capabilities: Vec<String>,
     /// Free-form client identifier, e.g. `selvage-harness/0.1.0`.
     pub client: Option<String>,
-    pub keepalive: KeepaliveConfig,
+    /// Overrides the awareness clock the server advertises. `None` — the default — uses the
+    /// server's values, so both sides of the session measure awareness the same way.
+    pub keepalive: Option<KeepaliveConfig>,
     pub initial_awareness: AwarenessState,
 }
 
@@ -154,7 +170,7 @@ impl ConnectOptions {
                 "selvage-client/{}",
                 env!("CARGO_PKG_VERSION")
             )),
-            keepalive: KeepaliveConfig::default(),
+            keepalive: None,
             initial_awareness: AwarenessState::default(),
         }
     }
@@ -175,16 +191,19 @@ impl ConnectOptions {
         self
     }
 
+    /// Overrides the server's advertised awareness clock. The server is the authority for
+    /// a session's keepalive; this exists for callers that have to run the clock faster,
+    /// such as tests.
     #[must_use]
     pub const fn with_keepalive(
         mut self,
         renew: Duration,
         expire: Duration,
     ) -> Self {
-        self.keepalive = KeepaliveConfig {
+        self.keepalive = Some(KeepaliveConfig {
             awareness_renew: renew,
             awareness_expire: expire,
-        };
+        });
         self
     }
 
