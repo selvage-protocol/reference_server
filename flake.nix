@@ -191,6 +191,7 @@
               cargo-tarpaulin
               bacon
               nodejs_22
+              actionlint
             ]
             ++ hooks.enabledPackages;
 
