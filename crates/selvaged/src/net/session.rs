@@ -372,12 +372,9 @@ impl Session {
 
     /// Handles one JSON envelope: a session method, or an error for anything else.
     async fn handle_text(&self, text: &str, shared: &Shared) {
-        let Ok(msg) = serde_json::from_str::<proto::ClientMessage>(text) else {
-            self.alert(
-                code::BAD_MESSAGE,
-                "the message is not a session envelope",
-            );
-            return;
+        let msg = match serde_json::from_str::<proto::ClientMessage>(text) {
+            Ok(msg) => msg,
+            Err(e) => return self.alert(code::BAD_MESSAGE, e.to_string()),
         };
         let Some(id) = msg.id else {
             self.alert(code::BAD_MESSAGE, "a request needs an id");
