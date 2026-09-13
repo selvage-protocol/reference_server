@@ -117,7 +117,7 @@ pub async fn connect(
     );
     let local_state = serde_json::to_string(&options.initial_awareness)?;
     let (sink, mut stream, awareness) = greet(&options, &url).await?;
-    let session = await_session(&mut stream, &url).await?;
+    let session = await_session(&mut stream, &options.base_url).await?;
     let start = EngineStart {
         sink,
         stream,
@@ -165,11 +165,11 @@ async fn greet(
 /// Waits for `room.created`/`room.joined`, or the reason the server refused.
 async fn await_session(
     stream: &mut Stream,
-    url: &str,
+    base_url: &str,
 ) -> Result<SessionInfo, Error> {
     loop {
         let frame = stream.next().await;
-        if let Some(session) = session_from(frame, url)? {
+        if let Some(session) = session_from(frame, base_url)? {
             return Ok(session);
         }
     }
@@ -178,10 +178,10 @@ async fn await_session(
 /// Reads one frame of the handshake. `Ok(None)` means "keep waiting".
 fn session_from(
     frame: Option<Result<Message, WireError>>,
-    url: &str,
+    base_url: &str,
 ) -> Result<Option<SessionInfo>, Error> {
     match frame {
-        Some(Ok(Message::Text(text))) => session_event(&text, url),
+        Some(Ok(Message::Text(text))) => session_event(&text, base_url),
         Some(Ok(Message::Close(_))) | None => Err(Error::Closed),
         Some(Err(e)) => Err(Error::Wire(e)),
         Some(Ok(_)) => Ok(None),
@@ -189,13 +189,16 @@ fn session_from(
 }
 
 /// Interprets the JSON envelope that ends the handshake. `Ok(None)` means "not yet".
-fn session_event(text: &str, url: &str) -> Result<Option<SessionInfo>, Error> {
+fn session_event(
+    text: &str,
+    base_url: &str,
+) -> Result<Option<SessionInfo>, Error> {
     let msg: proto::ServerMessage = serde_json::from_str(text)?;
     match msg.event.as_deref() {
         Some(event::ROOM_CREATED | event::ROOM_JOINED) => {
             let body = msg.params.unwrap_or_else(|| serde_json::json!({}));
             let params: proto::SessionParams = serde_json::from_value(body)?;
-            Ok(Some(session_info(params, url)))
+            Ok(Some(session_info(params, base_url)))
         }
         Some(event::SESSION_ERROR) => {
             let body = msg.params.unwrap_or_else(|| serde_json::json!({}));
@@ -217,7 +220,7 @@ fn text_param(params: &serde_json::Value, key: &str) -> Option<String> {
     params.get(key).and_then(|v| v.as_str()).map(str::to_string)
 }
 
-fn session_info(params: proto::SessionParams, endpoint: &str) -> SessionInfo {
+fn session_info(params: proto::SessionParams, base_url: &str) -> SessionInfo {
     SessionInfo {
         room_id: params.room_id,
         token: params.token,
@@ -227,7 +230,7 @@ fn session_info(params: proto::SessionParams, endpoint: &str) -> SessionInfo {
         documents: params.documents,
         capabilities: params.capabilities,
         keepalive: params.keepalive,
-        endpoint: endpoint.to_string(),
+        base_url: base_url.to_string(),
     }
 }
 

@@ -366,7 +366,35 @@ pub fn parse_join_query(query: &str) -> JoinQuery {
     out
 }
 
+/// A connection URL split into the server base and the room/token it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionUrl {
+    /// The `ws://host:port[/prefix]` part, without the endpoint path.
+    pub base: String,
+    pub join: JoinQuery,
+}
+
+/// Takes a full connection URL — in particular the invite URL a host publishes — apart
+/// into the server base and the join query, which is what a client needs to connect.
+///
+/// Returns `None` when the URL does not address the session endpoint.
+#[must_use]
+pub fn parse_session_url(url: &str) -> Option<SessionUrl> {
+    let (endpoint, query) = match url.split_once('?') {
+        Some((endpoint, query)) => (endpoint, query),
+        None => (url, ""),
+    };
+    let base = endpoint.strip_suffix(ENDPOINT_PATH)?;
+    Some(SessionUrl {
+        base: base.to_string(),
+        join: parse_join_query(query),
+    })
+}
+
 /// Builds the WebSocket URL for a connection. Host connections omit room and token.
+///
+/// `base` is the server base URL — `ws://host:port`, without the endpoint path. Pair
+/// with [`parse_session_url`] when the base has to come out of a URL again.
 #[must_use]
 pub fn session_url(
     base: &str,
@@ -530,6 +558,29 @@ mod tests {
                 token: None
             }
         );
+    }
+
+    #[test]
+    fn a_session_url_is_taken_apart_into_its_base() {
+        let url = "ws://127.0.0.1:8080/session?room=room%201&token=t%2Fk";
+        let parsed = parse_session_url(url).unwrap();
+        assert_eq!(parsed.base, "ws://127.0.0.1:8080");
+        assert_eq!(parsed.join.room.as_deref(), Some("room 1"));
+        assert_eq!(parsed.join.token.as_deref(), Some("t/k"));
+
+        // The base a URL was built from round-trips, wherever the endpoint sits.
+        for base in ["ws://127.0.0.1:8080", "wss://example.test/prefix"] {
+            let url = session_url(base, Some("r"), Some("t"));
+            assert_eq!(parse_session_url(&url).unwrap().base, base);
+        }
+
+        // A host connection carries no room, and anything off the endpoint is not a
+        // session URL at all.
+        assert_eq!(
+            parse_session_url("ws://h/session").unwrap().join,
+            JoinQuery::default()
+        );
+        assert_eq!(parse_session_url("ws://h/meta"), None);
     }
 
     #[test]

@@ -39,16 +39,23 @@ pub struct SessionInfo {
     pub documents: Vec<String>,
     pub capabilities: Vec<String>,
     pub keepalive: proto::Keepalive,
-    pub endpoint: String,
+    /// The server base URL this connection was opened against, without the endpoint
+    /// path. The invite URL is built from this and nothing else, so it cannot pick up
+    /// the endpoint path twice.
+    pub base_url: String,
 }
 
 impl SessionInfo {
-    /// The invite URL for this room, as a guest would use it.
+    /// The invite URL for this room, as a guest would use it: the server this session
+    /// is on, the room, and the token.
+    ///
+    /// This is the shared link the whole workflow is built on, and it is a URL a client
+    /// can connect with directly — see [`ConnectOptions::from_invite_url`].
     #[must_use]
     pub fn invite_url(&self) -> Option<String> {
         let token = self.token.as_ref()?;
         Some(proto::session_url(
-            &self.endpoint,
+            &self.base_url,
             Some(&self.room_id),
             Some(token),
         ))
@@ -112,6 +119,24 @@ impl ConnectOptions {
         options.token = Some(invite.token);
         options.role = Some(Role::Guest);
         options
+    }
+
+    /// Connects using an invite URL exactly as `invite_url` produced it: the link
+    /// carries the server, the room and the token, so pasting it is enough.
+    ///
+    /// Returns `None` when the URL does not address the session endpoint or does not
+    /// carry both a room and a token.
+    #[must_use]
+    pub fn from_invite_url(
+        url: &str,
+        display_name: impl Into<String>,
+    ) -> Option<Self> {
+        let parsed = proto::parse_session_url(url)?;
+        let mut options = Self::new(parsed.base, display_name);
+        options.room = parsed.join.room;
+        options.token = parsed.join.token;
+        options.role = Some(Role::Guest);
+        (options.room.is_some() && options.token.is_some()).then_some(options)
     }
 
     fn new(

@@ -13,6 +13,7 @@ use selvage_harness::{
     EditorAdapter, Harness, PeerInfo, Presence, Role, Selection, SyncEngine,
     drive_editor, wait_for, wait_for_convergence, wait_for_peer,
 };
+use selvage_protocol as proto;
 
 const PATH: &str = "src/main.rs";
 const SEED: &str = "fn main() {\n    println!(\"hello\");\n}\n";
@@ -24,18 +25,27 @@ type Failure = Box<dyn StdError>;
 async fn two_clients_converge_and_see_each_other() {
     let harness = Harness::start(Duration::from_secs(5)).await;
     let (host, room) = harness.host("Ada").await.expect("host connects");
-    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+    // The invite URL is the share, so the gate joins *through* it: a link a client
+    // cannot connect with fails here, whatever else it contains.
+    let parsed = proto::parse_session_url(&room.invite_url)
+        .expect("the invite URL is a session URL");
+    assert_eq!(
+        parsed.base,
+        harness.ws_base(),
+        "the invite URL names the server"
+    );
+    assert_eq!(parsed.join.room.as_deref(), Some(room.id.as_str()));
+    assert_eq!(parsed.join.token.as_deref(), Some(room.token.as_str()));
+    let guest = harness
+        .join_url(&room.invite_url, "Bob")
+        .await
+        .expect("a guest joins with the invite URL");
 
     // --- session layer -----------------------------------------------------
 
     assert_eq!(host.session().role, Role::Host);
     assert_eq!(guest.session().role, Role::Guest);
     assert_eq!(host.session().room_id, guest.session().room_id);
-    assert!(
-        room.invite_url.contains(&room.token),
-        "the invite URL carries the token: {}",
-        room.invite_url
-    );
 
     // --- one document, seeded by the host ----------------------------------
 

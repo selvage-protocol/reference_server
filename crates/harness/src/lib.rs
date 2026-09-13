@@ -128,6 +128,24 @@ impl Harness {
         SyncEngine::connect(options).await
     }
 
+    /// Joins with a published invite URL — the link itself, not the room id and token
+    /// taken out of it. This is what a human does when they paste the link, so it fails
+    /// when the link cannot be used as one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Invite`] when the URL is not a connection URL this client can
+    /// use, and whatever [`SyncEngine::connect`] returns when the server refuses.
+    pub async fn join_url(
+        &self,
+        invite_url: &str,
+        display_name: &str,
+    ) -> Result<SyncEngine, Error> {
+        let options = ConnectOptions::from_invite_url(invite_url, display_name)
+            .ok_or_else(|| Error::Invite(invite_url.to_string()))?;
+        SyncEngine::connect(options).await
+    }
+
     /// Reconnects a host that had disconnected: same room, hosts again.
     ///
     /// # Errors
