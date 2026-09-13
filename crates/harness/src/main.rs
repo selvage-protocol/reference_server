@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use selvage_harness::{
-    Harness, Presence, Room, Selection, SyncEngine, wait_for,
+    Harness, Presence, Room, SelectionOffsets, SyncEngine, wait_for,
 };
 
 const PATH: &str = "src/main.rs";
@@ -61,12 +61,12 @@ async fn seed(host: &SyncEngine, guest: &SyncEngine) -> Result<(), Failure> {
 
 /// Both cursors, each visible to the other side.
 async fn cursors(host: &SyncEngine, guest: &SyncEngine) -> Result<(), Failure> {
-    host.set_selection(PATH, Selection { anchor: 3, head: 7 })
+    host.set_selection(PATH, SelectionOffsets { anchor: 3, head: 7 })
         .await?;
     guest
         .set_selection(
             PATH,
-            Selection {
+            SelectionOffsets {
                 anchor: 11,
                 head: 15,
             },

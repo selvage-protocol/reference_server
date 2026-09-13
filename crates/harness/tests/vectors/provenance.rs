@@ -184,13 +184,20 @@ fn the_awareness_frames_are_the_ones_this_implementation_encodes() {
     let sent = sent_frames(&held);
     assert_eq!(sent.len(), 2, "vector 010 sends two binary frames");
 
-    for (index, (client, anchor)) in [(5_u64, 0_u64), (9, 4)].iter().enumerate()
+    // A selection endpoint is a CRDT anchor, never an offset (§8.1). The vector carries one
+    // of each encoding on purpose: the host's caret has no element to name, which is what the
+    // `tname` form is for, and the guest's names an element.
+    let tname = format!(r#"{{"tname":"{PATH}","assoc":0}}"#);
+    let item = r#"{"item":{"client":9,"clock":4},"assoc":0}"#.to_string();
+
+    for (index, (client, anchor)) in
+        [(5_u64, &tname), (9, &item)].into_iter().enumerate()
     {
         let state = format!(
             r#"{{"path":"{PATH}","selection":{{"anchor":{anchor},"head":{anchor}}}}}"#
         );
         assert_eq!(
-            hex(&awareness(*client, 1, &state)),
+            hex(&awareness(client, 1, &state)),
             sent[index],
             "the awareness frame of client {client}"
         );
@@ -204,7 +211,7 @@ fn the_awareness_frames_are_the_ones_this_implementation_encodes() {
         };
         let entry = read_back
             .clients
-            .get(&ClientID::new(*client))
+            .get(&ClientID::new(client))
             .expect("the client is in the update");
         assert_eq!(entry.clock, 1);
         assert_eq!(entry.json.as_ref(), state);

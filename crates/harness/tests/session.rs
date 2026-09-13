@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use selvage_harness::{
-    EngineEvent, Error, Harness, Role, Selection, ServerConfig, WAIT, wait_for,
-    wait_for_event,
+    EngineEvent, Error, Harness, Role, SelectionOffsets, ServerConfig, WAIT,
+    wait_for, wait_for_event,
 };
 use selvage_protocol as proto;
 use selvage_protocol::{close, code, event, method};
@@ -695,7 +695,7 @@ async fn a_guest_leaving_is_announced_and_its_presence_is_cleaned_up() {
     let (host, room) = harness.host("Ada").await.expect("host connects");
     let guest = harness.join(&room, "Bob").await.expect("guest joins");
     guest
-        .set_selection(PATH, Selection::caret(3))
+        .set_selection(PATH, SelectionOffsets::caret(3))
         .await
         .unwrap();
 

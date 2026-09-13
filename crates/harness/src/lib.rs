@@ -20,8 +20,9 @@ use tokio::time::{sleep, timeout};
 
 use selvage_client::ConnectOptions;
 pub use selvage_client::{
-    AwarenessState, EditorAdapter, EngineEvent, Error, Invite, PeerInfo,
-    Presence, Role, Selection, SyncEngine, drive_editor,
+    Anchor, AwarenessState, EditorAdapter, EngineEvent, Error, Invite, ItemId,
+    PeerInfo, Presence, Role, Selection, SelectionOffsets, SyncEngine,
+    drive_editor,
 };
 
 /// How long a test is willing to wait for a condition that should hold immediately.

@@ -28,7 +28,9 @@ pub use selvage_protocol::{Keepalive, PeerInfo, Role, WIRE_VERSION};
 pub use crate::editor::{EditorAdapter, EngineEvent, drive_editor};
 pub use crate::engine::{Command, EditOp};
 pub use crate::error::Error;
-pub use crate::presence::{AwarenessState, Presence, Selection};
+pub use crate::presence::{
+    Anchor, AwarenessState, ItemId, Presence, Selection, SelectionOffsets,
+};
 pub use crate::session::{
     ConnectOptions, Invite, KeepaliveConfig, SessionInfo,
 };
@@ -172,10 +174,15 @@ impl SyncEngine {
     /// Returns [`Error`] when the state cannot be encoded, or the engine has stopped.
     pub async fn set_awareness(
         &self,
-        state: AwarenessState,
+        path: Option<String>,
+        selection: Option<SelectionOffsets>,
     ) -> Result<(), Error> {
-        self.call(|reply| Command::SetAwareness { state, reply })
-            .await?
+        self.call(|reply| Command::SetAwareness {
+            path,
+            selection,
+            reply,
+        })
+        .await?
     }
 
     /// # Errors
@@ -184,13 +191,9 @@ impl SyncEngine {
     pub async fn set_selection(
         &self,
         path: impl Into<String>,
-        selection: Selection,
+        selection: SelectionOffsets,
     ) -> Result<(), Error> {
-        self.set_awareness(AwarenessState {
-            path: Some(path.into()),
-            selection: Some(selection),
-        })
-        .await
+        self.set_awareness(Some(path.into()), Some(selection)).await
     }
 
     /// Every presence record this engine knows, including the local client's.

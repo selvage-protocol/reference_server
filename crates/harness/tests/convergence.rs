@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use selvage_harness::{
-    EditorAdapter, EngineEvent, Harness, PeerInfo, Presence, Role, Selection,
-    SyncEngine, WAIT, drive_editor, wait_for, wait_for_convergence,
-    wait_for_peer,
+    EditorAdapter, EngineEvent, Harness, PeerInfo, Presence, Role,
+    SelectionOffsets, SyncEngine, WAIT, drive_editor, wait_for,
+    wait_for_convergence, wait_for_peer,
 };
 use selvage_protocol as proto;
 use tokio::sync::broadcast::Receiver;
@@ -131,8 +131,8 @@ async fn cursors(
     members: (&PeerInfo, &PeerInfo),
 ) -> Result<(), Failure> {
     let (bob, ada) = members;
-    let ada_selection = Selection { anchor: 0, head: 2 };
-    let bob_selection = Selection {
+    let ada_selection = SelectionOffsets { anchor: 0, head: 2 };
+    let bob_selection = SelectionOffsets {
         anchor: 11,
         head: 13,
     };
@@ -220,7 +220,14 @@ async fn matching_vectors(
 }
 
 /// True when `presence` is `name`'s cursor in the one document this suite uses.
-fn presence_is(presence: &Presence, name: &str, selection: Selection) -> bool {
+///
+/// The offsets are the ones the anchors resolved to here, which is the whole point: the peer
+/// published no index, and this replica recomputed one.
+fn presence_is(
+    presence: &Presence,
+    name: &str,
+    selection: SelectionOffsets,
+) -> bool {
     presence.display_name() == Some(name)
         && presence.path() == Some(PATH)
         && presence.selection() == Some(selection)
@@ -303,7 +310,7 @@ async fn a_cursor_move_is_not_a_document_change() {
 
     let mut events = host.subscribe();
     guest
-        .set_selection(PATH, Selection::caret(2))
+        .set_selection(PATH, SelectionOffsets::caret(2))
         .await
         .expect("the guest moves its cursor");
 

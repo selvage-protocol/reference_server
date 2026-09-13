@@ -1,12 +1,13 @@
 //! The unit of a text offset, which the wire never says but every peer must agree on.
 //!
-//! `spec/PROTOCOL.md` §8.1 puts a selection in the awareness state as `{ anchor, head }` and
-//! §12.4 records that the unit was never written down. It is UTF-16 code units: that is what
-//! `yjs` counts, what every editor's `offsetAt` counts, and what `yrs` calls
-//! `OffsetKind::Utf16`. An implementation that counts bytes or code points puts every cursor
-//! after the first non-BMP character in a different place from its peers, and the two peers
-//! show each other no cursor at all rather than the wrong one only in the happy case where
-//! the document is ASCII.
+//! `spec/PROTOCOL.md` §8.1 puts *no* offset on the wire — a selection travels as CRDT anchors —
+//! so the protocol fixes no unit, and an implementation fixes one at its editor-adapter seam
+//! instead. This client's seam, which `insert`, `delete` and `SelectionOffsets` all speak, is
+//! UTF-16 code units: that is what `yjs` counts, what every editor's `offsetAt` counts, and what
+//! `yrs` calls `OffsetKind::Utf16`. Being local does not make the unit free: an anchor is
+//! computed *from* an offset, so a client counting bytes or code points anchors a cursor to the
+//! wrong element, and its peers then render that cursor somewhere plausible-looking and wrong
+//! with nothing on the wire to reveal the disagreement.
 
 use std::time::Duration;
 

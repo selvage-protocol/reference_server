@@ -6,6 +6,7 @@
 //! y-protocols. Nothing in this file invents a document or awareness encoding.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -28,11 +29,14 @@ use yrs::sync::{Awareness, Message as YMessage, SyncMessage};
 use yrs::updates::decoder::DecoderV1;
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{
-    Doc, GetString, OffsetKind, Options, ReadTxn, Text as YText, Transact,
+    Assoc, BranchID, Doc, GetString, IndexedSequence, OffsetKind, Options,
+    ReadTxn, StickyIndex, Text as YText, TextRef, Transact,
 };
 
 use crate::editor::EngineEvent;
-use crate::presence::{AwarenessState, PeerInfo, Presence};
+use crate::presence::{
+    Anchor, AwarenessState, PeerInfo, Presence, Selection, SelectionOffsets,
+};
 use crate::{ConnectOptions, Error, KeepaliveConfig, SessionInfo};
 
 type Socket = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -65,7 +69,8 @@ pub enum Command {
         reply: oneshot::Sender<Result<(), Error>>,
     },
     SetAwareness {
-        state: AwarenessState,
+        path: Option<String>,
+        selection: Option<SelectionOffsets>,
         reply: oneshot::Sender<Result<(), Error>>,
     },
     Presence {
@@ -436,8 +441,12 @@ impl EngineTask {
                 self.apply_edit(&path, op);
                 let _ = reply.send(Ok(()));
             }
-            Command::SetAwareness { state, reply } => {
-                let result = self.set_local_awareness(&state);
+            Command::SetAwareness {
+                path,
+                selection,
+                reply,
+            } => {
+                let result = self.set_local_awareness(path, selection);
                 let _ = reply.send(result);
             }
             Command::Presence { reply } => {
@@ -553,11 +562,15 @@ impl EngineTask {
         entries
     }
 
+    /// Publishes this client's presence, turning the offsets the adapter speaks into the
+    /// anchors the wire carries (`spec/PROTOCOL.md` §8.1).
     fn set_local_awareness(
         &mut self,
-        state: &AwarenessState,
+        path: Option<String>,
+        selection: Option<SelectionOffsets>,
     ) -> Result<(), Error> {
-        let json = serde_json::to_string(state)?;
+        let state = self.anchored_state(path, selection);
+        let json = serde_json::to_string(&state)?;
         self.awareness.set_local_state_raw(json.clone());
         self.local_state = Some(json);
         self.publish_local_awareness()?;
@@ -565,6 +578,41 @@ impl EngineTask {
             presence: self.presence(),
         });
         Ok(())
+    }
+
+    /// The state to publish: a selection is anchored against this replica, and is dropped
+    /// when there is no path to anchor it in.
+    fn anchored_state(
+        &mut self,
+        path: Option<String>,
+        selection: Option<SelectionOffsets>,
+    ) -> AwarenessState {
+        let anchored = match (path.as_deref(), selection) {
+            (Some(target), Some(offsets)) => {
+                Some(self.anchor_selection(target, offsets))
+            }
+            _ => None,
+        };
+        AwarenessState {
+            path,
+            selection: anchored,
+        }
+    }
+
+    /// Anchors both endpoints of a selection against this replica.
+    fn anchor_selection(
+        &mut self,
+        path: &str,
+        offsets: SelectionOffsets,
+    ) -> Selection {
+        // `get_or_insert_text` takes a transaction of its own, so the handle has to be in
+        // hand before one is held; taking it under a live transaction deadlocks the task.
+        let text = self.doc().get_or_insert_text(path);
+        let txn = self.doc().transact();
+        Selection {
+            anchor: anchor_at(&txn, &text, offsets.anchor),
+            head: anchor_at(&txn, &text, offsets.head),
+        }
     }
 
     /// y-protocols awareness renews every 15s and expires at 30s: renewal means
@@ -612,18 +660,27 @@ impl EngineTask {
             self.awareness.client_id().get(),
             self.session.peer.clone(),
         );
+        // Resolution is deferred, not part of applying the update (§8.1): a state that
+        // arrived before its document resolves on a later read, not never.
+        let txn = self.awareness.doc().transact();
         let mut presence: Vec<Presence> = self
             .awareness
             .iter()
             // A removed client keeps its slot in the awareness map with no data.
             .filter(|(_, state)| state.data.is_some())
-            .map(|(client_id, state)| Presence {
-                client_id: client_id.get(),
-                peer: by_client.get(&client_id.get()).cloned(),
-                state: state
+            .map(|(client_id, entry)| {
+                let state: Option<AwarenessState> = entry
                     .data
                     .as_deref()
-                    .and_then(|json| serde_json::from_str(json).ok()),
+                    .and_then(|json| serde_json::from_str(json).ok());
+                let resolved =
+                    state.as_ref().and_then(|s| resolve_selection(&txn, s));
+                Presence {
+                    client_id: client_id.get(),
+                    peer: by_client.get(&client_id.get()).cloned(),
+                    state,
+                    resolved,
+                }
             })
             .collect();
         presence.sort_by_key(|p| p.client_id);
@@ -905,6 +962,52 @@ fn peer_from(params: Option<&serde_json::Value>) -> Option<PeerInfo> {
     let given = params?;
     let value = given.get("peer").unwrap_or(given);
     serde_json::from_value(value.clone()).ok()
+}
+
+/// The anchor for an offset in `text`: the element sitting there, or the `tname` form when
+/// there is no element to name — the end of the text, or an empty text (§8.1).
+///
+/// The fallback names the text itself rather than the path it was looked up under, so the two
+/// cannot drift apart.
+fn anchor_at<T: ReadTxn>(txn: &T, text: &TextRef, offset: u32) -> Anchor {
+    let sticky = text
+        .sticky_index(txn, offset, Assoc::After)
+        .unwrap_or_else(|| StickyIndex::from_type(txn, text, Assoc::After));
+    Anchor::from_sticky(&sticky)
+}
+
+/// Both endpoints of a published selection, resolved against this replica. An endpoint that
+/// does not resolve fails the whole selection: §8.1 forbids clamping to a guess.
+fn resolve_selection<T: ReadTxn>(
+    txn: &T,
+    state: &AwarenessState,
+) -> Option<SelectionOffsets> {
+    let path = state.path.as_deref()?;
+    let selection = state.selection.as_ref()?;
+    Some(SelectionOffsets {
+        anchor: resolve_anchor(txn, path, &selection.anchor)?,
+        head: resolve_anchor(txn, path, &selection.head)?,
+    })
+}
+
+/// The offset an anchor denotes here, or `None` when it names an element this replica has
+/// not seen or one living outside the text named by `path`.
+///
+/// Two checks, both required by §8.1 and neither implying the other: a `tname` must be the
+/// document the state was published for, and whatever the anchor resolves to must land in
+/// that document's text. The second is what catches an `item` from another type, which a
+/// `tname`-less anchor carries no other evidence about.
+fn resolve_anchor<T: ReadTxn>(
+    txn: &T,
+    path: &str,
+    anchor: &Anchor,
+) -> Option<u32> {
+    if !anchor.names_document(path) {
+        return None;
+    }
+    let offset = anchor.to_sticky()?.get_offset(txn)?;
+    (offset.branch.id() == BranchID::Root(Arc::from(path)))
+        .then_some(offset.index)
 }
 
 /// What a binary frame told this session about, one bit per kind: a frame may hold several

@@ -2,14 +2,19 @@
 //!
 //! The raw client here speaks the session handshake by hand, builds its awareness frame
 //! with `yrs` directly, and then stops renewing — which is what makes the expiry path
-//! observable in under a second.
+//! observable in under a second. Publishing a hand-written JSON state is the other half of
+//! its job: it is how these tests put a frame on the wire that the reference client would
+//! never produce, which is the only way to test what a receiver does with a bad one.
 
 use std::error::Error as StdError;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use selvage_client::{ConnectOptions, Role, SyncEngine};
-use selvage_harness::{Harness, Presence, Room, ServerConfig, wait_for};
+use selvage_harness::{
+    Harness, Presence, Room, SelectionOffsets, ServerConfig, WAIT, wait_for,
+    wait_for_convergence,
+};
 use selvage_protocol as proto;
 use selvage_protocol::{event, method};
 use serde_json::Value;
@@ -20,6 +25,9 @@ use tokio_tungstenite::tungstenite::Message;
 use yrs::Doc;
 use yrs::sync::{Awareness, Message as YMessage};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+
+const PATH: &str = "src/main.rs";
+const OTHER: &str = "src/other.rs";
 
 /// Anything this test can fail with.
 type Failure = Box<dyn StdError>;
@@ -56,11 +64,25 @@ async fn observer_on_a_local_clock(
     Ok(SyncEngine::connect(options).await?)
 }
 
-/// A peer that publishes awareness once and then goes quiet: it never renews, so the
-/// observer is the one that has to expire the state.
-async fn silent_peer(
+/// A host and a guest, both holding `PATH`, agreed on `seed`.
+async fn seeded(
+    harness: &Harness,
+    seed: &str,
+) -> Result<(SyncEngine, Room, SyncEngine), Failure> {
+    let (host, room) = harness.host("Ada").await?;
+    let guest = harness.join(&room, "Bob").await?;
+    host.open(PATH).await?;
+    guest.open(PATH).await?;
+    host.insert(PATH, 0, seed).await?;
+    wait_for_convergence(&host, &guest, PATH).await;
+    Ok((host, room, guest))
+}
+
+/// Joins `room` by hand as Cleo and publishes exactly `state`, then goes quiet.
+async fn raw_peer(
     harness: &Harness,
     room: &Room,
+    state: &str,
 ) -> Result<(Raw, Awareness), Failure> {
     let url = proto::session_url(
         &harness.ws_base(),
@@ -69,9 +91,7 @@ async fn silent_peer(
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await?;
     let mut awareness = Awareness::new(Doc::new());
-    awareness.set_local_state_raw(
-        r#"{"path":"src/main.rs","selection":{"anchor":1,"head":1}}"#,
-    );
+    awareness.set_local_state_raw(state);
     ws.send(Message::text(
         serde_json::json!({
             "v": proto::WIRE_VERSION,
@@ -94,6 +114,59 @@ async fn silent_peer(
     Ok((ws, awareness))
 }
 
+/// The client id of the replica that wrote the seed, which is what an `item` anchor into that
+/// seed has to name.
+fn writer_id(engine: &SyncEngine) -> Option<u64> {
+    engine.session().peer.awareness_client_id
+}
+
+/// A state whose two endpoints are both `anchor`, as a caret is.
+fn caret_state(anchor: &str) -> String {
+    format!(
+        r#"{{"path":"{PATH}","selection":{{"anchor":{anchor},"head":{anchor}}}}}"#
+    )
+}
+
+/// A peer that publishes awareness once and then goes quiet: it never renews, so the
+/// observer is the one that has to expire the state.
+async fn silent_peer(
+    harness: &Harness,
+    room: &Room,
+) -> Result<(Raw, Awareness), Failure> {
+    let anchor = format!(r#"{{"tname":"{PATH}","assoc":0}}"#);
+    raw_peer(harness, room, &caret_state(&anchor)).await
+}
+
+/// Waits until `observer` resolves `name`'s anchors to exactly `offsets`.
+async fn wait_for_caret(
+    observer: &SyncEngine,
+    name: &str,
+    offsets: SelectionOffsets,
+) -> Presence {
+    wait_for(
+        &format!("{name}'s cursor to resolve to {offsets:?}"),
+        || async {
+            observer.presence().await.ok()?.into_iter().find(|p| {
+                p.display_name() == Some(name) && p.selection() == Some(offsets)
+            })
+        },
+    )
+    .await
+}
+
+/// Waits until `observer` holds the state `name` published, whether or not it resolves.
+async fn wait_for_state(observer: &SyncEngine, name: &str) -> Presence {
+    wait_for(&format!("the state {name} published"), || async {
+        observer
+            .presence()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|p| p.display_name() == Some(name) && p.state.is_some())
+    })
+    .await
+}
+
 /// Waits for the silent peer's cursor on `observer` and then for it to expire, returning
 /// what presence is left afterwards.
 ///
@@ -110,7 +183,13 @@ async fn wait_for_cursor_to_expire(observer: &SyncEngine) -> Vec<Presence> {
             .find(is_cleo_cursor)
     })
     .await;
-    assert_eq!(seen.selection().map(|s| s.anchor), Some(1));
+    // The observer never opened the document, so there is nothing here to resolve against.
+    // What arrived is the anchors themselves, which is all this test needs to see.
+    assert_eq!(
+        seen.anchors().map(|s| s.anchor.tname.as_deref()),
+        Some(Some(PATH)),
+        "the cursor arrived as a `tname` anchor, not an offset"
+    );
 
     wait_for("the stale state to expire", || async {
         let presence = observer.presence().await.ok()?;
@@ -190,4 +269,217 @@ async fn the_client_runs_on_the_awareness_clock_the_server_advertises() {
     assert!(left.iter().any(|p| p.display_name() == Some("Ada")));
     assert_eq!(watcher.session().role, Role::Host);
     drop(silent);
+}
+
+/// An absolute offset drifts by the length of every edit landing before it. An anchor does
+/// not: the caret keeps naming the same element, so the *offset* it resolves to moves and the
+/// position in the text stays put. This is the whole reason §8.1 carries anchors.
+#[tokio::test]
+async fn a_caret_follows_its_element_when_an_edit_lands_before_it() {
+    let harness = Harness::start(WAIT).await;
+    let (host, _room, guest) =
+        seeded(&harness, "abc").await.expect("a seeded room");
+
+    guest
+        .set_selection(PATH, SelectionOffsets::caret(2))
+        .await
+        .expect("the guest puts a caret before `c`");
+    let before = wait_for_caret(&host, "Bob", SelectionOffsets::caret(2)).await;
+    let text_before = host.text(PATH).await.expect("the text");
+    assert_eq!(text_before.chars().nth(2), Some('c'));
+
+    host.insert(PATH, 0, "XYZ")
+        .await
+        .expect("the host types above the caret");
+
+    // Three characters went in above it, so the resolved offset is three further along.
+    let after = wait_for_caret(&host, "Bob", SelectionOffsets::caret(5)).await;
+    let text_after = host.text(PATH).await.expect("the text");
+    assert_eq!(text_after, "XYZabc");
+    assert_eq!(
+        text_after.chars().nth(5),
+        Some('c'),
+        "the caret still sits before the same character it did"
+    );
+    // Nothing was republished: the same anchors resolved to a different index.
+    assert_eq!(before.anchors(), after.anchors());
+}
+
+/// The end of a text has no element to name, so §8.1 requires the `tname` form — and that
+/// form follows appends forever, which is what a caret at the end of a file should do.
+#[tokio::test]
+async fn a_caret_at_the_end_stays_at_the_end_when_the_document_grows() {
+    let harness = Harness::start(WAIT).await;
+    let (host, _room, guest) =
+        seeded(&harness, "abc").await.expect("a seeded room");
+
+    guest
+        .set_selection(PATH, SelectionOffsets::caret(3))
+        .await
+        .expect("the guest puts its caret at the end");
+    let seen = wait_for_caret(&host, "Bob", SelectionOffsets::caret(3)).await;
+    assert_eq!(
+        seen.anchors().map(|s| s.anchor.tname.as_deref()),
+        Some(Some(PATH)),
+        "a position with no element to name is published as `tname`"
+    );
+
+    host.insert(PATH, 3, "de").await.expect("the host appends");
+
+    wait_for_caret(&host, "Bob", SelectionOffsets::caret(5)).await;
+    assert_eq!(host.text(PATH).await.expect("the text"), "abcde");
+}
+
+/// The seam's unit is UTF-16 code units, and an anchor is computed *from* an offset, so a
+/// client counting bytes would anchor this caret to the wrong element entirely.
+#[tokio::test]
+async fn a_caret_after_a_non_ascii_character_is_a_utf16_offset() {
+    let harness = Harness::start(WAIT).await;
+    let (host, _room, guest) =
+        seeded(&harness, "héllo").await.expect("a seeded room");
+
+    // `é` is one UTF-16 code unit and two UTF-8 bytes, so offset 2 is the first `l`.
+    guest
+        .set_selection(PATH, SelectionOffsets::caret(2))
+        .await
+        .expect("the guest puts a caret after `hé`");
+    wait_for_caret(&host, "Bob", SelectionOffsets::caret(2)).await;
+
+    // `😀` is two UTF-16 code units and four UTF-8 bytes, so a byte count would say 4.
+    host.insert(PATH, 0, "😀").await.expect("the host prepends");
+
+    wait_for_caret(&host, "Bob", SelectionOffsets::caret(4)).await;
+    let text = host.text(PATH).await.expect("the text");
+    assert_eq!(text, "😀héllo");
+    assert_eq!(
+        text.chars().nth(3),
+        Some('l'),
+        "UTF-16 offset 4 is the fourth character, because `😀` is two units"
+    );
+}
+
+/// A never-seen element cannot be resolved, and §8.1 forbids falling back to an offset or
+/// clamping to a guess: the peer is present, with no cursor.
+#[tokio::test]
+async fn an_anchor_naming_an_unknown_element_shows_no_selection() {
+    let harness = Harness::start(WAIT).await;
+    let (host, room, _guest) =
+        seeded(&harness, "abc").await.expect("a seeded room");
+
+    let state =
+        caret_state(r#"{"item":{"client":424242,"clock":7},"assoc":0}"#);
+    let (raw, _) = raw_peer(&harness, &room, &state)
+        .await
+        .expect("the hand-built peer publishes");
+
+    let seen = wait_for_state(&host, "Cleo").await;
+    assert_eq!(seen.path(), Some(PATH), "the state itself arrived");
+    assert!(seen.anchors().is_some(), "the anchors are still readable");
+    assert_eq!(
+        seen.selection(),
+        None,
+        "an element this replica has never seen is no cursor"
+    );
+    drop(raw);
+}
+
+/// `tname` *is* the document path, so one naming another document resolves into another type.
+/// §8.1 makes that a failure, and the branch check is what catches it — the receiver holds
+/// that other document here, so the anchor resolves and only the check rejects it.
+#[tokio::test]
+async fn an_anchor_naming_another_document_shows_no_selection() {
+    let harness = Harness::start(WAIT).await;
+    let (host, room, _guest) =
+        seeded(&harness, "abc").await.expect("a seeded room");
+    host.open(OTHER)
+        .await
+        .expect("the host opens a second document");
+
+    let state = caret_state(&format!(r#"{{"tname":"{OTHER}","assoc":0}}"#));
+    let (raw, _) = raw_peer(&harness, &room, &state)
+        .await
+        .expect("the hand-built peer publishes");
+
+    let seen = wait_for_state(&host, "Cleo").await;
+    assert_eq!(seen.path(), Some(PATH));
+    assert_eq!(
+        seen.selection(),
+        None,
+        "a `tname` that is not the state's path is a mismatch"
+    );
+    drop(raw);
+}
+
+/// The exact shape a yjs peer puts on the wire for a position inside a root type: `tname`
+/// naming the type *and* `item` naming the element in it. `yrs` collapses the two and emits
+/// `item` alone, so this pair only ever arrives from the other implementation — and treating
+/// it as malformed would show no cursor at all for every yjs peer, with nothing on the wire
+/// to say why. `item` is authoritative; `tname` is a check on it.
+#[tokio::test]
+async fn a_yjs_anchor_carrying_both_tname_and_item_resolves() {
+    let harness = Harness::start(WAIT).await;
+    let (host, room, _guest) =
+        seeded(&harness, "abc").await.expect("a seeded room");
+    let writer = writer_id(&host).expect("the host's replica has a client id");
+
+    let anchor = format!(
+        r#"{{"tname":"{PATH}","item":{{"client":{writer},"clock":1}},"assoc":0}}"#
+    );
+    let (raw, _) = raw_peer(&harness, &room, &caret_state(&anchor))
+        .await
+        .expect("the hand-built peer publishes");
+
+    // Clock 1 is the second character the host wrote, so the caret sits before `b`.
+    let seen = wait_for_caret(&host, "Cleo", SelectionOffsets::caret(1)).await;
+    assert_eq!(seen.path(), Some(PATH));
+    drop(raw);
+}
+
+/// The scope is still checked when an element sits beside it: a `tname` naming another
+/// document is a mismatch even though the `item` next to it would have resolved on its own.
+#[tokio::test]
+async fn a_yjs_anchor_whose_tname_is_not_the_path_shows_no_selection() {
+    let harness = Harness::start(WAIT).await;
+    let (host, room, _guest) =
+        seeded(&harness, "abc").await.expect("a seeded room");
+    let writer = writer_id(&host).expect("the host's replica has a client id");
+
+    let anchor = format!(
+        r#"{{"tname":"{OTHER}","item":{{"client":{writer},"clock":1}},"assoc":0}}"#
+    );
+    let (raw, _) = raw_peer(&harness, &room, &caret_state(&anchor))
+        .await
+        .expect("the hand-built peer publishes");
+
+    let seen = wait_for_state(&host, "Cleo").await;
+    assert_eq!(seen.path(), Some(PATH));
+    assert_eq!(
+        seen.selection(),
+        None,
+        "the scope must be the document the state was published for"
+    );
+    drop(raw);
+}
+
+/// Adding a member must never be a protocol break (§4.1, §8.1). A receiver ignores what it
+/// does not know — in the state object and inside an anchor alike — and resolves the rest.
+#[tokio::test]
+async fn unknown_keys_are_ignored_and_the_selection_still_resolves() {
+    let harness = Harness::start(WAIT).await;
+    let (host, room, _guest) =
+        seeded(&harness, "abc").await.expect("a seeded room");
+
+    let anchor =
+        format!(r#"{{"tname":"{PATH}","assoc":0,"nudge":"a later version"}}"#);
+    let state = format!(
+        r#"{{"path":"{PATH}","selection":{{"anchor":{anchor},"head":{anchor}}},"mood":"calm","visibleRanges":[[0,3]]}}"#
+    );
+    let (raw, _) = raw_peer(&harness, &room, &state)
+        .await
+        .expect("the hand-built peer publishes");
+
+    // `tname` with `assoc` 0 is the end of the text, which is 3 characters long here.
+    let seen = wait_for_caret(&host, "Cleo", SelectionOffsets::caret(3)).await;
+    assert_eq!(seen.path(), Some(PATH));
+    drop(raw);
 }
