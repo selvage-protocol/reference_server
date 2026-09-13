@@ -2,7 +2,7 @@
   "id": "001",
   "title": "GET /meta advertises the version, capabilities and keepalive",
   "spec": "PROTOCOL.md#2-transport",
-  "notes": "The `server` member is free-form, so it is a binding: every other byte is exact. The reference server writes this body with `serde_json::to_string`, which is the canonical form of spec/CANONICAL.md. A path that is not `/meta` answers 404.",
+  "notes": "The `server` member is free-form, so it is a binding: every other byte is exact. The reference server writes this body with `serde_json::to_string`, which is the canonical form of CANONICAL.md. A path that is not `/meta` answers 404.",
   "steps": [
     {
       "op": "http",
