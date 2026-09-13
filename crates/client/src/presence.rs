@@ -29,7 +29,8 @@ pub struct Selection {
 }
 
 impl Selection {
-    pub fn caret(at: u32) -> Self {
+    #[must_use]
+    pub const fn caret(at: u32) -> Self {
         Self {
             anchor: at,
             head: at,
@@ -48,14 +49,17 @@ pub struct Presence {
 }
 
 impl Presence {
+    #[must_use]
     pub fn display_name(&self) -> Option<&str> {
         self.peer.as_ref().map(|p| p.display_name.as_str())
     }
 
+    #[must_use]
     pub fn path(&self) -> Option<&str> {
         self.state.as_ref()?.path.as_deref()
     }
 
+    #[must_use]
     pub fn selection(&self) -> Option<Selection> {
         self.state.as_ref()?.selection
     }

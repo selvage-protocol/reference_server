@@ -8,8 +8,12 @@
 
 use std::sync::Arc;
 
-use crate::presence::{PeerInfo, Presence};
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::task::JoinHandle;
+
 use crate::SyncEngine;
+use crate::presence::{PeerInfo, Presence};
 
 /// Everything an editor adapter is told about the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,34 +55,73 @@ pub trait EditorAdapter: Send + Sync + 'static {
 /// The engine stays usable by the caller: this only reads the event stream, and the
 /// adapter is expected to call back into the engine (through whatever handle it holds)
 /// when the editor makes a local change.
-pub fn drive_editor(engine: &SyncEngine, adapter: Arc<dyn EditorAdapter>) -> tokio::task::JoinHandle<()> {
-    let mut events = engine.subscribe();
-    let engine = engine.clone();
-    tokio::spawn(async move {
-        loop {
-            match events.recv().await {
-                Ok(EngineEvent::DocumentChanged { path }) => {
-                    if let Ok(text) = engine.text(&path).await {
-                        adapter.document_changed(&path, &text);
-                    }
-                }
-                Ok(EngineEvent::DocumentsChanged { documents }) => {
-                    adapter.documents_changed(&documents);
-                }
-                Ok(EngineEvent::PeersChanged { peers }) => adapter.peers_changed(&peers),
-                Ok(EngineEvent::PresenceChanged { presence }) => {
-                    adapter.presence_changed(&presence)
-                }
-                Ok(EngineEvent::HostDetached { grace_ms }) => adapter.host_detached(grace_ms),
-                Ok(EngineEvent::HostAttached { peer }) => adapter.host_attached(&peer),
-                Ok(EngineEvent::RoomGone { reason }) => adapter.room_gone(&reason),
-                Ok(EngineEvent::Disconnected) => {
-                    adapter.disconnected();
-                    return;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+#[must_use]
+pub fn drive_editor(
+    engine: &SyncEngine,
+    adapter: Arc<dyn EditorAdapter>,
+) -> JoinHandle<()> {
+    let events = engine.subscribe();
+    tokio::spawn(pump(engine.clone(), adapter, events))
+}
+
+/// Reads the event stream until the session ends. The subscription is taken before
+/// the task starts, so nothing published after this call can slip past.
+async fn pump(
+    engine: SyncEngine,
+    adapter: Arc<dyn EditorAdapter>,
+    mut events: broadcast::Receiver<EngineEvent>,
+) {
+    loop {
+        let Some(event) = next_event(&mut events).await else {
+            return;
+        };
+        if !deliver(&engine, adapter.as_ref(), event).await {
+            return;
+        }
+    }
+}
+
+/// Waits for the next engine event, skipping the ones a slow reader missed.
+async fn next_event(
+    events: &mut broadcast::Receiver<EngineEvent>,
+) -> Option<EngineEvent> {
+    loop {
+        match events.recv().await {
+            Ok(event) => return Some(event),
+            Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => return None,
+        }
+    }
+}
+
+/// Tells the adapter about one event. Returns `false` when the session is over.
+async fn deliver(
+    engine: &SyncEngine,
+    adapter: &dyn EditorAdapter,
+    event: EngineEvent,
+) -> bool {
+    match event {
+        EngineEvent::DocumentChanged { path } => {
+            if let Ok(text) = engine.text(&path).await {
+                adapter.document_changed(&path, &text);
             }
         }
-    })
+        EngineEvent::DocumentsChanged { documents } => {
+            adapter.documents_changed(&documents);
+        }
+        EngineEvent::PeersChanged { peers } => adapter.peers_changed(&peers),
+        EngineEvent::PresenceChanged { presence } => {
+            adapter.presence_changed(&presence);
+        }
+        EngineEvent::HostDetached { grace_ms } => {
+            adapter.host_detached(grace_ms);
+        }
+        EngineEvent::HostAttached { peer } => adapter.host_attached(&peer),
+        EngineEvent::RoomGone { reason } => adapter.room_gone(&reason),
+        EngineEvent::Disconnected => {
+            adapter.disconnected();
+            return false;
+        }
+    }
+    true
 }

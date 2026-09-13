@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use selvage_protocol::{Keepalive, PeerInfo, Role};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{
+    UnboundedReceiver, UnboundedSender, unbounded_channel,
+};
 
 /// A frame the connection task should write out.
 #[derive(Debug, Clone)]
@@ -40,6 +42,8 @@ pub struct Room {
     /// Order in which documents were first opened; the set survives peers leaving.
     pub documents: Vec<String>,
     host: Option<String>,
+    /// When the host's grace period runs out. Informational: `generation` is what
+    /// actually guards the reaper.
     pub host_deadline: Option<Instant>,
     /// Bumped whenever the host attaches or detaches, so a stale grace timer cannot
     /// destroy a room that has been reclaimed.
@@ -47,12 +51,14 @@ pub struct Room {
 }
 
 impl Room {
+    #[must_use]
     pub fn host_present(&self) -> bool {
         self.host
             .as_ref()
             .is_some_and(|id| self.peers.contains_key(id))
     }
 
+    #[must_use]
     pub fn peers_except(&self, peer_id: &str) -> Vec<PeerInfo> {
         self.peers
             .values()
@@ -61,11 +67,12 @@ impl Room {
             .collect()
     }
 
-    pub fn broadcast(&self, except: Option<&str>, out: Outbound) {
-        for peer in self.peers.values() {
-            if Some(peer.info.peer_id.as_str()) == except {
-                continue;
-            }
+    pub fn broadcast(&self, except: Option<&str>, out: &Outbound) {
+        let others = self
+            .peers
+            .values()
+            .filter(|peer| Some(peer.info.peer_id.as_str()) != except);
+        for peer in others {
             peer.send(out.clone());
         }
     }
@@ -73,17 +80,19 @@ impl Room {
     pub fn attach_host(&mut self, peer_id: &str) {
         self.host = Some(peer_id.to_string());
         self.host_deadline = None;
-        self.generation += 1;
+        self.generation = self.generation.saturating_add(1);
     }
 
+    /// Hands the host role back and arms the grace period. Returns the new generation.
     pub fn detach_host(&mut self, grace: Duration) -> u64 {
         self.host = None;
-        self.host_deadline = Some(Instant::now() + grace);
-        self.generation += 1;
+        self.host_deadline = Instant::now().checked_add(grace);
+        self.generation = self.generation.saturating_add(1);
         self.generation
     }
 
-    pub fn generation(&self) -> u64 {
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
         self.generation
     }
 
@@ -103,11 +112,19 @@ impl Room {
     }
 }
 
-/// Outcome of seating a connection in a room.
-pub enum Seat {
-    /// The connection minted the room; only the minting host is told the token.
-    Created { room_id: String, token: String },
-    Joined,
+/// A room about to be minted: its id, its invite token and the keepalive it advertises.
+pub struct NewRoom {
+    pub id: String,
+    pub token: String,
+    pub keepalive: Keepalive,
+}
+
+/// A connection's claim on a room: which room, with which token, in which role.
+#[derive(Debug, Clone, Copy)]
+pub struct Claim<'a> {
+    pub room_id: &'a str,
+    pub token: Option<&'a str>,
+    pub role: Role,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,69 +134,78 @@ pub enum SeatError {
     HostPresent,
 }
 
-#[derive(Default)]
 pub struct Registry {
     rooms: HashMap<String, Room>,
+    /// How long a room outlives its host disconnecting.
+    room_grace: Duration,
 }
 
 impl Registry {
-    pub fn new() -> Self {
-        Self::default()
+    #[must_use]
+    pub fn new(room_grace: Duration) -> Self {
+        Self {
+            rooms: HashMap::new(),
+            room_grace,
+        }
     }
 
-    pub fn create(
-        &mut self,
-        room_id: String,
-        token: String,
-        keepalive: Keepalive,
-        host: Peer,
-    ) -> Seat {
+    /// Mints a room and seats its host in it.
+    pub fn create(&mut self, new: NewRoom, host: Peer) {
         let mut room = Room {
-            id: room_id.clone(),
-            token: token.clone(),
-            keepalive,
+            id: new.id.clone(),
+            token: new.token,
+            keepalive: new.keepalive,
             peers: HashMap::new(),
             documents: Vec::new(),
             host: None,
             host_deadline: None,
             generation: 0,
         };
-        room.peers.insert(host.info.peer_id.clone(), host.clone());
         room.attach_host(&host.info.peer_id);
-        self.rooms.insert(room_id.clone(), room);
-        Seat::Created { room_id, token }
+        room.peers.insert(host.info.peer_id.clone(), host);
+        self.rooms.insert(new.id, room);
     }
 
-    /// Seats a connection in an existing room. `role` is what the client claimed;
-    /// the host role can only be taken while the room is between host connections.
+    /// Seats a connection in an existing room. The claimed role is honoured only while
+    /// the room is between host connections.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SeatError::Unknown`] for a room that does not exist,
+    /// [`SeatError::TokenMismatch`] for a wrong token, and [`SeatError::HostPresent`]
+    /// when the host role is taken.
     pub fn admit(
         &mut self,
-        room_id: &str,
-        token: Option<&str>,
-        role: Role,
+        claim: Claim<'_>,
         peer: Peer,
-    ) -> Result<Seat, SeatError> {
-        let room = self.rooms.get_mut(room_id).ok_or(SeatError::Unknown)?;
-        if Some(room.token.as_str()) != token {
+    ) -> Result<(), SeatError> {
+        let room = self
+            .rooms
+            .get_mut(claim.room_id)
+            .ok_or(SeatError::Unknown)?;
+        if Some(room.token.as_str()) != claim.token {
             return Err(SeatError::TokenMismatch);
         }
-        if role == Role::Host {
-            if room.host_present() {
-                return Err(SeatError::HostPresent);
-            }
+        if claim.role == Role::Host && room.host_present() {
+            return Err(SeatError::HostPresent);
+        }
+        if claim.role == Role::Host {
             room.attach_host(&peer.info.peer_id);
         }
         room.peers.insert(peer.info.peer_id.clone(), peer);
-        Ok(Seat::Joined)
+        Ok(())
     }
 
+    #[must_use]
     pub fn peer(&self, room_id: &str, peer_id: &str) -> Option<&Peer> {
         self.rooms.get(room_id)?.peers.get(peer_id)
     }
 
-    /// Detaches a peer. Returns whether it was the host, so the caller can arm the
-    /// grace timer, and whether the room became empty.
-    pub fn detach(&mut self, room_id: &str, peer_id: &str, grace: Duration) -> Option<Detach> {
+    /// Detaches a peer. Returns whether it was the host, so the caller can announce
+    /// `host.detached`, and whether the room became empty.
+    #[must_use]
+    pub fn detach(&mut self, room_id: &str, peer_id: &str) -> Option<Detach> {
+        let grace = self.room_grace;
         let room = self.rooms.get_mut(room_id)?;
         let was_host = room.host.as_deref() == Some(peer_id);
         room.peers.remove(peer_id);
@@ -191,10 +217,10 @@ impl Registry {
         Some(Detach {
             was_host,
             generation,
-            room_empty: room.peers.is_empty(),
         })
     }
 
+    #[must_use]
     pub fn room(&self, room_id: &str) -> Option<&Room> {
         self.rooms.get(room_id)
     }
@@ -205,7 +231,12 @@ impl Registry {
 
     /// Tears a room down if it is still host-less at `generation`, returning the
     /// peers that were in it so the caller can tell them.
-    pub fn reap_if_host_absent(&mut self, room_id: &str, generation: u64) -> Vec<Peer> {
+    #[must_use]
+    pub fn reap_if_host_absent(
+        &mut self,
+        room_id: &str,
+        generation: u64,
+    ) -> Vec<Peer> {
         let Some(room) = self.rooms.get(room_id) else {
             return Vec::new();
         };
@@ -218,6 +249,7 @@ impl Registry {
             .unwrap_or_default()
     }
 
+    #[must_use]
     pub fn remove(&mut self, room_id: &str) -> Option<Room> {
         self.rooms.remove(room_id)
     }
@@ -226,10 +258,10 @@ impl Registry {
 pub struct Detach {
     pub was_host: bool,
     pub generation: u64,
-    pub room_empty: bool,
 }
 
-pub fn peer_channel(info: PeerInfo) -> (Peer, tokio::sync::mpsc::UnboundedReceiver<Outbound>) {
+#[must_use]
+pub fn peer_channel(info: PeerInfo) -> (Peer, UnboundedReceiver<Outbound>) {
     let (tx, rx) = unbounded_channel();
     (Peer { info, tx }, rx)
 }

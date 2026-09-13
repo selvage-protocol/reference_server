@@ -4,15 +4,19 @@
 //! sleeps and hopes: waiting is always bounded polling of a real predicate, and a
 //! timeout reports the state it actually observed.
 
-use std::net::SocketAddr;
+use std::future::Future;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use selvaged::{Server, ServerConfig};
+use tokio::sync::broadcast::error::RecvError;
+use tokio::task::JoinHandle;
+use tokio::time::{sleep, timeout};
 
 use selvage_client::ConnectOptions;
 pub use selvage_client::{
-    drive_editor, AwarenessState, EditorAdapter, EngineEvent, Error, PeerInfo, Presence, Role,
-    Selection, SyncEngine,
+    AwarenessState, EditorAdapter, EngineEvent, Error, Invite, PeerInfo,
+    Presence, Role, Selection, SyncEngine, drive_editor,
 };
 
 /// How long a test is willing to wait for a condition that should hold immediately.
@@ -21,7 +25,7 @@ pub const WAIT: Duration = Duration::from_secs(5);
 /// A running server on an ephemeral port.
 pub struct Harness {
     addr: SocketAddr,
-    task: tokio::task::JoinHandle<()>,
+    task: JoinHandle<()>,
 }
 
 /// A room that a host client minted.
@@ -32,64 +36,111 @@ pub struct Room {
     pub invite_url: String,
 }
 
+impl Room {
+    /// What a guest needs to join.
+    #[must_use]
+    pub fn invite(&self) -> Invite {
+        Invite::new(self.id.clone(), self.token.clone())
+    }
+}
+
 impl Harness {
     /// Starts a server with a short room grace period, so lifecycle tests do not take
     /// thirty seconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the loopback port cannot be bound.
+    #[expect(
+        clippy::expect_used,
+        reason = "the harness owns this loopback port; not binding it must fail the test"
+    )]
     pub async fn start(room_grace: Duration) -> Self {
         let config = ServerConfig {
             room_grace,
             ..ServerConfig::default()
         };
-        let server = Server::bind("127.0.0.1:0".parse().expect("valid address"), config)
-            .await
-            .expect("the harness can bind an ephemeral port");
-        let addr = server.local_addr().expect("bound listener has an address");
+        let server =
+            Server::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), config)
+                .await
+                .expect("the harness can bind an ephemeral port");
+        let addr = server.local_addr();
         let task = tokio::spawn(server.run());
         Self { addr, task }
     }
 
+    #[must_use]
     pub fn ws_base(&self) -> String {
-        format!("ws://{addr}", addr = self.addr)
+        format!("ws://{}", self.addr)
     }
 
+    #[must_use]
     pub fn http_base(&self) -> String {
-        format!("http://{addr}", addr = self.addr)
+        format!("http://{}", self.addr)
     }
 
     /// Connects a host, which mints a room.
-    pub async fn host(&self, display_name: &str) -> Result<(SyncEngine, Room), Error> {
-        let engine = SyncEngine::connect(ConnectOptions::host(self.ws_base(), display_name)).await?;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when the host cannot connect.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the server does not invite the host that minted the room.
+    #[expect(
+        clippy::expect_used,
+        reason = "the server always invites the host that minted the room; a session \
+                  without a token means it did not, which must fail the test"
+    )]
+    pub async fn host(
+        &self,
+        display_name: &str,
+    ) -> Result<(SyncEngine, Room), Error> {
+        let engine = SyncEngine::connect(ConnectOptions::host(
+            self.ws_base(),
+            display_name,
+        ))
+        .await?;
+        let session = engine.session();
         let room = Room {
-            id: engine.session().room_id.clone(),
-            token: engine.session().token.clone().expect("a host is told the token"),
-            invite_url: engine
-                .session()
+            id: session.room_id.clone(),
+            token: session.token.clone().expect("a host is told the token"),
+            invite_url: session
                 .invite_url()
                 .expect("a host can build an invite URL"),
         };
         Ok((engine, room))
     }
 
-    /// Connects a guest using the room's invite URL.
-    pub async fn join(&self, room: &Room, display_name: &str) -> Result<SyncEngine, Error> {
-        SyncEngine::connect(ConnectOptions::guest(
-            self.ws_base(),
-            display_name,
-            room.id.clone(),
-            room.token.clone(),
-        ))
-        .await
+    /// Connects a guest with the room's invite.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when the guest cannot connect or the server refuses it.
+    pub async fn join(
+        &self,
+        room: &Room,
+        display_name: &str,
+    ) -> Result<SyncEngine, Error> {
+        let options =
+            ConnectOptions::guest(self.ws_base(), display_name, room.invite());
+        SyncEngine::connect(options).await
     }
 
     /// Reconnects a host that had disconnected: same room, hosts again.
-    pub async fn reclaim(&self, room: &Room, display_name: &str) -> Result<SyncEngine, Error> {
-        let options = ConnectOptions::guest(
-            self.ws_base(),
-            display_name,
-            room.id.clone(),
-            room.token.clone(),
-        )
-        .with_role(Role::Host);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when the reconnect is refused, e.g. because a host is present.
+    pub async fn reclaim(
+        &self,
+        room: &Room,
+        display_name: &str,
+    ) -> Result<SyncEngine, Error> {
+        let options =
+            ConnectOptions::guest(self.ws_base(), display_name, room.invite())
+                .with_role(Role::Host);
         SyncEngine::connect(options).await
     }
 
@@ -102,34 +153,55 @@ impl Harness {
 ///
 /// A timeout is a test failure that reports the last observed state rather than a
 /// pass that depended on timing.
+///
+/// # Panics
+///
+/// Panics when `label` never becomes true within [`WAIT`].
 pub async fn wait_for<F, Fut, T>(label: &str, mut check: F) -> T
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Option<T>>,
+    Fut: Future<Output = Option<T>>,
 {
-    let deadline = Instant::now() + WAIT;
+    let start = Instant::now();
     loop {
         if let Some(value) = check().await {
             return value;
         }
-        if Instant::now() >= deadline {
-            panic!("timed out after {WAIT:?} waiting for {label}");
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            start.elapsed() < WAIT,
+            "timed out after {WAIT:?} waiting for {label}"
+        );
+        sleep(Duration::from_millis(5)).await;
     }
 }
 
 /// Waits until both engines hold identical text for `path`, then returns it.
-pub async fn wait_for_convergence(a: &SyncEngine, b: &SyncEngine, path: &str) -> String {
+///
+/// # Panics
+///
+/// Panics when the replicas do not converge within [`WAIT`].
+pub async fn wait_for_convergence(
+    a: &SyncEngine,
+    b: &SyncEngine,
+    path: &str,
+) -> String {
     wait_for(&format!("replicas to converge on {path}"), || async {
-        let (left, right) = (a.text(path).await.ok()?, b.text(path).await.ok()?);
+        let (left, right) =
+            (a.text(path).await.ok()?, b.text(path).await.ok()?);
         (left == right).then_some(left)
     })
     .await
 }
 
 /// Waits until `engine` can see a remote peer with this display name.
-pub async fn wait_for_peer(engine: &SyncEngine, display_name: &str) -> PeerInfo {
+///
+/// # Panics
+///
+/// Panics when the peer does not appear within [`WAIT`].
+pub async fn wait_for_peer(
+    engine: &SyncEngine,
+    display_name: &str,
+) -> PeerInfo {
     wait_for(&format!("peer {display_name} to appear"), || async {
         engine
             .peers()
@@ -142,7 +214,14 @@ pub async fn wait_for_peer(engine: &SyncEngine, display_name: &str) -> PeerInfo 
 }
 
 /// Waits until `engine` sees awareness from a peer with this display name.
-pub async fn wait_for_presence(engine: &SyncEngine, display_name: &str) -> Presence {
+///
+/// # Panics
+///
+/// Panics when the presence does not appear within [`WAIT`].
+pub async fn wait_for_presence(
+    engine: &SyncEngine,
+    display_name: &str,
+) -> Presence {
     wait_for(&format!("presence from {display_name}"), || async {
         engine
             .presence()
@@ -155,24 +234,33 @@ pub async fn wait_for_presence(engine: &SyncEngine, display_name: &str) -> Prese
 }
 
 /// Waits for a specific engine event, ignoring the others.
+///
+/// # Panics
+///
+/// Panics when the event does not arrive within [`WAIT`], or when the engine's event
+/// stream closes first.
+#[expect(
+    clippy::panic,
+    reason = "a wait that timed out is a test failure, not a value the caller can recover from"
+)]
 pub async fn wait_for_event(
     engine: &SyncEngine,
     label: &str,
     matches: impl Fn(&EngineEvent) -> bool,
 ) -> EngineEvent {
-    use tokio::sync::broadcast::error::RecvError;
     let mut events = engine.subscribe();
-    let deadline = Instant::now() + WAIT;
+    let start = Instant::now();
     loop {
-        if Instant::now() >= deadline {
-            panic!("timed out after {WAIT:?} waiting for {label}");
-        }
-        match tokio::time::timeout(Duration::from_millis(50), events.recv()).await {
+        assert!(
+            start.elapsed() < WAIT,
+            "timed out after {WAIT:?} waiting for {label}"
+        );
+        match timeout(Duration::from_millis(50), events.recv()).await {
             Ok(Ok(event)) if matches(&event) => return event,
-            Ok(Ok(_)) => continue,
-            Ok(Err(RecvError::Lagged(_))) => continue,
-            Ok(Err(RecvError::Closed)) => panic!("the engine stream closed while waiting for {label}"),
-            Err(_) => continue,
+            Ok(Err(RecvError::Closed)) => {
+                panic!("the engine stream closed while waiting for {label}");
+            }
+            _ => {}
         }
     }
 }

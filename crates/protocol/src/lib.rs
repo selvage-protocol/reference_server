@@ -6,6 +6,9 @@
 //! payloads are *not* described here — they are y-protocols binary frames
 //! (`yrs::sync::protocol::Message`) and are opaque to the server.
 
+use std::fmt::Write as _;
+use std::str;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -73,13 +76,14 @@ pub mod close {
 }
 
 /// Maps a fatal session error code to the close code used to end the connection.
+#[must_use]
 pub fn close_code_for(code: &str) -> u16 {
     match code {
-        self::code::ROOM_UNKNOWN => close::ROOM_UNKNOWN,
-        self::code::TOKEN_INVALID => close::TOKEN_INVALID,
-        self::code::ROOM_GONE => close::ROOM_GONE,
-        self::code::HOST_PRESENT => close::HOST_PRESENT,
-        self::code::UNSUPPORTED_VERSION => close::UNSUPPORTED_VERSION,
+        code::ROOM_UNKNOWN => close::ROOM_UNKNOWN,
+        code::TOKEN_INVALID => close::TOKEN_INVALID,
+        code::ROOM_GONE => close::ROOM_GONE,
+        code::HOST_PRESENT => close::HOST_PRESENT,
+        code::UNSUPPORTED_VERSION => close::UNSUPPORTED_VERSION,
         _ => close::PROTOCOL_ERROR,
     }
 }
@@ -92,10 +96,11 @@ pub enum Role {
 }
 
 impl Role {
-    pub fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Role::Host => "host",
-            Role::Guest => "guest",
+            Self::Host => "host",
+            Self::Guest => "guest",
         }
     }
 }
@@ -147,6 +152,7 @@ pub struct ClientMessage {
 }
 
 impl ClientMessage {
+    #[must_use]
     pub fn new(id: u64, method: &str, params: Value) -> Self {
         Self {
             v: WIRE_VERSION.to_string(),
@@ -156,8 +162,15 @@ impl ClientMessage {
         }
     }
 
-    pub fn to_text(&self) -> String {
-        serde_json::to_string(self).expect("client message is serializable")
+    /// Serializes the envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serializer's error. These shapes are infallible in practice, so it
+    /// is propagated rather than unwrapped purely so callers decide what a failed
+    /// send means.
+    pub fn to_text(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
     }
 }
 
@@ -179,6 +192,7 @@ pub struct ServerMessage {
 }
 
 impl ServerMessage {
+    #[must_use]
     pub fn response(id: u64, result: Value) -> Self {
         Self {
             v: WIRE_VERSION.to_string(),
@@ -190,6 +204,7 @@ impl ServerMessage {
         }
     }
 
+    #[must_use]
     pub fn error(id: u64, code: &str, message: impl Into<String>) -> Self {
         Self {
             v: WIRE_VERSION.to_string(),
@@ -204,6 +219,7 @@ impl ServerMessage {
         }
     }
 
+    #[must_use]
     pub fn event(name: &str, params: Value) -> Self {
         Self {
             v: WIRE_VERSION.to_string(),
@@ -215,8 +231,15 @@ impl ServerMessage {
         }
     }
 
-    pub fn to_text(&self) -> String {
-        serde_json::to_string(self).expect("server message is serializable")
+    /// Serializes the envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serializer's error. These shapes are infallible in practice, so it
+    /// is propagated rather than unwrapped purely so callers decide what a failed
+    /// send means.
+    pub fn to_text(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
     }
 }
 
@@ -300,11 +323,15 @@ pub struct Meta {
 }
 
 impl Meta {
+    #[must_use]
     pub fn reference() -> Self {
         Self {
             server: concat!("selvaged/", env!("CARGO_PKG_VERSION")).to_string(),
             wire_versions: vec![WIRE_VERSION.to_string()],
-            capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
+            capabilities: CAPABILITIES
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             keepalive: Keepalive::default(),
             roles: vec!["host".to_string(), "guest".to_string()],
         }
@@ -319,6 +346,7 @@ pub struct JoinQuery {
 }
 
 /// Parses a URL query string into a room/token pair. Unknown parameters are ignored.
+#[must_use]
 pub fn parse_join_query(query: &str) -> JoinQuery {
     let mut out = JoinQuery::default();
     for pair in query.split('&') {
@@ -339,61 +367,77 @@ pub fn parse_join_query(query: &str) -> JoinQuery {
 }
 
 /// Builds the WebSocket URL for a connection. Host connections omit room and token.
-pub fn session_url(base: &str, room: Option<&str>, token: Option<&str>) -> String {
-    let mut url = format!("{}{}", base.trim_end_matches('/'), ENDPOINT_PATH);
+#[must_use]
+pub fn session_url(
+    base: &str,
+    room: Option<&str>,
+    token: Option<&str>,
+) -> String {
+    let mut url = format!("{}{ENDPOINT_PATH}", base.trim_end_matches('/'));
     let mut sep = '?';
-    if let Some(room) = room {
+    for (key, part) in [("room", room), ("token", token)] {
+        let Some(text) = part else {
+            continue;
+        };
         url.push(sep);
         sep = '&';
-        url.push_str("room=");
-        url.push_str(&percent_encode(room));
-    }
-    if let Some(token) = token {
-        url.push(sep);
-        url.push_str("token=");
-        url.push_str(&percent_encode(token));
+        url.push_str(key);
+        url.push('=');
+        url.push_str(&percent_encode(text));
     }
     url
 }
 
+/// True for the characters RFC 3986 leaves unescaped.
+const fn is_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+#[must_use]
 pub fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
+    for byte in s.bytes() {
+        if is_unreserved(byte) {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
         }
     }
     out
 }
 
+/// Consumes `%XX` at the head of `rest`, returning the byte and what follows it.
+fn take_escaped(rest: &[u8]) -> Option<(u8, &[u8])> {
+    let pair = rest.get(..2)?;
+    let hex = str::from_utf8(pair).ok()?;
+    let byte = u8::from_str_radix(hex, 16).ok()?;
+    Some((byte, rest.get(2..)?))
+}
+
+#[must_use]
 pub fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-            if let Some(byte) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        if bytes[i] == b'+' {
-            out.push(b' ');
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut rest = s.as_bytes();
+    while let Some((first, tail)) = rest.split_first() {
+        let escaped = if *first == b'%' {
+            take_escaped(tail)
         } else {
-            out.push(bytes[i]);
+            None
+        };
+        if let Some((byte, after)) = escaped {
+            out.push(byte);
+            rest = after;
+            continue;
         }
-        i += 1;
+        out.push(if *first == b'+' { b' ' } else { *first });
+        rest = tail;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
 
 /// True when the wire version in an envelope is compatible with this implementation.
 /// Compatible means same major; while at 0.x, same minor.
+#[must_use]
 pub fn is_compatible(version: &str) -> bool {
     let parse = |s: &str| -> Option<(u64, u64)> {
         let rest = s.strip_prefix("selvage/")?;
@@ -407,11 +451,7 @@ pub fn is_compatible(version: &str) -> bool {
             if a.0 != b.0 {
                 return false;
             }
-            if b.0 == 0 {
-                a.1 == b.1
-            } else {
-                true
-            }
+            b.0 != 0 || a.1 == b.1
         }
         _ => false,
     }
@@ -423,24 +463,39 @@ mod tests {
 
     #[test]
     fn envelope_shapes() {
-        let req = ClientMessage::new(7, method::DOC_OPEN, serde_json::json!({"path": "a.rs"}));
-        let text = req.to_text();
+        let req = ClientMessage::new(
+            7,
+            method::DOC_OPEN,
+            serde_json::json!({"path": "a.rs"}),
+        );
+        let text = req.to_text().unwrap();
         assert_eq!(
             text,
             r#"{"v":"selvage/1","id":7,"method":"doc.open","params":{"path":"a.rs"}}"#
         );
 
-        let ok = ServerMessage::response(7, serde_json::json!({})).to_text();
+        let ok = ServerMessage::response(7, serde_json::json!({}))
+            .to_text()
+            .unwrap();
         assert_eq!(ok, r#"{"v":"selvage/1","id":7,"result":{}}"#);
 
-        let err = ServerMessage::error(7, code::UNKNOWN_METHOD, "no such method").to_text();
+        let err =
+            ServerMessage::error(7, code::UNKNOWN_METHOD, "no such method")
+                .to_text()
+                .unwrap();
         assert_eq!(
             err,
             r#"{"v":"selvage/1","id":7,"error":{"code":"unknown_method","message":"no such method"}}"#
         );
 
-        let ev = ServerMessage::event(event::PEER_LEFT, serde_json::json!({"x": 1})).to_text();
-        assert_eq!(ev, r#"{"v":"selvage/1","event":"peer.left","params":{"x":1}}"#);
+        let ev =
+            ServerMessage::event(event::PEER_LEFT, serde_json::json!({"x": 1}))
+                .to_text()
+                .unwrap();
+        assert_eq!(
+            ev,
+            r#"{"v":"selvage/1","event":"peer.left","params":{"x":1}}"#
+        );
     }
 
     #[test]
@@ -455,8 +510,12 @@ mod tests {
 
     #[test]
     fn join_query_round_trip() {
-        let url = session_url("ws://127.0.0.1:8080", Some("room 1"), Some("t/k"));
-        assert_eq!(url, "ws://127.0.0.1:8080/session?room=room%201&token=t%2Fk");
+        let url =
+            session_url("ws://127.0.0.1:8080", Some("room 1"), Some("t/k"));
+        assert_eq!(
+            url,
+            "ws://127.0.0.1:8080/session?room=room%201&token=t%2Fk"
+        );
         let q = parse_join_query(url.split_once('?').unwrap().1);
         assert_eq!(q.room.as_deref(), Some("room 1"));
         assert_eq!(q.token.as_deref(), Some("t/k"));
@@ -464,10 +523,13 @@ mod tests {
         let host = session_url("ws://127.0.0.1:8080/", None, None);
         assert_eq!(host, "ws://127.0.0.1:8080/session");
         assert_eq!(parse_join_query(""), JoinQuery::default());
-        assert_eq!(parse_join_query("extra=1&room=r"), JoinQuery {
-            room: Some("r".into()),
-            token: None
-        });
+        assert_eq!(
+            parse_join_query("extra=1&room=r"),
+            JoinQuery {
+                room: Some("r".into()),
+                token: None
+            }
+        );
     }
 
     #[test]
