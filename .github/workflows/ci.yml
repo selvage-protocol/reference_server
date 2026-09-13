@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      # The runner image guarantees only ~14 GB free, and a cold cache has to fit a rust-overlay
+      # toolchain plus crane's dependency artefacts. These are the preinstalled toolchains nothing
+      # here uses. Each removal is non-fatal so an image change cannot break the job, and the df
+      # either side shows what it actually bought. No third-party action involved.
+      - name: free disk space
+        run: |
+          df -h /
+          sudo rm -rf \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/lib/android \
+            /usr/local/share/boost \
+            /usr/share/dotnet || true
+          df -h /
+
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # `primary-key` is required: without it the action fails before any check runs.
+      # No `purge`: it needs `actions: write`, and this workflow has `contents: read`.
+      # No `gc-max-store-size`: the checks are built with --no-link, so a GC here would
+      # collect the very store paths this cache exists to save.
+      - name: restore and save the Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      - name: format
+        run: nix build .#checks.x86_64-linux.fmt --no-link --print-build-logs
+
+      - name: clippy
+        run: nix build .#checks.x86_64-linux.clippy --no-link --print-build-logs
+
+      # The vector replay is part of this suite: the vendored `vectors/` directory reaches the
+      # sandbox through `SELVAGE_VECTORS`, so no specification checkout is needed here.
+      - name: tests
+        run: nix build .#checks.x86_64-linux.nextest --no-link --print-build-logs
+
+      # `crates/selvaged` is FSL-1.1-MIT; everything else is MIT OR Apache-2.0. Nothing else
+      # in this workflow can see that rule break.
+      - name: licences
+        run: nix develop . -c cargo deny check licenses
+
+      - name: evaluate every check
+        run: nix flake check --no-build .
+
+      # Unknown actions, bad expressions and shell mistakes, caught before the run.
+      - name: lint the workflows
+        run: nix develop . -c actionlint
