@@ -157,6 +157,9 @@
               inherit cargoArtifacts;
               partitions = 1;
               partitionType = "count";
+              # The vectors sit beside the spec, outside this Cargo workspace, so the sandbox
+              # — which receives only `impl/` — is handed them explicitly.
+              SELVAGE_VECTORS = ../spec/vectors;
             }
           );
 
@@ -164,6 +167,7 @@
             commonArgs
             // {
               inherit src cargoArtifacts;
+              SELVAGE_VECTORS = ../spec/vectors;
               pname = "${binName}-tarpaulin";
               buildPhaseCargoCommand = "cargo tarpaulin --fail-under 80";
               installPhase = "mkdir -p $out";

@@ -14,6 +14,7 @@
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::env;
 use std::error::Error as StdError;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -134,11 +135,18 @@ pub struct AwarenessSpec {
 
 type Raw = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// The vector directory, relative to this crate.
+/// The vector directory: `SELVAGE_VECTORS` when the build supplies it, otherwise the repository's
+/// `spec/vectors` relative to this crate.
+///
+/// The Nix build copies only `impl/` into the sandbox, so `impl/flake.nix` hands the directory in
+/// explicitly; from a checkout the relative path is correct.
 #[must_use]
 pub fn root() -> PathBuf {
     // `impl/crates/harness` -> the repository's `spec/vectors`.
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../spec/vectors")
+    env::var_os("SELVAGE_VECTORS").map_or_else(
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../spec/vectors"),
+        PathBuf::from,
+    )
 }
 
 /// Every vector, ordered by id.
