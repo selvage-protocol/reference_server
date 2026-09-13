@@ -900,6 +900,55 @@ async fn a_long_close_reason_is_cut_down_to_fit_a_control_frame() {
         "the reason still says what went wrong: {reason}"
     );
 }
+/// The negotiation endpoint does not look at the request method: `HEAD` answers `200` with
+/// a body, which is what the spec says it does and an RFC 9110 deviation worth pinning so
+/// that it is a choice rather than an accident.
+#[tokio::test]
+async fn the_negotiation_endpoint_ignores_the_request_method() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let addr = harness.ws_base().trim_start_matches("ws://").to_string();
+    let mut stream = TcpStream::connect(&addr).await.expect("connects");
+    stream
+        .write_all(b"HEAD /meta HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+        .await
+        .expect("sends a HEAD request");
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .await
+        .expect("reads the response");
+    assert!(response.starts_with("HTTP/1.1 200"), "got {response:?}");
+    let (_, body) = response.split_once("\r\n\r\n").expect("a body");
+    assert!(body.contains("wire_versions"), "got {body:?}");
+}
+
+/// A binary first frame is a fault in the *shape* of the frame, so it is reported as
+/// `bad_message` and closes with 4000 — not as `hello_required`, which is for a text frame
+/// that is not `session.hello`.
+#[tokio::test]
+async fn a_binary_first_frame_is_a_bad_message() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.send(0x2, &[0x00, 0x01, 0x02])
+        .await
+        .expect("sends a binary frame");
+
+    assert_eq!(
+        raw.next_json().await.expect("the refusal")["params"]["code"],
+        code::BAD_MESSAGE
+    );
+    assert_eq!(
+        raw.read_to_close()
+            .await
+            .expect("a close frame")
+            .close_code(),
+        Some(close::PROTOCOL_ERROR)
+    );
+}
+
 /// A connection that never finishes its HTTP request head is dropped: a client cannot hold
 /// a connection open by sending half a request and stopping.
 #[tokio::test]

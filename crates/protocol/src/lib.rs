@@ -597,6 +597,9 @@ mod tests {
     #[test]
     fn version_compatibility() {
         assert!(is_compatible("selvage/1"));
+        // At major 1 the rule is same-major, so the minor is not decisive.
+        assert!(is_compatible("selvage/1.9"));
+        assert!(is_compatible("selvage/1.0"));
         assert!(!is_compatible("selvage/2"));
         assert!(!is_compatible("selvage"));
         assert!(!is_compatible("selvage/x"));
