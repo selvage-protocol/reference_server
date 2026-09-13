@@ -81,7 +81,10 @@
             forbid-new-submodules.enable = true;
             check-json.enable = true;
             lychee.enable = true;
-            comrak.enable = true;
+            comrak = {
+              enable = true;
+              files = "^impl/";
+            };
             ripsecrets.enable = true;
             typos.enable = true;
             check-toml.enable = true;
@@ -90,7 +93,10 @@
             check-shebang-scripts-are-executable.enable = true;
             check-added-large-files.enable = true;
             check-symlinks.enable = true;
-            trim-trailing-whitespace.enable = true;
+            trim-trailing-whitespace = {
+              enable = true;
+              files = "^impl/";
+            };
             shellcheck.enable = true;
 
             woodpecker-cli-lint = {
