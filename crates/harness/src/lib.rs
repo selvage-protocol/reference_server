@@ -6,6 +6,10 @@
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::panic::{PanicHookInfo, set_hook, take_hook};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use selvaged::{Server, ServerConfig};
@@ -22,10 +26,110 @@ pub use selvage_client::{
 /// How long a test is willing to wait for a condition that should hold immediately.
 pub const WAIT: Duration = Duration::from_secs(5);
 
+/// Every panic raised in this process, as the hook saw it.
+///
+/// A task that panics does not fail the test that owns it: the panic is caught by the
+/// runtime and the task is dropped, which a green suite cannot tell from success. The
+/// log plus the [`PanicWatch`] every [`Harness`] carries turns that into a failure.
+fn panic_log() -> &'static Mutex<Vec<String>> {
+    static LOG: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Set while a [`PanicWatch`] is reporting, so its own failure is not recorded.
+fn reporting() -> &'static AtomicBool {
+    static REPORTING: AtomicBool = AtomicBool::new(false);
+    &REPORTING
+}
+
+/// Records one panic, unless a failure is already being reported.
+fn note_panic(info: &PanicHookInfo<'_>) {
+    if reporting().load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut log) = panic_log().lock() {
+        log.push(info.to_string());
+    }
+}
+
+/// Records every panic in this process, then defers to the hook that was installed.
+///
+/// A panic is recorded as it starts, before the stack unwinds, so a test that waits for
+/// a task to finish has already seen the panic when that wait returns.
+fn record_panics() {
+    static HOOK: OnceLock<()> = OnceLock::new();
+    HOOK.get_or_init(|| {
+        let previous = take_hook();
+        set_hook(Box::new(move |info| {
+            note_panic(info);
+            previous(info);
+        }));
+    });
+}
+
+/// The panics raised while a harness was alive, checked when that harness is dropped.
+///
+/// The check is part of the harness rather than something a test opts into: a test that
+/// never looks for a panic still fails on one. What it reports it also removes, so one
+/// crash fails the first test to notice it rather than every test in the binary. The log
+/// is process-wide, so a panic raised after its own harness was dropped is reported by
+/// the next harness dropped; only a panic raised after the last harness is never seen.
+struct PanicWatch {
+    seen: usize,
+}
+
+impl PanicWatch {
+    fn start() -> Self {
+        record_panics();
+        let seen = panic_log().lock().map_or(0, |log| log.len());
+        Self { seen }
+    }
+
+    /// Takes the panics raised since this watch started.
+    fn take_raised(&self) -> Vec<String> {
+        panic_log()
+            .lock()
+            .map(|mut log| {
+                let at = self.seen.min(log.len());
+                log.split_off(at)
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for PanicWatch {
+    #[expect(
+        clippy::panic,
+        reason = "a panic in a task must fail the test that owns the task"
+    )]
+    fn drop(&mut self) {
+        let raised = self.take_raised();
+        if raised.is_empty() {
+            return;
+        }
+        if thread::panicking() {
+            // This test is already failing; panicking again would abort the run.
+            eprintln!(
+                "a task panicked while this test was running: {raised:#?}"
+            );
+            return;
+        }
+        // Reporting the failure must not itself be recorded as one.
+        reporting().store(true, Ordering::Relaxed);
+        panic!("a task panicked while this test was running: {raised:#?}");
+    }
+}
+
 /// A running server on an ephemeral port.
 pub struct Harness {
     addr: SocketAddr,
     task: JoinHandle<()>,
+    /// Kept for its `Drop` impl: a test that never looks for a panic still fails on one.
+    #[expect(
+        dead_code,
+        reason = "the field is a guard; nothing is meant to read it"
+    )]
+    panics: PanicWatch,
 }
 
 /// A room that a host client minted.
@@ -66,7 +170,11 @@ impl Harness {
                 .expect("the harness can bind an ephemeral port");
         let addr = server.local_addr();
         let task = tokio::spawn(server.run());
-        Self { addr, task }
+        Self {
+            addr,
+            task,
+            panics: PanicWatch::start(),
+        }
     }
 
     #[must_use]
