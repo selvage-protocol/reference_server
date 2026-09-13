@@ -1,0 +1,22 @@
+[package]
+name = "selvage-harness"
+description = "Headless server + client harness for the Selvage Session Protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "selvage-harness"
+path = "src/main.rs"
+
+[dependencies]
+selvage-protocol.workspace = true
+selvage-client.workspace = true
+selvaged.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
