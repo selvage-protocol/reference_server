@@ -27,7 +27,9 @@ use yrs::sync::protocol::{
 use yrs::sync::{Awareness, Message as YMessage, SyncMessage};
 use yrs::updates::decoder::DecoderV1;
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-use yrs::{Doc, GetString, ReadTxn, Text as YText, Transact};
+use yrs::{
+    Doc, GetString, OffsetKind, Options, ReadTxn, Text as YText, Transact,
+};
 
 use crate::editor::EngineEvent;
 use crate::presence::{AwarenessState, PeerInfo, Presence};
@@ -142,7 +144,14 @@ async fn greet(
     options: &ConnectOptions,
     url: &str,
 ) -> Result<(Sink, Stream, Awareness), Error> {
-    let doc = Doc::new();
+    // A text offset on this API is a UTF-16 code unit, the unit `yjs`, every editor's
+    // `offsetAt` and every peer on the wire use (spec/PROTOCOL.md §8.1). `yrs` defaults to
+    // UTF-8 byte offsets, which would put a cursor after the first non-BMP character
+    // somewhere else than every other implementation does.
+    let doc = Doc::with_options(Options {
+        offset_kind: OffsetKind::Utf16,
+        ..Options::default()
+    });
     let awareness_client_id = doc.client_id().get();
     let mut awareness = Awareness::new(doc);
     awareness.set_local_state_raw(serde_json::to_string(
