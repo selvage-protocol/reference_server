@@ -404,9 +404,6 @@ impl EngineTask {
         if self.open_documents.iter().all(|p| p != path) {
             self.open_documents.push(path.to_string());
         }
-        if self.documents.iter().all(|p| p != path) {
-            self.documents.push(path.to_string());
-        }
         self.doc().get_or_insert_text(path);
         let result =
             self.request(method::DOC_OPEN, serde_json::json!({ "path": path }));
@@ -418,7 +415,6 @@ impl EngineTask {
 
     fn close(&mut self, path: &str, reply: oneshot::Sender<Result<(), Error>>) {
         self.open_documents.retain(|p| p != path);
-        self.documents.retain(|p| p != path);
         let result = self
             .request(method::DOC_CLOSE, serde_json::json!({ "path": path }));
         let _ = reply.send(result);
@@ -648,11 +644,8 @@ impl EngineTask {
         match msg.event.as_deref() {
             Some(event::PEER_JOINED) => self.peer_joined(msg.params.as_ref()),
             Some(event::PEER_LEFT) => self.peer_left(msg.params.as_ref()),
-            Some(event::DOC_OPENED) => {
-                self.document_changed(msg.params.as_ref(), true);
-            }
-            Some(event::DOC_CLOSED) => {
-                self.document_changed(msg.params.as_ref(), false);
+            Some(event::DOC_OPENED | event::DOC_CLOSED) => {
+                self.documents_changed(msg.params.as_ref());
             }
             Some(event::HOST_DETACHED) => {
                 self.host_detached(msg.params.as_ref());
@@ -699,31 +692,19 @@ impl EngineTask {
         });
     }
 
-    fn document_changed(
-        &mut self,
-        params: Option<&serde_json::Value>,
-        opened: bool,
-    ) {
+    /// Takes the room's open-document set from an event about it. The event carries the
+    /// set itself, so a peer that has just closed a document another peer still holds is
+    /// told the document is still open rather than guessing from its own action.
+    fn documents_changed(&mut self, params: Option<&serde_json::Value>) {
         let parsed = params.and_then(|p| {
             serde_json::from_value::<proto::DocEvent>(p.clone()).ok()
         });
         if let Some(doc) = parsed {
-            self.record_document(&doc.path, opened);
+            self.documents = doc.documents;
         }
         let _ = self.events.send(EngineEvent::DocumentsChanged {
             documents: self.documents.clone(),
         });
-    }
-
-    /// Adds or removes a path from the room's open-document set.
-    fn record_document(&mut self, path: &str, opened: bool) {
-        if !opened {
-            self.documents.retain(|p| p != path);
-            return;
-        }
-        if !self.documents.iter().any(|p| p == path) {
-            self.documents.push(path.to_string());
-        }
     }
 
     fn host_detached(&self, params: Option<&serde_json::Value>) {

@@ -153,6 +153,11 @@ fn params_refused(id: u64, error: &serde_json::Error) -> proto::ServerMessage {
     proto::ServerMessage::error(id, code::BAD_PARAMS, error.to_string())
 }
 
+/// The result of a document method: the room's open-document set after the change.
+fn doc_set(documents: &[String]) -> Value {
+    serde_json::json!({ "documents": documents })
+}
+
 fn path_required(id: u64) -> proto::ServerMessage {
     proto::ServerMessage::error(id, code::BAD_PARAMS, "path is required")
 }
@@ -327,7 +332,7 @@ impl Seating<'_> {
                 token: None,
                 self_peer: self.info.clone(),
                 peers: room.peers_except(&self.applicant.peer_id),
-                documents: room.documents.clone(),
+                documents: room.documents().to_vec(),
                 capabilities: capabilities(),
                 keepalive: room.keepalive,
             },
@@ -402,7 +407,7 @@ impl Session {
         }
     }
 
-    /// `doc.open`: adds a path to the room's open set and announces it.
+    /// `doc.open`: declares a path open for this peer and announces the room's set.
     async fn open_document(&self, request: Request, shared: &Shared) {
         let path = match serde_json::from_value::<proto::DocOpenParams>(
             request.params,
@@ -411,22 +416,24 @@ impl Session {
             Ok(_) => return self.reply(&path_required(request.id)),
             Err(e) => return self.reply(&params_refused(request.id, &e)),
         };
-        let mut guard = shared.registry.lock().await;
-        if let Some(room) = guard.room_mut(&self.room_id) {
-            room.open_document(&path);
-        }
-        drop(guard);
+        let documents = self.hold(shared, &path).await;
         self.reply(&proto::ServerMessage::response(
             request.id,
-            serde_json::json!({}),
+            doc_set(&documents),
         ));
-        let announced =
-            serde_json::json!({ "peer_id": self.peer_id, "path": path });
-        self.announce(shared, event_frame(event::DOC_OPENED, announced))
-            .await;
+        let announced = serde_json::json!({
+            "peer_id": self.peer_id,
+            "path": path,
+            "documents": documents,
+        });
+        self.announce_documents(
+            shared,
+            event_frame(event::DOC_OPENED, announced),
+        )
+        .await;
     }
 
-    /// `doc.close`: removes a path from the room's open set and announces it.
+    /// `doc.close`: releases this peer's hold on a path and announces the room's set.
     async fn close_document(&self, request: Request, shared: &Shared) {
         let params = match serde_json::from_value::<proto::DocCloseParams>(
             request.params,
@@ -434,19 +441,41 @@ impl Session {
             Ok(params) => params,
             Err(e) => return self.reply(&params_refused(request.id, &e)),
         };
-        let mut guard = shared.registry.lock().await;
-        if let Some(room) = guard.room_mut(&self.room_id) {
-            room.close_document(&params.path);
-        }
-        drop(guard);
+        let documents = self.release(shared, &params.path).await;
         self.reply(&proto::ServerMessage::response(
             request.id,
-            serde_json::json!({}),
+            doc_set(&documents),
         ));
-        let announced =
-            serde_json::json!({ "peer_id": self.peer_id, "path": params.path });
-        self.announce(shared, event_frame(event::DOC_CLOSED, announced))
-            .await;
+        let announced = serde_json::json!({
+            "peer_id": self.peer_id,
+            "path": params.path,
+            "documents": documents,
+        });
+        self.announce_documents(
+            shared,
+            event_frame(event::DOC_CLOSED, announced),
+        )
+        .await;
+    }
+
+    /// Records this peer's hold on a path, returning the room's set afterwards.
+    async fn hold(&self, shared: &Shared, path: &str) -> Vec<String> {
+        let mut guard = shared.registry.lock().await;
+        let Some(room) = guard.room_mut(&self.room_id) else {
+            return Vec::new();
+        };
+        room.open_document(&self.peer_id, path);
+        room.documents().to_vec()
+    }
+
+    /// Releases this peer's hold on a path, returning the room's set afterwards.
+    async fn release(&self, shared: &Shared, path: &str) -> Vec<String> {
+        let mut guard = shared.registry.lock().await;
+        let Some(room) = guard.room_mut(&self.room_id) else {
+            return Vec::new();
+        };
+        room.close_document(&self.peer_id, path);
+        room.documents().to_vec()
     }
 
     /// Tells a connection its wire version is not this server's, then closes it.
@@ -478,9 +507,15 @@ impl Session {
         self.reply(&msg);
     }
 
-    async fn announce(&self, shared: &Shared, frame: Option<Outbound>) {
+    /// Sends an open-document-set change to every peer, the one that made it included:
+    /// the set is the room's, so everyone has to hold the same view of it.
+    async fn announce_documents(
+        &self,
+        shared: &Shared,
+        frame: Option<Outbound>,
+    ) {
         let guard = shared.registry.lock().await;
-        deliver(guard.room(&self.room_id), Some(&self.peer_id), frame);
+        deliver(guard.room(&self.room_id), None, frame);
     }
 
     /// Detaches this connection, tells the room, and arms the room's grace period if

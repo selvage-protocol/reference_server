@@ -4,7 +4,7 @@
 //! Nothing here looks at document or awareness payloads. A room knows only which
 //! peers are connected and which documents they have declared open.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use selvage_protocol::{Keepalive, PeerInfo, Role};
@@ -39,8 +39,11 @@ pub struct Room {
     pub token: String,
     pub keepalive: Keepalive,
     pub peers: HashMap<String, Peer>,
-    /// Order in which documents were first opened; the set survives peers leaving.
-    pub documents: Vec<String>,
+    /// The paths peers have declared open, in first-opened order. The set belongs to the
+    /// room and outlives the peers that opened a path; only `doc.close` removes one.
+    documents: Vec<String>,
+    /// Which paths each connected peer currently holds open.
+    open: HashMap<String, BTreeSet<String>>,
     host: Option<String>,
     /// When the host's grace period runs out. Informational: `generation` is what
     /// actually guards the reaper.
@@ -96,19 +99,43 @@ impl Room {
         self.generation
     }
 
-    pub fn open_document(&mut self, path: &str) -> bool {
+    pub fn open_document(&mut self, peer_id: &str, path: &str) -> bool {
+        self.claims_mut(peer_id).insert(path.to_string());
         if self.documents.iter().any(|p| p == path) {
-            false
-        } else {
-            self.documents.push(path.to_string());
-            true
+            return false;
         }
+        self.documents.push(path.to_string());
+        true
     }
 
-    pub fn close_document(&mut self, path: &str) -> bool {
+    /// Releases one peer's hold on a path. The path leaves the room only when no peer
+    /// still holds it open.
+    pub fn close_document(&mut self, peer_id: &str, path: &str) -> bool {
+        if let Some(mine) = self.open.get_mut(peer_id) {
+            mine.remove(path);
+        }
+        if self.open.values().any(|paths| paths.contains(path)) {
+            return false;
+        }
         let before = self.documents.len();
         self.documents.retain(|p| p != path);
         self.documents.len() != before
+    }
+
+    /// The room's open-document set.
+    #[must_use]
+    pub fn documents(&self) -> &[String] {
+        &self.documents
+    }
+
+    /// Forgets what a peer held open. The paths stay in the room's set: it outlives the
+    /// peers that opened them, so a host that reconnects is told what was in play.
+    fn forget_claims(&mut self, peer_id: &str) {
+        self.open.remove(peer_id);
+    }
+
+    fn claims_mut(&mut self, peer_id: &str) -> &mut BTreeSet<String> {
+        self.open.entry(peer_id.to_string()).or_default()
     }
 }
 
@@ -157,6 +184,7 @@ impl Registry {
             keepalive: new.keepalive,
             peers: HashMap::new(),
             documents: Vec::new(),
+            open: HashMap::new(),
             host: None,
             host_deadline: None,
             generation: 0,
@@ -209,6 +237,7 @@ impl Registry {
         let room = self.rooms.get_mut(room_id)?;
         let was_host = room.host.as_deref() == Some(peer_id);
         room.peers.remove(peer_id);
+        room.forget_claims(peer_id);
         let generation = if was_host {
             room.detach_host(grace)
         } else {

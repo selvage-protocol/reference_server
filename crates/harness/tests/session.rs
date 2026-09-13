@@ -22,6 +22,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 const PATH: &str = "src/main.rs";
 
+/// A path only the guest in the document-set test holds open.
+const GUEST_ONLY: &str = "only/guest.rs";
+
 /// Anything these tests can fail with.
 type Failure = Box<dyn StdError>;
 
@@ -274,8 +277,26 @@ async fn open(ws: &mut Raw, id: u64, path: &str) -> Result<(), Failure> {
     loop {
         let response = next_json(ws).await?;
         if response.get("id").and_then(Value::as_u64) == Some(id) {
-            assert_eq!(response.get("result"), Some(&serde_json::json!({})));
+            let result = response.get("result").ok_or("a result")?;
+            let documents = result
+                .get("documents")
+                .and_then(Value::as_array)
+                .ok_or("the open set")?;
+            assert!(
+                documents.contains(&Value::from(path)),
+                "the result reports the room's open set: {result}"
+            );
             return Ok(());
+        }
+    }
+}
+
+/// The next response to `id`, skipping the events the server sends in between.
+async fn response_for(ws: &mut Raw, id: u64) -> Result<Value, Failure> {
+    loop {
+        let frame = next_json(ws).await?;
+        if frame.get("id").and_then(Value::as_u64) == Some(id) {
+            return Ok(frame);
         }
     }
 }
@@ -349,9 +370,8 @@ async fn unknown_methods_return_an_error_and_unknown_fields_are_ignored() {
     )
     .await
     .expect("sends");
-    let opened = next_json(&mut raw).await.expect("response");
-    assert_eq!(opened["id"], 2);
-    assert_eq!(opened["result"], serde_json::json!({}));
+    let opened = response_for(&mut raw, 2).await.expect("the response");
+    assert_eq!(opened["result"]["documents"], serde_json::json!([PATH]));
 
     // An unknown method: an error response, not silence.
     send_json(
@@ -365,8 +385,7 @@ async fn unknown_methods_return_an_error_and_unknown_fields_are_ignored() {
     )
     .await
     .expect("sends");
-    let refused = next_json(&mut raw).await.expect("refusal");
-    assert_eq!(refused["id"], 3);
+    let refused = response_for(&mut raw, 3).await.expect("the refusal");
     assert_eq!(refused["error"]["code"], code::UNKNOWN_METHOD);
     assert!(refused["result"].is_null());
 
@@ -693,6 +712,57 @@ async fn a_guest_leaving_is_announced_and_its_presence_is_cleaned_up() {
     })
     .await;
     assert_eq!(presence, 1, "only the host's own awareness is left");
+}
+
+/// The open-document set is the room's, but a document is open because peers hold it
+/// open: one peer closing a document the host still has must not close it for the room.
+#[tokio::test]
+async fn closing_a_document_leaves_the_peers_that_still_hold_it() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+    host.open(PATH).await.expect("the host opens the document");
+    guest
+        .open(PATH)
+        .await
+        .expect("the guest opens the document");
+
+    // The guest closes the document the host still holds open.
+    guest
+        .close(PATH)
+        .await
+        .expect("the guest closes the document");
+
+    // A document only the guest holds bounds the frames before it: one connection's
+    // frames are processed in order, so the room knowing this one means it has already
+    // processed the close. The document stays open, so the barrier is observable.
+    guest
+        .open(GUEST_ONLY)
+        .await
+        .expect("the guest opens its own document");
+    let on_host =
+        wait_for("the room to know the guest's own document", || async {
+            let documents = host.documents().await.ok()?;
+            documents
+                .contains(&GUEST_ONLY.to_string())
+                .then_some(documents)
+        })
+        .await;
+    assert!(
+        on_host.contains(&PATH.to_string()),
+        "the host still holds the document open: {on_host:?}"
+    );
+
+    // The client that closed it agrees, and so does one that joins afterwards.
+    assert!(guest.documents().await.unwrap().contains(&PATH.to_string()));
+    let late = harness
+        .join(&room, "Cleo")
+        .await
+        .expect("a late joiner connects");
+    assert!(
+        late.documents().await.unwrap().contains(&PATH.to_string()),
+        "a late joiner is still told the document is open"
+    );
 }
 
 async fn http_get(url: &str) -> Result<String, Failure> {

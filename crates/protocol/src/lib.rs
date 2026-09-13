@@ -296,11 +296,22 @@ pub struct PeerEvent {
     pub peer: PeerInfo,
 }
 
-/// `doc.opened` / `doc.closed` params.
+/// `doc.opened` / `doc.closed` params. `documents` is the room's open-document set
+/// after the change, so every peer holds the same view of it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocEvent {
     pub peer_id: String,
     pub path: String,
+    #[serde(default)]
+    pub documents: Vec<String>,
+}
+
+/// The result of `doc.open` / `doc.close`: the room's open-document set after the
+/// change, which is what makes a request's effect visible to its own caller.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DocSet {
+    #[serde(default)]
+    pub documents: Vec<String>,
 }
 
 /// `room.gone` params.
