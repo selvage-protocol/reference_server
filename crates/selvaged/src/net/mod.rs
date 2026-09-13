@@ -84,10 +84,13 @@ impl Shared {
             return respond_status(&mut tcp, Status::NotFound, NOT_FOUND).await;
         }
         // The head we consumed while routing has to go back in front of the socket.
-        let prefixed = PrefixedStream::new(take(&mut head.raw), tcp);
-        let Ok(ws) = tokio_tungstenite::accept_async(prefixed).await else {
+        let prefixed = PrefixedStream::new(take(&mut head.request), tcp);
+        let Ok(mut ws) = tokio_tungstenite::accept_async(prefixed).await else {
             return Ok(());
         };
+        // The upgrade refuses a request with anything behind it, so bytes that arrived
+        // in the same read as the head wait here until the frame parser asks for them.
+        ws.get_mut().push_back(take(&mut head.tail));
         self.serve_session(ws, proto::parse_join_query(&head.query))
             .await;
         Ok(())
@@ -276,7 +279,11 @@ impl Status {
 }
 
 struct Head {
-    raw: Vec<u8>,
+    /// The request head, up to and including the blank line that ends it.
+    request: Vec<u8>,
+    /// Whatever the same read returned behind the head, which a client that pipelines
+    /// its handshake puts there.
+    tail: Vec<u8>,
     path: String,
     query: String,
     is_websocket_upgrade: bool,
@@ -302,10 +309,8 @@ async fn read_http_head(tcp: &mut TcpStream) -> io::Result<Option<Head>> {
         }
     };
 
-    let Some(raw) = buf.get(..end) else {
-        return Ok(None);
-    };
-    let head_text = String::from_utf8_lossy(raw).into_owned();
+    let tail = buf.split_off(end);
+    let head_text = String::from_utf8_lossy(&buf).into_owned();
     let request_line = head_text.lines().next().unwrap_or_default();
     let target = request_line.split_whitespace().nth(1).unwrap_or_default();
     let (path, query) = match target.split_once('?') {
@@ -314,7 +319,10 @@ async fn read_http_head(tcp: &mut TcpStream) -> io::Result<Option<Head>> {
     };
 
     Ok(Some(Head {
-        raw: raw.to_vec(),
+        // Everything the read returned, split where the head ends: bytes behind it are
+        // frames a client pipelined, and they still have to reach the frame parser.
+        request: buf,
+        tail,
         path: path.to_string(),
         query: query.to_string(),
         is_websocket_upgrade: head_text
@@ -351,8 +359,9 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// A socket with the already-read HTTP head pushed back in front of it, so the
-/// WebSocket upgrade sees the request bytes we consumed while routing.
+/// A socket with bytes queued in front of it: the HTTP head the routing consumed, and
+/// any frames that arrived in the same read and still have to reach the WebSocket
+/// parser.
 pub struct PrefixedStream<T> {
     prefix: Vec<u8>,
     pos: usize,
@@ -366,6 +375,11 @@ impl<T> PrefixedStream<T> {
             pos: 0,
             inner,
         }
+    }
+
+    /// Queues more bytes to be read after everything already queued.
+    fn push_back(&mut self, mut bytes: Vec<u8>) {
+        self.prefix.append(&mut bytes);
     }
 }
 

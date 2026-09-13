@@ -629,6 +629,32 @@ async fn a_guest_left_in_a_dead_room_is_closed_cleanly() {
         .expect("a clean close");
 }
 
+/// The upgrade request and the first frame in one write, which is what a client that
+/// pipelines its handshake sends. The bytes behind the HTTP head belong to the
+/// WebSocket parser: dropping them costs the connection its `session.hello`, and the
+/// session an unexplained timeout.
+#[tokio::test]
+async fn a_frame_behind_the_http_head_reaches_the_session() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let hello = serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 1,
+        "method": method::SESSION_HELLO,
+        "params": {"display_name": "Coalesced"},
+    })
+    .to_string();
+    let frame = client_frame(0x1, hello.as_bytes()).expect("a small frame");
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &frame)
+        .await
+        .expect("the upgrade succeeds");
+
+    let created = timeout(WAIT, raw.next_json())
+        .await
+        .expect("the server answers the hello that arrived with the head")
+        .expect("room.created");
+    assert_eq!(created["event"], event::ROOM_CREATED);
+}
+
 #[tokio::test]
 async fn a_guest_leaving_is_announced_and_its_presence_is_cleaned_up() {
     let harness = Harness::start(Duration::from_secs(5)).await;
