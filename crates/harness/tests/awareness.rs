@@ -561,6 +561,39 @@ async fn an_anchor_naming_a_deleted_element_points_at_the_boundary() {
     assert_eq!(after.anchors(), Some(&anchors), "nothing was republished");
 }
 
+/// The `assoc` policy §12.4 records, pinned where it makes a difference. Both clients publish
+/// `0` for both endpoints, so an endpoint is bound to the element *after* it, and an insertion
+/// landing exactly on one is the only case that tells `0` from `-1`: here it lands on the head
+/// endpoint and the selection extends over it.
+#[tokio::test]
+async fn a_selection_endpoint_extends_when_an_insert_lands_exactly_on_it() {
+    let harness = Harness::start(WAIT).await;
+    let (host, _room, guest) =
+        seeded(&harness, "abcdef").await.expect("a seeded room");
+
+    let selected = SelectionOffsets { anchor: 2, head: 5 };
+    guest
+        .set_selection(PATH, selected)
+        .await
+        .expect("the guest selects `cde`");
+    let before = wait_for_caret(&host, "Bob", selected).await;
+    assert_eq!(
+        before.anchors().map(|s| s.head.assoc),
+        Some(0),
+        "the head endpoint is published with `assoc: 0`"
+    );
+
+    host.insert(PATH, 5, "ZZ")
+        .await
+        .expect("the host types exactly at the head endpoint");
+
+    let extended = SelectionOffsets { anchor: 2, head: 7 };
+    let after = wait_for_caret(&host, "Bob", extended).await;
+    assert_eq!(host.text(PATH).await.expect("the text"), "abcdeZZf");
+    assert_eq!(after.selection(), Some(extended));
+    assert_eq!(after.anchors(), before.anchors(), "nothing was republished");
+}
+
 /// The exact shape a yjs peer puts on the wire for a position inside a root type: `tname`
 /// naming the type *and* `item` naming the element in it. `yrs` collapses the two and emits
 /// `item` alone, so this pair only ever arrives from the other implementation — and treating
