@@ -1,0 +1,19 @@
+[package]
+name = "selvaged"
+description = "Memory-only reference server for the Selvage Session Protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "selvaged"
+path = "src/main.rs"
+
+[dependencies]
+selvage-protocol.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+rand = "0.10"
+serde_json.workspace = true
