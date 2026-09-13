@@ -86,7 +86,6 @@ pub struct EngineTask {
     pub sink: Sink,
     pub stream: Stream,
     pub awareness: Awareness,
-    #[allow(dead_code)]
     pub session: SessionInfo,
     pub commands: mpsc::UnboundedReceiver<Command>,
     pub events: broadcast::Sender<EngineEvent>,
