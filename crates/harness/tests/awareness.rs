@@ -13,7 +13,7 @@ use futures_util::{SinkExt, StreamExt};
 use selvage_client::{ConnectOptions, Role, SyncEngine};
 use selvage_harness::{
     Harness, Presence, Room, SelectionOffsets, ServerConfig, WAIT, wait_for,
-    wait_for_convergence,
+    wait_for_convergence, wait_for_described,
 };
 use selvage_protocol as proto;
 use selvage_protocol::{event, method};
@@ -143,12 +143,19 @@ async fn wait_for_caret(
     name: &str,
     offsets: SelectionOffsets,
 ) -> Presence {
-    wait_for(
+    wait_for_described(
         &format!("{name}'s cursor to resolve to {offsets:?}"),
+        || describe_presence(observer, name),
         || async {
-            observer.presence().await.ok()?.into_iter().find(|p| {
-                p.display_name() == Some(name) && p.selection() == Some(offsets)
-            })
+            observer
+                .presence()
+                .await
+                .ok()?
+                .into_iter()
+                .find(|p| {
+                    p.display_name() == Some(name)
+                        && p.selection() == Some(offsets)
+                })
         },
     )
     .await
@@ -156,15 +163,56 @@ async fn wait_for_caret(
 
 /// Waits until `observer` holds the state `name` published, whether or not it resolves.
 async fn wait_for_state(observer: &SyncEngine, name: &str) -> Presence {
-    wait_for(&format!("the state {name} published"), || async {
-        observer
-            .presence()
-            .await
-            .ok()?
-            .into_iter()
-            .find(|p| p.display_name() == Some(name) && p.state.is_some())
-    })
+    wait_for_described(
+        &format!("the state {name} published"),
+        || describe_presence(observer, name),
+        || async {
+            observer
+                .presence()
+                .await
+                .ok()?
+                .into_iter()
+                .find(|p| {
+                    p.display_name() == Some(name) && p.state.is_some()
+                })
+        },
+    )
     .await
+}
+
+/// Waits until `observer` holds the state `name` published for `path` specifically.
+async fn wait_for_state_at(
+    observer: &SyncEngine,
+    name: &str,
+    path: &str,
+) -> Presence {
+    wait_for_described(
+        &format!("the state {name} published for {path}"),
+        || describe_presence(observer, name),
+        || async {
+            observer
+                .presence()
+                .await
+                .ok()?
+                .into_iter()
+                .find(|p| p.display_name() == Some(name) && p.path() == Some(path))
+        },
+    )
+    .await
+}
+
+/// What an awareness wait reports when it times out: what presence held instead.
+async fn describe_presence(observer: &SyncEngine, name: &str) -> String {
+    match observer.presence().await {
+        Err(error) => format!("the engine stopped: {error}"),
+        Ok(presence) => {
+            let held: Vec<&Presence> = presence
+                .iter()
+                .filter(|p| p.display_name() == Some(name))
+                .collect();
+            format!("{name}: {held:?}")
+        }
+    }
 }
 
 /// Waits for the silent peer's cursor on `observer` and then for it to expire, returning
@@ -408,6 +456,49 @@ async fn an_anchor_naming_another_document_shows_no_selection() {
         "a `tname` that is not the state's path is a mismatch"
     );
     drop(raw);
+}
+
+/// A sender must not manufacture a position. §8.1 forbids a *receiver* from clamping to a
+/// guess, but the sender is where the guess was being made: `sticky_index` returns `None` for
+/// an offset past the end as well as for the end itself, so the scope-only fallback turned
+/// "there is no such position here" into "the caret is at the end of the text" — a state that
+/// every peer resolves and that nothing on the wire distinguishes from the real thing.
+#[tokio::test]
+async fn a_sender_publishes_no_selection_it_cannot_anchor() {
+    let harness = Harness::start(WAIT).await;
+    let (host, _room, guest) =
+        seeded(&harness, "abc").await.expect("a seeded room");
+
+    // Opened, but nobody has written to it: this replica holds no `Y.Text` for the path, so
+    // it cannot say where an offset in it is.
+    host.open(OTHER).await.expect("the host opens a second document");
+    host.set_selection(OTHER, SelectionOffsets::caret(0))
+        .await
+        .expect("the host names the document");
+    let unwritten = wait_for_state_at(&guest, "Ada", OTHER).await;
+    assert_eq!(
+        unwritten.anchors(),
+        None,
+        "a document this replica has not received is not a position in it"
+    );
+
+    // And an offset past the end of a text it does hold is not one either.
+    host.set_selection(PATH, SelectionOffsets::caret(99))
+        .await
+        .expect("the host names an offset past the end");
+    let past = wait_for_state_at(&guest, "Ada", PATH).await;
+    assert_eq!(past.anchors(), None, "there is no element at offset 99");
+
+    // The contrast: a position that does exist is published, as an anchor.
+    host.set_selection(PATH, SelectionOffsets::caret(3))
+        .await
+        .expect("the host puts its caret at the end of the text");
+    let held = wait_for_caret(&guest, "Ada", SelectionOffsets::caret(3)).await;
+    assert_eq!(
+        held.anchors().map(|s| s.anchor.tname.as_deref()),
+        Some(Some(PATH)),
+        "the end of the text is the scope-only form §8.1 requires"
+    );
 }
 
 /// The exact shape a yjs peer puts on the wire for a position inside a root type: `tname`

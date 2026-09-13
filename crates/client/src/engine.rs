@@ -545,10 +545,13 @@ impl EngineTask {
         self.awareness.doc_mut()
     }
 
+    /// The text of a document this replica holds, empty for one it does not hold or that
+    /// nobody has written to. Reading never creates the text.
     fn read_text(&mut self, path: &str) -> String {
-        let text = self.doc().get_or_insert_text(path);
-        let txn = self.doc().transact();
-        text.get_string(&txn)
+        let doc = self.doc();
+        let txn = doc.transact();
+        txn.get_text(path)
+            .map_or_else(String::new, |text| text.get_string(&txn))
     }
 
     fn state_vector(&mut self) -> Vec<(u64, u32)> {
@@ -588,9 +591,7 @@ impl EngineTask {
         selection: Option<SelectionOffsets>,
     ) -> AwarenessState {
         let anchored = match (path.as_deref(), selection) {
-            (Some(target), Some(offsets)) => {
-                Some(self.anchor_selection(target, offsets))
-            }
+            (Some(target), Some(offsets)) => self.anchor_selection(target, offsets),
             _ => None,
         };
         AwarenessState {
@@ -599,20 +600,26 @@ impl EngineTask {
         }
     }
 
-    /// Anchors both endpoints of a selection against this replica.
+    /// Anchors both endpoints of a selection against this replica, or `None` when it cannot:
+    /// §8.1 forbids a *sender* from manufacturing a position, and the scope-only fallback is
+    /// indistinguishable on the wire from a genuine caret at the end of the text.
     fn anchor_selection(
         &mut self,
         path: &str,
         offsets: SelectionOffsets,
-    ) -> Selection {
-        // `get_or_insert_text` takes a transaction of its own, so the handle has to be in
-        // hand before one is held; taking it under a live transaction deadlocks the task.
-        let text = self.doc().get_or_insert_text(path);
+    ) -> Option<Selection> {
         let txn = self.doc().transact();
-        Selection {
+        // A document this replica has not received has no text to anchor against, and an
+        // offset past the end of one is not a position in it either.
+        let text = txn.get_text(path)?;
+        let end = text.len(&txn);
+        if offsets.anchor > end || offsets.head > end {
+            return None;
+        }
+        Some(Selection {
             anchor: anchor_at(&txn, &text, offsets.anchor),
             head: anchor_at(&txn, &text, offsets.head),
-        }
+        })
     }
 
     /// y-protocols awareness renews every 15s and expires at 30s: renewal means
@@ -751,12 +758,13 @@ impl EngineTask {
         Ok(())
     }
 
-    /// Adds a path to this client's own open set, and gives it the text to edit.
+    /// Adds a path to this client's own open set. The text itself arrives with the document:
+    /// creating one here would make an unreceived document look like an empty one, and §8.1
+    /// forbids a sender from anchoring a selection against the difference.
     fn hold(&mut self, path: &str) {
         if self.open_documents.iter().all(|p| p != path) {
             self.open_documents.push(path.to_string());
         }
-        self.doc().get_or_insert_text(path);
     }
 
     /// Removes a path from this client's own open set.
@@ -967,8 +975,10 @@ fn peer_from(params: Option<&serde_json::Value>) -> Option<PeerInfo> {
 /// The anchor for an offset in `text`: the element sitting there, or the `tname` form when
 /// there is no element to name — the end of the text, or an empty text (§8.1).
 ///
-/// The fallback names the text itself rather than the path it was looked up under, so the two
-/// cannot drift apart.
+/// `sticky_index` returns `None` for a position past the end as well, so a caller must check
+/// the offset against the text before asking (see `anchor_selection`); here a `None` means the
+/// end and nothing else, and the fallback names the text itself rather than the path it was
+/// looked up under, so the two cannot drift apart.
 fn anchor_at<T: ReadTxn>(txn: &T, text: &TextRef, offset: u32) -> Anchor {
     let sticky = text
         .sticky_index(txn, offset, Assoc::After)
