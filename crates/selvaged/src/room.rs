@@ -25,9 +25,22 @@ pub enum Outbound {
 pub struct Peer {
     pub info: PeerInfo,
     pub tx: UnboundedSender<Outbound>,
+    /// The room's arrival counter when this peer was seated. `peers` carries no order in the
+    /// protocol (`PROTOCOL.md` §6.2), but the frame's bytes must not be a hash artifact either,
+    /// so the list is written in join order and this is what says what that is.
+    joined: u64,
 }
 
 impl Peer {
+    #[must_use]
+    pub const fn new(info: PeerInfo, tx: UnboundedSender<Outbound>) -> Self {
+        Self {
+            info,
+            tx,
+            joined: 0,
+        }
+    }
+
     pub fn send(&self, out: Outbound) {
         // The receiver lives in the connection task; a send only fails once it is gone.
         let _ = self.tx.send(out);
@@ -51,6 +64,8 @@ pub struct Room {
     /// Bumped whenever the host attaches or detaches, so a stale grace timer cannot
     /// destroy a room that has been reclaimed.
     generation: u64,
+    /// The arrival counter a newly seated peer takes its place from.
+    arrivals: u64,
 }
 
 impl Room {
@@ -63,11 +78,23 @@ impl Room {
 
     #[must_use]
     pub fn peers_except(&self, peer_id: &str) -> Vec<PeerInfo> {
-        self.peers
+        // In join order, so that two runs of the same transcript write the same bytes. The
+        // prose promises no order and a receiver must not depend on one (`PROTOCOL.md` §6.2);
+        // this is what the reference server happens to write.
+        let mut peers: Vec<&Peer> = self
+            .peers
             .values()
             .filter(|p| p.info.peer_id != peer_id)
-            .map(|p| p.info.clone())
-            .collect()
+            .collect();
+        peers.sort_by_key(|p| p.joined);
+        peers.into_iter().map(|p| p.info.clone()).collect()
+    }
+
+    /// Seats a peer, remembering when it arrived.
+    fn seat(&mut self, mut peer: Peer) {
+        peer.joined = self.arrivals;
+        self.arrivals = self.arrivals.saturating_add(1);
+        self.peers.insert(peer.info.peer_id.clone(), peer);
     }
 
     pub fn broadcast(&self, except: Option<&str>, out: &Outbound) {
@@ -188,9 +215,10 @@ impl Registry {
             host: None,
             host_deadline: None,
             generation: 0,
+            arrivals: 0,
         };
         room.attach_host(&host.info.peer_id);
-        room.peers.insert(host.info.peer_id.clone(), host);
+        room.seat(host);
         self.rooms.insert(new.id, room);
     }
 
@@ -220,7 +248,7 @@ impl Registry {
         if claim.role == Role::Host {
             room.attach_host(&peer.info.peer_id);
         }
-        room.peers.insert(peer.info.peer_id.clone(), peer);
+        room.seat(peer);
         Ok(())
     }
 
@@ -292,5 +320,5 @@ pub struct Detach {
 #[must_use]
 pub fn peer_channel(info: PeerInfo) -> (Peer, UnboundedReceiver<Outbound>) {
     let (tx, rx) = unbounded_channel();
-    (Peer { info, tx }, rx)
+    (Peer::new(info, tx), rx)
 }
