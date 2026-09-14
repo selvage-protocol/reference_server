@@ -3,7 +3,7 @@
 # Runs the steps of .github/workflows/ci.yml on this machine, without containers (this host
 # has no Docker or Podman, so `act` cannot run here).
 #
-#   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, licences, eval, lint
+#   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval, lint
 #   scripts/ci-local.sh nightly   # coverage, the rest of cargo-deny and cargo-audit (slow)
 #   scripts/ci-local.sh lint      # actionlint over the workflow files, on its own
 #   scripts/ci-local.sh all       # everything the `checks` job runs (nightly is opt-in: it is slow)
@@ -32,6 +32,11 @@ job_checks() {
   nix build .#checks.x86_64-linux.clippy --no-link --print-build-logs
   say "checks: tests"
   nix build .#checks.x86_64-linux.nextest --no-link --print-build-logs
+  # `packages.default` is what `nix run` hands back, and until this step existed nothing built
+  # it: `nix flake check --no-build` below only *evaluates* it, so it could be — and was —
+  # broken without any job noticing.
+  say "checks: the default package"
+  nix build .#default --no-link --print-build-logs
   say "checks: licences"
   nix develop . -c cargo deny check licenses
   say "checks: evaluate every check"
