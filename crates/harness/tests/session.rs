@@ -340,6 +340,16 @@ async fn next_json_within(raw: &mut RawSocket, label: &str) -> Value {
     }
 }
 
+/// The next response to `id` on a raw connection, skipping the events in between.
+async fn raw_response_for(raw: &mut RawSocket, id: u64) -> Value {
+    loop {
+        let frame = next_json_within(raw, "a response").await;
+        if frame.get("id").and_then(Value::as_u64) == Some(id) {
+            return frame;
+        }
+    }
+}
+
 /// Reads until the connection closes, returning the close code.
 async fn close_code(ws: &mut Raw) -> Result<u16, Failure> {
     loop {
@@ -1028,6 +1038,74 @@ async fn a_refused_request_fails_and_leaves_local_state_alone() {
         documents.contains(&PATH.to_string()).then_some(())
     })
     .await;
+}
+
+/// `doc.open` and `doc.close` carry the same `path` field, so they validate it the same
+/// way: a path that is empty and a path that is all whitespace are both `bad_params` at
+/// both methods, and the connection survives either. The answer the request got is the
+/// evidence — a blank path that is accepted shows up as a result, and one that is
+/// refused as an `error` with the request's own id.
+#[tokio::test]
+async fn doc_open_and_doc_close_validate_the_path_the_same_way() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({"display_name": "Ada", "role": "host"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut raw, "room.created").await["event"],
+        event::ROOM_CREATED
+    );
+
+    for (id, name, path) in [
+        (2_u64, method::DOC_OPEN, ""),
+        (3, method::DOC_OPEN, "   "),
+        (4, method::DOC_CLOSE, ""),
+        (5, method::DOC_CLOSE, "   "),
+    ] {
+        raw.send_json(&serde_json::json!({
+            "v": proto::WIRE_VERSION,
+            "id": id,
+            "method": name,
+            "params": {"path": path},
+        }))
+        .await
+        .expect("sends");
+        let refused = raw_response_for(&mut raw, id).await;
+        assert_eq!(
+            refused["error"]["code"],
+            code::BAD_PARAMS,
+            "{name} accepted the path {path:?}"
+        );
+    }
+
+    // A real path is still a real path: the check refuses a bad one, not every one.
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 6,
+        "method": method::DOC_OPEN,
+        "params": {"path": PATH},
+    }))
+    .await
+    .expect("sends");
+    assert_eq!(
+        raw_response_for(&mut raw, 6).await["result"]["documents"],
+        serde_json::json!([PATH])
+    );
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 7,
+        "method": method::DOC_CLOSE,
+        "params": {"path": PATH},
+    }))
+    .await
+    .expect("sends");
+    assert_eq!(
+        raw_response_for(&mut raw, 7).await["result"]["documents"],
+        serde_json::json!([])
+    );
 }
 
 /// A close reason is control-frame payload: RFC 6455 allows 125 bytes, two of which the
