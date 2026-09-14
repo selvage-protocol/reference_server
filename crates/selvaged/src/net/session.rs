@@ -157,12 +157,17 @@ fn doc_set(documents: &[String]) -> Value {
     serde_json::json!({ "documents": documents })
 }
 
-fn params_refused(id: u64, error: &serde_json::Error) -> proto::ServerMessage {
-    proto::ServerMessage::error(id, code::BAD_PARAMS, error.to_string())
-}
-
-fn path_required(id: u64) -> proto::ServerMessage {
-    proto::ServerMessage::error(id, code::BAD_PARAMS, "path is required")
+/// The `path` of a `doc.open` or `doc.close` request. The two params are the same shape
+/// (§5) — a path and nothing else — so one type reads either and the rule that a path is
+/// non-blank lives here for both. Params that do not parse and a path that is empty or
+/// all whitespace are both `bad_params`.
+fn document_path(raw: Value) -> Result<String, Refusal> {
+    let params = serde_json::from_value::<proto::DocOpenParams>(raw)
+        .map_err(|e| (code::BAD_PARAMS, e.to_string()))?;
+    if params.path.trim().is_empty() {
+        return Err((code::BAD_PARAMS, "path is required".to_string()));
+    }
+    Ok(params.path)
 }
 
 /// Sends a frame to a room's peers, minus one, if the room still exists and the frame
@@ -419,12 +424,13 @@ impl Session {
 
     /// `doc.open`: declares a path open for this peer and announces the room's set.
     async fn open_document(&self, request: Request, shared: &Shared) {
-        let path = match serde_json::from_value::<proto::DocOpenParams>(
-            request.params,
-        ) {
-            Ok(params) if !params.path.trim().is_empty() => params.path,
-            Ok(_) => return self.reply(&path_required(request.id)),
-            Err(e) => return self.reply(&params_refused(request.id, &e)),
+        let path = match document_path(request.params) {
+            Ok(path) => path,
+            Err((code, message)) => {
+                return self.reply(&proto::ServerMessage::error(
+                    request.id, code, message,
+                ));
+            }
         };
         let documents = self.hold(shared, &path).await;
         self.reply(&proto::ServerMessage::response(
@@ -445,20 +451,22 @@ impl Session {
 
     /// `doc.close`: releases this peer's hold on a path and announces the room's set.
     async fn close_document(&self, request: Request, shared: &Shared) {
-        let params = match serde_json::from_value::<proto::DocCloseParams>(
-            request.params,
-        ) {
-            Ok(params) => params,
-            Err(e) => return self.reply(&params_refused(request.id, &e)),
+        let path = match document_path(request.params) {
+            Ok(path) => path,
+            Err((code, message)) => {
+                return self.reply(&proto::ServerMessage::error(
+                    request.id, code, message,
+                ));
+            }
         };
-        let documents = self.release(shared, &params.path).await;
+        let documents = self.release(shared, &path).await;
         self.reply(&proto::ServerMessage::response(
             request.id,
             doc_set(&documents),
         ));
         let announced = serde_json::json!({
             "peer_id": self.peer_id,
-            "path": params.path,
+            "path": path,
             "documents": documents,
         });
         self.announce_documents(
