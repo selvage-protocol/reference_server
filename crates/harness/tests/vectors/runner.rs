@@ -388,8 +388,9 @@ impl Session {
 /// The vector's frame with every placeholder replaced by the value it matched.
 ///
 /// A placeholder is a whole string member, so it appears in the canonical text as `"$name"`.
-/// Members are written in ascending order and arrays in order, so the placeholders in the
-/// text are the wildcards in the order the match saw them.
+/// `text` is the vector's frame written canonically — after matching, which may have put an
+/// unordered array into the wire's order — so its placeholders are the wildcards in the order
+/// the match saw them.
 ///
 /// # Errors
 ///
@@ -418,13 +419,15 @@ fn expected_bytes(text: &str, matched: &[String]) -> Result<String, Failure> {
 /// Matches one vector value against one on the wire, binding placeholders as it goes.
 ///
 /// Objects must have the *same* member set in both directions: a version-locked vector is
-/// checking that no member has been silently added or renamed (`CANONICAL.md` §3).
+/// checking that no member has been silently added or renamed (`CANONICAL.md` §3). The expected
+/// side is mutable because matching an array the prose leaves unordered *reorders* it into the
+/// order the wire sent (§2.7), which is what the byte comparison is then built from.
 #[expect(
     clippy::excessive_nesting,
     reason = "a recursive matcher over JSON; the nesting is the shape of the data"
 )]
 fn matches(
-    expected: &Value,
+    expected: &mut Value,
     actual: &Value,
     bindings: &mut Bindings,
 ) -> Result<(), String> {
@@ -435,14 +438,14 @@ fn matches(
         return bindings.bind(name, value);
     }
 
-    match (expected, actual) {
+    match (&mut *expected, actual) {
         (Value::Object(want), Value::Object(have)) => {
-            for (member, value) in want {
+            for (member, value) in want.iter_mut() {
                 let found = have.get(member).ok_or_else(|| {
                     format!("missing member `{member}` in {actual}")
                 })?;
-                if member == "peers" {
-                    matches_peers(value, found, bindings)?;
+                if UNORDERED.contains(&member.as_str()) {
+                    matches_unordered(value, found, bindings)?;
                 } else {
                     matches(value, found, bindings)?;
                 }
@@ -464,57 +467,102 @@ fn matches(
                     have.len()
                 ));
             }
-            for (left, right) in want.iter().zip(have.iter()) {
+            for (left, right) in want.iter_mut().zip(have.iter()) {
                 matches(left, right, bindings)?;
             }
             Ok(())
         }
-        _ if expected == actual => Ok(()),
-        _ => Err(format!("expected {expected}, the wire has {actual}")),
+        (left, right) => {
+            if *left == *right {
+                Ok(())
+            } else {
+                Err(format!("expected {left}, the wire has {right}"))
+            }
+        }
     }
 }
 
-/// Peers are compared as a set: the protocol promises no order for them.
+/// Members whose prose promises no order: matched as a multiset, then put into the wire's order
+/// (`CANONICAL.md` §2.7). `documents` is not here — `PROTOCOL.md` §6.2 promises it first-opened
+/// order, and the comparison holds the wire to that.
+const UNORDERED: [&str; 4] =
+    ["peers", "capabilities", "wire_versions", "roles"];
+
+/// Matches an array the prose leaves unordered, and leaves `want` in the wire's order.
+///
+/// The members are matched first, each against a distinct member of the wire, so the frame is
+/// checked member by member. `want` is then reordered to the wire's order, because the byte
+/// comparison that follows would otherwise see the order and reject a frame that is the same
+/// frame: for these arrays the order is not part of any claim, and it is not something a vector
+/// can name — a `peer_id` is minted by the server.
 #[expect(
     clippy::excessive_nesting,
     reason = "a set comparison that tries each candidate; the nesting is the search"
 )]
-fn matches_peers(
-    want: &Value,
+fn matches_unordered(
+    want: &mut Value,
     have: &Value,
     bindings: &mut Bindings,
 ) -> Result<(), String> {
     let (Some(pairs), Some(held)) = (want.as_array(), have.as_array()) else {
-        return Err(format!("expected a list of peers, the wire has {have}"));
+        return Err(format!("expected a list, the wire has {have}"));
     };
     if pairs.len() != held.len() {
         return Err(format!(
-            "expected {} peers, the wire has {}",
+            "expected {} members, the wire has {}",
             pairs.len(),
             held.len()
         ));
     }
+    let vector = pairs.clone();
+    // The placeholders already bound before this array; the re-order below rebuilds only the
+    // ones this array contributes, so it must not drop the ones in front of it.
+    let base = bindings.matched.len();
     let mut used = vec![false; held.len()];
-    for value in pairs {
+    // Where each of the vector's members was found on the wire.
+    let mut at: Vec<usize> = Vec::with_capacity(vector.len());
+    for want_value in &vector {
         let mut found = None;
         for (index, candidate) in held.iter().enumerate() {
             if used.get(index) == Some(&true) {
                 continue;
             }
             let mut trial = bindings.clone();
-            if matches(value, candidate, &mut trial).is_ok() {
+            let mut value = want_value.clone();
+            if matches(&mut value, candidate, &mut trial).is_ok() {
                 found = Some((index, trial));
                 break;
             }
         }
         let Some((index, trial)) = found else {
-            return Err(format!("no peer in {have:?} matches {value}"));
+            return Err(format!("no member in {have:?} matches {want_value}"));
         };
         if let Some(slot) = used.get_mut(index) {
             *slot = true;
         }
+        at.push(index);
         *bindings = trial;
     }
+
+    let mut order: Vec<usize> = (0..vector.len()).collect();
+    order.sort_by_key(|&position| {
+        at.get(position).copied().unwrap_or(usize::MAX)
+    });
+    if order == (0..vector.len()).collect::<Vec<_>>() {
+        return Ok(());
+    }
+    if let Some(slot) = want.as_array_mut() {
+        *slot = order
+            .iter()
+            .filter_map(|&position| vector.get(position).cloned())
+            .collect();
+    }
+    // Bind again, in the order the frame will be written in. The placeholders bound before
+    // this array are kept; only this array's are rebuilt.
+    let mut trial = bindings.clone();
+    trial.matched.truncate(base);
+    matches(want, have, &mut trial)?;
+    *bindings = trial;
     Ok(())
 }
 
@@ -524,17 +572,31 @@ fn check_text(
     expected: &str,
     bindings: &mut Bindings,
 ) -> Result<(), Failure> {
-    let want: Value = serde_json::from_str(expected)
+    let mut want: Value = serde_json::from_str(expected)
         .map_err(|e| format!("the vector frame is not JSON: {e}"))?;
     let have: Value = serde_json::from_str(actual)
         .map_err(|e| format!("the wire frame is not JSON: {e}: {actual}"))?;
+    // The vector's own bytes are checked before matching, which may reorder an unordered
+    // array: a vector's claim about the wire is only readable if the vector is written the
+    // way a frame is written (`CANONICAL.md` §2).
+    let form = serde_json::to_string(&want)?;
+    if form != expected {
+        return Err(format!(
+            "the vector frame is not in the canonical form of `CANONICAL.md` §2:\n  vector: {expected}\n  form:   {form}"
+        )
+        .into());
+    }
     // The named bindings carry across steps; the matched values are this frame's, in order.
     let mut trial = bindings.clone();
     trial.matched.clear();
-    matches(&want, &have, &mut trial).map_err(|problem| {
+    matches(&mut want, &have, &mut trial).map_err(|problem| {
         format!("frame does not match:\n  vector: {expected}\n  wire:   {actual}\n  {problem}")
     })?;
-    let wanted = expected_bytes(expected, &trial.matched)?;
+    // Matching puts an unordered array into the wire's order; the frame is then written the
+    // way the wire wrote it, so the bytes compared are the ones that frame has and not the
+    // order the vector happened to list its members in.
+    let wanted =
+        expected_bytes(&serde_json::to_string(&want)?, &trial.matched)?;
     *bindings = trial;
     if actual != wanted {
         return Err(format!(
@@ -878,4 +940,141 @@ pub async fn replay(vector: &Vector) -> Result<(), Failure> {
             })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! The comparison, driven with frames whose answer is known. A comparison that only ever
+    //! runs against a server cannot show that it still fails when it should, and the byte
+    //! comparison is the part of this runner that decides whether a transcript held.
+
+    use super::{Bindings, check_text};
+
+    /// A frame in the byte form of `CANONICAL.md` §2, which is what a vector carries.
+    fn canonical(value: &serde_json::Value) -> String {
+        serde_json::to_string(value).expect("a JSON value has a byte form")
+    }
+
+    #[test]
+    fn an_unordered_array_in_another_order_is_the_same_frame() {
+        // `peers` is a set: the order the server built it in is not something a vector can
+        // name, and the byte comparison must see the frame the wire sent (`CANONICAL.md`
+        // §2.7). The server's own order is looked at in `room.rs`; this is the comparison.
+        let expected = canonical(&serde_json::json!({
+            "event": "room.joined",
+            "params": {
+                "peers": [
+                    {"display_name": "Ada", "peer_id": "$host_peer", "role": "host"},
+                    {"display_name": "Bob", "peer_id": "$guest_peer", "role": "guest"},
+                ],
+                "room_id": "$room",
+            },
+            "v": "selvage/1",
+        }));
+        let actual = canonical(&serde_json::json!({
+            "event": "room.joined",
+            "params": {
+                "peers": [
+                    {"display_name": "Bob", "peer_id": "p-2", "role": "guest"},
+                    {"display_name": "Ada", "peer_id": "p-1", "role": "host"},
+                ],
+                "room_id": "r-1",
+            },
+            "v": "selvage/1",
+        }));
+        let mut bindings = Bindings::default();
+        check_text(&actual, &expected, &mut bindings)
+            .expect("the same frame with its peers in the other order");
+        assert_eq!(
+            bindings.named.get("$host_peer").map(String::as_str),
+            Some("p-1")
+        );
+        assert_eq!(
+            bindings.named.get("$guest_peer").map(String::as_str),
+            Some("p-2")
+        );
+    }
+
+    #[test]
+    fn a_placeholder_bound_before_a_reordered_array_survives() {
+        // The re-order rebuilds this array's placeholders in the wire's order, and the byte
+        // comparison writes the whole frame from all of them: the ones bound before the
+        // array must not be dropped on the way.
+        let expected = canonical(&serde_json::json!({
+            "event": "room.joined",
+            "params": {
+                "a_peer": "$first",
+                "peers": [
+                    {"display_name": "Ada", "peer_id": "$host_peer", "role": "host"},
+                    {"display_name": "Bob", "peer_id": "$guest_peer", "role": "guest"},
+                ],
+            },
+            "v": "selvage/1",
+        }));
+        let actual = canonical(&serde_json::json!({
+            "event": "room.joined",
+            "params": {
+                "a_peer": "p-9",
+                "peers": [
+                    {"display_name": "Bob", "peer_id": "p-2", "role": "guest"},
+                    {"display_name": "Ada", "peer_id": "p-1", "role": "host"},
+                ],
+            },
+            "v": "selvage/1",
+        }));
+        check_text(&actual, &expected, &mut Bindings::default()).expect(
+            "a binding made before the array must survive the re-order",
+        );
+    }
+
+    #[test]
+    fn an_unordered_array_with_a_wrong_member_is_not_the_same_frame() {
+        let expected = canonical(&serde_json::json!({
+            "event": "room.joined",
+            "params": {"capabilities": ["awareness", "y-protocols/1"], "room_id": "$room"},
+            "v": "selvage/1",
+        }));
+        let actual = canonical(&serde_json::json!({
+            "event": "room.joined",
+            "params": {"capabilities": ["awareness", "host-reclaim"], "room_id": "r-1"},
+            "v": "selvage/1",
+        }));
+        assert!(
+            check_text(&actual, &expected, &mut Bindings::default()).is_err()
+        );
+    }
+
+    #[test]
+    fn an_ordered_array_in_another_order_is_not_the_same_frame() {
+        // `PROTOCOL.md` §6.2 promises `documents` first-opened order, so it is the one array
+        // the comparison holds to the order it was written in.
+        let expected = canonical(&serde_json::json!({
+            "event": "doc.opened",
+            "params": {"documents": ["a.rs", "b.rs"], "path": "a.rs"},
+            "v": "selvage/1",
+        }));
+        let actual = canonical(&serde_json::json!({
+            "event": "doc.opened",
+            "params": {"documents": ["b.rs", "a.rs"], "path": "a.rs"},
+            "v": "selvage/1",
+        }));
+        assert!(
+            check_text(&actual, &expected, &mut Bindings::default()).is_err()
+        );
+    }
+
+    #[test]
+    fn a_vector_not_in_canonical_form_is_refused() {
+        // A vector whose bytes are not the form a frame is written in is not readable as a
+        // claim, so the comparison refuses it before it matches anything.
+        let expected = r#"{"v":"selvage/1","event":"room.gone","params":{"room_id":"$room","reason":"done"}}"#;
+        let actual = canonical(&serde_json::json!({
+            "event": "room.gone",
+            "params": {"reason": "done", "room_id": "r-1"},
+            "v": "selvage/1",
+        }));
+        let error = check_text(&actual, expected, &mut Bindings::default())
+            .expect_err("a vector that is not canonical has no readable claim");
+        assert!(error.to_string().contains("canonical form"), "{error}");
+    }
 }
