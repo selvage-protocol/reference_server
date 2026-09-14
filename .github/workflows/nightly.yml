@@ -58,9 +58,10 @@ jobs:
         run: nix develop . -c cargo audit
 
   # See `ci.yml`: an issue is the only signal an Actions-blind session can read.
+  # A pull request files nothing: its check runs are readable on the pull request itself.
   report:
     needs: [nightly]
-    if: failure()
+    if: failure() && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     permissions:
       issues: write
@@ -81,7 +82,7 @@ jobs:
 
   clear:
     needs: [nightly]
-    if: success()
+    if: success() && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     permissions:
       issues: write

@@ -76,9 +76,10 @@ jobs:
   # This repository has no Actions access from the sessions that work on it, so a red
   # run is invisible until someone downloads the logs by hand. An issue is the one
   # signal that is readable: file or update it on failure, close it when green again.
+  # A pull request files nothing: its check runs are readable on the pull request itself.
   report:
     needs: [checks]
-    if: failure()
+    if: failure() && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     permissions:
       issues: write
@@ -99,7 +100,7 @@ jobs:
 
   clear:
     needs: [checks]
-    if: success()
+    if: success() && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     permissions:
       issues: write
