@@ -51,6 +51,18 @@
           inherit src;
           strictDeps = true;
           pname = binName;
+
+          # `cleanCargoSource` copies the Cargo workspace and nothing else, so without this the
+          # sandbox cannot see `vectors/` and the four anchors-crossing tests in
+          # `crates/harness/tests/awareness.rs` panic on the fixture instead of running. It
+          # belongs on the shared args rather than on one check: `nextest` and `tarpaulin` each
+          # carried their own copy, `packages.default` — which is `checks.build` — carried
+          # none, and that is why it failed to build from the day the vectors were vendored.
+          #
+          # `doCheck = false` on the package was the alternative, leaving `checks.nextest` as
+          # the only test gate. It is cheaper — `nix run` would not wait on the suite, and this
+          # line invalidates `cargoArtifacts` — but it answers a missing input by not testing.
+          SELVAGE_VECTORS = ./vectors;
         };
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;

@@ -61,6 +61,11 @@ jobs:
       - name: tests
         run: nix build .#checks.x86_64-linux.nextest --no-link --print-build-logs
 
+      # `packages.default` is what `nix run` hands back. Nothing built it — the `evaluate every
+      # check` step below only evaluates it — so it was free to break quietly, and did.
+      - name: the default package
+        run: nix build .#default --no-link --print-build-logs
+
       # `crates/selvaged` is FSL-1.1-MIT; everything else is MIT OR Apache-2.0. Nothing else
       # in this workflow can see that rule break.
       - name: licences
