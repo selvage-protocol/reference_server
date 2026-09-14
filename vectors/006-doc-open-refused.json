@@ -2,7 +2,7 @@
   "id": "006",
   "title": "A refused `doc.open` is an error response and leaves the connection open",
   "spec": "PROTOCOL.md#docopen",
-  "notes": "A blank path, and a request with no `params` at all, are both `bad_params`: `path` is required and the connection survives both. The third request opens the document to show that it did. `error.message` is not stable, so the vectors bind it rather than assert it.",
+  "notes": "A blank path, and a request with no `params` at all, are both `bad_params`: `path` is required, non-empty after trimming, and the connection survives both. The first frame is sent knowing it does not conform — a path of spaces is not a path — which is why it is marked `refused`. The third request opens the document to show that it did. `error.message` is not stable, so the vectors bind it rather than assert it.",
   "steps": [
     {
       "op": "open",
@@ -22,6 +22,7 @@
     {
       "op": "send",
       "conn": "host",
+      "refused": true,
       "text": "{\"id\":2,\"method\":\"doc.open\",\"params\":{\"path\":\"  \"},\"v\":\"selvage/1\"}"
     },
     {
