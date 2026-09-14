@@ -1,30 +1,29 @@
-name: ci
+name: nightly
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  schedule:
+    # 03:17 UTC daily: off the hour, so it does not collide with every other cron.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  checks:
+  nightly:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
-      # The runner image guarantees only ~14 GB free, and a cold cache has to fit a rust-overlay
-      # toolchain plus crane's dependency artefacts. These are the preinstalled toolchains nothing
-      # here uses. Each removal is non-fatal so an image change cannot break the job, and the df
-      # either side shows what it actually bought. No third-party action involved.
+      # Copied from `ci.yml`: the runner image guarantees only ~14 GB free, and a cold
+      # cache has to fit a rust-overlay toolchain plus crane's dependency artefacts.
       - name: free disk space
         run: |
           df -h /
@@ -40,44 +39,27 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
-      # `primary-key` is required: without it the action fails before any check runs.
-      # No `purge`: it needs `actions: write`, and this workflow has `contents: read`.
-      # No `gc-max-store-size`: the checks are built with --no-link, so a GC here would
-      # collect the very store paths this cache exists to save.
       - name: restore and save the Nix store
         uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
 
-      - name: format
-        run: nix build .#checks.x86_64-linux.fmt --no-link --print-build-logs
+      # These three are the ones that were left behind when the monorepo was split, and
+      # none of them has a home in `ci.yml`. The vectors are read from the checkout's
+      # `vectors/`, so no `SELVAGE_VECTORS` is needed here (the sandbox check sets it).
+      - name: coverage
+        run: nix develop . -c cargo tarpaulin --fail-under 80
 
-      - name: clippy
-        run: nix build .#checks.x86_64-linux.clippy --no-link --print-build-logs
+      - name: cargo-deny
+        run: nix develop . -c cargo deny check
 
-      # The vector replay is part of this suite: the vendored `vectors/` directory reaches the
-      # sandbox through `SELVAGE_VECTORS`, so no specification checkout is needed here.
-      - name: tests
-        run: nix build .#checks.x86_64-linux.nextest --no-link --print-build-logs
+      - name: cargo-audit
+        run: nix develop . -c cargo audit
 
-      # `crates/selvaged` is FSL-1.1-MIT; everything else is MIT OR Apache-2.0. Nothing else
-      # in this workflow can see that rule break.
-      - name: licences
-        run: nix develop . -c cargo deny check licenses
-
-      - name: evaluate every check
-        run: nix flake check --no-build .
-
-      # Unknown actions, bad expressions and shell mistakes, caught before the run.
-      - name: lint the workflows
-        run: nix develop . -c actionlint
-
-  # This repository has no Actions access from the sessions that work on it, so a red
-  # run is invisible until someone downloads the logs by hand. An issue is the one
-  # signal that is readable: file or update it on failure, close it when green again.
+  # See `ci.yml`: an issue is the only signal an Actions-blind session can read.
   report:
-    needs: [checks]
+    needs: [nightly]
     if: failure()
     runs-on: ubuntu-24.04
     permissions:
@@ -98,7 +80,7 @@ jobs:
           fi
 
   clear:
-    needs: [checks]
+    needs: [nightly]
     if: success()
     runs-on: ubuntu-24.04
     permissions:

@@ -3,10 +3,10 @@
 # Runs the steps of .github/workflows/ci.yml on this machine, without containers (this host
 # has no Docker or Podman, so `act` cannot run here).
 #
-#   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, licences, eval
+#   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, licences, eval, lint
 #   scripts/ci-local.sh nightly   # coverage, the rest of cargo-deny and cargo-audit (slow)
-#   scripts/ci-local.sh lint      # actionlint over the workflow files
-#   scripts/ci-local.sh all       # lint + checks   (nightly is opt-in: it is slow)
+#   scripts/ci-local.sh lint      # actionlint over the workflow files, on its own
+#   scripts/ci-local.sh all       # everything the `checks` job runs (nightly is opt-in: it is slow)
 #
 # Keep this in step with the workflow — it runs the same commands, so that a red job is found
 # here rather than on a runner. `lint` catches unknown actions, bad expressions and shell
@@ -36,6 +36,8 @@ job_checks() {
   nix develop . -c cargo deny check licenses
   say "checks: evaluate every check"
   nix flake check --no-build .
+  say "checks: lint the workflows"
+  nix develop . -c actionlint
 }
 
 job_nightly() {
@@ -56,7 +58,7 @@ case "${1:-all}" in
   checks) job_checks ;;
   nightly) job_nightly ;;
   lint) job_lint ;;
-  all) job_lint && job_checks ;;
+  all) job_checks ;;
   *)
     printf 'usage: %s [checks|nightly|lint|all]\n' "$0" >&2
     exit 2
