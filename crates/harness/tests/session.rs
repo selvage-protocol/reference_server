@@ -503,6 +503,52 @@ async fn joining_needs_the_room_and_the_token() {
     assert_eq!(host.peers().await.unwrap().len(), 0);
 }
 
+/// `display_name` is bounded at 32 UTF-16 code units (`PROTOCOL.md` §5), so an astral
+/// character costs two. A name of exactly 32 code units — one of them astral — seats; one code
+/// unit over is refused `bad_params` before seating. Counting bytes or code points answers both
+/// the wrong way: the at-limit name is 34 bytes, and the over-limit one is 32 code points.
+#[tokio::test]
+async fn display_name_is_bounded_in_utf16_code_units() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+
+    let at_limit = format!("{}𝄞", "a".repeat(30));
+    assert_eq!(at_limit.encode_utf16().count(), 32);
+    let mut host = connect(&proto::session_url(&harness.ws_base(), None, None))
+        .await
+        .expect("connects");
+    hello(
+        &mut host,
+        &serde_json::json!({ "display_name": at_limit.as_str(), "role": "host" }),
+    )
+    .await
+    .expect("says hello");
+    let created = next_json(&mut host).await.expect("room.created");
+    assert_eq!(created["event"], event::ROOM_CREATED);
+    assert_eq!(created["params"]["self"]["display_name"], at_limit.as_str());
+
+    let over_limit = format!("{}𝄞", "a".repeat(31));
+    assert_eq!(over_limit.encode_utf16().count(), 33);
+    assert_eq!(over_limit.chars().count(), 32);
+    let mut refused =
+        connect(&proto::session_url(&harness.ws_base(), None, None))
+            .await
+            .expect("connects");
+    hello(
+        &mut refused,
+        &serde_json::json!({ "display_name": over_limit.as_str(), "role": "host" }),
+    )
+    .await
+    .expect("says hello");
+    assert_eq!(
+        next_json(&mut refused).await.expect("refusal")["params"]["code"],
+        code::BAD_PARAMS
+    );
+    assert_eq!(
+        close_code(&mut refused).await.expect("close frame"),
+        close::PROTOCOL_ERROR
+    );
+}
+
 /// §10's compatibility rule is applied to the grammar §10 and `CANONICAL.md` §2.5 write,
 /// not to whatever a number parser happens to accept: a version outside it is refused at
 /// the handshake rather than seated. `selvage/1.2.3` is the spelling the TypeScript

@@ -39,6 +39,18 @@ pub const CAPABILITIES: &[&str] = &[
     "host-reclaim",
 ];
 
+/// The longest `display_name` a server seats, in UTF-16 code units (`PROTOCOL.md` §5).
+///
+/// Counted the way a JavaScript string is measured, so an astral character costs two.
+/// `str::len` (bytes) and `chars().count()` (code points) both answer the wrong question.
+pub const DISPLAY_NAME_MAX_UTF16: usize = 32;
+
+/// Whether a `display_name` is longer than [`DISPLAY_NAME_MAX_UTF16`].
+#[must_use]
+pub fn display_name_over_limit(name: &str) -> bool {
+    name.encode_utf16().count() > DISPLAY_NAME_MAX_UTF16
+}
+
 /// Client -> server method names.
 pub mod method {
     pub const SESSION_HELLO: &str = "session.hello";
@@ -589,6 +601,23 @@ mod tests {
         assert_eq!(msg.id, Some(1));
         let params: HelloParams = serde_json::from_value(msg.params).unwrap();
         assert_eq!(params.display_name, "Ada");
+    }
+
+    #[test]
+    fn a_display_name_is_measured_in_utf16_code_units() {
+        // One astral character, so 32 code units from 31 code points.
+        let at_limit = format!("{}𝄞", "a".repeat(30));
+        assert_eq!(at_limit.encode_utf16().count(), 32);
+        assert!(!display_name_over_limit(&at_limit));
+
+        // One unit over, and still only 32 code points: a code-point bound admits it.
+        let over_limit = format!("{}𝄞", "a".repeat(31));
+        assert_eq!(over_limit.encode_utf16().count(), 33);
+        assert_eq!(over_limit.chars().count(), 32);
+        assert!(display_name_over_limit(&over_limit));
+
+        // Bytes answer the other way: the at-limit name is already 34 of them.
+        assert_eq!(at_limit.len(), 34);
     }
 
     #[test]
