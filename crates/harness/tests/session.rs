@@ -316,6 +316,30 @@ async fn response_for(ws: &mut Raw, id: u64) -> Result<Value, Failure> {
     }
 }
 
+/// The session target a guest joins a room with.
+fn guest_target(room_id: &str, token: &str) -> String {
+    format!(
+        "{}?room={}&token={}",
+        proto::ENDPOINT_PATH,
+        proto::percent_encode(room_id),
+        proto::percent_encode(token)
+    )
+}
+
+/// The next JSON frame on a raw connection, under the harness's deadline. A raw socket
+/// has no timeout of its own, and a test that waits for ever is not a test that passed.
+#[expect(
+    clippy::panic,
+    reason = "a frame that never arrives is a test failure, not a value to recover"
+)]
+async fn next_json_within(raw: &mut RawSocket, label: &str) -> Value {
+    match timeout(WAIT, raw.next_json()).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(e)) => panic!("{label}: {e}"),
+        Err(elapsed) => panic!("{label}: {elapsed}"),
+    }
+}
+
 /// Reads until the connection closes, returning the close code.
 async fn close_code(ws: &mut Raw) -> Result<u16, Failure> {
     loop {
@@ -584,6 +608,79 @@ async fn host_reconnect_within_the_grace_period_keeps_the_room() {
     let documents = host.documents().await.unwrap();
     assert!(documents.contains(&PATH.to_string()), "got {documents:?}");
     assert_eq!(guest.text(PATH).await.unwrap(), "shared\n");
+}
+
+/// `host.attached` means a host reclaimed the room (§6, §9.1), so a guest that joins
+/// while the room is between hosts must not produce one: a conforming peer told
+/// `host.attached` concludes the room has a host again and can then let it die under it.
+/// The guest's own `doc.open` is a barrier — one connection's frames are answered in
+/// order — so what arrives between the join and that answer is pinned, not timed.
+#[tokio::test]
+async fn a_guest_joining_during_the_grace_period_is_not_announced_as_the_host()
+{
+    let harness = Harness::start(Duration::from_secs(10)).await;
+    let mut host = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    host.hello(&serde_json::json!({"display_name": "Ada", "role": "host"}))
+        .await
+        .expect("says hello");
+    let created = next_json_within(&mut host, "room.created").await;
+    let room_id = created["params"]["room_id"].as_str().unwrap().to_string();
+    let token = created["params"]["token"].as_str().unwrap().to_string();
+    let target = guest_target(&room_id, &token);
+
+    let mut watcher = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the upgrade succeeds");
+    watcher
+        .hello(&serde_json::json!({"display_name": "Bob"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut watcher, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+
+    // The host leaves; the room survives between hosts, which is the whole grace period.
+    drop(host);
+    assert_eq!(
+        next_json_within(&mut watcher, "peer.left").await["event"],
+        event::PEER_LEFT
+    );
+    assert_eq!(
+        next_json_within(&mut watcher, "host.detached").await["event"],
+        event::HOST_DETACHED
+    );
+
+    let mut late = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the upgrade succeeds");
+    late.hello(&serde_json::json!({"display_name": "Cleo"}))
+        .await
+        .expect("says hello");
+    let joined = next_json_within(&mut watcher, "peer.joined").await;
+    assert_eq!(
+        joined["event"],
+        event::PEER_JOINED,
+        "a guest joining a hostless room is a peer, not a host: {joined}"
+    );
+    assert_eq!(joined["params"]["peer"]["role"], "guest");
+    assert_eq!(joined["params"]["peer"]["display_name"], "Cleo");
+
+    late.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 2,
+        "method": method::DOC_OPEN,
+        "params": {"path": PATH},
+    }))
+    .await
+    .expect("sends");
+    assert_eq!(
+        next_json_within(&mut watcher, "doc.opened").await["event"],
+        event::DOC_OPENED,
+        "nothing else may be announced between the join and the next event"
+    );
 }
 
 #[tokio::test]

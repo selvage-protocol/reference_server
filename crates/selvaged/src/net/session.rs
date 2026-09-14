@@ -316,7 +316,9 @@ impl Seating<'_> {
                 self.peer,
             )
             .map_err(|e| refusal_for(e, room_id))?;
-        if !host_was_present {
+        // `host.attached` is a host reclaiming the room (§6, §9.1): a guest joining
+        // while the room is between hosts is a `peer.joined` and nothing more.
+        if !host_was_present && self.role == proto::Role::Host {
             let attached = event_frame(
                 event::HOST_ATTACHED,
                 serde_json::json!({ "peer": self.info }),
