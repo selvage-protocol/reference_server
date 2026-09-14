@@ -5,15 +5,18 @@
 //! timeout reports the state it actually observed.
 
 use std::future::Future;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::panic::{PanicHookInfo, set_hook, take_hook};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use selvaged::Server;
 pub use selvaged::ServerConfig;
+use tokio::io::copy_bidirectional;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
@@ -199,7 +202,25 @@ impl Harness {
         format!("http://{}", self.addr)
     }
 
+    /// The server's `host:port`, for a relay to forward to.
+    #[must_use]
+    pub fn upstream(&self) -> String {
+        self.addr.to_string()
+    }
+
     /// Connects a host, which mints a room.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when the host cannot connect.
+    pub async fn host(
+        &self,
+        display_name: &str,
+    ) -> Result<(SyncEngine, Room), Error> {
+        self.host_at(&self.ws_base(), display_name).await
+    }
+
+    /// Connects a host through `base` — a relay's address — which mints a room.
     ///
     /// # Errors
     ///
@@ -213,15 +234,14 @@ impl Harness {
         reason = "the server always invites the host that minted the room; a session \
                   without a token means it did not, which must fail the test"
     )]
-    pub async fn host(
+    pub async fn host_at(
         &self,
+        base: &str,
         display_name: &str,
     ) -> Result<(SyncEngine, Room), Error> {
-        let engine = SyncEngine::connect(ConnectOptions::host(
-            self.ws_base(),
-            display_name,
-        ))
-        .await?;
+        let engine =
+            SyncEngine::connect(ConnectOptions::host(base, display_name))
+                .await?;
         let session = engine.session();
         let room = Room {
             id: session.room_id.clone(),
@@ -243,8 +263,25 @@ impl Harness {
         room: &Room,
         display_name: &str,
     ) -> Result<SyncEngine, Error> {
-        let options =
-            ConnectOptions::guest(self.ws_base(), display_name, room.invite());
+        self.join_at(&self.ws_base(), room, display_name).await
+    }
+
+    /// Connects a guest through `base` — a relay's address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when the guest cannot connect or the server refuses it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a relay address, a room and a display name are the three things a join is"
+    )]
+    pub async fn join_at(
+        &self,
+        base: &str,
+        room: &Room,
+        display_name: &str,
+    ) -> Result<SyncEngine, Error> {
+        let options = ConnectOptions::guest(base, display_name, room.invite());
         SyncEngine::connect(options).await
     }
 
@@ -284,6 +321,91 @@ impl Harness {
 
     pub fn abort(&self) {
         self.task.abort();
+    }
+}
+
+/// A TCP relay in front of the server that a test can cut.
+///
+/// Dropping a real connection without stopping the server is what exercises
+/// reconnection (`PROTOCOL.md` §9.1): aborting the server's accept loop would take the
+/// room down with it, and there is no protocol method that closes one peer's socket.
+/// The relay inspects nothing; it is the network failing under a session.
+pub struct DropProxy {
+    addr: SocketAddr,
+    task: JoinHandle<()>,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl DropProxy {
+    /// Starts a relay to `upstream`, a `host:port`, on an ephemeral loopback port.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bind error when no loopback port can be taken.
+    pub async fn start(upstream: &str) -> io::Result<Self> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let addr = listener.local_addr()?;
+        let target = upstream.to_string();
+        let connections: Arc<Mutex<Vec<JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let tracked = Arc::clone(&connections);
+        let task = tokio::spawn(accept_loop(listener, target, tracked));
+        Ok(Self {
+            addr,
+            task,
+            connections,
+        })
+    }
+
+    #[must_use]
+    pub fn ws_base(&self) -> String {
+        format!("ws://{}", self.addr)
+    }
+
+    /// Cuts every relayed connection, dropping both of its sockets. The server sees its
+    /// own side close, so what follows is an ordinary peer drop, not a shutdown.
+    pub fn drop_all(&self) {
+        let mut connections = match self.connections.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for handle in connections.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for DropProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+        self.drop_all();
+    }
+}
+
+/// Forwards one relayed connection in both directions until either side closes.
+async fn relay(mut client: TcpStream, target: String) {
+    if let Ok(mut server) = TcpStream::connect(&target).await {
+        let _ = copy_bidirectional(&mut client, &mut server).await;
+    }
+}
+
+/// Records a relayed connection so [`DropProxy::drop_all`] can cut it.
+fn track(connections: &Mutex<Vec<JoinHandle<()>>>, handle: JoinHandle<()>) {
+    let mut handles = match connections.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    handles.push(handle);
+}
+
+/// Accepts relayed connections until the listener is dropped.
+async fn accept_loop(
+    listener: TcpListener,
+    target: String,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+) {
+    while let Ok((client, _)) = listener.accept().await {
+        track(&connections, tokio::spawn(relay(client, target.clone())));
     }
 }
 

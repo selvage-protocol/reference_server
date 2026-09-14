@@ -17,8 +17,7 @@ pub mod error;
 pub mod presence;
 pub mod session;
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::timeout;
@@ -32,11 +31,8 @@ pub use crate::presence::{
     Anchor, AwarenessState, ItemId, Presence, Selection, SelectionOffsets,
 };
 pub use crate::session::{
-    ConnectOptions, Invite, KeepaliveConfig, SessionInfo,
+    ConnectOptions, Invite, KeepaliveConfig, ReconnectPolicy, SessionInfo,
 };
-
-/// How long the session handshake may take before the connection is abandoned.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A connected sync engine.
 ///
@@ -46,11 +42,14 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct SyncEngine {
     commands: mpsc::UnboundedSender<Command>,
     events: broadcast::Sender<EngineEvent>,
-    session: Arc<SessionInfo>,
+    session: Arc<Mutex<SessionInfo>>,
 }
 
 impl SyncEngine {
     /// Connects, completes the session handshake and starts the engine task.
+    ///
+    /// A failure here is a failure: reconnection retries a session that dropped, never
+    /// the first connection behind the caller's back (`PROTOCOL.md` §9.1).
     ///
     /// # Errors
     ///
@@ -58,22 +57,26 @@ impl SyncEngine {
     /// session, or the handshake does not finish within ten seconds.
     pub async fn connect(options: ConnectOptions) -> Result<Self, Error> {
         let established =
-            timeout(HANDSHAKE_TIMEOUT, engine::connect(options)).await;
-        let (channel, session) = match established {
+            timeout(engine::HANDSHAKE_TIMEOUT, engine::connect(options)).await;
+        let (channel, _) = match established {
             Ok(result) => result?,
             Err(_) => return Err(Error::Closed),
         };
         Ok(Self {
             commands: channel.commands,
             events: channel.events,
-            session: Arc::new(session),
+            session: channel.session,
         })
     }
 
-    /// What the server said at the end of the handshake.
+    /// What the server said at the end of the handshake. It changes on a reconnect: a
+    /// reconnecting client is a new peer, and the room is the same.
     #[must_use]
-    pub fn session(&self) -> &SessionInfo {
-        &self.session
+    pub fn session(&self) -> SessionInfo {
+        match self.session.lock() {
+            Ok(session) => session.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     /// Opens a document: it becomes part of this client's open set and of the room's.

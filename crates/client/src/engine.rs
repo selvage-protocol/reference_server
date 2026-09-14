@@ -6,38 +6,44 @@
 //! y-protocols. Nothing in this file invents a document or awareness encoding.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio::time::{Interval, MissedTickBehavior, interval};
+use tokio::time::{Interval, MissedTickBehavior, interval, sleep, timeout};
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Error as WireError;
 use tokio_tungstenite::tungstenite::Message;
 
 use selvage_protocol as proto;
-use selvage_protocol::{event, method};
+use selvage_protocol::{code, event, method};
 use yrs::block::ClientID;
 use yrs::encoding::read::Cursor;
 use yrs::sync::protocol::{
     DefaultProtocol, MessageReader, Protocol as YProtocol,
 };
 use yrs::sync::{Awareness, Message as YMessage, SyncMessage};
-use yrs::updates::decoder::DecoderV1;
+use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{
     Assoc, BranchID, Doc, GetString, IndexedSequence, OffsetKind, Options,
-    ReadTxn, StickyIndex, Text as YText, TextRef, Transact,
+    ReadTxn, StateVector, StickyIndex, Text as YText, TextRef, Transact,
+    Update,
 };
 
 use crate::editor::EngineEvent;
 use crate::presence::{
     Anchor, AwarenessState, PeerInfo, Presence, Selection, SelectionOffsets,
 };
+use crate::session::ReconnectPolicy;
 use crate::{ConnectOptions, Error, KeepaliveConfig, SessionInfo};
+
+/// How long a handshake may take before the attempt is abandoned, first connect and
+/// reconnect alike.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Socket = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = SplitSink<Socket, Message>;
@@ -101,18 +107,22 @@ pub enum Command {
 pub struct Channel {
     pub commands: mpsc::UnboundedSender<Command>,
     pub events: broadcast::Sender<EngineEvent>,
+    /// The current session description, replaced on a reconnect.
+    pub session: Arc<Mutex<SessionInfo>>,
 }
 
-/// What the task needs before it can start the connection task.
-struct EngineStart {
+/// A completed handshake: a socket, the replica it was seated with, and the server's
+/// description of the session.
+struct Replica {
     sink: Sink,
     stream: Stream,
     awareness: Awareness,
-    keepalive: KeepaliveConfig,
-    local_state: Option<String>,
+    session: SessionInfo,
 }
 
-/// Runs the whole connection attempt: socket, handshake, then the task.
+/// Runs one connection attempt: socket, handshake, and the reply. Never retried here:
+/// a first connect that fails is a failure the caller sees, and a reconnect decides for
+/// itself whether another attempt is worth making.
 ///
 /// # Errors
 ///
@@ -121,52 +131,41 @@ struct EngineStart {
 pub async fn connect(
     options: ConnectOptions,
 ) -> Result<(Channel, SessionInfo), Error> {
+    let local_state = serde_json::to_string(&options.initial_awareness)?;
+    let replica = handshake(&options, None, &local_state).await?;
+    let session = replica.session.clone();
+    Ok((spawn(options, replica, local_state), session))
+}
+
+/// Opens the socket, seeds a fresh `Y.Doc` and sends `session.hello`.
+///
+/// Every attempt gets a fresh replica: a reconnecting client is a new peer, and `yrs`
+/// keeps a tombstone for an awareness client id whose state was removed, so reusing one
+/// drops the first republish. `previous` carries the outgoing replica's state into the
+/// new one, so what the client already holds is not lost with the socket.
+async fn handshake(
+    options: &ConnectOptions,
+    previous: Option<Vec<u8>>,
+    local_state: &str,
+) -> Result<Replica, Error> {
+    // A text offset on this API is a UTF-16 code unit, the unit `yjs`, every editor's
+    // `offsetAt` and every peer on the wire use (PROTOCOL.md §8.1). `yrs` defaults to
+    // UTF-8 byte offsets, which would put a cursor after the first non-BMP character
+    // somewhere else than every other implementation does.
+    let doc = fresh_doc(previous)?;
+    let awareness_client_id = doc.client_id().get();
+    let mut awareness = Awareness::new(doc);
+    awareness.set_local_state_raw(local_state.to_string());
+
     let url = proto::session_url(
         &options.base_url,
         options.room.as_deref(),
         options.token.as_deref(),
     );
-    let local_state = serde_json::to_string(&options.initial_awareness)?;
-    let (sink, mut stream, awareness) = greet(&options, &url).await?;
-    let session = await_session(&mut stream, &options.base_url).await?;
-    // The server advertises the session's keepalive; a caller that did not override it
-    // runs on the server's clock, so both ends measure awareness the same way.
-    let keepalive = options
-        .keepalive
-        .unwrap_or_else(|| KeepaliveConfig::from(session.keepalive));
-    let start = EngineStart {
-        sink,
-        stream,
-        awareness,
-        keepalive,
-        local_state: Some(local_state),
-    };
-    Ok((spawn(start, &session), session))
-}
-
-/// Opens the socket, seeds the local `Y.Doc` and sends `session.hello`.
-async fn greet(
-    options: &ConnectOptions,
-    url: &str,
-) -> Result<(Sink, Stream, Awareness), Error> {
-    // A text offset on this API is a UTF-16 code unit, the unit `yjs`, every editor's
-    // `offsetAt` and every peer on the wire use (PROTOCOL.md §8.1). `yrs` defaults to
-    // UTF-8 byte offsets, which would put a cursor after the first non-BMP character
-    // somewhere else than every other implementation does.
-    let doc = Doc::with_options(Options {
-        offset_kind: OffsetKind::Utf16,
-        ..Options::default()
-    });
-    let awareness_client_id = doc.client_id().get();
-    let mut awareness = Awareness::new(doc);
-    awareness.set_local_state_raw(serde_json::to_string(
-        &options.initial_awareness,
-    )?);
-
     let (ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .map_err(Error::Wire)?;
-    let (mut sink, stream) = ws.split();
+    let (mut sink, mut stream) = ws.split();
 
     let hello = proto::ClientMessage::new(
         1,
@@ -182,7 +181,32 @@ async fn greet(
     sink.send(Message::text(hello.to_text()?))
         .await
         .map_err(Error::Wire)?;
-    Ok((sink, stream, awareness))
+    let session = await_session(&mut stream, &options.base_url).await?;
+    Ok(Replica {
+        sink,
+        stream,
+        awareness,
+        session,
+    })
+}
+
+/// A new replica carrying `previous`'s state, if any. The fresh client id is what a
+/// reconnect needs; the state is what it must not lose.
+fn fresh_doc(previous: Option<Vec<u8>>) -> Result<Doc, Error> {
+    let doc = Doc::with_options(Options {
+        offset_kind: OffsetKind::Utf16,
+        ..Options::default()
+    });
+    if let Some(update) = previous
+        && !update.is_empty()
+    {
+        let decoded = Update::decode_v1(&update)
+            .map_err(|e| Error::Yjs(e.to_string()))?;
+        doc.transact_mut()
+            .apply_update(decoded)
+            .map_err(|e| Error::Yjs(e.to_string()))?;
+    }
+    Ok(doc)
 }
 
 /// Waits for `room.created`/`room.joined`, or the reason the server refused.
@@ -257,27 +281,42 @@ fn session_info(params: proto::SessionParams, base_url: &str) -> SessionInfo {
     }
 }
 
-fn spawn(start: EngineStart, session: &SessionInfo) -> Channel {
+fn spawn(
+    options: ConnectOptions,
+    replica: Replica,
+    local_state: String,
+) -> Channel {
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     let (events_tx, _) = broadcast::channel(64);
+    let session_slot = Arc::new(Mutex::new(replica.session.clone()));
+    // The server advertises the session's keepalive; a caller that did not override it
+    // runs on the server's clock, so both ends measure awareness the same way.
+    let keepalive = options
+        .keepalive
+        .unwrap_or_else(|| KeepaliveConfig::from(replica.session.keepalive));
+    let room = options.room.clone();
+    let token = options.token.clone();
     let task = EngineTask {
-        sink: start.sink,
-        stream: start.stream,
-        awareness: start.awareness,
-        session: session.clone(),
+        policy: options.reconnect,
+        options,
+        sink: replica.sink,
+        stream: replica.stream,
+        awareness: replica.awareness,
+        session: replica.session,
+        session_slot: Arc::clone(&session_slot),
+        room,
+        token,
+        terminal: false,
+        attempts: 0,
         commands: commands_rx,
         events: events_tx.clone(),
-        keepalive: start.keepalive,
-        documents: session.documents.clone(),
+        keepalive,
+        documents: Vec::new(),
         open_documents: Vec::new(),
-        peers: session
-            .peers
-            .iter()
-            .map(|peer| (peer.peer_id.clone(), peer.clone()))
-            .collect(),
+        peers: HashMap::new(),
         request_id: 1,
         pending: HashMap::new(),
-        local_state: start.local_state,
+        local_state: Some(local_state),
         queued: VecDeque::new(),
         paused: false,
     };
@@ -285,18 +324,67 @@ fn spawn(start: EngineStart, session: &SessionInfo) -> Channel {
     Channel {
         commands: commands_tx,
         events: events_tx,
+        session: session_slot,
     }
 }
 
-/// Runs the turn loop until the session ends. Returns `false` when the socket failed
-/// rather than the session ending cleanly.
-async fn session(task: &mut EngineTask, renew: &mut Interval) -> bool {
+/// How a turn loop ended.
+enum SessionEnd {
+    /// The session ended deliberately: the client asked to stop.
+    Stopped,
+    /// The socket failed. Whether that is recoverable is the caller's call.
+    Dropped,
+}
+
+/// The result of one turn of the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    Continue,
+    /// The client asked to end the session; nothing is recovered.
+    Stopped,
+    /// The socket failed. This may be recoverable.
+    Dropped,
+}
+
+/// The outcome of a reconnect.
+enum Reconnect {
+    /// Re-helloed and seated as a fresh peer.
+    Seated,
+    /// Retries are exhausted or a refusal was terminal: report a disconnect.
+    GivenUp,
+    /// The client was shut down while waiting: emit nothing.
+    Disposed,
+}
+
+/// The outcome of one reconnect attempt.
+enum Attempt {
+    Seated(Box<Replica>),
+    Retry,
+    Refused,
+}
+
+/// Refusals after which retrying the same URL cannot help (`PROTOCOL.md` §9.1, §11).
+fn is_terminal_code(name: &str) -> bool {
+    matches!(
+        name,
+        code::ROOM_UNKNOWN
+            | code::TOKEN_INVALID
+            | code::HOST_PRESENT
+            | code::UNSUPPORTED_VERSION
+            | code::ROOM_GONE
+    )
+}
+
+/// Runs the turn loop until the session ends.
+async fn session(task: &mut EngineTask, renew: &mut Interval) -> SessionEnd {
     if task.flush_outbound().await.is_err() {
-        return false;
+        return SessionEnd::Dropped;
     }
     loop {
-        if !task.turn(renew).await {
-            return true;
+        match task.turn(renew).await {
+            Turn::Continue => {}
+            Turn::Stopped => return SessionEnd::Stopped,
+            Turn::Dropped => return SessionEnd::Dropped,
         }
         // One flush per turn: every path only queues frames, and a paused client keeps
         // queueing until it is resumed.
@@ -304,7 +392,7 @@ async fn session(task: &mut EngineTask, renew: &mut Interval) -> bool {
             continue;
         }
         if task.flush_outbound().await.is_err() {
-            return false;
+            return SessionEnd::Dropped;
         }
     }
 }
@@ -350,11 +438,27 @@ impl Pending {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the outbound pause and a terminal refusal are independent state"
+)]
 struct EngineTask {
+    policy: ReconnectPolicy,
+    options: ConnectOptions,
     sink: Sink,
     stream: Stream,
     awareness: Awareness,
     session: SessionInfo,
+    /// The description `SyncEngine::session` reads, replaced on every reconnect.
+    session_slot: Arc<Mutex<SessionInfo>>,
+    /// The room to reconnect to, learned from `room.created` when this client minted it.
+    room: Option<String>,
+    /// The token a reconnect has to carry, learned from `room.created`.
+    token: Option<String>,
+    /// A refusal a retry cannot change was seen; the next drop must not be retried.
+    terminal: bool,
+    /// Reconnect attempts made since the last successful seat.
+    attempts: u32,
     commands: mpsc::UnboundedReceiver<Command>,
     events: broadcast::Sender<EngineEvent>,
     keepalive: KeepaliveConfig,
@@ -379,8 +483,64 @@ impl EngineTask {
         let mut renew = interval(self.keepalive.awareness_renew);
         renew.set_missed_tick_behavior(MissedTickBehavior::Delay);
         renew.tick().await;
+        self.seat();
+        while self.cycle(&mut renew).await {}
+        // Whatever is still outstanding can never be answered now.
+        self.fail_pending();
+    }
 
-        // Open the document sync handshake: peers reply with the state we are missing.
+    /// Runs one connection's lifetime. Returns `false` when the task is done: the
+    /// client asked to stop, retries are exhausted, or a terminal refusal arrived.
+    async fn cycle(&mut self, renew: &mut Interval) -> bool {
+        match session(self, renew).await {
+            SessionEnd::Stopped => return false,
+            SessionEnd::Dropped => {}
+        }
+        // The frames that were queued belonged to the socket that just died. What they
+        // carried is either in the document — recovered by the sync handshake — or
+        // re-issued by the caller that asked for it.
+        self.fail_pending();
+        self.queued.clear();
+        match self.reconnect().await {
+            Reconnect::Seated => {
+                self.seat();
+                true
+            }
+            Reconnect::GivenUp => {
+                self.disconnect();
+                false
+            }
+            Reconnect::Disposed => false,
+        }
+    }
+
+    /// One turn of the session: waits on commands, the awareness clock and the socket,
+    /// and reports what the turn did.
+    async fn turn(&mut self, renew: &mut Interval) -> Turn {
+        tokio::select! {
+            command = self.commands.recv() => self.handle_command(command).await,
+            _ = renew.tick() => {
+                self.renew_awareness();
+                Turn::Continue
+            }
+            incoming = self.stream.next() => self.handle_incoming(incoming),
+        }
+    }
+
+    /// Applies a completed handshake: a fresh peer, the room's document set, the sync
+    /// handshake, and this client's own documents re-opened. Runs for the first seat and
+    /// for every reconnect alike.
+    fn seat(&mut self) {
+        // §9.1: the documents this client still holds open are re-opened, which is what
+        // puts them back in the room's set when nobody else had them. Content is not
+        // replayed: the sync handshake brings it back from the peers.
+        for path in self.open_documents.clone() {
+            let (reply, _gone) = oneshot::channel();
+            self.request(Pending::Open { path, reply });
+        }
+        // §7: immediately after seating, SyncStep1 with our state vector — every peer
+        // replies with what we are missing. Then publish our awareness, so a newcomer's
+        // presence is complete before anyone moves a cursor.
         let step1 = {
             let txn = self.doc().transact();
             encode_y_message(&YMessage::Sync(SyncMessage::SyncStep1(
@@ -389,35 +549,158 @@ impl EngineTask {
         };
         self.enqueue(Message::binary(step1));
         let _ = self.publish_local_awareness();
-        if !session(&mut self, &mut renew).await {
-            self.disconnect();
-        }
-        // Whatever is still outstanding can never be answered now.
-        self.fail_pending();
+        self.remember();
+        self.terminal = false;
+        self.attempts = 0;
+        let _ = self.events.send(EngineEvent::DocumentsChanged {
+            documents: self.documents.clone(),
+        });
+        let _ = self.events.send(EngineEvent::PeersChanged {
+            peers: self.peer_list(),
+        });
     }
 
-    /// One turn of the session: waits on commands, the awareness clock and the socket,
-    /// and reports whether the session should continue.
-    async fn turn(&mut self, renew: &mut Interval) -> bool {
-        tokio::select! {
-            command = self.commands.recv() => self.handle_command(command).await,
-            _ = renew.tick() => self.renew_awareness(),
-            incoming = self.stream.next() => self.handle_incoming(incoming),
+    /// Records what this seat says about the session: the room to reconnect to, the
+    /// token a reconnect has to carry, the room's document set and its peers.
+    fn remember(&mut self) {
+        self.room = Some(self.session.room_id.clone());
+        if self.session.token.is_some() {
+            self.token = self.session.token.clone();
+        }
+        self.documents = self.session.documents.clone();
+        self.peers = self
+            .session
+            .peers
+            .iter()
+            .map(|peer| (peer.peer_id.clone(), peer.clone()))
+            .collect();
+        self.publish_session();
+    }
+
+    fn publish_session(&self) {
+        let mut slot = match self.session_slot.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        slot.clone_from(&self.session);
+    }
+
+    // --- reconnecting --------------------------------------------------------
+
+    /// Re-hellos the room after a recoverable drop, under the policy (`PROTOCOL.md`
+    /// §9.1). Returns whether the session was reseated, given up on, or shut down while
+    /// waiting.
+    async fn reconnect(&mut self) -> Reconnect {
+        if self.terminal || !self.policy.enabled {
+            return Reconnect::GivenUp;
+        }
+        self.retry_until_seated().await
+    }
+
+    /// Attempts until one seats, a terminal refusal stops the retries, or the client is
+    /// shut down. Returns the last decision.
+    async fn retry_until_seated(&mut self) -> Reconnect {
+        let mut outcome: Option<Reconnect> = None;
+        while outcome.is_none() && self.attempts < self.policy.max_attempts {
+            outcome = self.retry_once().await;
+        }
+        outcome.unwrap_or(Reconnect::GivenUp)
+    }
+
+    /// One wait-then-attempt step. `None` says another attempt is allowed.
+    async fn retry_once(&mut self) -> Option<Reconnect> {
+        if !self.pause_before_retry(self.backoff_delay()).await {
+            return Some(Reconnect::Disposed);
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        match self.attempt().await {
+            Attempt::Seated(replica) => Some(self.reseat(replica)),
+            Attempt::Retry => None,
+            Attempt::Refused => Some(Reconnect::GivenUp),
         }
     }
 
-    /// Handles one inbound frame. Returns `false` when the session must stop.
+    /// Moves a freshly handshaken replica into this task.
+    fn reseat(&mut self, replica: Box<Replica>) -> Reconnect {
+        self.sink = replica.sink;
+        self.stream = replica.stream;
+        self.awareness = replica.awareness;
+        self.session = replica.session;
+        Reconnect::Seated
+    }
+
+    /// The delay before the next attempt: `initial_delay` doubling to `max_delay`.
+    fn backoff_delay(&self) -> Duration {
+        let factor = 1u32.checked_shl(self.attempts).unwrap_or(u32::MAX);
+        self.policy
+            .initial_delay
+            .saturating_mul(factor)
+            .min(self.policy.max_delay)
+    }
+
+    /// Waits out the backoff, serving commands as they arrive so a caller that shuts the
+    /// engine down does not wait out the whole delay. Returns `false` on shutdown.
+    async fn pause_before_retry(&mut self, delay: Duration) -> bool {
+        let wait = sleep(delay);
+        tokio::pin!(wait);
+        loop {
+            tokio::select! {
+                () = &mut wait => return true,
+                command = self.commands.recv() => {
+                    if self.handle_command(command).await != Turn::Continue {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// One bounded reconnect attempt. The replica this client already holds is carried
+    /// into the fresh one, so what it knows is not lost with the socket; a terminal
+    /// refusal stops the retries, every other failure is retried.
+    async fn attempt(&self) -> Attempt {
+        let mut options = self.options.clone();
+        options.room.clone_from(&self.room);
+        options.token.clone_from(&self.token);
+        let local_state =
+            self.local_state.clone().unwrap_or_else(|| "{}".to_string());
+        let previous = {
+            let txn = self.awareness.doc().transact();
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+        let outcome = timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake(&options, Some(previous), &local_state),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(replica)) => Attempt::Seated(Box::new(replica)),
+            Ok(Err(Error::Protocol { code, message }))
+                if is_terminal_code(&code) =>
+            {
+                let _ = self
+                    .events
+                    .send(EngineEvent::SessionError { code, message });
+                Attempt::Refused
+            }
+            _ => Attempt::Retry,
+        }
+    }
+
+    /// Handles one inbound frame.
     fn handle_incoming(
         &mut self,
         incoming: Option<Result<Message, WireError>>,
-    ) -> bool {
+    ) -> Turn {
         match incoming {
             Some(Ok(Message::Binary(frame))) => self.handle_binary(&frame),
             Some(Ok(Message::Text(text))) => self.handle_text(&text),
-            Some(Ok(Message::Close(_)) | Err(_)) | None => return false,
+            Some(Ok(Message::Close(_)) | Err(_)) | None => {
+                return Turn::Dropped;
+            }
             Some(Ok(_)) => {}
         }
-        true
+        Turn::Continue
     }
 
     fn disconnect(&self) {
@@ -426,10 +709,10 @@ impl EngineTask {
 
     // --- commands ------------------------------------------------------------
 
-    /// Runs one command. Returns `false` when the task must stop.
-    async fn handle_command(&mut self, command: Option<Command>) -> bool {
+    /// Runs one command.
+    async fn handle_command(&mut self, command: Option<Command>) -> Turn {
         let Some(next) = command else {
-            return false;
+            return Turn::Stopped;
         };
         match next {
             Command::Open { path, reply } => self.open(&path, reply),
@@ -470,7 +753,7 @@ impl EngineTask {
             }
             Command::Shutdown { reply } => return self.shutdown(reply).await,
         }
-        true
+        Turn::Continue
     }
 
     /// Asks the server to open a document. Local state moves when it agrees.
@@ -530,13 +813,13 @@ impl EngineTask {
         self.flush_outbound().await
     }
 
-    async fn shutdown(&mut self, reply: Option<oneshot::Sender<()>>) -> bool {
+    async fn shutdown(&mut self, reply: Option<oneshot::Sender<()>>) -> Turn {
         let _ = self.flush_outbound().await;
         let _ = self.sink.close().await;
         if let Some(ack) = reply {
             let _ = ack.send(());
         }
-        false
+        Turn::Stopped
     }
 
     // --- state ---------------------------------------------------------------
@@ -627,13 +910,12 @@ impl EngineTask {
     /// y-protocols awareness renews every 15s and expires at 30s: renewal means
     /// republishing the same state so peers see a newer clock. The awareness clock
     /// never ends the session.
-    fn renew_awareness(&mut self) -> bool {
+    fn renew_awareness(&mut self) {
         if let Some(json) = self.local_state.clone() {
             self.awareness.set_local_state_raw(json);
             let _ = self.publish_local_awareness();
         }
         self.expire_awareness();
-        true
     }
 
     fn expire_awareness(&mut self) {
@@ -867,8 +1149,9 @@ impl EngineTask {
     }
 
     /// A fault the server could not attach to a request id. There is nobody to return it
-    /// to, so it goes to the adapter.
-    fn session_error(&self, params: Option<&serde_json::Value>) {
+    /// to, so it goes to the adapter. A terminal code also ends the retries: the same
+    /// refusal would greet the next connection.
+    fn session_error(&mut self, params: Option<&serde_json::Value>) {
         let code = params
             .and_then(|p| p.get("code"))
             .and_then(serde_json::Value::as_str)
@@ -879,6 +1162,9 @@ impl EngineTask {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("the server reported a fault")
             .to_string();
+        if is_terminal_code(&code) {
+            self.terminal = true;
+        }
         let _ = self
             .events
             .send(EngineEvent::SessionError { code, message });
@@ -953,12 +1239,14 @@ impl EngineTask {
         });
     }
 
-    fn room_gone(&self, params: Option<&serde_json::Value>) {
+    fn room_gone(&mut self, params: Option<&serde_json::Value>) {
         let reason = params
             .and_then(|p| p.get("reason"))
             .and_then(|v| v.as_str())
             .unwrap_or("room gone")
             .to_string();
+        // §9: after `room.gone` there is no room to rejoin, on any URL.
+        self.terminal = true;
         let _ = self.events.send(EngineEvent::RoomGone { reason });
     }
 }

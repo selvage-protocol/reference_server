@@ -93,6 +93,29 @@ impl Invite {
     }
 }
 
+/// How a dropped connection is retried (`PROTOCOL.md` §9.1).
+///
+/// The protocol only asks that a retry be bounded; these are the reference client's
+/// numbers. A refusal that a retry cannot change is terminal whatever this says.
+#[derive(Debug, Clone, Copy)]
+pub struct ReconnectPolicy {
+    pub enabled: bool,
+    pub initial_delay: Duration,
+    pub max_delay: Duration,
+    pub max_attempts: u32,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            initial_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(10),
+            max_attempts: 5,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ConnectOptions {
     /// Scheme and authority, without the `/session` path.
@@ -110,6 +133,9 @@ pub struct ConnectOptions {
     /// Overrides the awareness clock the server advertises. `None` — the default — uses the
     /// server's values, so both sides of the session measure awareness the same way.
     pub keepalive: Option<KeepaliveConfig>,
+    /// How a dropped connection is retried. `enabled` turns reconnection off; the
+    /// fields override the defaults.
+    pub reconnect: ReconnectPolicy,
     /// The awareness state to publish as soon as the session is seated, published **verbatim**:
     /// its anchors are not checked against this replica and not converted from offsets, which
     /// is what a caller that already holds anchored state — a reconnect, say — needs. The
@@ -176,6 +202,7 @@ impl ConnectOptions {
                 env!("CARGO_PKG_VERSION")
             )),
             keepalive: None,
+            reconnect: ReconnectPolicy::default(),
             initial_awareness: AwarenessState::default(),
         }
     }
@@ -209,6 +236,14 @@ impl ConnectOptions {
             awareness_renew: renew,
             awareness_expire: expire,
         });
+        self
+    }
+
+    /// Overrides how a dropped connection is retried. A policy with `enabled: false`
+    /// leaves reconnection to the caller.
+    #[must_use]
+    pub const fn with_reconnect(mut self, policy: ReconnectPolicy) -> Self {
+        self.reconnect = policy;
         self
     }
 

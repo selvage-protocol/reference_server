@@ -1,0 +1,222 @@
+//! Reconnection (`PROTOCOL.md` §9.1): a dropped socket is re-helloed by the client
+//! itself, with a bounded backoff, as a fresh peer. The drop is a relay cut in front of
+//! the server, so the server and the room stay up — aborting its accept loop would take
+//! the room with it, and no session method closes one peer's socket.
+
+use std::error::Error as StdError;
+use std::time::Duration;
+
+use selvage_harness::{
+    DropProxy, EngineEvent, Error, Harness, Role, WAIT, wait_for,
+    wait_for_described, wait_for_event,
+};
+use selvage_protocol::code;
+
+const PATH: &str = "src/main.rs";
+const GUEST_ONLY: &str = "only/guest.rs";
+
+/// Anything these tests can fail with.
+type Failure = Box<dyn StdError>;
+
+#[tokio::test]
+async fn a_dropped_guest_reconnects_and_reopens_its_document()
+-> Result<(), Failure> {
+    let harness = Harness::start(Duration::from_secs(30)).await;
+    let host_proxy = DropProxy::start(&harness.upstream()).await?;
+    let guest_proxy = DropProxy::start(&harness.upstream()).await?;
+    let (host, room) = harness.host_at(&host_proxy.ws_base(), "Ada").await?;
+    let guest = harness
+        .join_at(&guest_proxy.ws_base(), &room, "Bob")
+        .await?;
+
+    host.open(PATH).await?;
+    guest.open(PATH).await?;
+    host.insert(PATH, 0, "shared\n").await?;
+    wait_for("the guest to receive the seed", || async {
+        (guest.text(PATH).await.ok()? == "shared\n").then_some(())
+    })
+    .await;
+
+    // A document only this guest holds, so the room's set is the evidence that the
+    // reconnecting client re-opened it.
+    guest.open(GUEST_ONLY).await?;
+    guest.insert(GUEST_ONLY, 0, "guest keeps this\n").await?;
+    wait_for("the host to see the guest's document", || async {
+        host.documents()
+            .await
+            .ok()?
+            .contains(&GUEST_ONLY.to_string())
+            .then_some(())
+    })
+    .await;
+
+    let before = guest.session();
+    let old_peer_id = before.peer.peer_id.clone();
+    let old_client_id = before.peer.awareness_client_id;
+
+    guest_proxy.drop_all();
+
+    // It comes back as a new peer with a new awareness client id (spec §9.1: `yrs`
+    // tombstones the old one, so reusing it would drop the first republish).
+    let after = wait_for_described(
+        "the guest to be reseated as a fresh peer",
+        || async { format!("{:?}", guest.session()) },
+        || async {
+            let session = guest.session();
+            (session.peer.peer_id != old_peer_id).then_some(session)
+        },
+    )
+    .await;
+    assert_ne!(after.peer.awareness_client_id, old_client_id);
+    assert_eq!(after.role, Role::Guest);
+    assert_eq!(after.room_id, room.id);
+
+    // The host sees the old peer leave and a new one arrive.
+    wait_for_described(
+        "the host to see the guest rejoin",
+        || async { format!("{:?}", host.peers().await) },
+        || async {
+            let peers = host.peers().await.ok()?;
+            let bob = peers.iter().find(|peer| peer.display_name == "Bob")?;
+            (bob.peer_id != old_peer_id).then_some(())
+        },
+    )
+    .await;
+
+    // Its own document is open again: it left the room's set with the socket.
+    wait_for_described(
+        "the guest to re-open its document",
+        || async { format!("{:?}", host.documents().await) },
+        || async {
+            host.documents()
+                .await
+                .ok()?
+                .contains(&GUEST_ONLY.to_string())
+                .then_some(())
+        },
+    )
+    .await;
+
+    // Both documents still hold what they held, and the guest's own content was not
+    // lost with the socket.
+    assert_eq!(guest.text(PATH).await?, "shared\n");
+    assert_eq!(guest.text(GUEST_ONLY).await?, "guest keeps this\n");
+    assert_eq!(host.text(PATH).await?, "shared\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_dropped_host_reclaims_the_room() -> Result<(), Failure> {
+    let harness = Harness::start(Duration::from_secs(30)).await;
+    let host_proxy = DropProxy::start(&harness.upstream()).await?;
+    let (host, room) = harness.host_at(&host_proxy.ws_base(), "Ada").await?;
+    let guest = harness.join(&room, "Bob").await?;
+
+    host.open(PATH).await?;
+    guest.open(PATH).await?;
+    host.insert(PATH, 0, "shared\n").await?;
+    wait_for("the guest to receive the seed", || async {
+        (guest.text(PATH).await.ok()? == "shared\n").then_some(())
+    })
+    .await;
+
+    let before = host.session();
+    let old_peer_id = before.peer.peer_id.clone();
+    let old_client_id = before.peer.awareness_client_id;
+
+    let detached = wait_for_event(&guest, "host.detached", |event| {
+        matches!(event, EngineEvent::HostDetached { .. })
+    });
+    host_proxy.drop_all();
+    detached.await;
+
+    // A reclaiming host is a new peer as well as the new host.
+    let reattached = wait_for_event(&guest, "host.attached", |event| {
+        matches!(event, EngineEvent::HostAttached { .. })
+    });
+    let EngineEvent::HostAttached { peer } = reattached.await else {
+        panic!("host.attached");
+    };
+    assert_eq!(peer.display_name, "Ada");
+    assert_eq!(peer.role, Role::Host);
+    assert_ne!(peer.peer_id, old_peer_id);
+
+    // The host is reseated in the same room, under the token it minted with, and is a
+    // fresh awareness client.
+    let after = wait_for_described(
+        "the host to be reseated as a new peer",
+        || async { format!("{:?}", host.session()) },
+        || async {
+            let session = host.session();
+            (session.peer.peer_id != old_peer_id).then_some(session)
+        },
+    )
+    .await;
+    assert_eq!(after.room_id, room.id);
+    assert_eq!(after.role, Role::Host);
+    assert_ne!(after.peer.awareness_client_id, old_client_id);
+
+    // Reclaiming rather than minting: the room kept its document set, and the host kept
+    // the content that only it held.
+    assert_eq!(host.text(PATH).await?, "shared\n");
+    assert!(host.documents().await?.contains(&PATH.to_string()));
+
+    host.insert(PATH, 0, "// host again\n").await?;
+    let seen = wait_for("the guest to see the host's new edit", || async {
+        let text = guest.text(PATH).await.ok()?;
+        text.contains("host again").then_some(text)
+    })
+    .await;
+    assert_eq!(seen, "// host again\nshared\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_destroyed_room_is_terminal() -> Result<(), Failure> {
+    // The host's grace period is shorter than the client's first retry, so the room is
+    // gone by the time either side re-hellos — the refusal is `room_unknown`.
+    let harness = Harness::start(Duration::from_millis(300)).await;
+    let host_proxy = DropProxy::start(&harness.upstream()).await?;
+    let guest_proxy = DropProxy::start(&harness.upstream()).await?;
+    let (_host, room) = harness.host_at(&host_proxy.ws_base(), "Ada").await?;
+    let guest = harness
+        .join_at(&guest_proxy.ws_base(), &room, "Bob")
+        .await?;
+    guest.open(PATH).await?;
+
+    let gone = wait_for_event(&guest, "room.gone", |event| {
+        matches!(event, EngineEvent::RoomGone { .. })
+    });
+    host_proxy.drop_all();
+    let EngineEvent::RoomGone { reason } = gone.await else {
+        panic!("room.gone");
+    };
+    assert_eq!(reason, "host did not return");
+
+    // The refusal is terminal, so the client stops and says so rather than reconnecting
+    // into the same refusal. Its engine ends: commands fail rather than wait for a
+    // connection that will never come.
+    let stopped = wait_for_described(
+        "the guest to stop retrying",
+        || async { format!("{:?}", guest.text(PATH).await) },
+        || async {
+            guest.text(PATH).await.err().map(|error| error.to_string())
+        },
+    )
+    .await;
+    assert_eq!(stopped, "the session is closed");
+
+    // The id is gone for good, on any URL, with any token.
+    let refused = harness
+        .join(&room, "Late")
+        .await
+        .expect_err("the room is gone");
+    let Error::Protocol { code, .. } = refused else {
+        panic!("expected room_unknown, got {refused}");
+    };
+    assert_eq!(code, code::ROOM_UNKNOWN);
+
+    // Sanity: `WAIT` is the only deadline any of this leans on.
+    assert!(WAIT >= Duration::from_secs(5));
+    Ok(())
+}
