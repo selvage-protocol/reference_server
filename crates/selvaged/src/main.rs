@@ -51,21 +51,29 @@ fn arguments() -> Result<(SocketAddr, Duration), String> {
                 let value = args
                     .next()
                     .ok_or("--listen wants an address, e.g. 127.0.0.1:8080")?;
-                addr = value.parse().map_err(|e| {
-                    format!("--listen wants an address, e.g. 127.0.0.1:8080\n{e}")
-                })?;
+                addr = address(&value)?;
             }
             "--room-grace-ms" => {
                 let value = args
                     .next()
                     .ok_or("--room-grace-ms wants a number of milliseconds")?;
-                let ms: u64 = value.parse().map_err(|e| {
-                    format!("--room-grace-ms wants a number of milliseconds\n{e}")
-                })?;
-                room_grace = Duration::from_millis(ms);
+                room_grace = grace(&value)?;
             }
             _ => return Err(format!("{USAGE}\nunknown argument: {arg}")),
         }
     }
     Ok((addr, room_grace))
+}
+
+fn address(value: &str) -> Result<SocketAddr, String> {
+    value.parse().map_err(|e| {
+        format!("--listen wants an address, e.g. 127.0.0.1:8080\n{e}")
+    })
+}
+
+fn grace(value: &str) -> Result<Duration, String> {
+    let ms: u64 = value.parse().map_err(|e| {
+        format!("--room-grace-ms wants a number of milliseconds\n{e}")
+    })?;
+    Ok(Duration::from_millis(ms))
 }
