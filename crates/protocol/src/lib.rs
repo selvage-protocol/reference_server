@@ -492,16 +492,16 @@ pub fn percent_decode(s: &str) -> String {
 
 /// True when the wire version in an envelope is compatible with this implementation.
 /// Compatible means same major; while at 0.x, same minor.
+///
+/// A version outside the grammar of `CANONICAL.md` §2.5 is not compatible either: the
+/// schema's `wireVersion` refuses it, so a receiver that seats one is a receiver a
+/// conforming peer cannot predict.
 #[must_use]
 pub fn is_compatible(version: &str) -> bool {
-    let parse = |s: &str| -> Option<(u64, u64)> {
-        let rest = s.strip_prefix("selvage/")?;
-        let mut parts = rest.split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next().unwrap_or("0").parse().ok()?;
-        Some((major, minor))
-    };
-    match (parse(version), parse(WIRE_VERSION)) {
+    match (
+        parse_wire_version(version),
+        parse_wire_version(WIRE_VERSION),
+    ) {
         (Some(a), Some(b)) => {
             if a.0 != b.0 {
                 return false;
@@ -510,6 +510,34 @@ pub fn is_compatible(version: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// `selvage/` major, optionally `.` minor, both plain decimal with no leading zero.
+///
+/// A second `.` leaves the minor unparsable, so it is refused with everything else the
+/// grammar does not admit.
+fn parse_wire_version(version: &str) -> Option<(u64, u64)> {
+    let rest = version.strip_prefix("selvage/")?;
+    let parts = rest.split_once('.');
+    let major = parse_version_number(parts.map_or(rest, |(head, _)| head))?;
+    let minor = match parts {
+        Some((_, tail)) => parse_version_number(tail)?,
+        None => 0,
+    };
+    Some((major, minor))
+}
+
+/// A number as `CANONICAL.md` §2.4 writes one: ASCII digits, and no leading zero.
+///
+/// `u64::from_str` is laxer than the grammar in two ways that matter on the wire — it
+/// accepts `+1` and it accepts `01` — so the shape is checked before the parse.
+fn parse_version_number(text: &str) -> Option<u64> {
+    let decimal =
+        !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    if !decimal || (text.len() > 1 && text.starts_with('0')) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 #[cfg(test)]
@@ -620,5 +648,31 @@ mod tests {
         assert!(!is_compatible("selvage"));
         assert!(!is_compatible("selvage/x"));
         assert!(!is_compatible("other/1"));
+    }
+
+    /// The grammar of `CANONICAL.md` §2.5, which `schema/negotiation.json` encodes as
+    /// `wireVersion`. None of these is a `selvage/<number>[.<number>]` string, so none
+    /// is a version a receiver may seat.
+    #[test]
+    fn versions_outside_the_grammar_are_not_compatible() {
+        for version in [
+            "selvage/1.2.3",
+            "selvage/1.0.0",
+            "selvage/01",
+            "selvage/1.09",
+            "selvage/00",
+            "selvage/1.",
+            "selvage/.1",
+            "selvage/1..2",
+            "selvage/",
+            "selvage/+1",
+            "selvage/-1",
+            "selvage/ 1",
+            "selvage/1 ",
+            "selvage/1.x",
+            "selvage/99999999999999999999999",
+        ] {
+            assert!(!is_compatible(version), "{version} must be refused");
+        }
     }
 }
