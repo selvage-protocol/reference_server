@@ -493,6 +493,74 @@ async fn joining_needs_the_room_and_the_token() {
     assert_eq!(host.peers().await.unwrap().len(), 0);
 }
 
+/// §10's compatibility rule is applied to the grammar §10 and `CANONICAL.md` §2.5 write,
+/// not to whatever a number parser happens to accept: a version outside it is refused at
+/// the handshake rather than seated. `selvage/1.2.3` is the spelling the TypeScript
+/// engine refuses, and `selvage/01` one it accepts — both are outside the grammar, and
+/// both must be refused here or the same `v` is seated by one implementation and
+/// refused by the other.
+#[tokio::test]
+async fn a_version_outside_the_grammar_is_refused() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    for version in ["selvage/1.2.3", "selvage/01"] {
+        let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+            .await
+            .expect("the upgrade succeeds");
+        raw.send_json(&serde_json::json!({
+            "v": version,
+            "id": 1,
+            "method": method::SESSION_HELLO,
+            "params": {"display_name": "Off-grammar"},
+        }))
+        .await
+        .expect("sends");
+
+        let refusal = next_json_within(&mut raw, "the refusal").await;
+        assert_eq!(refusal["event"], event::SESSION_ERROR);
+        assert_eq!(
+            refusal["params"]["code"],
+            code::UNSUPPORTED_VERSION,
+            "{version} is not the grammar of §10"
+        );
+        assert_eq!(
+            raw.read_to_close()
+                .await
+                .expect("a close frame")
+                .close_code(),
+            Some(close::UNSUPPORTED_VERSION)
+        );
+    }
+}
+
+/// A request without an `id` is `bad_message` (§4.1, §11) whichever frame it is: the
+/// rule is not only for a connection that is already seated, or a conforming server
+/// refuses a `session.hello` this one seats.
+#[tokio::test]
+async fn a_hello_without_an_id_is_refused_before_seating() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "method": method::SESSION_HELLO,
+        "params": {"display_name": "Anonymous"},
+    }))
+    .await
+    .expect("sends");
+
+    let refusal = next_json_within(&mut raw, "the refusal").await;
+    assert_eq!(refusal["event"], event::SESSION_ERROR);
+    assert_eq!(refusal["params"]["code"], code::BAD_MESSAGE);
+    assert_eq!(
+        raw.read_to_close()
+            .await
+            .expect("a close frame")
+            .close_code(),
+        Some(close::PROTOCOL_ERROR)
+    );
+}
+
 /// The server routes document and awareness payloads and never decodes them: a frame
 /// it cannot possibly understand comes out byte-identical on the other side.
 #[tokio::test]
