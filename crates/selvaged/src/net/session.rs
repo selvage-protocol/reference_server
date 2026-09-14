@@ -108,6 +108,15 @@ pub async fn handshake(
             "session.hello requires a display_name".to_string(),
         ));
     }
+    if proto::display_name_over_limit(&params.display_name) {
+        return Err((
+            code::BAD_PARAMS,
+            format!(
+                "display_name is longer than {} UTF-16 code units",
+                proto::DISPLAY_NAME_MAX_UTF16
+            ),
+        ));
+    }
     Ok(Hello {
         params,
         claims_host,

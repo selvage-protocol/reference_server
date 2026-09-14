@@ -1,0 +1,46 @@
+{
+  "id": "019",
+  "title": "A `session.hello` whose `display_name` is over 32 UTF-16 code units is `bad_params`",
+  "spec": "PROTOCOL.md#session-hello--the-handshake",
+  "notes": "The bound on `display_name` is 32 UTF-16 code units, not 32 bytes and not 32 code points. The refused name is 31 ASCII characters plus one astral character: 32 code points but 33 UTF-16 code units, one unit over, which a code-point bound would admit. The schema's `maxLength` counts Unicode code points and so cannot express the protocol's unit; `refused` is the vector's own signal that the frame is deliberately outside the protocol. The second connection shows the boundary from the other side: 30 ASCII characters plus the same astral character is exactly 32 code units and seats normally.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "toolong",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "toolong",
+      "refused": true,
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa𝄞\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "toolong",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_params\",\"message\":\"$_\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "toolong",
+      "code": 4000
+    },
+    {
+      "op": "open",
+      "conn": "atlimit",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "atlimit",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa𝄞\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "atlimit",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa𝄞\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},\"token\":\"$token\"},\"v\":\"selvage/1\"}"
+    }
+  ],
+  "selvage": "selvage/1",
+  "canonical": "SJ-C/1"
+}
