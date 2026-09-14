@@ -234,10 +234,7 @@ impl Applicant {
             role,
             info: &info,
             room_id: self.join.room.as_deref(),
-            peer: Peer {
-                info: info.clone(),
-                tx: self.tx.clone(),
-            },
+            peer: Peer::new(info.clone(), self.tx.clone()),
         };
         let mut guard = registry.lock().await;
         let (event_name, params) = seating.place(&mut guard)?;
