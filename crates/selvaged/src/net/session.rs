@@ -81,6 +81,9 @@ pub async fn handshake(
         serde_json::from_str(&text).map_err(|e| {
             envelope_refusal("first message is not a session envelope", &e)
         })?;
+    if msg.id.is_none() {
+        return Err((code::BAD_MESSAGE, "a request needs an id".to_string()));
+    }
     if msg.method != method::SESSION_HELLO {
         return Err((
             code::HELLO_REQUIRED,
@@ -149,13 +152,13 @@ fn refusal_for(error: SeatError, room_id: &str) -> Refusal {
     }
 }
 
-fn params_refused(id: u64, error: &serde_json::Error) -> proto::ServerMessage {
-    proto::ServerMessage::error(id, code::BAD_PARAMS, error.to_string())
-}
-
 /// The result of a document method: the room's open-document set after the change.
 fn doc_set(documents: &[String]) -> Value {
     serde_json::json!({ "documents": documents })
+}
+
+fn params_refused(id: u64, error: &serde_json::Error) -> proto::ServerMessage {
+    proto::ServerMessage::error(id, code::BAD_PARAMS, error.to_string())
 }
 
 fn path_required(id: u64) -> proto::ServerMessage {
