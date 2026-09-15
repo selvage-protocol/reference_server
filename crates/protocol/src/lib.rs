@@ -57,6 +57,7 @@ pub mod method {
     pub const SESSION_RENAME: &str = "session.rename";
     pub const DOC_OPEN: &str = "doc.open";
     pub const DOC_CLOSE: &str = "doc.close";
+    pub const DOC_GRANT: &str = "doc.grant";
 }
 
 /// Server -> client event names.
@@ -68,6 +69,7 @@ pub mod event {
     pub const PEER_RENAMED: &str = "peer.renamed";
     pub const DOC_OPENED: &str = "doc.opened";
     pub const DOC_CLOSED: &str = "doc.closed";
+    pub const DOC_GRANTED: &str = "doc.granted";
     pub const HOST_DETACHED: &str = "host.detached";
     pub const HOST_ATTACHED: &str = "host.attached";
     pub const ROOM_GONE: &str = "room.gone";
@@ -319,6 +321,14 @@ pub struct DocCloseParams {
     pub path: String,
 }
 
+/// `doc.grant` params: the host's whole listing of the working tree, replacing the room's
+/// grant wholesale. The order is part of what the frame says (`CANONICAL.md` §2.7) and a
+/// server carries it unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrantParams {
+    pub paths: Vec<String>,
+}
+
 /// `session.rename` params: the name this connection wants from now on. The bound is the
 /// handshake's (`PROTOCOL.md` §5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +359,12 @@ pub struct DocEvent {
     pub documents: Vec<String>,
     pub path: String,
     pub peer_id: String,
+}
+
+/// `doc.granted` params: the room's grant as it now stands, in the order its host wrote it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrantedParams {
+    pub paths: Vec<String>,
 }
 
 /// The result of `doc.open` / `doc.close`: the room's open-document set after the
@@ -645,6 +661,40 @@ mod tests {
         let parsed: RenameParams =
             serde_json::from_value(request.params).unwrap();
         assert_eq!(parsed.display_name, "Ada Lovelace");
+    }
+
+    #[test]
+    fn grant_frames() {
+        // The listing is an ordered array and the order survives both directions: this crate
+        // writes what it was given and reads it back unchanged.
+        let paths = vec!["README.md".to_string(), "ｆ.txt".to_string()];
+        let request = ClientMessage::new(
+            3,
+            method::DOC_GRANT,
+            serde_json::json!(GrantParams {
+                paths: paths.clone()
+            }),
+        );
+        assert_eq!(
+            request.to_text().unwrap(),
+            r#"{"id":3,"method":"doc.grant","params":{"paths":["README.md","ｆ.txt"]},"v":"selvage/1"}"#
+        );
+
+        let event = ServerMessage::event(
+            event::DOC_GRANTED,
+            serde_json::json!(GrantedParams { paths }),
+        );
+        assert_eq!(
+            event.to_text().unwrap(),
+            r#"{"event":"doc.granted","params":{"paths":["README.md","ｆ.txt"]},"v":"selvage/1"}"#
+        );
+
+        let parsed: GrantParams =
+            serde_json::from_value(request.params).unwrap();
+        assert_eq!(parsed.paths, vec!["README.md", "ｆ.txt"]);
+        let params: GrantedParams =
+            serde_json::from_value(event.params.unwrap_or_default()).unwrap();
+        assert_eq!(params.paths, vec!["README.md", "ｆ.txt"]);
     }
 
     #[test]
