@@ -213,6 +213,19 @@ fn fresh_doc(previous: Option<Vec<u8>>) -> Result<Doc, Error> {
     Ok(doc)
 }
 
+/// The state a fresh replica is seated with, or `None` when there is nothing to carry.
+///
+/// A replica that has integrated nothing encodes to the encoding of nothing, which
+/// [`fresh_doc`] would decode and apply for no effect at all — and the encode is O(document),
+/// once per attempt. The state vector is O(clients), which is why it is what decides.
+fn seed_update(doc: &Doc) -> Option<Vec<u8>> {
+    let txn = doc.transact();
+    if txn.state_vector().is_empty() {
+        return None;
+    }
+    Some(txn.encode_state_as_update_v1(&StateVector::default()))
+}
+
 /// Waits for `room.created`/`room.joined`, or the reason the server refused.
 async fn await_session(
     stream: &mut Stream,
@@ -688,13 +701,10 @@ impl EngineTask {
         options.token.clone_from(&self.token);
         let local_state =
             self.local_state.clone().unwrap_or_else(|| "{}".to_string());
-        let previous = {
-            let txn = self.awareness.doc().transact();
-            txn.encode_state_as_update_v1(&StateVector::default())
-        };
+        let previous = seed_update(self.awareness.doc());
         let outcome = timeout(
             HANDSHAKE_TIMEOUT,
-            handshake(&options, Some(previous), &local_state),
+            handshake(&options, previous, &local_state),
         )
         .await;
         match outcome {
@@ -1453,4 +1463,72 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     millis(elapsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as StdError;
+
+    use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact};
+
+    use super::{fresh_doc, seed_update};
+
+    const PATH: &str = "src/main.rs";
+
+    /// The state vector of a replica, in the shape the engine reports it.
+    fn vector(doc: &Doc) -> Vec<(u64, u32)> {
+        let txn = doc.transact();
+        let mut entries: Vec<(u64, u32)> = txn
+            .state_vector()
+            .iter()
+            .map(|(client, clock)| (client.get(), *clock))
+            .collect();
+        entries.sort_unstable();
+        entries
+    }
+
+    /// A replica that has integrated nothing has no seed to carry, and what it would encode
+    /// is the encoding of nothing: applying it is what seating the fresh replica *without*
+    /// it does, which is what makes skipping the encode safe.
+    #[test]
+    fn a_replica_that_holds_nothing_has_no_seed()
+    -> Result<(), Box<dyn StdError>> {
+        let empty = fresh_doc(None)?;
+        assert!(
+            seed_update(&empty).is_none(),
+            "an empty replica has nothing to carry"
+        );
+
+        let encoded = {
+            let txn = empty.transact();
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+        let nothing = fresh_doc(None)?;
+        let carried = fresh_doc(Some(encoded))?;
+        assert_eq!(
+            vector(&carried),
+            vector(&nothing),
+            "an empty update applied leaves an empty replica"
+        );
+        Ok(())
+    }
+
+    /// A replica that holds text carries it: the seed is not skipped for a replica with
+    /// content, and re-seating with it keeps what the client had.
+    #[test]
+    fn a_replica_that_holds_text_has_a_seed() -> Result<(), Box<dyn StdError>> {
+        let doc = fresh_doc(None)?;
+        let text = doc.get_or_insert_text(PATH);
+        let mut txn = doc.transact_mut();
+        text.insert(&mut txn, 0, "fn main() {}");
+        drop(txn);
+
+        let seed = seed_update(&doc);
+        assert!(seed.is_some(), "a replica holding text has a seed");
+        let seated = fresh_doc(seed)?;
+        let txn = seated.transact();
+        let restored = txn.get_text(PATH).map(|text| text.get_string(&txn));
+        assert_eq!(restored.as_deref(), Some("fn main() {}"));
+        Ok(())
+    }
 }
