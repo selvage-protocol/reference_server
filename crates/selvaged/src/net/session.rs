@@ -24,6 +24,19 @@ use super::{SessionStream, Shared, event_frame};
 /// Why a connection was not seated: the error code and the message to send back.
 type Refusal = (&'static str, String);
 
+/// The longest grant this server will carry, in paths. A listing is bounded as policy and not
+/// as a peer's contract (`PROTOCOL.md` §2.1, §5): the transport already refuses a frame over
+/// its own bound, so this is the backstop against a pathologically wide listing that a host
+/// should have bounded itself (§5). It sits well above the file count of any working tree a
+/// host should be sharing — a checkout that reaches it is one whose build output or dependency
+/// tree was not excluded.
+pub const MAX_GRANT_PATHS: usize = 100_000;
+
+/// The longest single path in a grant, in bytes. The server does not resolve or normalise
+/// paths, so this is the only thing it can say about one; POSIX's own `PATH_MAX` is 4096 bytes
+/// for a whole path, and a workspace-relative one is shorter than that (`PROTOCOL.md` §5).
+pub const MAX_GRANT_PATH_BYTES: usize = 4096;
+
 /// One request off the wire: the id to answer and the params to interpret.
 struct Request {
     id: u64,
@@ -198,6 +211,37 @@ fn rename_name(raw: Value) -> Result<String, Refusal> {
         ));
     }
     Ok(params.display_name)
+}
+
+/// The `paths` of a `doc.grant` request (`PROTOCOL.md` §5): the host's whole listing, in the
+/// order it wrote it. The shape is a path's (`document_path`), an empty array is a listing
+/// that grants nothing and not a fault, and the listing is rejected `bad_params` with the
+/// connection open when it is over this server's bounds. The order is never touched: the
+/// server carries what it was given and does not sort, deduplicate or normalise it.
+fn grant_paths(raw: Value) -> Result<Vec<String>, Refusal> {
+    let params = serde_json::from_value::<proto::GrantParams>(raw)
+        .map_err(|e| (code::BAD_PARAMS, e.to_string()))?;
+    if params.paths.len() > MAX_GRANT_PATHS {
+        return Err((
+            code::BAD_PARAMS,
+            format!("a grant is at most {MAX_GRANT_PATHS} paths"),
+        ));
+    }
+    for path in &params.paths {
+        if path.trim().is_empty() {
+            return Err((
+                code::BAD_PARAMS,
+                "a grant path is required".to_string(),
+            ));
+        }
+        if path.len() > MAX_GRANT_PATH_BYTES {
+            return Err((
+                code::BAD_PARAMS,
+                format!("a grant path is at most {MAX_GRANT_PATH_BYTES} bytes"),
+            ));
+        }
+    }
+    Ok(params.paths)
 }
 
 /// Sends a frame to a room's peers, minus one, if the room still exists and the frame
@@ -436,6 +480,7 @@ impl Session {
         match method.as_str() {
             method::DOC_OPEN => self.open_document(request, shared).await,
             method::DOC_CLOSE => self.close_document(request, shared).await,
+            method::DOC_GRANT => self.grant(request, shared).await,
             method::SESSION_RENAME => self.rename(request, shared).await,
             method::SESSION_HELLO => self.reply(&proto::ServerMessage::error(
                 id,
@@ -550,6 +595,56 @@ impl Session {
         let mut guard = shared.registry.lock().await;
         let room = guard.room_mut(&self.room_id)?;
         room.rename_peer(&self.peer_id, display_name)
+    }
+
+    /// `doc.grant` (`PROTOCOL.md` §5): replaces the room's grant with the host's listing and
+    /// tells the whole room, the host included. Only the connection the server holds as the
+    /// room's host may publish one; §11 has no code for "not permitted", so anyone else is
+    /// refused `bad_params`, which is the code a malformed request gets. A malformed or
+    /// over-long listing is refused the same way and changes nothing.
+    async fn grant(&self, request: Request, shared: &Shared) {
+        let paths = match grant_paths(request.params) {
+            Ok(paths) => paths,
+            Err((code, message)) => {
+                return self.reply(&proto::ServerMessage::error(
+                    request.id, code, message,
+                ));
+            }
+        };
+        if !self.store_grant(shared, paths.clone()).await {
+            return self.reply(&proto::ServerMessage::error(
+                request.id,
+                code::BAD_PARAMS,
+                "the room's grant is its host's to publish".to_string(),
+            ));
+        }
+        // The response is queued before the event, as a `doc.open` result precedes its
+        // `doc.opened`: both leave on this connection's channel, so the bytes keep order.
+        self.reply(&proto::ServerMessage::response(
+            request.id,
+            serde_json::json!({}),
+        ));
+        let announced = serde_json::json!({ "paths": paths });
+        self.announce_documents(
+            shared,
+            event_frame(event::DOC_GRANTED, announced),
+        )
+        .await;
+    }
+
+    /// Stores the room's new grant if this connection is its host, returning whether it was
+    /// stored. `false` means the room is gone or this connection is not its host, and then
+    /// nothing was written.
+    async fn store_grant(&self, shared: &Shared, paths: Vec<String>) -> bool {
+        let mut guard = shared.registry.lock().await;
+        let Some(room) = guard.room_mut(&self.room_id) else {
+            return false;
+        };
+        if !room.is_host(&self.peer_id) {
+            return false;
+        }
+        room.set_grant(paths);
+        true
     }
 
     /// Records this peer's hold on a path, returning the room's set afterwards.

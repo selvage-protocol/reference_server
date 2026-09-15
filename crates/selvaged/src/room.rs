@@ -55,6 +55,10 @@ pub struct Room {
     /// The paths peers have declared open, in first-opened order. The set belongs to the
     /// room and outlives the peers that opened a path; only `doc.close` removes one.
     documents: Vec<String>,
+    /// The host's listing of its working tree, in the order the host wrote it. Like the
+    /// open-document set it belongs to the room and outlives the peers in it; only a
+    /// `doc.grant` changes it, and only the host may send one.
+    grant: Vec<String>,
     /// Which paths each connected peer currently holds open.
     open: HashMap<String, BTreeSet<String>>,
     host: Option<String>,
@@ -74,6 +78,12 @@ impl Room {
         self.host
             .as_ref()
             .is_some_and(|id| self.peers.contains_key(id))
+    }
+
+    /// Whether `peer_id` is the connection the server holds as this room's host.
+    #[must_use]
+    pub fn is_host(&self, peer_id: &str) -> bool {
+        self.host.as_deref() == Some(peer_id)
     }
 
     #[must_use]
@@ -169,6 +179,18 @@ impl Room {
         &self.documents
     }
 
+    /// Replaces the room's grant wholesale: a listing is a snapshot, not a delta, and its
+    /// order is the host's, carried unchanged (`CANONICAL.md` §2.7).
+    pub fn set_grant(&mut self, paths: Vec<String>) {
+        self.grant = paths;
+    }
+
+    /// The room's grant.
+    #[must_use]
+    pub fn grant(&self) -> &[String] {
+        &self.grant
+    }
+
     /// Forgets what a peer held open. The paths stay in the room's set: it outlives the
     /// peers that opened them, so a host that reconnects is told what was in play.
     fn forget_claims(&mut self, peer_id: &str) {
@@ -225,6 +247,7 @@ impl Registry {
             keepalive: new.keepalive,
             peers: HashMap::new(),
             documents: Vec::new(),
+            grant: Vec::new(),
             open: HashMap::new(),
             host: None,
             host_deadline: None,
