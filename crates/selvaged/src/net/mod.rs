@@ -9,6 +9,7 @@ use std::mem::take;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -16,9 +17,8 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::{
-    UnboundedReceiver, UnboundedSender, unbounded_channel,
-};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, MissedTickBehavior, interval, timeout};
 use tokio_tungstenite::tungstenite::Message;
@@ -27,7 +27,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use selvage_protocol as proto;
 use selvage_protocol::event;
 
-use crate::room::{Outbound, Registry};
+use crate::room::{MAX_QUEUE_FRAMES, Outbound, Registry};
 use crate::{ServerConfig, random_hex};
 
 mod session;
@@ -128,24 +128,38 @@ impl Shared {
                 .await;
         let seated = match greeted {
             Ok(hello) => {
+                let (poison_tx, poison_rx) = oneshot::channel();
                 let applicant = Applicant {
                     peer_id: format!("p-{}", random_hex(8)),
                     join,
                     hello,
                     tx: wire.tx.clone(),
+                    poison: poison_tx,
                 };
-                applicant.seat(&self.registry, &self.config).await
+                applicant
+                    .seat(self)
+                    .await
+                    .map(|session| (session, poison_rx))
             }
             Err(refusal) => Err(refusal),
         };
         match seated {
-            Ok(session) => self.drive(session, wire).await,
+            Ok((session, poison)) => self.drive(session, wire, poison).await,
             Err((code, message)) => refuse(wire, code, message).await,
         }
     }
 
     /// Runs a seated session until the connection ends, then lets the peers know.
-    async fn drive(&self, session: Session, wire: Wire) {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a drive names its session, transport and poison channel; all three move into the turn loop"
+    )]
+    async fn drive(
+        &self,
+        session: Session,
+        wire: Wire,
+        poison: oneshot::Receiver<()>,
+    ) {
         let mut ping = interval(self.config.ping_interval);
         ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
         ping.tick().await;
@@ -154,6 +168,7 @@ impl Shared {
             session,
             wire,
             ping,
+            poison,
         };
         pump(&mut live, self).await;
         live.session.leave(self).await;
@@ -168,14 +183,14 @@ impl Shared {
 /// The transport half of a connection: what is read, what is queued and who drains it.
 pub struct Wire {
     pub stream: SessionStream,
-    pub tx: UnboundedSender<Outbound>,
+    pub tx: Sender<Outbound>,
     writer: JoinHandle<()>,
 }
 
 impl Wire {
     fn new(ws: SessionSocket) -> Self {
         let (sink, stream) = ws.split();
-        let (tx, rx) = unbounded_channel::<Outbound>();
+        let (tx, rx) = channel::<Outbound>(MAX_QUEUE_FRAMES);
         Self {
             stream,
             tx,
@@ -184,11 +199,22 @@ impl Wire {
     }
 }
 
+/// How long a connection's writer may take to drain once the session is over. A peer
+/// that stopped reading holds the writer in its send; the frames it would have written
+/// were already dropped with the queue, so the wait is bounded and the socket goes
+/// with the writer.
+const WRITER_GRACE: Duration = Duration::from_secs(2);
+
 /// Waits for a writer task, unless the turn loop already observed it finish: a
-/// `JoinHandle` whose output the loop has taken panics when it is polled again.
+/// `JoinHandle` whose output the loop has taken panics when it is polled again. The
+/// wait is bounded: a writer stuck on a peer that stopped reading is stopped, and the
+/// socket with it.
 async fn join_writer(writer: &mut JoinHandle<()>) {
-    if !writer.is_finished() {
-        let _ = writer.await;
+    if writer.is_finished() {
+        return;
+    }
+    if timeout(WRITER_GRACE, &mut *writer).await.is_err() {
+        writer.abort();
     }
 }
 
@@ -197,6 +223,9 @@ struct Live {
     session: Session,
     wire: Wire,
     ping: Interval,
+    /// Ends the turn loop when the registry drops its sender: the peer was removed,
+    /// so there is nothing left to serve.
+    poison: oneshot::Receiver<()>,
 }
 
 /// The turn loop: protocol pings, session methods and inbound frames.
@@ -205,6 +234,7 @@ async fn pump(live: &mut Live, shared: &Shared) {
         let keep_going = tokio::select! {
             _ = live.ping.tick() => live.heartbeat(),
             _ = &mut live.wire.writer => false,
+            _ = &mut live.poison => false,
             incoming = live.wire.stream.next() => live.session.handle_frame(incoming, shared).await,
         };
         if !keep_going {
@@ -216,16 +246,13 @@ async fn pump(live: &mut Live, shared: &Shared) {
 impl Live {
     /// Sends one protocol-level ping. The keepalive never ends the session.
     fn heartbeat(&self) -> bool {
-        let _ = self.wire.tx.send(Outbound::Ping(Vec::new()));
+        let _ = self.wire.tx.try_send(Outbound::Ping(Vec::new()));
         true
     }
 }
 
 /// Writes queued frames until the last sender is dropped or the socket fails.
-async fn write_outbound(
-    mut sink: SessionSink,
-    mut rx: UnboundedReceiver<Outbound>,
-) {
+async fn write_outbound(mut sink: SessionSink, mut rx: Receiver<Outbound>) {
     while let Some(out) = rx.recv().await {
         let closing = matches!(out, Outbound::Close(..));
         if sink.send(frame_of_outbound(out)).await.is_err() {
@@ -245,11 +272,11 @@ async fn refuse(wire: Wire, code: &'static str, message: String) {
         serde_json::json!({ "code": code, "message": message }),
     );
     if let Some(frame) = frame_of(&event) {
-        let _ = wire.tx.send(frame);
+        let _ = wire.tx.try_send(frame);
     }
     let _ = wire
         .tx
-        .send(Outbound::Close(proto::close_code_for(code), message));
+        .try_send(Outbound::Close(proto::close_code_for(code), message));
     drop(wire.tx);
     let _ = wire.writer.await;
 }

@@ -4,12 +4,14 @@
 //! client library.
 
 use std::error::Error as StdError;
+use std::io::ErrorKind;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use selvage_harness::{
     EngineEvent, Error, Harness, Role, SelectionOffsets, ServerConfig,
-    SyncEngine, WAIT, wait_for, wait_for_event, wait_for_peer,
+    SyncEngine, WAIT, wait_for, wait_for_described, wait_for_event,
+    wait_for_peer,
 };
 use selvage_protocol as proto;
 use selvage_protocol::{close, code, event, method};
@@ -194,6 +196,28 @@ impl RawSocket {
         let mut scratch = [0u8; 64];
         while self.stream.read(&mut scratch).await? > 0 {}
         Ok(())
+    }
+
+    /// Reads until the socket ends, returning how: `None` for a clean FIN, else the
+    /// error that ended it. A writer stopped with unsent bytes still queued resets
+    /// the connection instead of closing it cleanly; either way nothing more arrives.
+    /// One read off the socket: `None` for more data, `Some` for how it ended.
+    async fn read_outcome(&mut self) -> Option<Option<ErrorKind>> {
+        let mut scratch = [0u8; 64];
+        match self.stream.read(&mut scratch).await {
+            Ok(0) => Some(None),
+            Ok(_) => None,
+            Err(error) => Some(Some(error.kind())),
+        }
+    }
+
+    async fn read_to_end(&mut self) -> Option<ErrorKind> {
+        loop {
+            match self.read_outcome().await {
+                None => (),
+                Some(how) => return how,
+            }
+        }
     }
 }
 
@@ -1650,4 +1674,131 @@ async fn http_get(url: &str) -> Result<String, Failure> {
         .split_once("\r\n\r\n")
         .ok_or("an HTTP body follows the headers")?;
     Ok(body.to_string())
+}
+
+/// A peer that stops reading is disconnected, not buffered forever. Its queue is
+/// bounded, so the first broadcast past a full queue removes it: the room is told
+/// `peer.left`, its task is stopped, and everyone else keeps being served. Filling the
+/// queue past the socket takes megabytes — 32 frames plus the kernel's — so the flood
+/// is 1 MiB binary frames, which stay well under the frame bound.
+#[tokio::test]
+async fn a_peer_that_stops_reading_is_disconnected_and_announced() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let target = format!(
+        "{}?room={}&token={}",
+        proto::ENDPOINT_PATH,
+        proto::percent_encode(&room.id),
+        proto::percent_encode(&room.token)
+    );
+
+    // The slow peer joins, proves it is seated, and then never reads again.
+    let mut slow = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the slow peer joins");
+    slow.hello(&serde_json::json!({"display_name": "Bob"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut slow, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+    wait_for_peer(&host, "Bob").await;
+
+    // A second raw peer floods the room with binary the slow one never reads.
+    let mut flood = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the flooding peer joins");
+    flood
+        .hello(&serde_json::json!({"display_name": "Flo"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut flood, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+    let big = vec![0xA5u8; 1024 * 1024];
+    for _ in 0..150 {
+        flood.send(0x2, &big).await.expect("floods");
+    }
+
+    // The room announces the removal, and the slow socket ends.
+    wait_for_described(
+        "the host to see the slow peer leave",
+        || async { format!("{:?}", host.peers().await) },
+        || async {
+            let peers = host.peers().await.ok()?;
+            (!peers.iter().any(|peer| peer.display_name == "Bob")).then_some(())
+        },
+    )
+    .await;
+    match timeout(WAIT, slow.read_to_end())
+        .await
+        .expect("the server ends the slow connection")
+    {
+        None | Some(ErrorKind::ConnectionReset) => {}
+        Some(kind) => {
+            panic!("the slow socket ends; it does not linger: {kind:?}")
+        }
+    }
+
+    // The room keeps serving everyone else.
+    host.open(PATH).await.expect("the host still opens");
+}
+
+/// A reply the queue will not take ends the session the same way a broadcast past a
+/// full queue does: the peer stopped reading, so the server removes it rather than
+/// stack more behind the unread frames. Replies echo the room's document set, so a few
+/// hundred opens of long paths overflow any socket past the bounded queue.
+#[tokio::test]
+async fn a_reply_past_a_full_queue_ends_the_session() {
+    let harness = Harness::start(Duration::from_millis(300)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({"display_name": "Ada", "role": "host"}))
+        .await
+        .expect("says hello");
+    let created = next_json_within(&mut raw, "room.created").await;
+    let room_id = created["params"]["room_id"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let token = created["params"]["token"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    // Hundreds of opens, none of them read: the replies alone exceed any socket.
+    let path = "a".repeat(4000);
+    for id in 2..302_u64 {
+        raw.send_json(&serde_json::json!({
+            "v": proto::WIRE_VERSION,
+            "id": id,
+            "method": method::DOC_OPEN,
+            "params": {"path": format!("{path}-{id}")},
+        }))
+        .await
+        .expect("sends");
+    }
+    match timeout(WAIT, raw.read_to_end())
+        .await
+        .expect("the server ends the session")
+    {
+        None | Some(ErrorKind::ConnectionReset) => {}
+        Some(kind) => panic!("the socket ends; it does not linger: {kind:?}"),
+    }
+
+    // The room died with its host: the grace period ran out long before the socket did,
+    // so the id refuses like an id that was never minted.
+    let url =
+        proto::session_url(&harness.ws_base(), Some(&room_id), Some(&token));
+    let mut late = connect(&url).await.expect("connects");
+    hello(&mut late, &serde_json::json!({"display_name": "Late"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json(&mut late).await.expect("refusal")["params"]["code"],
+        code::ROOM_UNKNOWN
+    );
 }

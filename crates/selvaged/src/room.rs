@@ -7,9 +7,15 @@
 use std::collections::{BTreeSet, HashMap};
 
 use selvage_protocol::{Keepalive, PeerInfo, Role};
-use tokio::sync::mpsc::{
-    UnboundedReceiver, UnboundedSender, unbounded_channel,
-};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::oneshot;
+
+/// How many frames one connection may have queued but unwritten. Past it the peer is
+/// slow: its frames are not dropped silently, the peer is disconnected and the room is
+/// told `peer.left`. A bound on frames bounds memory only with the frame bound (the
+/// transport's `MAX_FRAME_BYTES` in `net`): 32 full frames is the most one peer can
+/// make the server hold for it.
+pub const MAX_QUEUE_FRAMES: usize = 32;
 
 /// A frame the connection task should write out.
 #[derive(Debug, Clone)]
@@ -23,7 +29,7 @@ pub enum Outbound {
 #[derive(Clone)]
 pub struct Peer {
     pub info: PeerInfo,
-    pub tx: UnboundedSender<Outbound>,
+    pub tx: Sender<Outbound>,
     /// The room's arrival counter when this peer was seated. `peers` carries no order in the
     /// protocol (`PROTOCOL.md` §6.2), but the frame's bytes must not be a hash artifact either,
     /// so the list is written in join order and this is what says what that is.
@@ -32,7 +38,7 @@ pub struct Peer {
 
 impl Peer {
     #[must_use]
-    pub const fn new(info: PeerInfo, tx: UnboundedSender<Outbound>) -> Self {
+    pub const fn new(info: PeerInfo, tx: Sender<Outbound>) -> Self {
         Self {
             info,
             tx,
@@ -40,9 +46,12 @@ impl Peer {
         }
     }
 
-    pub fn send(&self, out: Outbound) {
-        // The receiver lives in the connection task; a send only fails once it is gone.
-        let _ = self.tx.send(out);
+    /// Queues one frame, reporting whether it fit. A full queue means the peer stopped
+    /// reading; the caller disconnects it rather than queue without bound. A closed
+    /// receiver means the connection task is already gone.
+    #[must_use]
+    pub fn send(&self, out: Outbound) -> bool {
+        self.tx.try_send(out).is_ok()
     }
 }
 
@@ -103,14 +112,21 @@ impl Room {
         self.peers.insert(peer.info.peer_id.clone(), peer);
     }
 
-    pub fn broadcast(&self, except: Option<&str>, out: &Outbound) {
-        let others = self
-            .peers
+    /// Queues a frame on every peer but one, returning the ids whose queue was full.
+    /// The room holds no unsent bytes for them; the caller removes them instead.
+    #[must_use]
+    pub fn broadcast(
+        &self,
+        except: Option<&str>,
+        out: &Outbound,
+    ) -> Vec<String> {
+        self.peers
             .values()
-            .filter(|peer| Some(peer.info.peer_id.as_str()) != except);
-        for peer in others {
-            peer.send(out.clone());
-        }
+            .filter(|peer| Some(peer.info.peer_id.as_str()) != except)
+            .map(|peer| (peer.send(out.clone()), peer))
+            .filter(|(queued, _)| !queued)
+            .map(|(_, peer)| peer.info.peer_id.clone())
+            .collect()
     }
 
     pub fn attach_host(&mut self, peer_id: &str) {
@@ -222,6 +238,11 @@ pub enum SeatError {
 #[derive(Default)]
 pub struct Registry {
     rooms: HashMap<String, Room>,
+    /// How to end each seated connection's task, by peer id. Dropping the sender
+    /// completes the task's poison channel, so taking it here ends the task: a slow
+    /// peer's task is ended when it is removed, and a clean leave takes its sender
+    /// only so the map does not keep one for a task that is already ending.
+    tasks: HashMap<String, oneshot::Sender<()>>,
 }
 
 impl Registry {
@@ -279,6 +300,17 @@ impl Registry {
         self.rooms.get(room_id)?.peers.get(peer_id)
     }
 
+    /// Remembers how to end a seated connection's task.
+    pub fn set_task(&mut self, peer_id: &str, poison: oneshot::Sender<()>) {
+        self.tasks.insert(peer_id.to_string(), poison);
+    }
+
+    /// Forgets a connection's task, returning how to end it. Dropping the sender ends
+    /// the task; `None` when the peer was never seated or its task was already taken.
+    pub fn take_task(&mut self, peer_id: &str) -> Option<oneshot::Sender<()>> {
+        self.tasks.remove(peer_id)
+    }
+
     /// Detaches a peer. Returns whether it was the host, so the caller can announce
     /// `host.detached`, and whether the room became empty.
     #[must_use]
@@ -334,7 +366,40 @@ pub struct Detach {
 }
 
 #[must_use]
-pub fn peer_channel(info: PeerInfo) -> (Peer, UnboundedReceiver<Outbound>) {
-    let (tx, rx) = unbounded_channel();
+pub fn peer_channel(info: PeerInfo) -> (Peer, Receiver<Outbound>) {
+    let (tx, rx) = channel(MAX_QUEUE_FRAMES);
     (Peer::new(info, tx), rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The queue bound is exact: a full queue's worth of frames fits, and the next
+    /// broadcast reports the peer slow instead of queueing without bound.
+    #[test]
+    fn a_full_queue_reports_the_peer_slow() {
+        let mut registry = Registry::default();
+        let info = PeerInfo {
+            peer_id: "p-slow".to_string(),
+            display_name: "Slow".to_string(),
+            role: Role::Guest,
+            awareness_client_id: None,
+        };
+        let (peer, _leftovers) = peer_channel(info);
+        registry.create(
+            NewRoom {
+                id: "r-1".to_string(),
+                token: "t".to_string(),
+                keepalive: Keepalive::default(),
+            },
+            peer,
+        );
+        let room = registry.room("r-1").expect("the room is minted");
+        let out = Outbound::Text("{}".to_string());
+        for _ in 0..MAX_QUEUE_FRAMES {
+            assert!(room.broadcast(None, &out).is_empty());
+        }
+        assert_eq!(room.broadcast(None, &out), vec!["p-slow".to_string()]);
+    }
 }

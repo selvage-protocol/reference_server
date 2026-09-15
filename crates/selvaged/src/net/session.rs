@@ -1,13 +1,13 @@
 //! The session protocol: the handshake, seating a connection, and the session methods
 //! a seated connection answers.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde_json::Value;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
+use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Error as WireError;
 use tokio_tungstenite::tungstenite::Message;
@@ -53,7 +53,10 @@ pub struct Applicant {
     pub peer_id: String,
     pub join: proto::JoinQuery,
     pub hello: Hello,
-    pub tx: UnboundedSender<Outbound>,
+    pub tx: Sender<Outbound>,
+    /// How to end this connection's task once it is seated: taking it out of the
+    /// registry and dropping it completes the task's poison channel.
+    pub poison: oneshot::Sender<()>,
 }
 
 /// The result of the handshake.
@@ -62,6 +65,11 @@ pub struct Hello {
     /// A connection without a room in the URL is minting one.
     claims_host: bool,
 }
+
+/// What seating a newcomer produces: the reply for its own connection, and the frame
+/// the peers already in the room get when a host reclaims it — `None` for a mint and
+/// for a guest join, which announce nothing beyond `peer.joined`.
+type Placement = ((&'static str, proto::SessionParams), Option<Outbound>);
 
 /// Everything that decides where a newcomer is seated.
 struct Seating<'a> {
@@ -255,16 +263,134 @@ fn grant_paths(raw: Value) -> Result<Vec<String>, Refusal> {
     Ok(params.paths)
 }
 
-/// Sends a frame to a room's peers, minus one, if the room still exists and the frame
-/// could be serialized at all.
-fn deliver(room: Option<&Room>, except: Option<&str>, frame: Option<Outbound>) {
-    let Some(target) = room else {
+/// A peer taken out of the room under the lock: what its announcements need after it.
+struct DetachedPeer {
+    peer_id: String,
+    was_host: bool,
+    generation: u64,
+    /// Dropping this ends the connection's task. A removed peer is gone either way;
+    /// ending its task is what closes its socket.
+    poison: Option<oneshot::Sender<()>>,
+}
+
+/// Removes a peer under the lock: its seat, its claims and its task handle. The room
+/// outlives the announcement, so the frames the departure needs are built by the
+/// caller once the lock is dropped.
+fn detach_locked(
+    registry: &mut Registry,
+    room_id: &str,
+    peer_id: &str,
+) -> Option<DetachedPeer> {
+    let detach = registry.detach(room_id, peer_id)?;
+    let poison = registry.take_task(peer_id);
+    Some(DetachedPeer {
+        peer_id: peer_id.to_string(),
+        was_host: detach.was_host,
+        generation: detach.generation,
+        poison,
+    })
+}
+
+/// The `peer.left` a departure is announced with.
+fn peer_left_frame(peer_id: &str) -> Option<Outbound> {
+    event_frame(event::PEER_LEFT, serde_json::json!({ "peer_id": peer_id }))
+}
+
+/// The `host.detached` a host's departure is announced with.
+fn host_detached_frame(grace_ms: u64) -> Option<Outbound> {
+    event_frame(
+        event::HOST_DETACHED,
+        serde_json::json!({ "grace_ms": grace_ms }),
+    )
+}
+
+/// The room grace period in whole milliseconds, as `host.detached` carries it.
+fn grace_ms(config: &ServerConfig) -> u64 {
+    u64::try_from(config.room_grace.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Sends a frame to a room's peers, minus one. A peer whose queue is full is not kept
+/// and told nothing: it is removed, the room is told `peer.left`, and its task is
+/// stopped. Frames the departures themselves need join the same loop, so a burst of
+/// slow peers drains without recursing.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a delivery names its server, room, exclusion and frame; a struct would hide one call site's meaning"
+)]
+async fn deliver(
+    shared: &Shared,
+    room_id: &str,
+    except: Option<&str>,
+    frame: Option<Outbound>,
+) {
+    let mut pending: Vec<(Option<String>, Outbound)> = Vec::new();
+    if let Some(out) = frame {
+        pending.push((except.map(str::to_string), out));
+    }
+    while let Some((skip, out)) = pending.pop() {
+        let slow: Vec<String> = {
+            let guard = shared.registry.lock().await;
+            guard
+                .room(room_id)
+                .map(|room| room.broadcast(skip.as_deref(), &out))
+                .unwrap_or_default()
+        };
+        for peer_id in slow {
+            eject_into(shared, room_id, &peer_id, &mut pending).await;
+        }
+    }
+}
+
+/// Removes one slow peer found by [`deliver`], queuing the frames its departure needs
+/// with the ones still unsent. Dropping its poison ends its task.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an ejection names its server, room, peer and the queue it appends to"
+)]
+async fn eject_into(
+    shared: &Shared,
+    room_id: &str,
+    peer_id: &str,
+    pending: &mut Vec<(Option<String>, Outbound)>,
+) {
+    let detached = {
+        let mut guard = shared.registry.lock().await;
+        detach_locked(&mut guard, room_id, peer_id)
+    };
+    let Some(removed) = detached else {
         return;
     };
-    let Some(out) = frame else {
+    if let Some(left) = peer_left_frame(&removed.peer_id) {
+        pending.push((None, left));
+    }
+    if removed.was_host {
+        let grace = grace_ms(&shared.config);
+        if let Some(gone) = host_detached_frame(grace) {
+            pending.push((None, gone));
+        }
+        reap_later(shared.clone(), room_id.to_string(), removed.generation);
+    }
+    drop(removed.poison);
+}
+
+/// Detaches a peer the server stops serving, tells the room, arms the grace period if
+/// the host just left, and ends the connection's task. A clean leave and a slow-peer
+/// removal end the same way: the seat is gone, so there is nothing left to serve.
+async fn remove_peer(shared: &Shared, room_id: &str, peer_id: &str) {
+    let detached = {
+        let mut guard = shared.registry.lock().await;
+        detach_locked(&mut guard, room_id, peer_id)
+    };
+    let Some(removed) = detached else {
         return;
     };
-    target.broadcast(except, &out);
+    deliver(shared, room_id, None, peer_left_frame(&removed.peer_id)).await;
+    if removed.was_host {
+        let grace = grace_ms(&shared.config);
+        deliver(shared, room_id, None, host_detached_frame(grace)).await;
+        reap_later(shared.clone(), room_id.to_string(), removed.generation);
+    }
+    drop(removed.poison);
 }
 
 fn capabilities() -> Vec<String> {
@@ -312,55 +438,58 @@ impl Applicant {
 
     /// Mints a room or admits this connection to an existing one, then queues the
     /// handshake response. The response is queued while the registry lock is held, so
-    /// it is the first frame on the connection's channel.
+    /// it is the first frame on the connection's channel; the announcements to the
+    /// peers already in the room wait until the lock is dropped, since a slow one of
+    /// them is removed rather than written to.
     ///
     /// # Errors
     ///
     /// Returns the refusal to send back when the room is unknown, the token is wrong,
     /// or the host role is taken.
-    pub async fn seat(
-        self,
-        registry: &Arc<Mutex<Registry>>,
-        config: &ServerConfig,
-    ) -> Result<Session, Refusal> {
+    pub async fn seat(self, shared: &Shared) -> Result<Session, Refusal> {
         let role = self.role();
         let info = self.info(role);
         let seating = Seating {
             applicant: &self,
-            config,
+            config: &shared.config,
             role,
             info: &info,
             room_id: self.join.room.as_deref(),
             peer: Peer::new(info.clone(), self.tx.clone()),
         };
-        let mut guard = registry.lock().await;
-        let (event_name, params) = seating.place(&mut guard)?;
+        let mut guard = shared.registry.lock().await;
+        let ((event_name, params), attached) = seating.place(&mut guard)?;
+        guard.set_task(&self.peer_id, self.poison);
 
         let body = serde_json::to_value(&params).map_err(|e| bad_body(&e))?;
         let response = event_frame(event_name, body);
         if let Some(frame) = response {
-            let _ = self.tx.send(frame);
+            let _ = self.tx.try_send(frame);
         }
         // A joining connection learns the room's grant straight after its `room.joined`, so
         // it needs no round trip and `room.joined` needs no fifth member. It is queued after
         // the reply, so the reply is still this connection's first frame.
         let granted = join_grant(guard.room(&params.room_id));
         if let Some(frame) = granted {
-            let _ = self.tx.send(frame);
+            let _ = self.tx.try_send(frame);
         }
         // Late arrivals must be announced to the peers already in the room.
-        if params.token.is_none() {
-            let joined = event_frame(
-                event::PEER_JOINED,
-                serde_json::json!({ "peer": info }),
-            );
-            deliver(guard.room(&params.room_id), Some(&self.peer_id), joined);
-        }
+        let joined = if params.token.is_none() {
+            event_frame(event::PEER_JOINED, serde_json::json!({ "peer": info }))
+        } else {
+            None
+        };
+        let room_id = params.room_id.clone();
+        let peer_id = self.peer_id.clone();
+        let tx = self.tx.clone();
         drop(guard);
+        deliver(shared, &room_id, Some(&peer_id), attached).await;
+        deliver(shared, &room_id, Some(&peer_id), joined).await;
         Ok(Session {
             peer_id: self.peer_id,
             room_id: params.room_id,
-            tx: self.tx,
+            tx,
+            poisoned: AtomicBool::new(false),
         })
     }
 }
@@ -370,12 +499,10 @@ fn bad_body(error: &serde_json::Error) -> Refusal {
 }
 
 impl Seating<'_> {
-    fn place(
-        self,
-        registry: &mut Registry,
-    ) -> Result<(&'static str, proto::SessionParams), Refusal> {
+    /// Seats the newcomer: its reply, and the reclaim frame for the room if any.
+    fn place(self, registry: &mut Registry) -> Result<Placement, Refusal> {
         match self.room_id {
-            None => Ok(self.mint(registry)),
+            None => Ok((self.mint(registry), None)),
             Some(room_id) => self.admit(registry, room_id),
         }
     }
@@ -412,7 +539,7 @@ impl Seating<'_> {
         self,
         registry: &mut Registry,
         room_id: &str,
-    ) -> Result<(&'static str, proto::SessionParams), Refusal> {
+    ) -> Result<Placement, Refusal> {
         let host_was_present =
             registry.room(room_id).is_some_and(Room::host_present);
         registry
@@ -427,31 +554,31 @@ impl Seating<'_> {
             .map_err(|e| refusal_for(e, room_id))?;
         // `host.attached` is a host reclaiming the room (§6, §9.1): a guest joining
         // while the room is between hosts is a `peer.joined` and nothing more.
-        if !host_was_present && self.role == proto::Role::Host {
-            let attached = event_frame(
+        let attached = if !host_was_present && self.role == proto::Role::Host {
+            event_frame(
                 event::HOST_ATTACHED,
                 serde_json::json!({ "peer": self.info }),
-            );
-            deliver(
-                registry.room(room_id),
-                Some(&self.applicant.peer_id),
-                attached,
-            );
-        }
+            )
+        } else {
+            None
+        };
         let room = registry
             .room(room_id)
             .ok_or_else(|| (code::ROOM_GONE, "the room is gone".to_string()))?;
         Ok((
-            event::ROOM_JOINED,
-            proto::SessionParams {
-                room_id: room.id.clone(),
-                token: None,
-                self_peer: self.info.clone(),
-                peers: room.peers_except(&self.applicant.peer_id),
-                documents: room.documents().to_vec(),
-                capabilities: capabilities(),
-                keepalive: room.keepalive,
-            },
+            (
+                event::ROOM_JOINED,
+                proto::SessionParams {
+                    room_id: room.id.clone(),
+                    token: None,
+                    self_peer: self.info.clone(),
+                    peers: room.peers_except(&self.applicant.peer_id),
+                    documents: room.documents().to_vec(),
+                    capabilities: capabilities(),
+                    keepalive: room.keepalive,
+                },
+            ),
+            attached,
         ))
     }
 }
@@ -460,7 +587,10 @@ impl Seating<'_> {
 pub struct Session {
     peer_id: String,
     room_id: String,
-    tx: UnboundedSender<Outbound>,
+    tx: Sender<Outbound>,
+    /// Set when a reply found the queue full: the peer stopped reading, and the next
+    /// inbound frame ends the session rather than stacking more behind the unread ones.
+    poisoned: AtomicBool,
 }
 
 impl Session {
@@ -485,10 +615,13 @@ impl Session {
 
     /// Relays a document or awareness payload to the rest of the room, untouched.
     async fn relay(&self, frame: Vec<u8>, shared: &Shared) {
-        let guard = shared.registry.lock().await;
-        if let Some(room) = guard.room(&self.room_id) {
-            room.broadcast(Some(&self.peer_id), &Outbound::Binary(frame));
-        }
+        deliver(
+            shared,
+            &self.room_id,
+            Some(&self.peer_id),
+            Some(Outbound::Binary(frame)),
+        )
+        .await;
     }
 
     /// Handles one JSON envelope: a session method, or an error for anything else.
@@ -522,6 +655,12 @@ impl Session {
                 code::UNKNOWN_METHOD,
                 format!("no such method: {other}"),
             )),
+        }
+        // A reply the queue would not take means the peer stopped reading: end the
+        // session rather than stack more behind the unread frames. The room learns of
+        // it as `peer.left`, like any other drop.
+        if self.poisoned.swap(false, Ordering::Relaxed) {
+            remove_peer(shared, &self.room_id, &self.peer_id).await;
         }
     }
 
@@ -697,23 +836,31 @@ impl Session {
         room.documents().to_vec()
     }
 
-    /// Tells a connection its wire version is not this server's, then closes it.
+    /// Tells a connection its wire version is not this server's, then closes it. When
+    /// even the close cannot be queued the session is already over: the poison the
+    /// reply left ends it on this very frame.
     fn expire(&self, id: u64, version: &str) {
         self.reply(&proto::ServerMessage::error(
             id,
             code::UNSUPPORTED_VERSION,
             format!("unsupported wire version {version}"),
         ));
-        let _ = self.tx.send(Outbound::Close(
+        let _ = self.tx.try_send(Outbound::Close(
             close::UNSUPPORTED_VERSION,
             "version".to_string(),
         ));
     }
 
-    /// Queues a response or an error for the connection.
+    /// Queues a response or an error for the connection. A full queue means the peer
+    /// stopped reading: the frame is dropped and the session is marked, and the next
+    /// inbound frame disconnects it. The room is told `peer.left`; nothing unsent is
+    /// kept for the peer, and no reply is presented as delivered that was not queued.
     fn reply(&self, msg: &proto::ServerMessage) {
-        if let Some(frame) = super::frame_of(msg) {
-            let _ = self.tx.send(frame);
+        let Some(frame) = super::frame_of(msg) else {
+            return;
+        };
+        if self.tx.try_send(frame).is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
         }
     }
 
@@ -734,34 +881,13 @@ impl Session {
         shared: &Shared,
         frame: Option<Outbound>,
     ) {
-        let guard = shared.registry.lock().await;
-        deliver(guard.room(&self.room_id), None, frame);
+        deliver(shared, &self.room_id, None, frame).await;
     }
 
     /// Detaches this connection, tells the room, and arms the room's grace period if
     /// the host just left.
     pub async fn leave(&self, shared: &Shared) {
-        let mut guard = shared.registry.lock().await;
-        let Some(detach) = guard.detach(&self.room_id, &self.peer_id) else {
-            return;
-        };
-        let left = event_frame(
-            event::PEER_LEFT,
-            serde_json::json!({ "peer_id": self.peer_id }),
-        );
-        deliver(guard.room(&self.room_id), None, left);
-        if !detach.was_host {
-            return;
-        }
-        let grace_ms = u64::try_from(shared.config.room_grace.as_millis())
-            .unwrap_or(u64::MAX);
-        let detached = event_frame(
-            event::HOST_DETACHED,
-            serde_json::json!({ "grace_ms": grace_ms }),
-        );
-        deliver(guard.room(&self.room_id), None, detached);
-        drop(guard);
-        reap_later(shared.clone(), self.room_id.clone(), detach.generation);
+        remove_peer(shared, &self.room_id, &self.peer_id).await;
     }
 }
 
@@ -769,16 +895,19 @@ impl Session {
 fn reap_later(shared: Shared, room_id: String, generation: u64) {
     tokio::spawn(async move {
         sleep(shared.config.room_grace).await;
-        let peers = shared
-            .registry
-            .lock()
-            .await
-            .reap_if_host_absent(&room_id, generation);
+        let mut guard = shared.registry.lock().await;
+        let peers = guard.reap_if_host_absent(&room_id, generation);
+        for peer in &peers {
+            drop(guard.take_task(&peer.info.peer_id));
+        }
+        drop(guard);
         tell_room_gone(&room_id, peers);
     });
 }
 
 /// Tells the peers left behind that the room is gone, then closes their connections.
+/// A queue that will not take even the close is not kept for the peer: its task was
+/// already ended, and the socket goes with it.
 fn tell_room_gone(room_id: &str, peers: Vec<Peer>) {
     let frame = event_frame(
         event::ROOM_GONE,
@@ -786,8 +915,9 @@ fn tell_room_gone(room_id: &str, peers: Vec<Peer>) {
     );
     for peer in peers {
         if let Some(out) = frame.clone() {
-            peer.send(out);
+            let _ = peer.send(out);
         }
-        peer.send(Outbound::Close(close::ROOM_GONE, "room gone".to_string()));
+        let _ = peer
+            .send(Outbound::Close(close::ROOM_GONE, "room gone".to_string()));
     }
 }
