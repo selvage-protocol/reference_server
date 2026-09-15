@@ -13,17 +13,19 @@ use futures_util::{SinkExt, StreamExt};
 use selvage_client::{ConnectOptions, Role, SyncEngine};
 use selvage_harness::{
     Anchor, Harness, Presence, Room, SelectionOffsets, ServerConfig, WAIT,
-    wait_for, wait_for_convergence, wait_for_described,
+    wait_for, wait_for_convergence, wait_for_described, wait_for_peer,
 };
 use selvage_protocol as proto;
 use selvage_protocol::{event, method};
 use serde_json::Value;
 use tokio::net::TcpStream;
+use tokio::time::sleep;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
 
 use yrs::sync::protocol::SyncMessage;
 use yrs::sync::{Awareness, Message as YMessage};
+use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{
     Assoc, ClientID, Doc, GetString, IndexedSequence, OffsetKind, Options,
@@ -998,4 +1000,112 @@ async fn unknown_keys_are_ignored_and_the_selection_still_resolves() {
     let seen = wait_for_caret(&host, "Cleo", SelectionOffsets::caret(3)).await;
     assert_eq!(seen.path(), Some(PATH));
     drop(raw);
+}
+
+/// Reads awareness frames from a raw peer until one carries a state `stop` accepts, returning
+/// that state with every state `client_id` published that has been read, in arrival order.
+///
+/// Arrival order is what makes a count of these a fact rather than a sample: the server relays
+/// to a peer in the order it received, so once a state has been read, every frame sent before
+/// it has been read too. The deadline turns a state that never arrives into a failure that
+/// reports the ones that did rather than a test that waits forever.
+async fn frames_until(
+    ws: &mut Raw,
+    client_id: u64,
+    mut stop: impl FnMut(&Value) -> bool,
+) -> Result<(Value, Vec<Value>), Failure> {
+    let mut seen: Vec<Value> = Vec::new();
+    let wait = sleep(WAIT);
+    tokio::pin!(wait);
+    loop {
+        tokio::select! {
+            () = &mut wait => {
+                return Err(format!(
+                    "no state was accepted within {WAIT:?}; saw {seen:#?}"
+                )
+                .into());
+            }
+            incoming = ws.next() => {
+                let Some(frame) = incoming else {
+                    return Err("the observer's connection ended".into());
+                };
+                let Message::Binary(payload) = frame? else {
+                    continue;
+                };
+                let Ok(YMessage::Awareness(update)) = YMessage::decode_v1(&payload)
+                else {
+                    continue;
+                };
+                let Some(entry) = update.clients.get(&ClientID::new(client_id))
+                else {
+                    continue;
+                };
+                let state: Value = serde_json::from_str(&entry.json)?;
+                seen.push(state.clone());
+                if stop(&state) {
+                    return Ok((state, seen));
+                }
+            }
+        }
+    }
+}
+
+/// A caret that has not moved is not news. A state equal to the one this client last published
+/// is not handed to the awareness layer, so an application that republishes the selection it
+/// already published puts nothing on the wire. The two callers that do publish an unchanged
+/// state are the renewal — deliberately that state on a newer clock (§8.2) — and a fresh seat,
+/// where the peers have never seen this client's state under its new awareness client id
+/// (§9.1).
+#[tokio::test]
+async fn a_repeated_selection_is_not_published_twice() {
+    // The renewal publishes this same state on a newer clock by design (§8.2), so it is put an
+    // hour out of the way: every awareness frame here is then a publish the engine chose.
+    let harness = Harness::start_with(ServerConfig {
+        room_grace: WAIT,
+        keepalive: proto::Keepalive {
+            ping_interval_ms: 30_000,
+            awareness_renew_ms: 3_600_000,
+            awareness_expire_ms: 3_600_000,
+        },
+        ..ServerConfig::default()
+    })
+    .await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    host.open(PATH).await.expect("the host opens the document");
+    host.insert(PATH, 0, "abcdef\n")
+        .await
+        .expect("the host writes it");
+    let (mut observer, _) = raw_join(&harness, &room, "Cleo")
+        .await
+        .expect("the observer joins");
+    // A newcomer makes the host publish its own state, and that frame has to be behind us
+    // before the frames under test are counted.
+    wait_for_peer(&host, "Cleo").await;
+    let ada = writer_id(&host).expect("the host's replica has a client id");
+
+    // The same caret twice, then a caret that moved. The count is read against the moved
+    // caret as a fence — nothing here sleeps and hopes for a second frame.
+    host.set_selection(PATH, SelectionOffsets::caret(1))
+        .await
+        .expect("the host takes a caret");
+    let (first, _) = frames_until(&mut observer, ada, |state| {
+        state.get("path").and_then(Value::as_str) == Some(PATH)
+    })
+    .await
+    .expect("the host's caret to arrive");
+
+    host.set_selection(PATH, SelectionOffsets::caret(1))
+        .await
+        .expect("the host takes the same caret");
+    host.set_selection(PATH, SelectionOffsets::caret(2))
+        .await
+        .expect("the host moves its caret");
+    let (_, after) = frames_until(&mut observer, ada, |state| *state != first)
+        .await
+        .expect("the moved caret to arrive");
+    assert_eq!(
+        after.len(),
+        1,
+        "the unchanged selection was published again: {after:#?}"
+    );
 }

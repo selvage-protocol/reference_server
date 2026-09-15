@@ -893,6 +893,12 @@ impl EngineTask {
 
     /// Publishes this client's presence, turning the offsets the adapter speaks into the
     /// anchors the wire carries (`PROTOCOL.md` §8.1).
+    ///
+    /// A state equal to the one already published is not published again: `yrs` emits an
+    /// awareness update for every `set_local_state_raw`, changed or not, and a caret that has
+    /// not moved is not news. The renewal and a fresh seat are the two callers that publish
+    /// regardless, because a newer clock and a new client id are each something a peer has to
+    /// see (§8.2, §9.1).
     fn set_local_awareness(
         &mut self,
         path: Option<String>,
@@ -900,6 +906,9 @@ impl EngineTask {
     ) -> Result<(), Error> {
         let state = self.anchored_state(path, selection);
         let json = serde_json::to_string(&state)?;
+        if self.local_state.as_deref() == Some(json.as_str()) {
+            return Ok(());
+        }
         self.awareness.set_local_state_raw(json.clone());
         self.local_state = Some(json);
         self.publish_local_awareness()?;
