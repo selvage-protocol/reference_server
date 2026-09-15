@@ -54,6 +54,7 @@ pub fn display_name_over_limit(name: &str) -> bool {
 /// Client -> server method names.
 pub mod method {
     pub const SESSION_HELLO: &str = "session.hello";
+    pub const SESSION_RENAME: &str = "session.rename";
     pub const DOC_OPEN: &str = "doc.open";
     pub const DOC_CLOSE: &str = "doc.close";
 }
@@ -64,6 +65,7 @@ pub mod event {
     pub const ROOM_JOINED: &str = "room.joined";
     pub const PEER_JOINED: &str = "peer.joined";
     pub const PEER_LEFT: &str = "peer.left";
+    pub const PEER_RENAMED: &str = "peer.renamed";
     pub const DOC_OPENED: &str = "doc.opened";
     pub const DOC_CLOSED: &str = "doc.closed";
     pub const HOST_DETACHED: &str = "host.detached";
@@ -317,10 +319,26 @@ pub struct DocCloseParams {
     pub path: String,
 }
 
+/// `session.rename` params: the name this connection wants from now on. The bound is the
+/// handshake's (`PROTOCOL.md` §5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameParams {
+    pub display_name: String,
+}
+
 /// `peer.joined` / `peer.left` params.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerEvent {
     pub peer: PeerInfo,
+}
+
+/// `peer.renamed` params: the one field a rename changes, about the peer it changed for.
+/// It carries no `role` and no `awareness_client_id`; a rename touches neither, and a
+/// receiver with no record for `peer_id` has to ignore the event rather than invent them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerRenamedParams {
+    pub display_name: String,
+    pub peer_id: String,
 }
 
 /// `doc.opened` / `doc.closed` params. `documents` is the room's open-document set
@@ -591,6 +609,42 @@ mod tests {
             ev,
             r#"{"event":"peer.left","params":{"x":1},"v":"selvage/1"}"#
         );
+    }
+
+    #[test]
+    fn rename_frames() {
+        let request = ClientMessage::new(
+            2,
+            method::SESSION_RENAME,
+            serde_json::json!({ "display_name": "Ada Lovelace" }),
+        );
+        assert_eq!(
+            request.to_text().unwrap(),
+            r#"{"id":2,"method":"session.rename","params":{"display_name":"Ada Lovelace"},"v":"selvage/1"}"#
+        );
+
+        let event = ServerMessage::event(
+            event::PEER_RENAMED,
+            serde_json::json!(PeerRenamedParams {
+                display_name: "Ada Lovelace".to_string(),
+                peer_id: "p-1".to_string(),
+            }),
+        );
+        assert_eq!(
+            event.to_text().unwrap(),
+            r#"{"event":"peer.renamed","params":{"display_name":"Ada Lovelace","peer_id":"p-1"},"v":"selvage/1"}"#
+        );
+
+        // The wire is the contract in both directions: what this crate builds is what it
+        // reads back.
+        let params: PeerRenamedParams =
+            serde_json::from_value(event.params.unwrap_or_default()).unwrap();
+        assert_eq!(params.display_name, "Ada Lovelace");
+        assert_eq!(params.peer_id, "p-1");
+
+        let parsed: RenameParams =
+            serde_json::from_value(request.params).unwrap();
+        assert_eq!(parsed.display_name, "Ada Lovelace");
     }
 
     #[test]
