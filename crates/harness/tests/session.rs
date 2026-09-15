@@ -18,6 +18,7 @@ use selvage_protocol::{close, code, event, method};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::broadcast;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -261,6 +262,25 @@ async fn read_matching(
         let frame = read_frame(stream).await?;
         if frame.opcode == opcode {
             return Ok(frame);
+        }
+    }
+}
+
+/// Waits for the engine to report an undecodable frame, ignoring everything else.
+async fn wait_for_bad_frame(
+    events: &mut broadcast::Receiver<EngineEvent>,
+) -> Result<String, Failure> {
+    loop {
+        match timeout(Duration::from_millis(50), events.recv()).await {
+            Ok(Ok(EngineEvent::SessionError { code, .. }))
+                if code == code::BAD_MESSAGE =>
+            {
+                return Ok(code);
+            }
+            Ok(Err(broadcast::error::RecvError::Closed)) => {
+                return Err("the event stream closed".into());
+            }
+            _ => {}
         }
     }
 }
@@ -2194,4 +2214,54 @@ async fn closing_a_path_nobody_holds_is_a_no_op_success() {
         serde_json::json!([]),
         "the set is unchanged"
     );
+}
+
+/// A binary frame no replica decodes is reported, not dropped: a raw peer sends bytes
+/// that fail decoding, the relay carries them opaquely, and the receiving engine says
+/// `session.error` instead of losing the sender's content silently. The session stays
+/// open — `PROTOCOL.md` §11 keeps a seated connection on a `bad_message`.
+#[tokio::test]
+async fn an_undecodable_binary_relay_is_reported_and_survived()
+-> Result<(), Failure> {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+    let target = format!(
+        "{}?room={}&token={}",
+        proto::ENDPOINT_PATH,
+        proto::percent_encode(&room.id),
+        proto::percent_encode(&room.token)
+    );
+    let mut raw = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the sender joins");
+    raw.hello(&serde_json::json!({"display_name": "Mallory"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut raw, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+
+    // Subscribed before the garbage is sent: the event must not slip past the wait.
+    let mut events = guest.subscribe();
+    raw.send(0x2, &[0x02, 0x00, 0x02, 0xFF, 0xFF])
+        .await
+        .expect("sends undecodable bytes");
+    let code = timeout(WAIT, wait_for_bad_frame(&mut events))
+        .await
+        .expect("a session error arrives")?;
+    assert_eq!(code, code::BAD_MESSAGE);
+
+    // The session survived the garbage: both engines still open and agree.
+    host.open(PATH).await.expect("the host opens");
+    guest.open(PATH).await.expect("the guest opens");
+    host.insert(PATH, 0, "kept\n")
+        .await
+        .expect("the host writes");
+    wait_for("the guest to receive the seed", || async {
+        (guest.text(PATH).await.ok()? == "kept\n").then_some(())
+    })
+    .await;
+    Ok(())
 }
