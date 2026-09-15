@@ -3,3 +3,6 @@
 .pre-commit-config.yaml
 result
 .tmp
+
+# Sibling checkouts for parallel work on this repository.
+.worktrees/
