@@ -270,12 +270,7 @@ impl Registry {
         clippy::too_many_arguments,
         reason = "a mint names its room, host and the cap it is checked against"
     )]
-    pub fn create(
-        &mut self,
-        new: NewRoom,
-        host: Peer,
-        max_rooms: usize,
-    ) -> bool {
+    pub fn create(&mut self, new: NewRoom, host: Peer, max_rooms: usize) -> bool {
         if self.rooms.len() >= max_rooms {
             return false;
         }
@@ -355,12 +350,13 @@ impl Registry {
     }
 
     /// Detaches a peer. Returns whether it was the host, so the caller can announce
-    /// `host.detached`, and whether the room became empty.
+    /// `host.detached`. `None` when the room is gone or the peer was never in it:
+    /// detaching twice announces once.
     #[must_use]
     pub fn detach(&mut self, room_id: &str, peer_id: &str) -> Option<Detach> {
         let room = self.rooms.get_mut(room_id)?;
         let was_host = room.host.as_deref() == Some(peer_id);
-        room.peers.remove(peer_id);
+        room.peers.remove(peer_id)?;
         room.forget_claims(peer_id);
         let generation = if was_host {
             room.detach_host()
