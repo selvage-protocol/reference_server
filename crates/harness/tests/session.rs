@@ -1828,7 +1828,7 @@ async fn minting_past_the_room_cap_is_refused() {
         ..ServerConfig::default()
     })
     .await;
-    harness.host("Ada").await.expect("the first room mints");
+    let (_ada, _first) = harness.host("Ada").await.expect("mints");
     let refused = harness.host("Bob").await.expect_err("no second room");
     let Error::Protocol { code, .. } = refused else {
         panic!("expected x.server_full, got {refused}");
@@ -1862,7 +1862,10 @@ async fn a_full_room_refuses_guests_but_not_its_host() {
     })
     .await;
     let (host, room) = harness.host("Ada").await.expect("host connects");
-    harness.join(&room, "Bob").await.expect("a guest joins");
+    let _bob = harness.join(&room, "Bob").await.expect("a guest joins");
+    // The room is observably full before the refusal is attempted: two seated peers
+    // against a cap of two, so a seat for Mallory would mean the cap did not apply.
+    wait_for_peer(&host, "Bob").await;
     let refused = harness.join(&room, "Mallory").await.expect_err("full");
     let Error::Protocol { code, .. } = refused else {
         panic!("expected x.room_full, got {refused}");
@@ -1870,11 +1873,11 @@ async fn a_full_room_refuses_guests_but_not_its_host() {
     assert_eq!(code, "x.room_full");
 
     // The host drops; a guest takes the freed seat; the host still reclaims past it.
+    // Every engine stays bound: dropping one disconnects it, and the freed seat would
+    // let the next join in for the wrong reason.
     host.disconnect().await.expect("the host leaves");
-    harness
-        .join(&room, "Mallory")
-        .await
-        .expect("the seat freed");
+    let _mallory =
+        harness.join(&room, "Mallory").await.expect("the seat freed");
     let back = harness
         .reclaim(&room, "Ada")
         .await
