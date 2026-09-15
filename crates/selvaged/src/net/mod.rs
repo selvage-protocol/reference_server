@@ -67,12 +67,25 @@ impl Shared {
 /// Serves connections until the listener itself fails.
 pub async fn serve(listener: TcpListener, shared: Shared) {
     loop {
-        let Ok((tcp, _addr)) = listener.accept().await else {
+        let Ok(tcp) = accept_nodelay(&listener).await else {
             continue;
         };
         let connection = shared.clone();
         tokio::spawn(connection.accept(tcp));
     }
+}
+
+/// Accepts one connection with Nagle's algorithm off.
+///
+/// A reply and the event that follows it are two small writes back to back — `doc.open`'s
+/// result and its `doc.opened` — and so is a burst of relayed frames. Nagle holds the second
+/// write until the first is acknowledged: latency the protocol earns nothing for, since its
+/// frames are whole messages that cannot usefully coalesce. Loopback acknowledges too quickly
+/// for it to show; a wide-area link does not.
+async fn accept_nodelay(listener: &TcpListener) -> io::Result<TcpStream> {
+    let (tcp, _addr) = listener.accept().await?;
+    tcp.set_nodelay(true)?;
+    Ok(tcp)
 }
 
 impl Shared {
@@ -454,5 +467,23 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<T> {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn an_accepted_socket_writes_without_nagle() {
+        let listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, served) =
+            tokio::join!(TcpStream::connect(addr), accept_nodelay(&listener));
+        client.unwrap();
+        assert!(served.unwrap().nodelay().unwrap());
     }
 }
