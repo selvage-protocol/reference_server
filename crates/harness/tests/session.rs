@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use selvage_harness::{
-    EngineEvent, Error, Harness, Role, SelectionOffsets, ServerConfig, WAIT,
-    wait_for, wait_for_event, wait_for_peer,
+    EngineEvent, Error, Harness, Role, SelectionOffsets, ServerConfig,
+    SyncEngine, WAIT, wait_for, wait_for_event, wait_for_peer,
 };
 use selvage_protocol as proto;
 use selvage_protocol::{close, code, event, method};
@@ -158,7 +158,7 @@ impl RawSocket {
         opcode: u8,
         payload: &[u8],
     ) -> Result<(), Failure> {
-        let frame = client_frame(opcode, payload)?;
+        let frame = client_frame(opcode, payload);
         self.stream.write_all(&frame).await?;
         Ok(())
     }
@@ -241,20 +241,30 @@ async fn read_matching(
     }
 }
 
-/// One masked client frame, in whichever length form fits.
-fn client_frame(opcode: u8, payload: &[u8]) -> Result<Vec<u8>, Failure> {
+/// One masked client frame, in whichever length form fits: seven bits, sixteen, or
+/// sixty-four. The server accepts frames far larger than a session envelope, and the
+/// grant's count bound is only reachable with one.
+fn client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     /// The 7-bit length that means the real one follows in two more bytes.
     const EXTENDED: u8 = 126;
+    /// ... and the one that means the next eight.
+    const LONG: u8 = 127;
     let mask = [0x21, 0x42, 0x63, 0x84];
-    let length = u16::try_from(payload.len())
-        .map_err(|_| "a client frame payload under 64 KiB")?;
     let mut frame = vec![0x80 | opcode];
+    // A payload longer than a `u64` cannot exist, so the widening below never saturates.
+    let length = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     match u8::try_from(length) {
-        Ok(short) if length < u16::from(EXTENDED) => frame.push(0x80 | short),
-        _ => {
-            frame.push(0x80 | EXTENDED);
-            frame.extend_from_slice(&length.to_be_bytes());
-        }
+        Ok(short) if length < u64::from(EXTENDED) => frame.push(0x80 | short),
+        _ => match u16::try_from(length) {
+            Ok(medium) if length < u64::from(u16::MAX) => {
+                frame.push(0x80 | EXTENDED);
+                frame.extend_from_slice(&medium.to_be_bytes());
+            }
+            _ => {
+                frame.push(0x80 | LONG);
+                frame.extend_from_slice(&length.to_be_bytes());
+            }
+        },
     }
     frame.extend_from_slice(&mask);
     frame.extend(
@@ -263,7 +273,7 @@ fn client_frame(opcode: u8, payload: &[u8]) -> Result<Vec<u8>, Failure> {
             .zip(mask.iter().cycle())
             .map(|(byte, key)| byte ^ key),
     );
-    Ok(frame)
+    frame
 }
 
 /// Reads an HTTP response head, returning it as text.
@@ -619,6 +629,229 @@ async fn a_peer_renames_itself_mid_session() {
     );
 }
 
+/// The paths of a listing, as a client sends them.
+fn paths(list: &[&str]) -> Vec<String> {
+    list.iter().map(|path| (*path).to_string()).collect()
+}
+
+/// Waits until a client's view of the room's grant is `wanted`.
+async fn wait_for_paths(engine: &SyncEngine, wanted: &[&str]) -> Vec<String> {
+    let listed = paths(wanted);
+    wait_for("the room's grant", || async {
+        let held = engine.granted_paths().await.ok()?;
+        (held == listed).then_some(held)
+    })
+    .await
+}
+
+/// A host publishes the room's grant, a guest that joins afterwards receives it, and a
+/// republish replaces it wholesale rather than adding to it (`PROTOCOL.md` §5, §6.3). The
+/// listing is the room's, not the connection's: the publisher is told by the event like
+/// every other peer, and a joiner inherits it without a round trip.
+#[tokio::test]
+async fn a_joiner_receives_the_rooms_grant_and_a_republish_replaces_it() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+
+    let listed = paths(&["README.md", "src/main.rs"]);
+    host.grant(listed.clone())
+        .await
+        .expect("the host publishes");
+    assert_eq!(
+        wait_for_paths(&host, &["README.md", "src/main.rs"]).await,
+        listed
+    );
+
+    // A joiner is told the listing the room holds — this one arrives as its own
+    // `doc.granted`, straight from the room's grant and not from the publisher's echo.
+    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+    assert_eq!(
+        wait_for_paths(&guest, &["README.md", "src/main.rs"]).await,
+        listed
+    );
+
+    // A snapshot, not a delta: the second publication drops a path by not naming it, and the
+    // next joiner inherits the shorter listing.
+    host.grant(paths(&["src/main.rs"]))
+        .await
+        .expect("the host republishes");
+    assert_eq!(
+        wait_for_paths(&host, &["src/main.rs"]).await,
+        paths(&["src/main.rs"])
+    );
+    assert_eq!(
+        wait_for_paths(&guest, &["src/main.rs"]).await,
+        paths(&["src/main.rs"])
+    );
+    let late = harness
+        .join(&room, "Cyd")
+        .await
+        .expect("a second guest joins");
+    assert_eq!(
+        wait_for_paths(&late, &["src/main.rs"]).await,
+        paths(&["src/main.rs"])
+    );
+
+    // An empty listing is a listing: the room grants nothing, and that is announced too.
+    host.grant(Vec::new()).await.expect("the host empties it");
+    assert_eq!(wait_for_paths(&host, &[]).await, Vec::<String>::new());
+    assert_eq!(wait_for_paths(&guest, &[]).await, Vec::<String>::new());
+    assert_eq!(wait_for_paths(&late, &[]).await, Vec::<String>::new());
+}
+
+/// Only the room's host may publish a grant. §11 has no code for "not permitted", so a
+/// grant from a guest is refused `bad_params`, it changes nothing, and the connection
+/// stays seated (`PROTOCOL.md` §5).
+#[tokio::test]
+async fn a_grant_from_a_guest_is_refused_and_changes_nothing() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+    host.grant(paths(&["src/main.rs"]))
+        .await
+        .expect("the host publishes");
+    assert_eq!(
+        wait_for_paths(&guest, &["src/main.rs"]).await,
+        paths(&["src/main.rs"])
+    );
+
+    let refused = guest
+        .grant(paths(&["only/guest.rs"]))
+        .await
+        .expect_err("only the room's host publishes");
+    let Error::Protocol { code, .. } = refused else {
+        panic!("expected bad_params, got {refused}");
+    };
+    assert_eq!(code, code::BAD_PARAMS);
+
+    // The refusal changed nothing, and the refused connection is still usable.
+    assert_eq!(
+        wait_for_paths(&guest, &["src/main.rs"]).await,
+        paths(&["src/main.rs"])
+    );
+    guest
+        .open(PATH)
+        .await
+        .expect("the connection is still seated");
+}
+
+/// The server carries the listing in the order it was given: it does not sort,
+/// deduplicate or normalise it (`PROTOCOL.md` §5, `CANONICAL.md` §2.7). Neither order nor
+/// repetition here is what a publisher should write — an astral `😀` precedes the
+/// fullwidth `ｆ` as UTF-16 code units and follows it as code points, `b` precedes `a`,
+/// and `a` appears twice — and the room holds exactly that.
+#[tokio::test]
+async fn the_server_carries_the_grant_in_the_order_it_was_given() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+
+    let listed = ["😀.txt", "ｆ.txt", "b.txt", "a.txt", "a.txt"];
+    host.grant(paths(&listed))
+        .await
+        .expect("the host publishes");
+
+    // The joiner is told the listing the room *holds*: a server that sorted or deduplicated
+    // on the way in would be caught here, where the publisher's own echo would not show it.
+    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+    assert_eq!(wait_for_paths(&guest, &listed).await, paths(&listed));
+}
+
+/// A joining connection learns the grant without a round trip, and it is told nothing when
+/// the room grants nothing: `doc.granted` follows the join reply if and only if the
+/// listing is non-empty (`PROTOCOL.md` §6.3). The guest's next frame here is the
+/// `doc.opened` the host then produces, so a server that sent an empty listing would put a
+/// frame in front of it and fail.
+#[tokio::test]
+async fn a_joiner_of_a_room_that_grants_nothing_gets_no_granted_event() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let mut guest =
+        RawSocket::open(&harness, &guest_target(&room.id, &room.token), &[])
+            .await
+            .expect("the upgrade succeeds");
+    guest
+        .hello(&serde_json::json!({"display_name": "Raw guest"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut guest, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+
+    host.open(PATH).await.expect("the host opens a document");
+    assert_eq!(
+        next_json_within(&mut guest, "doc.opened").await["event"],
+        event::DOC_OPENED
+    );
+}
+
+/// A grant over the server's bounds is `bad_params` with the connection left open, exactly
+/// as a malformed one is: the count and the per-path length are this server's policy, not
+/// the protocol's (`PROTOCOL.md` §2.1, §5). The numbers are `MAX_GRANT_PATHS` and
+/// `MAX_GRANT_PATH_BYTES` in `selvaged`; a test built from the constants would only show
+/// that they agree with themselves, so they are written out here.
+#[tokio::test]
+async fn a_grant_over_the_servers_bounds_is_refused_with_the_connection_open() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({"display_name": "Raw host"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut raw, "room.created").await["event"],
+        event::ROOM_CREATED
+    );
+
+    let too_many = vec!["a"; 100_001];
+    let too_long = "a".repeat(4097);
+    let refused = [
+        (2_u64, serde_json::json!({"paths": "src/main.rs"})),
+        (3_u64, serde_json::json!({"paths": ["src/main.rs", 7]})),
+        (4_u64, serde_json::json!({"paths": ["src/main.rs", "   "]})),
+        (5_u64, serde_json::json!({})),
+        (6_u64, serde_json::json!({"paths": [too_long]})),
+        (7_u64, serde_json::json!({"paths": too_many})),
+    ];
+    for (id, params) in &refused {
+        raw.send_json(&serde_json::json!({
+            "v": proto::WIRE_VERSION,
+            "id": id,
+            "method": method::DOC_GRANT,
+            "params": params,
+        }))
+        .await
+        .expect("sends");
+        let refusal = raw_response_for(&mut raw, *id).await;
+        assert_eq!(
+            refusal["error"]["code"],
+            code::BAD_PARAMS,
+            "id {id}: {refusal}"
+        );
+        assert!(refusal["result"].is_null());
+    }
+
+    // Every refusal left the connection seated, and a listing within the bounds is
+    // accepted: the response precedes the event, as a result precedes its doc.opened.
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 8,
+        "method": method::DOC_GRANT,
+        "params": {"paths": ["src/main.rs"]},
+    }))
+    .await
+    .expect("sends");
+    assert_eq!(
+        raw_response_for(&mut raw, 8).await["result"],
+        serde_json::json!({})
+    );
+    assert_eq!(
+        next_json_within(&mut raw, "doc.granted").await["event"],
+        event::DOC_GRANTED
+    );
+}
+
 /// §10's compatibility rule is applied to the grammar §10 and `CANONICAL.md` §2.5 write,
 /// not to whatever a number parser happens to accept: a version outside it is refused at
 /// the handshake rather than seated. `selvage/1.2.3` is the spelling the TypeScript
@@ -968,7 +1201,7 @@ async fn a_frame_behind_the_http_head_reaches_the_session() {
         "params": {"display_name": "Coalesced"},
     })
     .to_string();
-    let frame = client_frame(0x1, hello.as_bytes()).expect("a small frame");
+    let frame = client_frame(0x1, hello.as_bytes());
     let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &frame)
         .await
         .expect("the upgrade succeeds");

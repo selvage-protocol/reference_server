@@ -296,6 +296,57 @@ async fn a_reseated_guest_publishes_its_selection_again() -> Result<(), Failure>
     Ok(())
 }
 
+/// A client that reconnects into a room must learn the grant the room has *now* and must
+/// not keep the listing it held before: `doc.granted` reaches a joiner only when the
+/// listing is non-empty, so a room whose grant was emptied while the client was away has
+/// no frame to correct it (`PROTOCOL.md` §6.3). The listing is carried on the connection,
+/// not in `room.joined`, so a seat starts from nothing.
+#[tokio::test]
+async fn a_reseated_guest_drops_a_grant_the_room_no_longer_has()
+-> Result<(), Failure> {
+    let harness = Harness::start(Duration::from_secs(30)).await;
+    let proxy = DropProxy::start(&harness.upstream()).await?;
+    let (host, room) = harness.host("Ada").await?;
+    let guest = harness.join_at(&proxy.ws_base(), &room, "Bob").await?;
+
+    let listed = vec!["README.md".to_string(), "src/main.rs".to_string()];
+    host.grant(listed.clone()).await?;
+    wait_for_described(
+        "the guest to receive the room's grant",
+        || async { format!("{:?}", guest.granted_paths().await) },
+        || async {
+            let held = guest.granted_paths().await.ok()?;
+            (held == listed).then_some(held)
+        },
+    )
+    .await;
+
+    let old_peer_id = guest.session().peer.peer_id.clone();
+    proxy.drop_all();
+    // The room's grant empties while the guest is away. No event will announce it.
+    host.grant(Vec::new()).await?;
+
+    wait_for_described(
+        "the guest to be reseated as a fresh peer",
+        || async { format!("{:?}", guest.session()) },
+        || async {
+            let session = guest.session();
+            (session.peer.peer_id != old_peer_id).then_some(session)
+        },
+    )
+    .await;
+    wait_for_described(
+        "the guest to drop the listing the room no longer has",
+        || async { format!("{:?}", guest.granted_paths().await) },
+        || async {
+            let held = guest.granted_paths().await.ok()?;
+            held.is_empty().then_some(held)
+        },
+    )
+    .await;
+    Ok(())
+}
+
 /// Bob's cursor where this test put it, under the awareness client id `wanted` — or under any
 /// of them, when the caller has no id in mind yet.
 fn bobs_cursor(presence: &Presence, wanted: Option<u64>) -> bool {
