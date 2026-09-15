@@ -338,11 +338,6 @@ impl Registry {
         Ok(())
     }
 
-    #[must_use]
-    pub fn peer(&self, room_id: &str, peer_id: &str) -> Option<&Peer> {
-        self.rooms.get(room_id)?.peers.get(peer_id)
-    }
-
     /// Remembers how to end a seated connection's task.
     pub fn set_task(&mut self, peer_id: &str, poison: oneshot::Sender<()>) {
         self.tasks.insert(peer_id.to_string(), poison);

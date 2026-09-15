@@ -134,7 +134,8 @@ impl Role {
     }
 }
 
-/// A participant as seen by the session layer. Identity is the display name only.
+/// A participant as seen by the session layer. Peers are keyed by `peer_id`; the
+/// display name is a label, and nothing stops two peers sharing one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerInfo {
     /// Which y-protocols awareness client id this peer speaks with. Lets an editor
