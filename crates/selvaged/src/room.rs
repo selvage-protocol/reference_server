@@ -5,7 +5,6 @@
 //! peers are connected and which documents they have declared open.
 
 use std::collections::{BTreeSet, HashMap};
-use std::time::{Duration, Instant};
 
 use selvage_protocol::{Keepalive, PeerInfo, Role};
 use tokio::sync::mpsc::{
@@ -62,9 +61,6 @@ pub struct Room {
     /// Which paths each connected peer currently holds open.
     open: HashMap<String, BTreeSet<String>>,
     host: Option<String>,
-    /// When the host's grace period runs out. Informational: `generation` is what
-    /// actually guards the reaper.
-    pub host_deadline: Option<Instant>,
     /// Bumped whenever the host attaches or detaches, so a stale grace timer cannot
     /// destroy a room that has been reclaimed.
     generation: u64,
@@ -119,14 +115,13 @@ impl Room {
 
     pub fn attach_host(&mut self, peer_id: &str) {
         self.host = Some(peer_id.to_string());
-        self.host_deadline = None;
         self.generation = self.generation.saturating_add(1);
     }
 
-    /// Hands the host role back and arms the grace period. Returns the new generation.
-    pub fn detach_host(&mut self, grace: Duration) -> u64 {
+    /// Hands the host role back. Returns the new generation, which is what stops a grace
+    /// timer armed before this point from destroying a room the host has since reclaimed.
+    pub fn detach_host(&mut self) -> u64 {
         self.host = None;
-        self.host_deadline = Instant::now().checked_add(grace);
         self.generation = self.generation.saturating_add(1);
         self.generation
     }
@@ -224,21 +219,12 @@ pub enum SeatError {
     HostPresent,
 }
 
+#[derive(Default)]
 pub struct Registry {
     rooms: HashMap<String, Room>,
-    /// How long a room outlives its host disconnecting.
-    room_grace: Duration,
 }
 
 impl Registry {
-    #[must_use]
-    pub fn new(room_grace: Duration) -> Self {
-        Self {
-            rooms: HashMap::new(),
-            room_grace,
-        }
-    }
-
     /// Mints a room and seats its host in it.
     pub fn create(&mut self, new: NewRoom, host: Peer) {
         let mut room = Room {
@@ -250,7 +236,6 @@ impl Registry {
             grant: Vec::new(),
             open: HashMap::new(),
             host: None,
-            host_deadline: None,
             generation: 0,
             arrivals: 0,
         };
@@ -298,13 +283,12 @@ impl Registry {
     /// `host.detached`, and whether the room became empty.
     #[must_use]
     pub fn detach(&mut self, room_id: &str, peer_id: &str) -> Option<Detach> {
-        let grace = self.room_grace;
         let room = self.rooms.get_mut(room_id)?;
         let was_host = room.host.as_deref() == Some(peer_id);
         room.peers.remove(peer_id);
         room.forget_claims(peer_id);
         let generation = if was_host {
-            room.detach_host(grace)
+            room.detach_host()
         } else {
             room.generation()
         };

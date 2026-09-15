@@ -68,7 +68,7 @@ impl Server {
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
-        let registry = Arc::new(Mutex::new(Registry::new(config.room_grace)));
+        let registry = Arc::new(Mutex::new(Registry::default()));
         Ok(Self {
             listener,
             addr: bound,
