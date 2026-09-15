@@ -7,8 +7,8 @@ use std::error::Error as StdError;
 use std::time::Duration;
 
 use selvage_harness::{
-    DropProxy, EngineEvent, Error, Harness, Role, WAIT, wait_for,
-    wait_for_described, wait_for_event,
+    DropProxy, EngineEvent, Error, Harness, Presence, Role, SelectionOffsets,
+    WAIT, wait_for, wait_for_described, wait_for_event,
 };
 use selvage_protocol::code;
 
@@ -219,4 +219,87 @@ async fn a_destroyed_room_is_terminal() -> Result<(), Failure> {
     // Sanity: `WAIT` is the only deadline any of this leans on.
     assert!(WAIT >= Duration::from_secs(5));
     Ok(())
+}
+
+/// A re-seat is a new peer, and its awareness client id is new with it: the peers that were
+/// already in the room have never seen this client's state under that id, and the ones that
+/// joined while it was away have never seen it at all. An engine that suppressed the seat's publish
+/// because the state had not changed would leave every peer blind to this client's cursor
+/// until the next renewal — so the seat publishes regardless, and only a caller's path
+/// (`set_selection`) suppresses a state it already published.
+#[tokio::test]
+async fn a_reseated_guest_publishes_its_selection_again() -> Result<(), Failure>
+{
+    let harness = Harness::start(Duration::from_secs(30)).await;
+    let proxy = DropProxy::start(&harness.upstream()).await?;
+    let (host, room) = harness.host("Ada").await?;
+    let guest = harness.join_at(&proxy.ws_base(), &room, "Bob").await?;
+
+    host.open(PATH).await?;
+    guest.open(PATH).await?;
+    host.insert(PATH, 0, "shared\n").await?;
+    wait_for("the guest to receive the seed", || async {
+        (guest.text(PATH).await.ok()? == "shared\n").then_some(())
+    })
+    .await;
+
+    guest
+        .set_selection(PATH, SelectionOffsets::caret(3))
+        .await?;
+    let old_peer_id = guest.session().peer.peer_id.clone();
+    let old_client_id = guest.session().peer.awareness_client_id;
+    let before = wait_for_described(
+        "the host to see Bob's cursor",
+        || async { format!("{:?}", host.presence().await) },
+        || async {
+            host.presence()
+                .await
+                .ok()?
+                .into_iter()
+                .find(|presence| bobs_cursor(presence, old_client_id))
+        },
+    )
+    .await;
+
+    proxy.drop_all();
+
+    let seated = wait_for_described(
+        "the guest to be reseated as a fresh peer",
+        || async { format!("{:?}", guest.session()) },
+        || async {
+            let session = guest.session();
+            (session.peer.peer_id != old_peer_id).then_some(session)
+        },
+    )
+    .await;
+    assert_ne!(
+        seated.peer.awareness_client_id, old_client_id,
+        "a reseat is a fresh awareness client"
+    );
+
+    // The host forgot the old id along with the peer that owned it, so a cursor that is back
+    // is the new connection's — published at the seat, with no renewal the test waits for.
+    let restored = wait_for_described(
+        "Bob's cursor to come back under the new awareness client id",
+        || async { format!("{:?}", host.presence().await) },
+        || async {
+            let wanted = guest.session().peer.awareness_client_id;
+            host.presence()
+                .await
+                .ok()?
+                .into_iter()
+                .find(|presence| bobs_cursor(presence, wanted))
+        },
+    )
+    .await;
+    assert_ne!(restored.client_id, before.client_id);
+    Ok(())
+}
+
+/// Bob's cursor where this test put it, under the awareness client id `wanted` — or under any
+/// of them, when the caller has no id in mind yet.
+fn bobs_cursor(presence: &Presence, wanted: Option<u64>) -> bool {
+    presence.display_name() == Some("Bob")
+        && presence.selection() == Some(SelectionOffsets::caret(3))
+        && wanted.is_none_or(|client_id| presence.client_id == client_id)
 }
