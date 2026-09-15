@@ -4,10 +4,22 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-unmaintained = "workspace"
+# The default scope, not a narrowed one. `unmaintained` was `workspace` — only a crate that is a
+# direct dependency of a workspace member — which is what kept the unmaintained `smallstr` behind
+# `yrs` out of the report instead of in it. Anything the graph knowingly carries is listed under
+# `ignore` with a reason, so silence here is a decision somebody wrote down rather than a scope
+# that happened to hide the advisory.
+unmaintained = "all"
+# Left at cargo-deny's default; it reports a direct dependency of a workspace member.
 unsound = "workspace"
 
-ignore = []
+ignore = [
+  # `yrs` depends on `smallstr`, which is unmaintained and has no fixed release: RUSTSEC-2026-0215
+  # affects every version. There is no upgrade that clears it, so it is carried deliberately
+  # rather than scoped out of the check. Revisit when `yrs` drops the dependency — an entry that
+  # nothing matches warns (`unused-ignored-advisory`).
+  { id = "RUSTSEC-2026-0215", reason = "unmaintained transitive dependency of yrs; every version is affected and no patched release exists" },
+]
 
 [bans]
 multiple-versions = "warn"
