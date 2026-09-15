@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   checks:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7.0.1
@@ -85,7 +85,7 @@ jobs:
   report:
     needs: [checks]
     if: failure() && github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       issues: write
       contents: read
@@ -106,7 +106,7 @@ jobs:
   clear:
     needs: [checks]
     if: success() && github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       issues: write
       contents: read
