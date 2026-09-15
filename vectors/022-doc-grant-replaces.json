@@ -1,0 +1,155 @@
+{
+  "id": "022",
+  "title": "A republished grant replaces the room's listing, and an empty listing is a grant too",
+  "spec": "PROTOCOL.md#63-docgranted",
+  "notes": "A grant is a snapshot and not a delta: the second publication drops `README.md` by not naming it, and nothing on the wire ever removes one path. The server carries the order it is given and does not normalise it, so the second publication's last two paths are ordered the way a code-point sort would reverse — `😀.txt` begins with the surrogate U+D83D and so precedes `ｆ.txt` (U+FF46) as UTF-16 code units, while its code point (U+1F600) is the greater one — and a server that sorted a listing before storing it would put them the other way round. The third publication grants nothing: `paths` may be empty, and the emptying is announced to every peer like any other change. The last connection joins after it, so it receives `room.joined` alone and its next frame is the `doc.opened` the host then produces; a server that sent a `doc.granted` for an empty grant would put one in front of that frame and fail here. Seating is announced to every peer already in the room (§6), so Cyd's arrival is read on both the host and the guest before the host produces its next frame.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},\"token\":\"$token\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":2,\"method\":\"doc.grant\",\"params\":{\"paths\":[\"README.md\",\"src/main.rs\"]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":2,\"result\":{},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"doc.granted\",\"params\":{\"paths\":[\"README.md\",\"src/main.rs\"]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "open",
+      "conn": "guest",
+      "target": "/session?room=$room&token=$token"
+    },
+    {
+      "op": "send",
+      "conn": "guest",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Bob\",\"role\":\"guest\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"room.joined\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"}],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"doc.granted\",\"params\":{\"paths\":[\"README.md\",\"src/main.rs\"]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":3,\"method\":\"doc.grant\",\"params\":{\"paths\":[\"src/main.rs\",\"😀.txt\",\"ｆ.txt\"]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":3,\"result\":{},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"doc.granted\",\"params\":{\"paths\":[\"src/main.rs\",\"😀.txt\",\"ｆ.txt\"]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"doc.granted\",\"params\":{\"paths\":[\"src/main.rs\",\"😀.txt\",\"ｆ.txt\"]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":4,\"method\":\"doc.grant\",\"params\":{\"paths\":[]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":4,\"result\":{},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"doc.granted\",\"params\":{\"paths\":[]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"doc.granted\",\"params\":{\"paths\":[]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "open",
+      "conn": "late",
+      "target": "/session?room=$room&token=$token"
+    },
+    {
+      "op": "send",
+      "conn": "late",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Cyd\",\"role\":\"guest\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "late",
+      "text": "{\"event\":\"room.joined\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\",\"role\":\"guest\"}],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Cyd\",\"peer_id\":\"$late_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"display_name\":\"Cyd\",\"peer_id\":\"$late_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"display_name\":\"Cyd\",\"peer_id\":\"$late_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":5,\"method\":\"doc.open\",\"params\":{\"path\":\"late.txt\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":5,\"result\":{\"documents\":[\"late.txt\"]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"doc.opened\",\"params\":{\"documents\":[\"late.txt\"],\"path\":\"late.txt\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"doc.opened\",\"params\":{\"documents\":[\"late.txt\"],\"path\":\"late.txt\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "late",
+      "text": "{\"event\":\"doc.opened\",\"params\":{\"documents\":[\"late.txt\"],\"path\":\"late.txt\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    }
+  ],
+  "selvage": "selvage/1",
+  "canonical": "SJ-C/1"
+}
