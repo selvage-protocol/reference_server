@@ -179,6 +179,27 @@ fn document_path(raw: Value) -> Result<String, Refusal> {
     Ok(params.path)
 }
 
+/// The `display_name` of a `session.rename` request, which carries the handshake's bound
+/// (`PROTOCOL.md` §5). Params that do not parse and a name that is blank or over-long are
+/// all `bad_params`; unlike the handshake the refusal is a response, not a close.
+fn rename_name(raw: Value) -> Result<String, Refusal> {
+    let params = serde_json::from_value::<proto::RenameParams>(raw)
+        .map_err(|e| (code::BAD_PARAMS, e.to_string()))?;
+    if params.display_name.trim().is_empty() {
+        return Err((code::BAD_PARAMS, "display_name is required".to_string()));
+    }
+    if proto::display_name_over_limit(&params.display_name) {
+        return Err((
+            code::BAD_PARAMS,
+            format!(
+                "display_name is longer than {} UTF-16 code units",
+                proto::DISPLAY_NAME_MAX_UTF16
+            ),
+        ));
+    }
+    Ok(params.display_name)
+}
+
 /// Sends a frame to a room's peers, minus one, if the room still exists and the frame
 /// could be serialized at all.
 fn deliver(room: Option<&Room>, except: Option<&str>, frame: Option<Outbound>) {
@@ -415,6 +436,7 @@ impl Session {
         match method.as_str() {
             method::DOC_OPEN => self.open_document(request, shared).await,
             method::DOC_CLOSE => self.close_document(request, shared).await,
+            method::SESSION_RENAME => self.rename(request, shared).await,
             method::SESSION_HELLO => self.reply(&proto::ServerMessage::error(
                 id,
                 code::ALREADY_SEATED,
@@ -482,6 +504,54 @@ impl Session {
         .await;
     }
 
+    /// `session.rename` (`PROTOCOL.md` §5): changes this connection's own display name and
+    /// tells the whole room, the one that asked included. A malformed, blank or over-long
+    /// name is the error response `bad_params`, and the connection stays open — a seated
+    /// request fault is not a close (§9.2).
+    async fn rename(&self, request: Request, shared: &Shared) {
+        let display_name = match rename_name(request.params) {
+            Ok(name) => name,
+            Err((code, message)) => {
+                return self.reply(&proto::ServerMessage::error(
+                    request.id, code, message,
+                ));
+            }
+        };
+        let renamed = self.set_display_name(shared, &display_name).await;
+        // The response is queued before the event, as a `doc.open` result precedes its
+        // `doc.opened`: both leave on this connection's channel, so the bytes keep order.
+        self.reply(&proto::ServerMessage::response(
+            request.id,
+            serde_json::json!({}),
+        ));
+        let Some(peer) = renamed else {
+            // The room or the peer is already gone. The reply still stands; a rename on a
+            // peer that has just left is not a fault, and there is nobody to announce to.
+            return;
+        };
+        let announced = serde_json::json!({
+            "display_name": peer.display_name,
+            "peer_id": peer.peer_id,
+        });
+        self.announce_documents(
+            shared,
+            event_frame(event::PEER_RENAMED, announced),
+        )
+        .await;
+    }
+
+    /// Records this peer's new name, returning the record as it now reads. `None` when the
+    /// room or the peer is gone.
+    async fn set_display_name(
+        &self,
+        shared: &Shared,
+        display_name: &str,
+    ) -> Option<proto::PeerInfo> {
+        let mut guard = shared.registry.lock().await;
+        let room = guard.room_mut(&self.room_id)?;
+        room.rename_peer(&self.peer_id, display_name)
+    }
+
     /// Records this peer's hold on a path, returning the room's set afterwards.
     async fn hold(&self, shared: &Shared, path: &str) -> Vec<String> {
         let mut guard = shared.registry.lock().await;
@@ -531,8 +601,9 @@ impl Session {
         self.reply(&msg);
     }
 
-    /// Sends an open-document-set change to every peer, the one that made it included:
-    /// the set is the room's, so everyone has to hold the same view of it.
+    /// Sends a room-wide event to every peer, the one that made the change included: the
+    /// open-document set is the room's, so everyone has to hold the same view of it, and a
+    /// rename is announced to the mover as well as to the rest.
     async fn announce_documents(
         &self,
         shared: &Shared,
