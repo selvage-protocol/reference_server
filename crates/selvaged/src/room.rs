@@ -147,13 +147,29 @@ impl Room {
         self.generation
     }
 
-    pub fn open_document(&mut self, peer_id: &str, path: &str) -> bool {
-        self.claims_mut(peer_id).insert(path.to_string());
+    /// Records a peer's hold on a path, returning whether the path is newly in the
+    /// room's set — or `None` when the set is at its cap and the path is not in it. A
+    /// path the room already holds is always fine: re-opening one grows nothing.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an open names its peer, path and the cap it is checked against"
+    )]
+    pub fn open_document(
+        &mut self,
+        peer_id: &str,
+        path: &str,
+        max_documents: usize,
+    ) -> Option<bool> {
         if self.documents.iter().any(|p| p == path) {
-            return false;
+            self.claims_mut(peer_id).insert(path.to_string());
+            return Some(false);
         }
+        if self.documents.len() >= max_documents {
+            return None;
+        }
+        self.claims_mut(peer_id).insert(path.to_string());
         self.documents.push(path.to_string());
-        true
+        Some(true)
     }
 
     /// Releases one peer's hold on a path. The path leaves the room only when no peer
@@ -233,6 +249,7 @@ pub enum SeatError {
     Unknown,
     TokenMismatch,
     HostPresent,
+    RoomFull,
 }
 
 #[derive(Default)]
@@ -247,7 +264,21 @@ pub struct Registry {
 
 impl Registry {
     /// Mints a room and seats its host in it.
-    pub fn create(&mut self, new: NewRoom, host: Peer) {
+    /// Mints a room and seats its host in it, reporting whether there was room for
+    /// one more. `false` means the server is at its cap and nothing was minted.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a mint names its room, host and the cap it is checked against"
+    )]
+    pub fn create(
+        &mut self,
+        new: NewRoom,
+        host: Peer,
+        max_rooms: usize,
+    ) -> bool {
+        if self.rooms.len() >= max_rooms {
+            return false;
+        }
         let mut room = Room {
             id: new.id.clone(),
             token: new.token,
@@ -263,6 +294,7 @@ impl Registry {
         room.attach_host(&host.info.peer_id);
         room.seat(host);
         self.rooms.insert(new.id, room);
+        true
     }
 
     /// Seats a connection in an existing room. The claimed role is honoured only while
@@ -271,12 +303,19 @@ impl Registry {
     /// # Errors
     ///
     /// Returns [`SeatError::Unknown`] for a room that does not exist,
-    /// [`SeatError::TokenMismatch`] for a wrong token, and [`SeatError::HostPresent`]
-    /// when the host role is taken.
+    /// [`SeatError::TokenMismatch`] for a wrong token, [`SeatError::HostPresent`]
+    /// when the host role is taken, and [`SeatError::RoomFull`] when the room seats no
+    /// more peers. A host reclaiming a host-less room always seats: the room's owner
+    /// must be able to come back to a full room.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an admission names its claim, peer and the cap it is checked against"
+    )]
     pub fn admit(
         &mut self,
         claim: Claim<'_>,
         peer: Peer,
+        max_peers: usize,
     ) -> Result<(), SeatError> {
         let room = self
             .rooms
@@ -287,6 +326,10 @@ impl Registry {
         }
         if claim.role == Role::Host && room.host_present() {
             return Err(SeatError::HostPresent);
+        }
+        let reclaiming = claim.role == Role::Host && !room.host_present();
+        if room.peers.len() >= max_peers && !reclaiming {
+            return Err(SeatError::RoomFull);
         }
         if claim.role == Role::Host {
             room.attach_host(&peer.info.peer_id);
@@ -394,6 +437,7 @@ mod tests {
                 keepalive: Keepalive::default(),
             },
             peer,
+            usize::MAX,
         );
         let room = registry.room("r-1").expect("the room is minted");
         let out = Outbound::Text("{}".to_string());

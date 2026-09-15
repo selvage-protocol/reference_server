@@ -37,6 +37,20 @@ pub const MAX_GRANT_PATHS: usize = 100_000;
 /// for a whole path, and a workspace-relative one is shorter than that (`PROTOCOL.md` §5).
 pub const MAX_GRANT_PATH_BYTES: usize = 4096;
 
+/// The most path bytes a grant carries in total. The count and the per-path length cap
+/// the shape; this caps the bytes: `100_000` paths of 4096 bytes would otherwise be
+/// ~400 MiB of room state, re-serialized on every publish and delivered whole to every
+/// late joiner. What a late joiner can be sent is bounded by what could be published.
+pub const MAX_GRANT_BYTES: usize = 1024 * 1024;
+
+/// Capacity refusals are this server's policy, not the protocol's (`PROTOCOL.md` §2.1,
+/// §11): an implementation that needs a code of its own names it in the `x.` namespace
+/// rather than inventing a bare name a later version may want. Neither code is in the
+/// clients' terminal sets, so a refused client retries with its bounded backoff and
+/// then stops — the tolerable shape for a full server.
+const SERVER_FULL: &str = "x.server_full";
+const ROOM_FULL: &str = "x.room_full";
+
 /// The longest path a `doc.open` or `doc.close` carries, in bytes: the grant's bound,
 /// applied to the other path ingestion. A megabyte path was accepted, stored in the
 /// room's set and broadcast whole before this bound; §5 allows the same length in both.
@@ -184,6 +198,9 @@ fn refusal_for(error: SeatError, room_id: &str) -> Refusal {
             code::HOST_PRESENT,
             "the room already has a host".to_string(),
         ),
+        SeatError::RoomFull => {
+            (ROOM_FULL, "the room seats no more peers".to_string())
+        }
     }
 }
 
@@ -259,6 +276,13 @@ fn grant_paths(raw: Value) -> Result<Vec<String>, Refusal> {
                 format!("a grant path is at most {MAX_GRANT_PATH_BYTES} bytes"),
             ));
         }
+    }
+    let total: usize = params.paths.iter().map(String::len).sum();
+    if total > MAX_GRANT_BYTES {
+        return Err((
+            code::BAD_PARAMS,
+            format!("a grant is at most {MAX_GRANT_BYTES} path bytes in total"),
+        ));
     }
     Ok(params.paths)
 }
@@ -502,37 +526,46 @@ impl Seating<'_> {
     /// Seats the newcomer: its reply, and the reclaim frame for the room if any.
     fn place(self, registry: &mut Registry) -> Result<Placement, Refusal> {
         match self.room_id {
-            None => Ok((self.mint(registry), None)),
+            None => self.mint(registry),
             Some(room_id) => self.admit(registry, room_id),
         }
     }
 
-    fn mint(
-        self,
-        registry: &mut Registry,
-    ) -> (&'static str, proto::SessionParams) {
+    fn mint(self, registry: &mut Registry) -> Result<Placement, Refusal> {
         let room_id = mint_room_id();
         let token = mint_token();
-        registry.create(
+        if !registry.create(
             NewRoom {
                 id: room_id.clone(),
                 token: token.clone(),
                 keepalive: self.config.keepalive,
             },
             self.peer,
-        );
-        (
-            event::ROOM_CREATED,
-            proto::SessionParams {
-                room_id,
-                token: Some(token),
-                self_peer: self.info.clone(),
-                peers: Vec::new(),
-                documents: Vec::new(),
-                capabilities: capabilities(),
-                keepalive: self.config.keepalive,
-            },
-        )
+            self.config.max_rooms,
+        ) {
+            return Err((
+                SERVER_FULL,
+                format!(
+                    "the server holds at most {} rooms",
+                    self.config.max_rooms
+                ),
+            ));
+        }
+        Ok((
+            (
+                event::ROOM_CREATED,
+                proto::SessionParams {
+                    room_id,
+                    token: Some(token),
+                    self_peer: self.info.clone(),
+                    peers: Vec::new(),
+                    documents: Vec::new(),
+                    capabilities: capabilities(),
+                    keepalive: self.config.keepalive,
+                },
+            ),
+            None,
+        ))
     }
 
     fn admit(
@@ -550,8 +583,20 @@ impl Seating<'_> {
                     role: self.role,
                 },
                 self.peer,
+                self.config.max_peers_per_room,
             )
-            .map_err(|e| refusal_for(e, room_id))?;
+            .map_err(|error| match error {
+                SeatError::RoomFull => (
+                    ROOM_FULL,
+                    format!(
+                        "the room seats at most {} peers",
+                        self.config.max_peers_per_room
+                    ),
+                ),
+                SeatError::Unknown
+                | SeatError::TokenMismatch
+                | SeatError::HostPresent => refusal_for(error, room_id),
+            })?;
         // `host.attached` is a host reclaiming the room (§6, §9.1): a guest joining
         // while the room is between hosts is a `peer.joined` and nothing more.
         let attached = if !host_was_present && self.role == proto::Role::Host {
@@ -674,7 +719,16 @@ impl Session {
                 ));
             }
         };
-        let documents = self.hold(shared, &path).await;
+        let Some(documents) = self.hold(shared, &path).await else {
+            return self.reply(&proto::ServerMessage::error(
+                request.id,
+                ROOM_FULL,
+                format!(
+                    "the room holds at most {} open documents",
+                    shared.config.max_documents_per_room
+                ),
+            ));
+        };
         self.reply(&proto::ServerMessage::response(
             request.id,
             doc_set(&documents),
@@ -816,14 +870,19 @@ impl Session {
         true
     }
 
-    /// Records this peer's hold on a path, returning the room's set afterwards.
-    async fn hold(&self, shared: &Shared, path: &str) -> Vec<String> {
+    /// Records this peer's hold on a path, returning the room's set afterwards — or
+    /// `None` when the set is at its cap and the path is not in it.
+    async fn hold(&self, shared: &Shared, path: &str) -> Option<Vec<String>> {
         let mut guard = shared.registry.lock().await;
         let Some(room) = guard.room_mut(&self.room_id) else {
-            return Vec::new();
+            return Some(Vec::new());
         };
-        room.open_document(&self.peer_id, path);
-        room.documents().to_vec()
+        room.open_document(
+            &self.peer_id,
+            path,
+            shared.config.max_documents_per_room,
+        )
+        .map(|_| room.documents().to_vec())
     }
 
     /// Releases this peer's hold on a path, returning the room's set afterwards.

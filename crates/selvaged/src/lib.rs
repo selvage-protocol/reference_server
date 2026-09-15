@@ -33,6 +33,14 @@ pub struct ServerConfig {
     pub head_timeout: Duration,
     /// Keepalive values advertised to clients.
     pub keepalive: Keepalive,
+    /// How many rooms the server holds at once. Past it, minting is refused.
+    pub max_rooms: usize,
+    /// How many peers one room seats at once. Past it, joining is refused — unless the
+    /// newcomer reclaims a host-less room as its host, which always seats.
+    pub max_peers_per_room: usize,
+    /// How many paths one room's open-document set holds at once. Past it, opening a
+    /// new path is refused.
+    pub max_documents_per_room: usize,
 }
 
 impl Default for ServerConfig {
@@ -43,6 +51,9 @@ impl Default for ServerConfig {
             hello_timeout: Duration::from_secs(10),
             head_timeout: Duration::from_secs(5),
             keepalive: Keepalive::default(),
+            max_rooms: 1024,
+            max_peers_per_room: 128,
+            max_documents_per_room: 1024,
         }
     }
 }

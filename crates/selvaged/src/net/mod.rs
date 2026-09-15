@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, MissedTickBehavior, interval, timeout};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 
 use selvage_protocol as proto;
 use selvage_protocol::event;
@@ -36,6 +36,12 @@ use session::{Applicant, Session, handshake};
 
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const NOT_FOUND: &str = r#"{"error":"not found"}"#;
+
+/// The most one inbound WebSocket frame or message may carry, well under the
+/// library's 64 MiB default. A frame over the bound is a transport failure, not a
+/// session fault: the connection ends the way a dropped socket ends, and the room
+/// learns of it as `peer.left` (`PROTOCOL.md` §2.1).
+const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// RFC 6455 allows 125 bytes in a control-frame payload, and a close frame spends two of
 /// them on its status code.
@@ -108,7 +114,15 @@ impl Shared {
         }
         // The head we consumed while routing has to go back in front of the socket.
         let prefixed = PrefixedStream::new(take(&mut head.request), tcp);
-        let Ok(mut ws) = tokio_tungstenite::accept_async(prefixed).await else {
+        let framing = WebSocketConfig::default()
+            .max_message_size(Some(MAX_FRAME_BYTES))
+            .max_frame_size(Some(MAX_FRAME_BYTES));
+        let Ok(mut ws) = tokio_tungstenite::accept_async_with_config(
+            prefixed,
+            Some(framing),
+        )
+        .await
+        else {
             return Ok(());
         };
         // The upgrade refuses a request with anything behind it, so bytes that arrived
