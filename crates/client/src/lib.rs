@@ -126,6 +126,19 @@ impl SyncEngine {
         .await?
     }
 
+    /// Publishes the room's grant: the host's whole listing of its working tree, replacing
+    /// whatever the room held. A listing is a snapshot and not a delta — a shorter one is a
+    /// smaller grant, not a partial one — and its order is carried unchanged. The listing
+    /// reaches every peer, this client included, as the `doc.granted` event; only the room's
+    /// host may publish one, and a client that is not the host is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when the engine has stopped or the server refused the listing.
+    pub async fn grant(&self, paths: Vec<String>) -> Result<(), Error> {
+        self.call(|reply| Command::Grant { paths, reply }).await?
+    }
+
     /// The current text of a document. Empty for a document nobody has written to.
     ///
     /// # Errors
@@ -260,6 +273,16 @@ impl SyncEngine {
     /// Returns [`Error`] when the engine has stopped.
     pub async fn documents(&self) -> Result<Vec<String>, Error> {
         self.call(|reply| Command::Documents { reply }).await
+    }
+
+    /// The room's grant, as its host published it. Empty when the room grants nothing and
+    /// until the server has sent the listing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when the engine has stopped.
+    pub async fn granted_paths(&self) -> Result<Vec<String>, Error> {
+        self.call(|reply| Command::GrantedPaths { reply }).await
     }
 
     /// The documents this client has opened.

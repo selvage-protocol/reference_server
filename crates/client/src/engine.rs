@@ -69,6 +69,10 @@ pub enum Command {
         display_name: String,
         reply: oneshot::Sender<Result<(), Error>>,
     },
+    Grant {
+        paths: Vec<String>,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
     Text {
         path: String,
         reply: oneshot::Sender<String>,
@@ -93,6 +97,9 @@ pub enum Command {
         reply: oneshot::Sender<Vec<(u64, u32)>>,
     },
     Documents {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    GrantedPaths {
         reply: oneshot::Sender<Vec<String>>,
     },
     OpenDocuments {
@@ -329,6 +336,7 @@ fn spawn(
         events: events_tx.clone(),
         keepalive,
         documents: Vec::new(),
+        granted_paths: Vec::new(),
         open_documents: Vec::new(),
         peers: HashMap::new(),
         request_id: 1,
@@ -429,6 +437,10 @@ enum Pending {
         display_name: String,
         reply: oneshot::Sender<Result<(), Error>>,
     },
+    Grant {
+        paths: Vec<String>,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
 }
 
 impl Pending {
@@ -438,6 +450,7 @@ impl Pending {
             Self::Open { .. } => method::DOC_OPEN,
             Self::Close { .. } => method::DOC_CLOSE,
             Self::Rename { .. } => method::SESSION_RENAME,
+            Self::Grant { .. } => method::DOC_GRANT,
         }
     }
 
@@ -451,6 +464,7 @@ impl Pending {
             Self::Rename { display_name, .. } => {
                 serde_json::json!({ "display_name": display_name })
             }
+            Self::Grant { paths, .. } => serde_json::json!({ "paths": paths }),
         }
     }
 
@@ -460,7 +474,8 @@ impl Pending {
         let reply = match self {
             Self::Open { reply, .. }
             | Self::Close { reply, .. }
-            | Self::Rename { reply, .. } => reply,
+            | Self::Rename { reply, .. }
+            | Self::Grant { reply, .. } => reply,
         };
         let _ = reply.send(outcome);
     }
@@ -501,6 +516,10 @@ struct EngineTask {
     keepalive: KeepaliveConfig,
     /// The room's open-document set, as owned by the server.
     documents: Vec<String>,
+    /// The room's grant, as published by its host. It is not a member of `room.joined`: the
+    /// server sends `doc.granted` right after the join reply, and only when the listing is
+    /// non-empty.
+    granted_paths: Vec<String>,
     /// The documents this client has open, in the order it opened them.
     open_documents: Vec<String>,
     peers: HashMap<String, PeerInfo>,
@@ -592,6 +611,9 @@ impl EngineTask {
         let _ = self.events.send(EngineEvent::DocumentsChanged {
             documents: self.documents.clone(),
         });
+        let _ = self.events.send(EngineEvent::GrantChanged {
+            paths: self.granted_paths.clone(),
+        });
         let _ = self.events.send(EngineEvent::PeersChanged {
             peers: self.peer_list(),
         });
@@ -605,6 +627,10 @@ impl EngineTask {
             self.token = self.session.token.clone();
         }
         self.documents = self.session.documents.clone();
+        // The grant is not a member of `room.joined`, and the server sends `doc.granted` only
+        // for a non-empty listing, so a seat starts from nothing and learns what the room
+        // holds from the event. A stale listing must not outlive its connection.
+        self.granted_paths.clear();
         self.peers = self
             .session
             .peers
@@ -757,6 +783,7 @@ impl EngineTask {
             } => {
                 self.rename(display_name, reply);
             }
+            Command::Grant { paths, reply } => self.grant(paths, reply),
             Command::Text { path, reply } => {
                 let _ = reply.send(self.read_text(&path));
             }
@@ -783,6 +810,9 @@ impl EngineTask {
             }
             Command::Documents { reply } => {
                 let _ = reply.send(self.documents.clone());
+            }
+            Command::GrantedPaths { reply } => {
+                let _ = reply.send(self.granted_paths.clone());
             }
             Command::OpenDocuments { reply } => {
                 let _ = reply.send(self.open_documents.clone());
@@ -823,6 +853,16 @@ impl EngineTask {
             display_name,
             reply,
         });
+    }
+
+    /// Asks the server to publish the room's grant. Local state moves when the `doc.granted`
+    /// event arrives, which the publisher receives like every other peer.
+    fn grant(
+        &mut self,
+        paths: Vec<String>,
+        reply: oneshot::Sender<Result<(), Error>>,
+    ) {
+        self.request(Pending::Grant { paths, reply });
     }
 
     /// Applies a local edit and sends exactly the delta it produced. Sending the delta
@@ -1101,7 +1141,7 @@ impl EngineTask {
                 self.documents = documents_from(result)?;
                 self.release(path);
             }
-            Pending::Rename { .. } => return Ok(()),
+            Pending::Rename { .. } | Pending::Grant { .. } => return Ok(()),
         }
         let _ = self.events.send(EngineEvent::DocumentsChanged {
             documents: self.documents.clone(),
@@ -1202,6 +1242,7 @@ impl EngineTask {
             Some(event::DOC_OPENED | event::DOC_CLOSED) => {
                 self.documents_changed(msg.params.as_ref());
             }
+            Some(event::DOC_GRANTED) => self.grant_changed(msg.params.as_ref()),
             Some(event::HOST_DETACHED) => {
                 self.host_detached(msg.params.as_ref());
             }
@@ -1309,6 +1350,21 @@ impl EngineTask {
         }
         let _ = self.events.send(EngineEvent::DocumentsChanged {
             documents: self.documents.clone(),
+        });
+    }
+
+    /// Takes the room's grant from a `doc.granted`. The event carries the listing, so a
+    /// receiver replaces its view with `paths` and never merges the two: a shorter listing is
+    /// a smaller grant, not a partial one.
+    fn grant_changed(&mut self, params: Option<&serde_json::Value>) {
+        let parsed = params.and_then(|p| {
+            serde_json::from_value::<proto::GrantedParams>(p.clone()).ok()
+        });
+        if let Some(grant) = parsed {
+            self.granted_paths = grant.paths;
+        }
+        let _ = self.events.send(EngineEvent::GrantChanged {
+            paths: self.granted_paths.clone(),
         });
     }
 

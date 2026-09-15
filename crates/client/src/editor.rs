@@ -23,6 +23,8 @@ pub enum EngineEvent {
     DocumentChanged { path: String },
     /// The open-document set changed.
     DocumentsChanged { documents: Vec<String> },
+    /// The room's grant changed: the whole listing, replacing whatever the adapter held.
+    GrantChanged { paths: Vec<String> },
     /// Membership changed.
     PeersChanged { peers: Vec<PeerInfo> },
     /// Awareness changed: remote cursors moved, joined or expired.
@@ -44,6 +46,7 @@ pub enum EngineEvent {
 pub trait EditorAdapter: Send + Sync + 'static {
     fn document_changed(&self, _path: &str, _text: &str) {}
     fn documents_changed(&self, _documents: &[String]) {}
+    fn grant_changed(&self, _paths: &[String]) {}
     fn peers_changed(&self, _peers: &[PeerInfo]) {}
     fn presence_changed(&self, _presence: &[Presence]) {}
     fn host_detached(&self, _grace_ms: u64) {}
@@ -111,6 +114,9 @@ async fn deliver(
         }
         EngineEvent::DocumentsChanged { documents } => {
             adapter.documents_changed(&documents);
+        }
+        EngineEvent::GrantChanged { paths } => {
+            adapter.grant_changed(&paths);
         }
         EngineEvent::PeersChanged { peers } => adapter.peers_changed(&peers),
         EngineEvent::PresenceChanged { presence } => {
