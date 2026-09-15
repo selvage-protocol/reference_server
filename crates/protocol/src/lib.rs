@@ -87,6 +87,9 @@ pub mod code {
     pub const ROOM_GONE: &str = "room_gone";
     pub const TOKEN_INVALID: &str = "token_invalid";
     pub const HOST_PRESENT: &str = "host_present";
+    /// Reserved and never produced by this slice (`PROTOCOL.md` §11,
+    /// `schema/errors.json`): named here so receivers and senders spell it the same
+    /// way, not because any frame carries it. Closing a path nobody holds succeeds.
     pub const DOC_NOT_OPEN: &str = "doc_not_open";
     pub const ALREADY_SEATED: &str = "already_seated";
 }

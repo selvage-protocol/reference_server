@@ -2160,3 +2160,38 @@ async fn connections_past_the_cap_are_turned_away() {
     // The seated pair is undisturbed by the refusal.
     ada.open(PATH).await.expect("the room keeps serving");
 }
+
+/// Closing a path nobody holds is a no-op success: the set is unchanged, and no
+/// `doc_not_open` arrives, because the protocol reserves that code without producing
+/// it (`PROTOCOL.md` §11). A client written from the vocabulary list must not wait for
+/// an event that cannot arrive, and the server must not start emitting one.
+#[tokio::test]
+async fn closing_a_path_nobody_holds_is_a_no_op_success() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({"display_name": "Ada", "role": "host"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut raw, "room.created").await["event"],
+        event::ROOM_CREATED
+    );
+
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 2,
+        "method": method::DOC_CLOSE,
+        "params": {"path": "never/opened.rs"},
+    }))
+    .await
+    .expect("sends");
+    let answered = raw_response_for(&mut raw, 2).await;
+    assert!(answered["error"].is_null(), "no error: {answered}");
+    assert_eq!(
+        answered["result"]["documents"],
+        serde_json::json!([]),
+        "the set is unchanged"
+    );
+}
