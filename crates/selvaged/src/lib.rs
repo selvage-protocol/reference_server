@@ -33,6 +33,11 @@ pub struct ServerConfig {
     pub head_timeout: Duration,
     /// Keepalive values advertised to clients.
     pub keepalive: Keepalive,
+    /// How many connections the server holds at once, seated or not. Past it, a new
+    /// TCP connection is closed without an answer. Silence after the handshake is not
+    /// policed here: `PROTOCOL.md` §2.1 forbids timing a session out for inactivity,
+    /// so a deployment that needs an idle deadline puts it in front (§12).
+    pub max_connections: usize,
     /// How many rooms the server holds at once. Past it, minting is refused.
     pub max_rooms: usize,
     /// How many peers one room seats at once. Past it, joining is refused — unless the
@@ -51,6 +56,7 @@ impl Default for ServerConfig {
             hello_timeout: Duration::from_secs(10),
             head_timeout: Duration::from_secs(5),
             keepalive: Keepalive::default(),
+            max_connections: 1024,
             max_rooms: 1024,
             max_peers_per_room: 128,
             max_documents_per_room: 1024,

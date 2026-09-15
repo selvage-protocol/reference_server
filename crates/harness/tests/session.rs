@@ -2132,3 +2132,31 @@ async fn open_cost_grows_with_the_set_and_stops_at_the_cap() {
     };
     assert_eq!(code, "x.room_full");
 }
+
+/// Past the connection cap a new TCP connection is closed without an answer. The count
+/// covers handshakes as well as seats; what it does not cover is silence after the
+/// handshake, which the protocol forbids policing (`PROTOCOL.md` §2.1).
+#[tokio::test]
+async fn connections_past_the_cap_are_turned_away() {
+    let harness = Harness::start_with(ServerConfig {
+        max_connections: 2,
+        ..ServerConfig::default()
+    })
+    .await;
+    let (ada, room) = harness.host("Ada").await.expect("connects");
+    let _bob = harness.join(&room, "Bob").await.expect("joins");
+
+    let refused = timeout(
+        WAIT,
+        connect(&proto::session_url(&harness.ws_base(), None, None)),
+    )
+    .await
+    .expect("the refused attempt resolves");
+    assert!(
+        refused.is_err(),
+        "past the cap the server closes without answering"
+    );
+
+    // The seated pair is undisturbed by the refusal.
+    ada.open(PATH).await.expect("the room keeps serving");
+}

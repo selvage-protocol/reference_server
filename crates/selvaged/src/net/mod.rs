@@ -8,6 +8,7 @@ use std::io;
 use std::mem::take;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -58,26 +59,42 @@ pub type SessionStream = SplitStream<SessionSocket>;
 pub struct Shared {
     pub config: ServerConfig,
     pub registry: Arc<Mutex<Registry>>,
+    /// How many connections the server holds right now, seated or not. Past the
+    /// configured cap a new TCP connection is closed without an answer.
+    pub connections: Arc<AtomicUsize>,
 }
 
 impl Shared {
     #[must_use]
-    pub const fn new(
-        config: ServerConfig,
-        registry: Arc<Mutex<Registry>>,
-    ) -> Self {
-        Self { config, registry }
+    pub fn new(config: ServerConfig, registry: Arc<Mutex<Registry>>) -> Self {
+        Self {
+            config,
+            registry,
+            connections: Arc::new(AtomicUsize::new(0)),
+        }
     }
 }
 
-/// Serves connections until the listener itself fails.
+/// Serves connections until the listener itself fails. Past the configured cap a new
+/// connection is closed without an answer: the count covers handshakes as well as
+/// seats, so half-open sockets cannot pile up past it.
 pub async fn serve(listener: TcpListener, shared: Shared) {
     loop {
         let Ok(tcp) = accept_nodelay(&listener).await else {
             continue;
         };
+        if shared.connections.fetch_add(1, Ordering::SeqCst)
+            >= shared.config.max_connections
+        {
+            shared.connections.fetch_sub(1, Ordering::SeqCst);
+            continue;
+        }
         let connection = shared.clone();
-        tokio::spawn(connection.accept(tcp));
+        tokio::spawn(async move {
+            let live = Arc::clone(&connection.connections);
+            let _ = connection.accept(tcp).await;
+            live.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 }
 
