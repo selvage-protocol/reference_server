@@ -1457,6 +1457,77 @@ async fn doc_open_and_doc_close_validate_the_path_the_same_way() {
     );
 }
 
+/// A `doc.open` path is bounded like a grant path: 4096 bytes, the grant's own bound
+/// (`PROTOCOL.md` §5). A megabyte path was accepted, stored in the room's set and
+/// broadcast whole to every peer; both methods now refuse it `bad_params` with the
+/// connection open. The numbers are written out: a test built from the constant would
+/// only show that it agrees with itself.
+#[tokio::test]
+async fn doc_open_and_doc_close_bound_the_path_like_a_grant() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({"display_name": "Ada", "role": "host"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut raw, "room.created").await["event"],
+        event::ROOM_CREATED
+    );
+
+    let huge = "a".repeat(1024 * 1024);
+    let over = "a".repeat(4097);
+    for (id, name, path) in [
+        (2_u64, method::DOC_OPEN, huge.as_str()),
+        (3, method::DOC_CLOSE, huge.as_str()),
+        (4, method::DOC_OPEN, over.as_str()),
+        (5, method::DOC_CLOSE, over.as_str()),
+    ] {
+        raw.send_json(&serde_json::json!({
+            "v": proto::WIRE_VERSION,
+            "id": id,
+            "method": name,
+            "params": {"path": path},
+        }))
+        .await
+        .expect("sends");
+        let refused = raw_response_for(&mut raw, id).await;
+        assert_eq!(
+            refused["error"]["code"],
+            code::BAD_PARAMS,
+            "{name} with id {id} accepted an over-long path"
+        );
+    }
+
+    // The boundary still seats: 4096 bytes open and close like any other path.
+    let at = "a".repeat(4096);
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 6,
+        "method": method::DOC_OPEN,
+        "params": {"path": at},
+    }))
+    .await
+    .expect("sends");
+    assert_eq!(
+        raw_response_for(&mut raw, 6).await["result"]["documents"],
+        serde_json::json!([at])
+    );
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 7,
+        "method": method::DOC_CLOSE,
+        "params": {"path": at},
+    }))
+    .await
+    .expect("sends");
+    assert_eq!(
+        raw_response_for(&mut raw, 7).await["result"]["documents"],
+        serde_json::json!([])
+    );
+}
+
 /// A close reason is control-frame payload: RFC 6455 allows 125 bytes, two of which the
 /// status code takes. A reason built from client input — here a two-thousand-byte wire
 /// version — has to be cut down, or a conforming client rejects the frame instead of

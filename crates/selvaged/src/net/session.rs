@@ -37,6 +37,11 @@ pub const MAX_GRANT_PATHS: usize = 100_000;
 /// for a whole path, and a workspace-relative one is shorter than that (`PROTOCOL.md` §5).
 pub const MAX_GRANT_PATH_BYTES: usize = 4096;
 
+/// The longest path a `doc.open` or `doc.close` carries, in bytes: the grant's bound,
+/// applied to the other path ingestion. A megabyte path was accepted, stored in the
+/// room's set and broadcast whole before this bound; §5 allows the same length in both.
+pub const MAX_DOC_PATH_BYTES: usize = 4096;
+
 /// One request off the wire: the id to answer and the params to interpret.
 struct Request {
     id: u64,
@@ -188,6 +193,12 @@ fn document_path(raw: Value) -> Result<String, Refusal> {
         .map_err(|e| (code::BAD_PARAMS, e.to_string()))?;
     if params.path.trim().is_empty() {
         return Err((code::BAD_PARAMS, "path is required".to_string()));
+    }
+    if params.path.len() > MAX_DOC_PATH_BYTES {
+        return Err((
+            code::BAD_PARAMS,
+            format!("a document path is at most {MAX_DOC_PATH_BYTES} bytes"),
+        ));
     }
     Ok(params.path)
 }
