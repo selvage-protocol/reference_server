@@ -1,17 +1,15 @@
+# Only options stable `rustfmt` implements, because the pinned toolchain is stable and that is
+# the one CI runs. A nightly-only option is not a preference here: stable ignores it with a
+# warning, a nightly `rustfmt` applies it, and the same file then says two different things to
+# two contributors — whoever ran the nightly one would reformat the tree into an unrelated
+# diff. The nightly set was listed here once and did nothing: `imports_granularity`,
+# `group_imports`, `wrap_comments`, `format_strings`, `format_code_in_doc_comments`,
+# `normalize_comments`, `normalize_doc_attributes`, `format_macro_matchers`,
+# `condense_wildcard_suffixes`, `reorder_impl_items` and `error_on_unformatted`. Adding one
+# back is a decision to move the whole tree to nightly, not a formatting tweak.
 edition = "2024"
 style_edition = "2024"
-imports_granularity = "Module"
-group_imports = "StdExternalCrate"
-condense_wildcard_suffixes = true
-error_on_unformatted = true
-format_code_in_doc_comments = true
-format_macro_matchers = true
-format_strings = true
 max_width = 80
 newline_style = "Unix"
-normalize_comments = true
-normalize_doc_attributes = true
-reorder_impl_items = true
 use_field_init_shorthand = true
 use_try_shorthand = true
-wrap_comments = true
