@@ -109,18 +109,13 @@ async fn two_clients_converge_and_see_each_other() {
         "one entry per editing client, got {vectors:?}"
     );
 
-    // A late joiner must be brought up to the merged state.
+    // A late joiner must be brought up to the merged state: text and history alike.
     let late = harness
         .join(&room, "Cleo")
         .await
         .expect("third client joins");
     late.open(PATH).await.expect("third client opens");
-    let on_late =
-        wait_for("the late joiner to receive the merged document", || async {
-            let text = late.text(PATH).await.ok()?;
-            (text == merged).then_some(text)
-        })
-        .await;
+    let on_late = wait_for_convergence(&host, &late, PATH).await;
     assert_eq!(on_late, merged);
 }
 
@@ -322,4 +317,49 @@ async fn a_cursor_move_is_not_a_document_change() {
     if let Ok(EngineEvent::DocumentChanged { path }) = events.try_recv() {
         panic!("an awareness frame reported a document change: {path}");
     }
+}
+
+/// Two documents converge together: the gate above is single-document, so a second
+/// path with its own concurrent edits exercises the same merge twice over, with one
+/// history check for both.
+#[tokio::test]
+async fn two_documents_converge_together() -> Result<(), Failure> {
+    const OTHER: &str = "src/other.rs";
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+
+    for path in [PATH, OTHER] {
+        host.open(path).await.expect("the host opens");
+        guest.open(path).await.expect("the guest opens");
+        host.insert(path, 0, SEED).await.expect("the host seeds");
+        wait_for_convergence(&host, &guest, path).await;
+    }
+
+    for engine in [&host, &guest] {
+        engine.set_outbound_paused(true).await?;
+    }
+    host.insert(PATH, 0, "AAA ").await?;
+    guest.insert(PATH, 0, "BBB ").await?;
+    host.insert(OTHER, 0, "CCC ").await?;
+    guest.insert(OTHER, 0, "DDD ").await?;
+    for engine in [&host, &guest] {
+        engine.set_outbound_paused(false).await?;
+    }
+
+    let merged = wait_for_convergence(&host, &guest, PATH).await;
+    assert!(
+        merged.contains("AAA") && merged.contains("BBB"),
+        "{merged:?}"
+    );
+    let other = wait_for_convergence(&host, &guest, OTHER).await;
+    assert!(other.contains("CCC") && other.contains("DDD"), "{other:?}");
+
+    let vectors = matching_vectors(&host, &guest).await;
+    assert_eq!(
+        vectors.len(),
+        2,
+        "one entry per editing client, got {vectors:?}"
+    );
+    Ok(())
 }

@@ -11,12 +11,35 @@ use selvage_harness::{
     WAIT, wait_for, wait_for_described, wait_for_event,
 };
 use selvage_protocol::code;
+use tokio::sync::broadcast;
+use tokio::time::timeout;
 
 const PATH: &str = "src/main.rs";
 const GUEST_ONLY: &str = "only/guest.rs";
 
 /// Anything these tests can fail with.
 type Failure = Box<dyn StdError>;
+
+/// The next room-documents announcement containing `wanted`: the proof that a
+/// reconnecting client re-opened its document. The room's set keeps the path while its
+/// socket is gone — claims are forgotten, paths stay — so the set itself proves
+/// nothing; the `doc.opened` the room announces on re-open does.
+async fn wait_for_reopen(
+    events: &mut broadcast::Receiver<EngineEvent>,
+    wanted: &str,
+) -> Result<(), Failure> {
+    loop {
+        match events.recv().await {
+            Ok(EngineEvent::DocumentsChanged { documents })
+                if documents.iter().any(|path| path == wanted) =>
+            {
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(_) => return Err("the event stream closed".into()),
+        }
+    }
+}
 
 #[tokio::test]
 async fn a_dropped_guest_reconnects_and_reopens_its_document()
@@ -54,7 +77,18 @@ async fn a_dropped_guest_reconnects_and_reopens_its_document()
     let old_peer_id = before.peer.peer_id.clone();
     let old_client_id = before.peer.awareness_client_id;
 
+    // Subscribed before the drop: the re-open announcement must not slip past the
+    // wait below.
+    let mut host_events = host.subscribe();
     guest_proxy.drop_all();
+
+    // The set keeps the path while its socket is gone — claims are forgotten, paths
+    // stay — so it is already there before the client comes back, and waiting on the
+    // set itself would prove nothing.
+    assert!(
+        host.documents().await?.contains(&GUEST_ONLY.to_string()),
+        "the room keeps a dropped peer's paths"
+    );
 
     // It comes back as a new peer with a new awareness client id (spec §9.1: `yrs`
     // tombstones the old one, so reusing it would drop the first republish).
@@ -83,19 +117,11 @@ async fn a_dropped_guest_reconnects_and_reopens_its_document()
     )
     .await;
 
-    // Its own document is open again: it left the room's set with the socket.
-    wait_for_described(
-        "the guest to re-open its document",
-        || async { format!("{:?}", host.documents().await) },
-        || async {
-            host.documents()
-                .await
-                .ok()?
-                .contains(&GUEST_ONLY.to_string())
-                .then_some(())
-        },
-    )
-    .await;
+    // Its own document is open again: the room announced the re-open, which only a
+    // fresh `doc.open` from the reconnected client produces.
+    timeout(WAIT, wait_for_reopen(&mut host_events, GUEST_ONLY))
+        .await
+        .expect("the guest to re-open its document")?;
 
     // Both documents still hold what they held, and the guest's own content was not
     // lost with the socket.
