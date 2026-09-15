@@ -263,6 +263,18 @@ fn capabilities() -> Vec<String> {
         .collect()
 }
 
+/// The `doc.granted` a connection seated into a room receives right after its `room.joined`,
+/// or `None` when the room has no grant (`PROTOCOL.md` §6.3). It is a snapshot rather than a
+/// delta — the room already holds the listing — and a freshly minted room's grant is always
+/// empty, so a mint produces no frame.
+fn join_grant(room: Option<&Room>) -> Option<Outbound> {
+    let paths = room?.grant();
+    if paths.is_empty() {
+        return None;
+    }
+    event_frame(event::DOC_GRANTED, serde_json::json!({ "paths": paths }))
+}
+
 impl Applicant {
     /// The role this connection is seated as. A connection that arrives without a room
     /// mints that room, so it is its host whatever `session.hello` claims: honouring a
@@ -316,6 +328,13 @@ impl Applicant {
         let body = serde_json::to_value(&params).map_err(|e| bad_body(&e))?;
         let response = event_frame(event_name, body);
         if let Some(frame) = response {
+            let _ = self.tx.send(frame);
+        }
+        // A joining connection learns the room's grant straight after its `room.joined`, so
+        // it needs no round trip and `room.joined` needs no fifth member. It is queued after
+        // the reply, so the reply is still this connection's first frame.
+        let granted = join_grant(guard.room(&params.room_id));
+        if let Some(frame) = granted {
             let _ = self.tx.send(frame);
         }
         // Late arrivals must be announced to the peers already in the room.
