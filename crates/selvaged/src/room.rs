@@ -326,11 +326,6 @@ impl Registry {
             .map(|room| room.peers.into_values().collect())
             .unwrap_or_default()
     }
-
-    #[must_use]
-    pub fn remove(&mut self, room_id: &str) -> Option<Room> {
-        self.rooms.remove(room_id)
-    }
 }
 
 pub struct Detach {
