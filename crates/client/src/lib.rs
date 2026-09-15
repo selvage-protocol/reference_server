@@ -107,6 +107,25 @@ impl SyncEngine {
         .await?
     }
 
+    /// Changes this connection's display name for the rest of the session. The name in
+    /// force reaches every peer, this client included, as the `peer.renamed` event; a
+    /// refusal leaves the current name alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when the engine has stopped or the server refused the name.
+    pub async fn rename(
+        &self,
+        display_name: impl Into<String>,
+    ) -> Result<(), Error> {
+        let name = display_name.into();
+        self.call(|reply| Command::Rename {
+            display_name: name,
+            reply,
+        })
+        .await?
+    }
+
     /// The current text of a document. Empty for a document nobody has written to.
     ///
     /// # Errors

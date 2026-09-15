@@ -9,7 +9,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use selvage_harness::{
     EngineEvent, Error, Harness, Role, SelectionOffsets, ServerConfig, WAIT,
-    wait_for, wait_for_event,
+    wait_for, wait_for_event, wait_for_peer,
 };
 use selvage_protocol as proto;
 use selvage_protocol::{close, code, event, method};
@@ -546,6 +546,76 @@ async fn display_name_is_bounded_in_utf16_code_units() {
     assert_eq!(
         close_code(&mut refused).await.expect("close frame"),
         close::PROTOCOL_ERROR
+    );
+}
+
+/// A seated connection renames itself mid-session (`session.rename`, `PROTOCOL.md` §5): the
+/// mover and every other peer are told with `peer.renamed`, an out-of-bound name is a
+/// non-fatal `bad_params` that leaves the session usable, and a rename to the name already
+/// in force is still announced.
+#[tokio::test]
+async fn a_peer_renames_itself_mid_session() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+    let guest_id = guest.session().peer.peer_id;
+    assert_eq!(wait_for_peer(&host, "Bob").await.peer_id, guest_id);
+
+    // The room is told, and so is the mover: `peer.renamed` is addressed like `doc.opened`
+    // (to everyone), not like `peer.joined` (to the others).
+    guest
+        .rename("Robert")
+        .await
+        .expect("the rename is accepted");
+    assert_eq!(wait_for_peer(&host, "Robert").await.peer_id, guest_id);
+    let mine = wait_for("the mover's own name", || async {
+        let peer = guest.session().peer;
+        (peer.display_name == "Robert").then_some(peer)
+    })
+    .await;
+    assert_eq!(mine.display_name, "Robert");
+
+    // 32 code points but 33 UTF-16 units, one over the handshake's bound (§5): an error
+    // response, not a close. The seated connection keeps serving.
+    let over_limit = format!("{}𝄞", "a".repeat(31));
+    assert_eq!(over_limit.encode_utf16().count(), 33);
+    let refused = guest.rename(over_limit).await.expect_err("over the bound");
+    let Error::Protocol { code, .. } = refused else {
+        panic!("expected bad_params, got {refused}");
+    };
+    assert_eq!(code, code::BAD_PARAMS);
+    assert_eq!(
+        guest.session().peer.display_name,
+        "Robert",
+        "a refused rename changes nothing"
+    );
+
+    // The connection is still seated, and the mover's own record has the new name too.
+    guest.rename("Rob").await.expect("still seated");
+    let rob = wait_for("the mover's own name", || async {
+        let peer = guest.session().peer;
+        (peer.display_name == "Rob").then_some(peer)
+    })
+    .await;
+    assert_eq!(rob.display_name, "Rob");
+    assert_eq!(wait_for_peer(&host, "Rob").await.peer_id, guest_id);
+
+    // A rename to the name already in force is announced like any other: the server MUST
+    // NOT suppress it. The subscription is taken before the request because the engine can
+    // emit the event as it reads the frame, before the response this call waits for; the
+    // wait above has already drained the previous rename's event.
+    let mut events = guest.subscribe();
+    guest
+        .rename("Rob")
+        .await
+        .expect("an unchanged name is a rename");
+    let announced = timeout(WAIT, events.recv())
+        .await
+        .expect("the no-op rename is announced within the deadline")
+        .expect("the engine stream stays open");
+    assert!(
+        matches!(announced, EngineEvent::PeersChanged { .. }),
+        "a no-op rename is announced, got {announced:?}"
     );
 }
 

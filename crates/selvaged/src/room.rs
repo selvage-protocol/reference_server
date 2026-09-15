@@ -149,6 +149,20 @@ impl Room {
         self.documents.len() != before
     }
 
+    /// Renames a seated peer in place, returning the record as it now reads. The arrival
+    /// counter is deliberately untouched: a rename changes a name and nothing else, so the
+    /// room's peer list keeps its join order (`PROTOCOL.md` §5, `session.rename`).
+    #[must_use]
+    pub fn rename_peer(
+        &mut self,
+        peer_id: &str,
+        display_name: &str,
+    ) -> Option<PeerInfo> {
+        let peer = self.peers.get_mut(peer_id)?;
+        peer.info.display_name = display_name.to_string();
+        Some(peer.info.clone())
+    }
+
     /// The room's open-document set.
     #[must_use]
     pub fn documents(&self) -> &[String] {

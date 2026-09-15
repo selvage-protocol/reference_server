@@ -65,6 +65,10 @@ pub enum Command {
         path: String,
         reply: oneshot::Sender<Result<(), Error>>,
     },
+    Rename {
+        display_name: String,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
     Text {
         path: String,
         reply: oneshot::Sender<String>,
@@ -408,6 +412,10 @@ enum Pending {
         path: String,
         reply: oneshot::Sender<Result<(), Error>>,
     },
+    Rename {
+        display_name: String,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
 }
 
 impl Pending {
@@ -416,26 +424,42 @@ impl Pending {
         match self {
             Self::Open { .. } => method::DOC_OPEN,
             Self::Close { .. } => method::DOC_CLOSE,
+            Self::Rename { .. } => method::SESSION_RENAME,
         }
     }
 
     /// The params this request carries. They come from the same fields acceptance reads,
     /// so the request and its meaning cannot drift apart.
     fn params(&self) -> serde_json::Value {
-        let path = match self {
-            Self::Open { path, .. } | Self::Close { path, .. } => path,
-        };
-        serde_json::json!({ "path": path })
+        match self {
+            Self::Open { path, .. } | Self::Close { path, .. } => {
+                serde_json::json!({ "path": path })
+            }
+            Self::Rename { display_name, .. } => {
+                serde_json::json!({ "display_name": display_name })
+            }
+        }
     }
 
     /// Answers the caller. The response is what carries the outcome, so this is called
     /// once the server has spoken — or once it never will.
     fn answer(self, outcome: Result<(), Error>) {
         let reply = match self {
-            Self::Open { reply, .. } | Self::Close { reply, .. } => reply,
+            Self::Open { reply, .. }
+            | Self::Close { reply, .. }
+            | Self::Rename { reply, .. } => reply,
         };
         let _ = reply.send(outcome);
     }
+}
+
+/// The room's open-document set, from a `doc.open`/`doc.close` result.
+fn documents_from(
+    result: Option<&serde_json::Value>,
+) -> Result<Vec<String>, Error> {
+    let body = result.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let accepted: proto::DocSet = serde_json::from_value(body)?;
+    Ok(accepted.documents)
 }
 
 #[expect(
@@ -717,6 +741,12 @@ impl EngineTask {
         match next {
             Command::Open { path, reply } => self.open(&path, reply),
             Command::Close { path, reply } => self.close(&path, reply),
+            Command::Rename {
+                display_name,
+                reply,
+            } => {
+                self.rename(display_name, reply);
+            }
             Command::Text { path, reply } => {
                 let _ = reply.send(self.read_text(&path));
             }
@@ -768,6 +798,19 @@ impl EngineTask {
     fn close(&mut self, path: &str, reply: oneshot::Sender<Result<(), Error>>) {
         self.request(Pending::Close {
             path: path.to_string(),
+            reply,
+        });
+    }
+
+    /// Asks the server to change this connection's display name. Local state moves when the
+    /// `peer.renamed` event arrives, which the mover receives like every other peer.
+    fn rename(
+        &mut self,
+        display_name: String,
+        reply: oneshot::Sender<Result<(), Error>>,
+    ) {
+        self.request(Pending::Rename {
+            display_name,
             reply,
         });
     }
@@ -1023,18 +1066,23 @@ impl EngineTask {
     }
 
     /// Moves local state to what the server accepted. The room's open-document set comes
-    /// from the response, and this client's own holds follow from its own request.
+    /// from the response, and this client's own holds follow from its own request. A rename
+    /// returns `{}` and moves neither: its name arrives as `peer.renamed`.
     fn accept(
         &mut self,
         pending: &Pending,
         result: Option<&serde_json::Value>,
     ) -> Result<(), Error> {
-        let body = result.cloned().unwrap_or_else(|| serde_json::json!({}));
-        let accepted: proto::DocSet = serde_json::from_value(body)?;
-        self.documents = accepted.documents;
         match pending {
-            Pending::Open { path, .. } => self.hold(path),
-            Pending::Close { path, .. } => self.release(path),
+            Pending::Open { path, .. } => {
+                self.documents = documents_from(result)?;
+                self.hold(path);
+            }
+            Pending::Close { path, .. } => {
+                self.documents = documents_from(result)?;
+                self.release(path);
+            }
+            Pending::Rename { .. } => return Ok(()),
         }
         let _ = self.events.send(EngineEvent::DocumentsChanged {
             documents: self.documents.clone(),
@@ -1131,6 +1179,7 @@ impl EngineTask {
         match msg.event.as_deref() {
             Some(event::PEER_JOINED) => self.peer_joined(msg.params.as_ref()),
             Some(event::PEER_LEFT) => self.peer_left(msg.params.as_ref()),
+            Some(event::PEER_RENAMED) => self.peer_renamed(msg.params.as_ref()),
             Some(event::DOC_OPENED | event::DOC_CLOSED) => {
                 self.documents_changed(msg.params.as_ref());
             }
@@ -1201,6 +1250,31 @@ impl EngineTask {
         });
         let _ = self.events.send(EngineEvent::PresenceChanged {
             presence: self.presence(),
+        });
+    }
+
+    /// `peer.renamed` (`PROTOCOL.md` §5): the peer keeps its role and its awareness client
+    /// id, and only its name moves. The mover is not in `peers` — it is in `session.peer` —
+    /// so a rename of itself is applied there and published to `SyncEngine::session`.
+    fn peer_renamed(&mut self, params: Option<&serde_json::Value>) {
+        let parsed = params.and_then(|p| {
+            serde_json::from_value::<proto::PeerRenamedParams>(p.clone()).ok()
+        });
+        let Some(renamed) = parsed else {
+            return;
+        };
+        if let Some(peer) = self.peers.get_mut(&renamed.peer_id) {
+            peer.display_name.clone_from(&renamed.display_name);
+        }
+        if renamed.peer_id == self.session.peer.peer_id {
+            self.session
+                .peer
+                .display_name
+                .clone_from(&renamed.display_name);
+            self.publish_session();
+        }
+        let _ = self.events.send(EngineEvent::PeersChanged {
+            peers: self.peer_list(),
         });
     }
 
