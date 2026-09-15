@@ -270,7 +270,12 @@ impl Registry {
         clippy::too_many_arguments,
         reason = "a mint names its room, host and the cap it is checked against"
     )]
-    pub fn create(&mut self, new: NewRoom, host: Peer, max_rooms: usize) -> bool {
+    pub fn create(
+        &mut self,
+        new: NewRoom,
+        host: Peer,
+        max_rooms: usize,
+    ) -> bool {
         if self.rooms.len() >= max_rooms {
             return false;
         }

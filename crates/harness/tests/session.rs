@@ -1876,8 +1876,10 @@ async fn a_full_room_refuses_guests_but_not_its_host() {
     // Every engine stays bound: dropping one disconnects it, and the freed seat would
     // let the next join in for the wrong reason.
     host.disconnect().await.expect("the host leaves");
-    let _mallory =
-        harness.join(&room, "Mallory").await.expect("the seat freed");
+    let _mallory = harness
+        .join(&room, "Mallory")
+        .await
+        .expect("the seat freed");
     let back = harness
         .reclaim(&room, "Ada")
         .await
