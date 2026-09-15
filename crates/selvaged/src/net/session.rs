@@ -41,7 +41,14 @@ pub const MAX_GRANT_PATH_BYTES: usize = 4096;
 /// the shape; this caps the bytes: `100_000` paths of 4096 bytes would otherwise be
 /// ~400 MiB of room state, re-serialized on every publish and delivered whole to every
 /// late joiner. What a late joiner can be sent is bounded by what could be published.
-pub const MAX_GRANT_BYTES: usize = 1024 * 1024;
+///
+/// 4 MiB clears measured real use with headroom: a 25,000-path working-tree listing is
+/// 893,750 path bytes, and 100,000 typical paths are ~3.5 MiB, both publishing whole;
+/// a contaminated tree (123,883 files, ~11.9 MiB of path bytes with build outputs
+/// included) is refused, which is the documented policy — the host excludes what it
+/// should not be sharing (`PROTOCOL.md` §5). Measured in
+/// `crates/harness/tests/session.rs`.
+pub const MAX_GRANT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Capacity refusals are this server's policy, not the protocol's (`PROTOCOL.md` §2.1,
 /// §11): an implementation that needs a code of its own names it in the `x.` namespace

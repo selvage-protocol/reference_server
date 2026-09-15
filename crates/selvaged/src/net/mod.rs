@@ -41,8 +41,17 @@ const NOT_FOUND: &str = r#"{"error":"not found"}"#;
 /// The most one inbound WebSocket frame or message may carry, well under the
 /// library's 64 MiB default. A frame over the bound is a transport failure, not a
 /// session fault: the connection ends the way a dropped socket ends, and the room
-/// learns of it as `peer.left` (`PROTOCOL.md` §2.1).
-const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+/// learns of it as `peer.left` (`PROTOCOL.md` §2.1). Ending rather than refusing is
+/// structural, not policy: past the bound the transport cannot resync mid-message,
+/// so there is no session left to refuse on.
+///
+/// 8 MiB clears measured real use with headroom: a single 4 MB insert encodes to
+/// 4,000,031 wired bytes (update bytes track text bytes one-for-one plus ~30 B),
+/// and a tombstone-heavy document (9 KB live after 2000 inserts with 90% deleted)
+/// encodes to 34,663 wired bytes, ~3.9× its live text — so the bound clears bare
+/// pastes to ~8 MB and history-amplified documents to a few megabytes live.
+/// Measured in `crates/harness/tests/session.rs`.
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// RFC 6455 allows 125 bytes in a control-frame payload, and a close frame spends two of
 /// them on its status code.

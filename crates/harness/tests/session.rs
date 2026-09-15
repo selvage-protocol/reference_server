@@ -1979,8 +1979,8 @@ async fn opening_past_the_document_cap_is_refused_and_frees_again() {
     }
 }
 
-/// A grant is bounded in total bytes, not just count and per-path length. 300 paths of
-/// 4096 bytes (1,228,800 in total, past the 1 MiB budget) are refused `bad_params`,
+/// A grant is bounded in total bytes, not just count and per-path length. 1100 paths of
+/// 4096 bytes (4,505,600 in total, past the 4 MiB budget) are refused `bad_params`,
 /// while 20,000 short paths (~200,000 bytes) publish whole and reach a late joiner
 /// whole — bounded by what could be published.
 #[tokio::test]
@@ -2003,7 +2003,7 @@ async fn a_grant_over_the_total_byte_budget_is_refused() {
         .unwrap_or("")
         .to_string();
 
-    let oversized = vec!["a".repeat(4096); 300];
+    let oversized = vec!["a".repeat(4096); 1100];
     raw.send_json(&serde_json::json!({
         "v": proto::WIRE_VERSION,
         "id": 2,
@@ -2049,14 +2049,14 @@ async fn a_grant_over_the_total_byte_budget_is_refused() {
     .await;
     let total: usize = held.iter().map(String::len).sum();
     assert!(
-        total <= 1024 * 1024,
+        total <= 4 * 1024 * 1024,
         "the delivery stays within the budget: {total}"
     );
 }
 
 /// A frame over the bound ends the connection the way a dropped socket does: no
 /// `session.error`, and the room learns of it as `peer.left` (`PROTOCOL.md` §2.1). A
-/// 1 MiB binary still relays whole and byte-identical — the bound is 2 MiB, written
+/// 1 MiB binary still relays whole and byte-identical — the bound is 8 MiB, written
 /// out here.
 #[tokio::test]
 async fn a_frame_over_the_bound_ends_the_connection() -> Result<(), Failure> {
@@ -2104,9 +2104,22 @@ async fn a_frame_over_the_bound_ends_the_connection() -> Result<(), Failure> {
         .expect("the 1 MiB relay arrives")?;
     assert_eq!(relayed.payload, big);
 
-    // 3 MiB ends the sender's connection with nothing on the wire to say why.
-    let huge = vec![0xA5u8; 3 * 1024 * 1024];
-    flood.send(0x2, &huge).await.expect("sends 3 MiB");
+    // 9 MiB ends the sender's connection with nothing on the wire to say why. The
+    // server closes on the over-bound header, so the send itself can fail once the
+    // payload outgrows the socket buffers; either way the socket ends and lingers
+    // nowhere.
+    let huge = vec![0xA5u8; 9 * 1024 * 1024];
+    if let Err(failed) = flood.send(0x2, &huge).await {
+        let ended = failed.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionAborted
+            )
+        });
+        assert!(ended, "the oversize send ends the socket: {failed}");
+    }
     match timeout(WAIT, flood.read_to_end())
         .await
         .expect("the server ends the oversize connection")
