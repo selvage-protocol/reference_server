@@ -856,7 +856,7 @@ impl Session {
             return self.reply(&proto::ServerMessage::error(
                 request.id,
                 code::BAD_PARAMS,
-                "the room's grant is its host's to publish".to_string(),
+                "only the room's host may publish the grant".to_string(),
             ));
         }
         // The response is queued before the event, as a `doc.open` result precedes its
