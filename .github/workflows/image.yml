@@ -35,54 +35,21 @@ jobs:
           docker info
           docker buildx version
 
-  # TEMPORARY debug job (one CI round): the smoke fails in seconds with
-  # runner logs unreachable from automation, so this job posts the failing
-  # build's log tail as a PR comment, then retires. It needs issues:write
-  # for that single comment; everything else stays contents:read.
-  debug-build-log:
+  # TEMPORARY probe (one CI round): every buildx build fails in seconds
+  # while bootstrap passes. Either `buildx create` itself is broken here
+  # (then the explicit-builder path is dead) or the Dockerfile is at fault.
+  # This job runs create+bootstrap and nothing else; green means create
+  # works and the Dockerfile is next under suspicion.
+  probe-create:
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      issues: write
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - name: create the debug builder
+      - name: create and bootstrap an explicit builder
         run: |
-          docker buildx create --name debug-builder \
+          docker buildx create --name probe-builder \
             --driver docker-container --use
           docker buildx inspect --bootstrap
-      - name: build amd64 and post the log tail on the PR
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p .tmp
-          set +e
-          docker buildx build --platform linux/amd64 --load \
-            -t selvaged:debug-amd64 . > .tmp/debug-build.log 2>&1
-          code=$?
-          set -e
-          tail -c 12000 .tmp/debug-build.log > .tmp/debug-tail.txt
-          LOG_TAIL_FILE=.tmp/debug-tail.txt EXIT_CODE=$code python3 - <<'EOF'
-          import json
-          import os
-          import urllib.request
-
-          with open(os.environ["LOG_TAIL_FILE"]) as f:
-              tail = f.read()
-          body = (f"debug-build-log: amd64 `--load` build exited "
-                  f"{os.environ['EXIT_CODE']} (temporary debug job):\n\n```\n{tail}\n```")
-          payload = json.dumps({"body": body}).encode()
-          request = urllib.request.Request(
-              "https://api.github.com/repos/selvage-protocol/reference_server/issues/17/comments",
-              data=payload,
-              headers={"Authorization": f"Bearer {os.environ['GH_TOKEN']}",
-                       "Accept": "application/vnd.github+json"})
-          urllib.request.urlopen(request)
-          EOF
-          exit $code
+          docker buildx ls
 
   smoke:
     runs-on: blacksmith-4vcpu-ubuntu-2404
