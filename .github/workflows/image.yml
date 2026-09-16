@@ -35,80 +35,52 @@ jobs:
           docker info
           docker buildx version
 
-  # TEMPORARY bisection probes (one CI round): the smoke fails in ~25 s with
-  # logs unreachable from automation, so each script phase gets a job whose
-  # conclusion names the failing phase. All four retire once the smoke is green.
-  probe-phase-bootstrap:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
-    steps:
-      - uses: useblacksmith/setup-docker-builder@v2
-        with:
-          cache-key: selvaged-image
-      - name: bootstrap the builder
-        run: |
-          docker buildx ls
-          docker buildx inspect --bootstrap
-
-  probe-phase-tarball:
+  # TEMPORARY debug job (one CI round): the smoke fails in seconds with
+  # runner logs unreachable from automation, so this job posts the failing
+  # build's log tail as a PR comment, then retires. It needs issues:write
+  # for that single comment; everything else stays contents:read.
+  debug-build-log:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: docker/setup-qemu-action@v3
       - uses: useblacksmith/setup-docker-builder@v2
         with:
           cache-key: selvaged-image
-      - name: multi-arch build to a local OCI tarball
+      - name: build amd64 and post the log tail on the PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p .tmp
-          docker buildx build --platform linux/amd64,linux/arm64 \
-            -o type=oci,dest=.tmp/probe.tarball.tar .
-
-  probe-slice-amd64:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - uses: useblacksmith/setup-docker-builder@v2
-        with:
-          cache-key: selvaged-image
-      - name: load, run and check the amd64 image
-        run: |
-          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          set +e
           docker buildx build --platform linux/amd64 --load \
-            -t selvaged:probe-amd64 .
-          out="$(docker run --rm --platform linux/amd64 selvaged:probe-amd64 --version)"
-          docker run -d --name probe-amd64 --platform linux/amd64 \
-            -p 127.0.0.1:18080:8080 selvaged:probe-amd64
-          trap 'docker rm -f probe-amd64 >/dev/null' EXIT
-          scripts/check-server-version.sh http://127.0.0.1:18080 "$version" "$out"
+            -t selvaged:debug-amd64 . > .tmp/debug-build.log 2>&1
+          code=$?
+          set -e
+          tail -c 12000 .tmp/debug-build.log > .tmp/debug-tail.txt
+          LOG_TAIL_FILE=.tmp/debug-tail.txt EXIT_CODE=$code python3 - <<'EOF'
+          import json
+          import os
+          import urllib.request
 
-  probe-slice-arm64:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - uses: docker/setup-qemu-action@v3
-      - uses: useblacksmith/setup-docker-builder@v2
-        with:
-          cache-key: selvaged-image
-      - name: load, run and check the arm64 image
-        run: |
-          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
-          docker buildx build --platform linux/arm64 --load \
-            -t selvaged:probe-arm64 .
-          out="$(docker run --rm --platform linux/arm64 selvaged:probe-arm64 --version)"
-          docker run -d --name probe-arm64 --platform linux/arm64 \
-            -p 127.0.0.1:18081:8080 selvaged:probe-arm64
-          trap 'docker rm -f probe-arm64 >/dev/null' EXIT
-          scripts/check-server-version.sh http://127.0.0.1:18081 "$version" "$out"
+          with open(os.environ["LOG_TAIL_FILE"]) as f:
+              tail = f.read()
+          body = (f"debug-build-log: amd64 `--load` build exited "
+                  f"{os.environ['EXIT_CODE']} (temporary debug job):\n\n```\n{tail}\n```")
+          payload = json.dumps({"body": body}).encode()
+          request = urllib.request.Request(
+              "https://api.github.com/repos/selvage-protocol/reference_server/issues/17/comments",
+              data=payload,
+              headers={"Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                       "Accept": "application/vnd.github+json"})
+          urllib.request.urlopen(request)
+          EOF
+          exit $code
 
   smoke:
     runs-on: blacksmith-4vcpu-ubuntu-2404

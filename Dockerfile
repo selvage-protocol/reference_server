@@ -17,13 +17,14 @@ ARG RUNTIME=scratch
 ARG VERSION=dev
 ARG REVISION=unknown
 
-# One cross-toolchain image per target. The `-amd64` suffix is the image's
-# host architecture (the CI runners are x86_64), not the target: each stage
-# runs natively and cross-compiles, so no QEMU is needed to *build* arm64.
+# One cross-toolchain image per target, always run natively on the build host:
+# each stage cross-compiles its target triple, so building arm64 needs no
+# QEMU (only *running* the arm64 image does). The `-amd64` suffix is the
+# image's host architecture (the CI runners are x86_64), not the target.
 # These tags float with upstream stable (no versioned tags are published);
 # the build itself is pinned by `--locked`, and CI logs the builder digest.
-FROM messense/rust-musl-cross:x86_64-musl-amd64 AS builder-amd64
-FROM messense/rust-musl-cross:aarch64-musl-amd64 AS builder-arm64
+FROM --platform=$BUILDPLATFORM messense/rust-musl-cross:x86_64-musl-amd64 AS builder-amd64
+FROM --platform=$BUILDPLATFORM messense/rust-musl-cross:aarch64-musl-amd64 AS builder-arm64
 FROM builder-${TARGETARCH} AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
