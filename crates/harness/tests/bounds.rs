@@ -19,8 +19,8 @@ fn wired(update: Vec<u8>) -> Vec<u8> {
     encoder.to_vec()
 }
 
-/// A large-file sync: a single 4 MB insert wires to about its text bytes, clearing the
-/// 8 MiB frame bound the way the 4 MB convergence test in `session.rs` shows end to
+/// A large-file sync: a single 4 MiB insert wires to about its text bytes, clearing the
+/// 8 MiB frame bound the way the 4 MiB convergence test in `session.rs` shows end to
 /// end.
 #[test]
 fn a_large_single_insert_wires_to_about_its_text() {

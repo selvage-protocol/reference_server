@@ -23,9 +23,9 @@ pub const MAX_QUEUE_FRAMES: usize = 32;
 /// times the largest frame a legitimate session sends (an 8 MiB update, measured in
 /// `crates/harness/tests/session.rs`), so a full-state sync plus concurrent traffic
 /// still fits. Past it the peer is slow, like past the frame cap. One slow peer holds
-/// at most this many queued bytes, plus one frame being written (at most the 8 MiB
-/// frame bound) and the kernel's own buffers; the 33rd frame, or the byte past the
-/// cap, disconnects it instead.
+/// at most this many counted bytes — the count includes the frame being written,
+/// released only after its send completes — plus the kernel's own buffers; the 33rd
+/// frame, or the byte past the cap, disconnects it instead.
 pub const MAX_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 
 /// A frame the connection task should write out.
@@ -53,8 +53,9 @@ impl Outbound {
 
 /// One connection's outbound queue: the channel its frames leave through and the
 /// count of payload bytes queued but unwritten. Bytes are reserved before queueing
-/// and released once the writer takes the frame off, so the count tracks what the
-/// server holds for the peer rather than what it has ever sent.
+/// and released after the writer's send of the frame completes, written or not, so
+/// a frame being written stays counted and the count tracks what the server still
+/// holds for the peer rather than what it has ever sent.
 #[derive(Debug, Clone)]
 pub struct Queue {
     tx: Sender<Outbound>,
@@ -63,7 +64,7 @@ pub struct Queue {
 
 impl Queue {
     /// A fresh queue and its receiving end. The writer drains the receiver and
-    /// releases each frame's bytes as it leaves the queue.
+    /// releases each frame's bytes after its send completes.
     #[must_use]
     pub fn channel() -> (Self, Receiver<Outbound>) {
         let (tx, rx) = channel(MAX_QUEUE_FRAMES);

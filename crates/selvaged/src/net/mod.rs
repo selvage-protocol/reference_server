@@ -45,11 +45,11 @@ const NOT_FOUND: &str = r#"{"error":"not found"}"#;
 /// structural, not policy: past the bound the transport cannot resync mid-message,
 /// so there is no session left to refuse on.
 ///
-/// 8 MiB clears measured real use with headroom: a single 4 MB insert encodes to
-/// 4,000,031 wired bytes (update bytes track text bytes one-for-one plus ~30 B),
+/// 8 MiB clears measured real use with headroom: a single 4 MiB insert encodes to
+/// 4,194,338 wired bytes (update bytes track text bytes one-for-one plus ~34 B),
 /// and a tombstone-heavy document (9 KB live after 2000 inserts with 90% deleted)
 /// encodes to 34,663 wired bytes, ~3.9× its live text — so the bound clears bare
-/// pastes to ~8 MB and history-amplified documents to a few megabytes live. Shapes
+/// pastes to ~8 MiB and history-amplified documents to a few megabytes live. Shapes
 /// measured in `crates/harness/tests/bounds.rs`, clearance pinned in
 /// `crates/harness/tests/session.rs`.
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -296,7 +296,7 @@ impl Live {
 }
 
 /// Writes queued frames until the last sender is dropped or the socket fails. Each
-/// frame's bytes are released as it leaves the queue — written or not — so the byte
+/// frame's bytes are released after its send completes — written or not — so the byte
 /// count tracks what is still held for the peer.
 async fn write_outbound(
     mut sink: SessionSink,

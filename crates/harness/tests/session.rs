@@ -2369,9 +2369,9 @@ async fn frame_boundaries_are_exact() -> Result<(), Failure> {
     Ok(())
 }
 
-/// A large-but-legitimate document syncs whole. A 4 MB single insert converges — one
-/// ~4 MB delta frame — and after a 1 MB delete a late joiner still syncs the full
-/// ~3 MB state in one full-state frame. Both shapes fit the 8 MiB bound, and neither
+/// A large-but-legitimate document syncs whole. A 4 MiB single insert converges — one
+/// ~4 MiB delta frame — and after a 1 MiB delete a late joiner still syncs the full
+/// ~3 MiB state in one full-state frame. Both shapes fit the 8 MiB bound, and neither
 /// fit the old 2 MiB one, which killed the sender instead.
 #[tokio::test]
 async fn a_large_document_syncs_whole() -> Result<(), Failure> {
