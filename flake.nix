@@ -178,6 +178,11 @@
         formatter = pkgs.alejandra;
         packages.default = package;
         packages.image = image;
+        # skopeo inspects the image in the smoke without a daemon. A package
+        # (run by direct path after `nix build`), not a devShell command:
+        # `nix develop` is the interactive environment, and the smoke stays
+        # hermetic.
+        packages.skopeo = pkgs.skopeo;
 
         apps.default = {
           type = "app";
@@ -242,7 +247,6 @@
               bacon
               nodejs_22
               actionlint
-              skopeo
             ]
             ++ hooks.enabledPackages;
 

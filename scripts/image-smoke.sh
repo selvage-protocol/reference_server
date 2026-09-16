@@ -17,6 +17,7 @@ RESULT=".tmp/nix-image-result"
 # local images only, so it names the upstream default policy explicitly
 # (accept anything) instead of depending on host configuration.
 SKOPEO_POLICY="scripts/skopeo-policy.json"
+SKOPEO_LINK=".tmp/skopeo-result"
 OCI_DIR=".tmp/oci-image"
 BIN=".tmp/image-selvaged"
 
@@ -29,7 +30,12 @@ mkdir -p .tmp
 
 nix build .#image --out-link "$RESULT" --print-build-logs
 
-manifest_json="$(nix develop . -c skopeo inspect --raw "docker-archive:$RESULT")"
+# skopeo by direct store path, not via `nix develop`: the smoke stays out
+# of the interactive environment entirely (one fewer moving part per step).
+nix build .#skopeo --out-link "$SKOPEO_LINK" --print-build-logs
+SKOPEO="$SKOPEO_LINK/bin/skopeo"
+
+manifest_json="$("$SKOPEO" inspect --raw "docker-archive:$RESULT")"
 MANIFEST_JSON="$manifest_json" EXPECTED_ARCH="$want_arch" python3 - <<'EOF'
 import json
 import os
@@ -43,7 +49,7 @@ if len(manifest.get("layers", [])) < 1:
 print(f"manifest OK: {len(manifest['layers'])} layer(s), want arch {want}")
 EOF
 
-config_json="$(nix develop . -c skopeo inspect --config "docker-archive:$RESULT")"
+config_json="$("$SKOPEO" inspect --config "docker-archive:$RESULT")"
 CONFIG_JSON="$config_json" EXPECTED_ARCH="$want_arch" EXPECTED_VERSION="$VERSION" python3 - <<'EOF'
 import json
 import os
@@ -84,7 +90,7 @@ oci = os.environ["OCI_DIR"]
 shutil.rmtree(oci, ignore_errors=True)
 print(f"extracting to a fresh {oci}")
 EOF
-nix develop . -c skopeo copy --policy "$SKOPEO_POLICY" "docker-archive:$RESULT" "oci:$OCI_DIR"
+"$SKOPEO" copy --policy "$SKOPEO_POLICY" "docker-archive:$RESULT" "oci:$OCI_DIR"
 OCI_DIR="$OCI_DIR" OUT_BIN="$BIN" python3 - <<'EOF'
 import json
 import os
