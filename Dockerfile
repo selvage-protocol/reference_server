@@ -22,7 +22,7 @@ ARG REVISION=unknown
 # QEMU (only *running* the arm64 image does). The `-amd64` suffix is the
 # image's host architecture (the CI runners are x86_64), not the target.
 # These tags float with upstream stable (no versioned tags are published);
-# the build itself is pinned by `--locked`, and CI logs the builder digest.
+# the build itself is pinned by `--locked`.
 FROM --platform=$BUILDPLATFORM messense/rust-musl-cross:x86_64-musl-amd64 AS builder-amd64
 FROM --platform=$BUILDPLATFORM messense/rust-musl-cross:aarch64-musl-amd64 AS builder-arm64
 FROM builder-${TARGETARCH} AS builder

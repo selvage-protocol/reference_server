@@ -138,8 +138,10 @@ only `libc`/`mio` as OS shims), so the static build needs no C libraries, and
 the runtime holds one binary plus `/LICENSE` as non-root user 65532, no
 shell, no package manager. The `Dockerfile` cross-compiles both
 architectures natively on an x86_64 builder (one cross-toolchain stage per
-target), so building arm64 needs no QEMU — only *running* the arm64 image
-does.
+target, each pinned `--platform=$BUILDPLATFORM`), so building arm64 needs
+no QEMU — only *running* the arm64 image does. Build and run it on any
+machine with a working Docker; the CI runners are not such machines (see
+CI below), so the Dockerfile is human-verified, not CI-proven.
 
 Fallback is the same static binary on `gcr.io/distroless/static:nonroot`
 (`--build-arg RUNTIME=distroless`). If a future dependency ever breaks the
@@ -158,12 +160,11 @@ published releases. `--version`, `/meta`, and `CARGO_PKG_VERSION` are already
 wired together in code (`Meta::reference`, test-enforced by
 `version_matches_what_meta_serves`); `scripts/check-server-version.sh`
 asserts the same truthfulness against a running server, and
-`scripts/image-smoke.sh` runs the whole smoke without publishing: one
-multi-arch build to a local OCI tarball, manifest-list assertion from its
-index (`imagetools inspect` only speaks to registries, and there is no
-registry in the loop), then per-arch `--load` builds with `--version` and
-`/meta` checks.
-`scripts/ci-local.sh image` runs that smoke on a machine with Docker.
+`scripts/image-smoke.sh` runs the whole smoke without publishing and
+without Docker: it builds `packages.image` (the nix/dockerTools image
+below), verifies manifest and container config with skopeo, extracts the
+exact binary from the image layers, and checks `--version` and `/meta`
+against it. `scripts/ci-local.sh image` runs that smoke anywhere nix does.
 
 ### Compose
 
@@ -175,15 +176,23 @@ it pulls the published tag.
 
 ## CI
 
-`.github/workflows/image.yml` has three jobs. `probe` reports the runner's
-Docker daemon as green/red (CI logs are not automation-readable, so the
-conclusion carries it). `smoke` runs on every PR and on
-`main`: it proves the runner's Docker toolchain, creates an explicit local
-buildx builder (docker-container driver) plus QEMU, and runs
-`scripts/image-smoke.sh` — no registry in
-the loop at all, no
-credentials beyond the checkout. `publish` needs `smoke`, carries the only
+`.github/workflows/image.yml` has two jobs. `smoke` runs on every PR and on
+`main`, one leg per architecture (`amd64` on the usual Blacksmith runners,
+`arm64` on GitHub-hosted ARM — each building natively, no cross-compilation): the
+same nix preamble as the checks job, then `scripts/image-smoke.sh`, which
+needs no Docker daemon at all. That is deliberate, not incidental: nine CI
+rounds established that these runners cannot execute buildx builds (daemon,
+setup actions, pulls and builder bootstrap all green; every build dead in
+seconds, including `FROM scratch`), so the smoke builds the image the way
+the runners provably can — `nix build .#image` — and verifies it with
+skopeo. The `Dockerfile` above stays the portable static variant for
+machines with a working Docker; both agree on entrypoint, port, user,
+licence label and tag scheme, and the smoke asserts exactly those fields.
+
+`publish` needs `smoke`, carries the only
 elevated permission in the repo (`packages: write`), logs in to GHCR with the
 built-in `GITHUB_TOKEN`, and is gated on release tags (`refs/tags/v*`) — tags
-that are never cut from this work. FSL review stays open until the owner
+that are never cut from this work. It builds with Docker while the smoke
+builds with nix, so it must itself be re-proven green on a real run before
+any first publish. FSL review stays open until the owner
 closes it; the code merges, the artifacts do not.
