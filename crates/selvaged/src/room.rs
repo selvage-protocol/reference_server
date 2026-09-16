@@ -567,4 +567,30 @@ mod tests {
         let over = Outbound::Binary(vec![0xA5u8; 1]);
         assert_eq!(room.broadcast(None, &over), vec!["p-slow".to_string()]);
     }
+
+    /// Detaching a peer the room never seated announces nothing: the first detach of
+    /// a seated peer reports it, and detaching again — or one never there — is `None`.
+    #[test]
+    fn detaching_an_absent_peer_is_silent() {
+        let mut registry = Registry::default();
+        let info = PeerInfo {
+            peer_id: "p-ada".to_string(),
+            display_name: "Ada".to_string(),
+            role: Role::Host,
+            awareness_client_id: None,
+        };
+        let (peer, _leftovers) = peer_channel(info);
+        registry.create(
+            NewRoom {
+                id: "r-1".to_string(),
+                token: "t".to_string(),
+                keepalive: Keepalive::default(),
+            },
+            peer,
+            usize::MAX,
+        );
+        assert!(registry.detach("r-1", "p-ada").is_some());
+        assert!(registry.detach("r-1", "p-ada").is_none());
+        assert!(registry.detach("r-1", "p-never-there").is_none());
+    }
 }
