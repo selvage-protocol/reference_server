@@ -35,6 +35,81 @@ jobs:
           docker info
           docker buildx version
 
+  # TEMPORARY bisection probes (one CI round): the smoke fails in ~25 s with
+  # logs unreachable from automation, so each script phase gets a job whose
+  # conclusion names the failing phase. All four retire once the smoke is green.
+  probe-phase-bootstrap:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: useblacksmith/setup-docker-builder@v2
+        with:
+          cache-key: selvaged-image
+      - name: bootstrap the builder
+        run: |
+          docker buildx ls
+          docker buildx inspect --bootstrap
+
+  probe-phase-tarball:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v3
+      - uses: useblacksmith/setup-docker-builder@v2
+        with:
+          cache-key: selvaged-image
+      - name: multi-arch build to a local OCI tarball
+        run: |
+          mkdir -p .tmp
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            -o type=oci,dest=.tmp/probe.tarball.tar .
+
+  probe-slice-amd64:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: useblacksmith/setup-docker-builder@v2
+        with:
+          cache-key: selvaged-image
+      - name: load, run and check the amd64 image
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          docker buildx build --platform linux/amd64 --load \
+            -t selvaged:probe-amd64 .
+          out="$(docker run --rm --platform linux/amd64 selvaged:probe-amd64 --version)"
+          docker run -d --name probe-amd64 --platform linux/amd64 \
+            -p 127.0.0.1:18080:8080 selvaged:probe-amd64
+          trap 'docker rm -f probe-amd64 >/dev/null' EXIT
+          scripts/check-server-version.sh http://127.0.0.1:18080 "$version" "$out"
+
+  probe-slice-arm64:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v3
+      - uses: useblacksmith/setup-docker-builder@v2
+        with:
+          cache-key: selvaged-image
+      - name: load, run and check the arm64 image
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          docker buildx build --platform linux/arm64 --load \
+            -t selvaged:probe-arm64 .
+          out="$(docker run --rm --platform linux/arm64 selvaged:probe-arm64 --version)"
+          docker run -d --name probe-arm64 --platform linux/arm64 \
+            -p 127.0.0.1:18081:8080 selvaged:probe-arm64
+          trap 'docker rm -f probe-arm64 >/dev/null' EXIT
+          scripts/check-server-version.sh http://127.0.0.1:18081 "$version" "$out"
+
   smoke:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
