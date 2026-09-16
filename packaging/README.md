@@ -158,9 +158,11 @@ published releases. `--version`, `/meta`, and `CARGO_PKG_VERSION` are already
 wired together in code (`Meta::reference`, test-enforced by
 `version_matches_what_meta_serves`); `scripts/check-server-version.sh`
 asserts the same truthfulness against a running server, and
-`scripts/image-smoke.sh` runs the whole smoke without publishing: multi-arch
-build to a loopback registry, manifest-list assertion via
-`buildx imagetools inspect`, then per-arch `--version` and `/meta` checks.
+`scripts/image-smoke.sh` runs the whole smoke without publishing: one
+multi-arch build to a local OCI tarball, manifest-list assertion from its
+index (`imagetools inspect` only speaks to registries, and there is no
+registry in the loop), then per-arch `--load` builds with `--version` and
+`/meta` checks.
 `scripts/ci-local.sh image` runs that smoke on a machine with Docker.
 
 ### Compose
@@ -173,9 +175,12 @@ it pulls the published tag.
 
 ## CI
 
-`.github/workflows/image.yml` has two jobs. `smoke` runs on every PR and on
+`.github/workflows/image.yml` has three jobs. `probe` reports the runner's
+Docker daemon as green/red (CI logs are not automation-readable, so the
+conclusion carries it). `smoke` runs on every PR and on
 `main`: it proves the runner's Docker toolchain (`docker info`, QEMU +
-Blacksmith builder setup) and runs `scripts/image-smoke.sh` — no registry push, no
+Blacksmith builder setup) and runs `scripts/image-smoke.sh` — no registry in
+the loop at all, no
 credentials beyond the checkout. `publish` needs `smoke`, carries the only
 elevated permission in the repo (`packages: write`), logs in to GHCR with the
 built-in `GITHUB_TOKEN`, and is gated on release tags (`refs/tags/v*`) — tags

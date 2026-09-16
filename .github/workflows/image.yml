@@ -1,9 +1,9 @@
 name: image
 
 # The smoke job runs on every PR and on main without pushing anything: it
-# builds the multi-arch image, pushes it to a throwaway registry on the
-# runner's own loopback, and asserts the manifest list plus per-arch version
-# truthfulness there. The publish job below pushes to GHCR, and only on
+# builds the multi-arch image to a local OCI tarball, asserts the manifest
+# list from the tarball's index, and loads and runs each architecture to
+# check version truthfulness there. The publish job below pushes to GHCR, and only on
 # release tags — no tag has been cut, so it has never run. See
 # packaging/README.md (including the FSL-1.1-MIT redistribution review that
 # must happen before any future publish).
@@ -34,45 +34,6 @@ jobs:
           docker --version
           docker info
           docker buildx version
-
-  # One pull per job, so each image's reachability reads as a conclusion.
-  probe-hub-qemu:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
-    steps:
-      - name: pull the qemu binfmt image
-        run: docker pull tonistiigi/binfmt
-
-  # Each setup step in isolation, so a setup failure reads as a conclusion.
-  probe-setup-qemu:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
-    steps:
-      - uses: docker/setup-qemu-action@v3
-
-  probe-setup-builder:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
-    steps:
-      - uses: useblacksmith/setup-docker-builder@v2
-        with:
-          cache-key: selvaged-image
-      - name: list builders
-        run: docker buildx ls
-
-  probe-hub-registry:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
-    steps:
-      - name: pull the registry image
-        run: docker pull registry:2
-
-  probe-hub-builder:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 15
-    steps:
-      - name: pull the musl cross image
-        run: docker pull messense/rust-musl-cross:x86_64-musl-amd64
 
   smoke:
     runs-on: blacksmith-4vcpu-ubuntu-2404

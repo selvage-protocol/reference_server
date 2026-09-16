@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Full image smoke without publishing. Builds the multi-arch image, pushes it
-# to a throwaway registry on loopback, verifies the manifest list with
-# `buildx imagetools inspect`, then asserts per-arch `--version` and
-# `GET /meta` truthfulness. Nothing leaves the machine: the only registry
-# involved listens on 127.0.0.1 and is removed on exit.
+# Full image smoke without publishing. Builds the multi-arch image to a local
+# OCI tarball, asserts its manifest list names both architectures, then
+# loads and runs each architecture: `--version` and `GET /meta` must agree
+# with the Cargo version. Nothing is pushed anywhere — there is no registry
+# in the loop at all, loopback or otherwise.
 #
 # Needs: docker, a working buildx builder that can build multi-arch (the CI
 # workflow sets one up with Blacksmith's builder action; a stock install's
@@ -14,12 +14,13 @@ set -euo pipefail
 VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
 SHA="$(git rev-parse --short HEAD)"
 TAG="$(scripts/image-tag.sh "$SHA")"
-IMAGE="127.0.0.1:5000/selvaged:ci"
+TARBALL=".tmp/selvaged-smoke.tar"
 
 cleanup() {
-    docker rm -f smoke-amd64 smoke-arm64 ci-registry >/dev/null 2>&1 || true
+    docker rm -f smoke-amd64 smoke-arm64 >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+mkdir -p .tmp
 
 if ! docker buildx inspect --bootstrap >/dev/null 2>&1; then
     echo "no working buildx builder (needed for the multi-arch smoke)" >&2
@@ -27,27 +28,27 @@ if ! docker buildx inspect --bootstrap >/dev/null 2>&1; then
     exit 1
 fi
 
-docker run -d --name ci-registry -p 127.0.0.1:5000:5000 registry:2 >/dev/null
-docker buildx build --platform linux/amd64,linux/arm64 --push -t "$IMAGE" \
+# One multi-arch build to a local file. `imagetools inspect` only speaks to
+# registries, so the manifest list is asserted from the tarball's index
+# instead — that index IS the multi-arch manifest list.
+docker buildx build --platform linux/amd64,linux/arm64 \
+    -o "type=oci,dest=$TARBALL" \
     --build-arg "VERSION=$VERSION" \
     --build-arg "REVISION=$(git rev-parse HEAD)" .
-
-echo "--- manifest list ---"
-docker buildx imagetools inspect "$IMAGE"
-manifest_json="$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Manifest}}')"
-IMAGE_MANIFEST_JSON="$manifest_json" python3 - <<'EOF'
+TARBALL_PATH="$TARBALL" python3 - <<'EOF'
 import json
 import os
-import sys
+import tarfile
 
-manifest = json.loads(os.environ["IMAGE_MANIFEST_JSON"])
+path = os.environ["TARBALL_PATH"]
+with tarfile.open(path) as tar:
+    index = json.load(tar.extractfile("index.json"))
 arches = sorted(
-    m["platform"]["architecture"] for m in manifest["manifests"]
+    m["platform"]["architecture"] for m in index["manifests"]
 )
 if arches != ["amd64", "arm64"]:
-    print(f"manifest arches are {arches}, want ['amd64', 'arm64']",
-          file=sys.stderr)
-    sys.exit(1)
+    print(f"manifest arches are {arches}, want ['amd64', 'arm64']")
+    raise SystemExit(1)
 print(f"manifest OK: {arches}")
 EOF
 
@@ -57,9 +58,14 @@ port_for() {
 
 for arch in amd64 arm64; do
     port="$(port_for "$arch")"
-    version_output="$(docker run --rm --platform "linux/$arch" "$IMAGE" --version)"
+    docker buildx build --platform "linux/$arch" --load \
+        -t "selvaged:smoke-$arch" \
+        --build-arg "VERSION=$VERSION" \
+        --build-arg "REVISION=$SHA" .
+    version_output="$(docker run --rm --platform "linux/$arch" \
+        "selvaged:smoke-$arch" --version)"
     docker run -d --name "smoke-$arch" --platform "linux/$arch" \
-        -p "127.0.0.1:$port:8080" "$IMAGE" >/dev/null
+        -p "127.0.0.1:$port:8080" "selvaged:smoke-$arch" >/dev/null
     scripts/check-server-version.sh "http://127.0.0.1:$port" \
         "$VERSION" "$version_output"
     docker rm -f "smoke-$arch" >/dev/null

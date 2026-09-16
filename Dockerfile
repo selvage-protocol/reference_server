@@ -36,7 +36,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then echo aarch64; else echo x86_64; fi \
         /selvaged \
     && /selvaged --version
 
-FROM scratch AS runtime-scratch
+FROM scratch AS runtime-scratch # hadolint ignore=DL3006
 COPY --from=builder /selvaged /selvaged
 COPY crates/selvaged/LICENSE /LICENSE
 USER 65532
@@ -51,7 +51,7 @@ EXPOSE 8080
 ENTRYPOINT ["/selvaged"]
 CMD ["--listen", "0.0.0.0:8080"]
 
-FROM runtime-${RUNTIME} AS final
+FROM runtime-${RUNTIME} AS final # hadolint ignore=DL3006
 # The FSL-1.1-MIT licence travels inside the image (see /LICENSE) and in its
 # annotations. Pushing this image anywhere is redistribution of the binary:
 # review the Competing Use scope before publishing — see packaging/README.md.
