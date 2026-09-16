@@ -121,8 +121,8 @@ fn grace(value: &str) -> Result<Duration, String> {
 fn addr_in_use_hint(addr: SocketAddr) -> String {
     format!(
         "address {addr} is already in use — stop the process holding it, or bind \
-        somewhere else with `--listen {}:0` (the server prints the port it got)",
-        addr.ip()
+        somewhere else with `--listen {}` (the server prints the port it got)",
+        SocketAddr::new(addr.ip(), 0)
     )
 }
 
@@ -138,6 +138,13 @@ fn startup_lines(local: SocketAddr, room_grace: Duration) -> Vec<String> {
             "note: {local} is loopback-only, so friends cannot reach it — bind \
             `--listen 0.0.0.0:PORT` and hand them a URL that reaches your machine \
             (a tunnel works for a first test)"
+        ));
+    }
+    if local.ip().is_unspecified() {
+        lines.push(format!(
+            "note: {local} listens on every interface — replace the wildcard with \
+            a hostname or address your friends can reach (a tunnel URL works for \
+            a first test)"
         ));
     }
     lines.push(format!(
@@ -238,6 +245,9 @@ mod tests {
         let hint = addr_in_use_hint(addr);
         assert!(hint.contains("already in use"), "{hint}");
         assert!(hint.contains("--listen 127.0.0.1:0"), "{hint}");
+        let six: SocketAddr = "[::1]:8080".parse().expect("parses");
+        let six_hint = addr_in_use_hint(six);
+        assert!(six_hint.contains("--listen [::1]:0"), "{six_hint}");
     }
 
     #[test]
@@ -258,10 +268,22 @@ mod tests {
     }
 
     #[test]
-    fn startup_stays_quiet_for_a_public_bind() {
+    fn startup_guides_a_wildcard_bind() {
         let local: SocketAddr = "0.0.0.0:8080".parse().expect("parses");
         let joined = startup_lines(local, Duration::from_secs(30)).join("\n");
         assert!(!joined.contains("loopback-only"), "{joined}");
+        assert!(
+            joined.contains("replace the wildcard"),
+            "a wildcard is not a client URL: {joined}"
+        );
+    }
+
+    #[test]
+    fn startup_stays_quiet_for_a_specific_address() {
+        let local: SocketAddr = "192.0.2.7:8080".parse().expect("parses");
+        let joined = startup_lines(local, Duration::from_secs(30)).join("\n");
+        assert!(!joined.contains("loopback-only"), "{joined}");
+        assert!(!joined.contains("wildcard"), "{joined}");
         assert!(joined.contains("same invite link"), "{joined}");
     }
 }
