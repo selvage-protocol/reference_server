@@ -5,6 +5,8 @@
 //! peers are connected and which documents they have declared open.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use selvage_protocol::{Keepalive, PeerInfo, Role};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
@@ -12,10 +14,18 @@ use tokio::sync::oneshot;
 
 /// How many frames one connection may have queued but unwritten. Past it the peer is
 /// slow: its frames are not dropped silently, the peer is disconnected and the room is
-/// told `peer.left`. A bound on frames bounds memory only with the frame bound (the
-/// transport's `MAX_FRAME_BYTES` in `net`): 32 full frames is the most one peer can
-/// make the server hold for it.
+/// told `peer.left`. Frames alone cannot bound memory — one full-set echo already
+/// wires to ~4.2 MiB — so `MAX_QUEUE_BYTES` bounds the bytes beside it and this stays
+/// as the backstop for a flood of small frames.
 pub const MAX_QUEUE_FRAMES: usize = 32;
+
+/// How many payload bytes one connection may have queued but unwritten: 32 MiB, four
+/// times the largest frame a legitimate session sends (an 8 MiB update, measured in
+/// `crates/harness/tests/session.rs`), so a full-state sync plus concurrent traffic
+/// still fits. Past it the peer is slow, like past the frame cap. One slow peer holds
+/// at most this many queued bytes, plus the frame being written and the kernel's own
+/// buffers; the 33rd frame, or the byte past the cap, disconnects it instead.
+pub const MAX_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 
 /// A frame the connection task should write out.
 #[derive(Debug, Clone)]
@@ -26,10 +36,89 @@ pub enum Outbound {
     Close(u16, String),
 }
 
+impl Outbound {
+    /// The payload bytes this frame holds queued: what the byte cap accounts. The
+    /// envelope around them (the enum, the channel slot) is tens of bytes per frame
+    /// and is not counted; 32 frames of it vanish beside a megabyte payload.
+    #[must_use]
+    pub const fn payload_len(&self) -> usize {
+        match self {
+            Self::Text(text) => text.len(),
+            Self::Binary(bytes) | Self::Ping(bytes) => bytes.len(),
+            Self::Close(_, reason) => reason.len(),
+        }
+    }
+}
+
+/// One connection's outbound queue: the channel its frames leave through and the
+/// count of payload bytes queued but unwritten. Bytes are reserved before queueing
+/// and released once the writer takes the frame off, so the count tracks what the
+/// server holds for the peer rather than what it has ever sent.
+#[derive(Debug, Clone)]
+pub struct Queue {
+    tx: Sender<Outbound>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl Queue {
+    /// A fresh queue and its receiving end. The writer drains the receiver and
+    /// releases each frame's bytes as it leaves the queue.
+    #[must_use]
+    pub fn channel() -> (Self, Receiver<Outbound>) {
+        let (tx, rx) = channel(MAX_QUEUE_FRAMES);
+        (
+            Self {
+                tx,
+                queued: Arc::new(AtomicUsize::new(0)),
+            },
+            rx,
+        )
+    }
+
+    /// Shares the byte count with the writer draining this queue.
+    #[must_use]
+    pub fn queued_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.queued)
+    }
+
+    /// Payload bytes currently held for the peer: queued, being written, or reserved
+    /// just before the channel refused the frame. Never above the cap.
+    #[must_use]
+    pub fn queued_bytes(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
+    }
+
+    /// Queues one frame, reporting whether it fit. Past either bound the peer is
+    /// slow and the caller disconnects it rather than queue without bound. The byte
+    /// reservation is atomic — reserved bytes never exceed the cap — and a
+    /// reservation whose frame the channel refuses is released outright. A closed
+    /// receiver means the connection task is already gone.
+    #[must_use]
+    pub fn try_queue(&self, out: Outbound) -> bool {
+        let len = out.payload_len();
+        if self
+            .queued
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current
+                    .checked_add(len)
+                    .filter(|reserved| *reserved <= MAX_QUEUE_BYTES)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        if self.tx.try_send(out).is_ok() {
+            return true;
+        }
+        self.queued.fetch_sub(len, Ordering::Relaxed);
+        false
+    }
+}
+
 #[derive(Clone)]
 pub struct Peer {
     pub info: PeerInfo,
-    pub tx: Sender<Outbound>,
+    pub queue: Queue,
     /// The room's arrival counter when this peer was seated. `peers` carries no order in the
     /// protocol (`PROTOCOL.md` §6.2), but the frame's bytes must not be a hash artifact either,
     /// so the list is written in join order and this is what says what that is.
@@ -38,10 +127,10 @@ pub struct Peer {
 
 impl Peer {
     #[must_use]
-    pub const fn new(info: PeerInfo, tx: Sender<Outbound>) -> Self {
+    pub const fn new(info: PeerInfo, queue: Queue) -> Self {
         Self {
             info,
-            tx,
+            queue,
             joined: 0,
         }
     }
@@ -51,7 +140,7 @@ impl Peer {
     /// receiver means the connection task is already gone.
     #[must_use]
     pub fn send(&self, out: Outbound) -> bool {
-        self.tx.try_send(out).is_ok()
+        self.queue.try_queue(out)
     }
 }
 
@@ -406,8 +495,8 @@ pub struct Detach {
 
 #[must_use]
 pub fn peer_channel(info: PeerInfo) -> (Peer, Receiver<Outbound>) {
-    let (tx, rx) = channel(MAX_QUEUE_FRAMES);
-    (Peer::new(info, tx), rx)
+    let (queue, rx) = Queue::channel();
+    (Peer::new(info, queue), rx)
 }
 
 #[cfg(test)]
@@ -441,5 +530,41 @@ mod tests {
             assert!(room.broadcast(None, &out).is_empty());
         }
         assert_eq!(room.broadcast(None, &out), vec!["p-slow".to_string()]);
+    }
+
+    /// The byte bound is exact beside the frame bound: payload bytes up to the cap
+    /// fit, and the next byte reports the peer slow — long before the 32nd frame.
+    #[test]
+    fn queued_bytes_past_the_cap_report_the_peer_slow() {
+        let mut registry = Registry::default();
+        let info = PeerInfo {
+            peer_id: "p-slow".to_string(),
+            display_name: "Slow".to_string(),
+            role: Role::Guest,
+            awareness_client_id: None,
+        };
+        let (peer, _leftovers) = peer_channel(info);
+        registry.create(
+            NewRoom {
+                id: "r-1".to_string(),
+                token: "t".to_string(),
+                keepalive: Keepalive::default(),
+            },
+            peer,
+            usize::MAX,
+        );
+        let room = registry.room("r-1").expect("the room is minted");
+        let chunk = Outbound::Binary(vec![0xA5u8; 8 * 1024 * 1024]);
+        for _ in 0..4 {
+            assert!(room.broadcast(None, &chunk).is_empty());
+        }
+        assert_eq!(
+            room.peers
+                .get("p-slow")
+                .map(|peer| peer.queue.queued_bytes()),
+            Some(MAX_QUEUE_BYTES)
+        );
+        let over = Outbound::Binary(vec![0xA5u8; 1]);
+        assert_eq!(room.broadcast(None, &over), vec!["p-slow".to_string()]);
     }
 }

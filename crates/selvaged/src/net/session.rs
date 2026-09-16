@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde_json::Value;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Error as WireError;
@@ -16,7 +15,7 @@ use selvage_protocol as proto;
 use selvage_protocol::{close, code, event, method};
 
 use crate::ServerConfig;
-use crate::room::{Claim, NewRoom, Outbound, Peer, Registry, Room, SeatError};
+use crate::room::{Claim, NewRoom, Outbound, Peer, Queue, Registry, Room, SeatError};
 use crate::{mint_room_id, mint_token};
 
 use super::{SessionStream, Shared, event_frame};
@@ -74,7 +73,7 @@ pub struct Applicant {
     pub peer_id: String,
     pub join: proto::JoinQuery,
     pub hello: Hello,
-    pub tx: Sender<Outbound>,
+    pub queue: Queue,
     /// How to end this connection's task once it is seated: taking it out of the
     /// registry and dropping it completes the task's poison channel.
     pub poison: oneshot::Sender<()>,
@@ -486,7 +485,7 @@ impl Applicant {
             role,
             info: &info,
             room_id: self.join.room.as_deref(),
-            peer: Peer::new(info.clone(), self.tx.clone()),
+            peer: Peer::new(info.clone(), self.queue.clone()),
         };
         let mut guard = shared.registry.lock().await;
         let ((event_name, params), attached) = seating.place(&mut guard)?;
@@ -495,14 +494,14 @@ impl Applicant {
         let body = serde_json::to_value(&params).map_err(|e| bad_body(&e))?;
         let response = event_frame(event_name, body);
         if let Some(frame) = response {
-            let _ = self.tx.try_send(frame);
+            let _ = self.queue.try_queue(frame);
         }
         // A joining connection learns the room's grant straight after its `room.joined`, so
         // it needs no round trip and `room.joined` needs no fifth member. It is queued after
         // the reply, so the reply is still this connection's first frame.
         let granted = join_grant(guard.room(&params.room_id));
         if let Some(frame) = granted {
-            let _ = self.tx.try_send(frame);
+            let _ = self.queue.try_queue(frame);
         }
         // Late arrivals must be announced to the peers already in the room.
         let joined = if params.token.is_none() {
@@ -512,14 +511,14 @@ impl Applicant {
         };
         let room_id = params.room_id.clone();
         let peer_id = self.peer_id.clone();
-        let tx = self.tx.clone();
+        let queue = self.queue.clone();
         drop(guard);
         deliver(shared, &room_id, Some(&peer_id), attached).await;
         deliver(shared, &room_id, Some(&peer_id), joined).await;
         Ok(Session {
             peer_id: self.peer_id,
             room_id: params.room_id,
-            tx,
+            queue,
             poisoned: AtomicBool::new(false),
         })
     }
@@ -639,7 +638,7 @@ impl Seating<'_> {
 pub struct Session {
     peer_id: String,
     room_id: String,
-    tx: Sender<Outbound>,
+    queue: Queue,
     /// Set when a reply found the queue full: the peer stopped reading, and the next
     /// inbound frame ends the session rather than stacking more behind the unread ones.
     poisoned: AtomicBool,
@@ -911,7 +910,7 @@ impl Session {
             code::UNSUPPORTED_VERSION,
             format!("unsupported wire version {version}"),
         ));
-        let _ = self.tx.try_send(Outbound::Close(
+        let _ = self.queue.try_queue(Outbound::Close(
             close::UNSUPPORTED_VERSION,
             "version".to_string(),
         ));
@@ -925,7 +924,7 @@ impl Session {
         let Some(frame) = super::frame_of(msg) else {
             return;
         };
-        if self.tx.try_send(frame).is_err() {
+        if !self.queue.try_queue(frame) {
             self.poisoned.store(true, Ordering::Relaxed);
         }
     }

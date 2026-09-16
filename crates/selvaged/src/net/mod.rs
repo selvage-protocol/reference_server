@@ -18,7 +18,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, MissedTickBehavior, interval, timeout};
@@ -28,7 +28,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use selvage_protocol as proto;
 use selvage_protocol::event;
 
-use crate::room::{MAX_QUEUE_FRAMES, Outbound, Registry};
+use crate::room::{Outbound, Queue, Registry};
 use crate::{ServerConfig, random_hex};
 
 mod session;
@@ -173,7 +173,7 @@ impl Shared {
                     peer_id: format!("p-{}", random_hex(8)),
                     join,
                     hello,
-                    tx: wire.tx.clone(),
+                    queue: wire.queue.clone(),
                     poison: poison_tx,
                 };
                 applicant
@@ -214,8 +214,8 @@ impl Shared {
         live.session.leave(self).await;
         // The registry held a sender for this peer too; `leave` dropped it, so this is
         // the last one and the writer loop can finish.
-        let Wire { tx, mut writer, .. } = live.wire;
-        drop(tx);
+        let Wire { queue, mut writer, .. } = live.wire;
+        drop(queue);
         join_writer(&mut writer).await;
     }
 }
@@ -223,18 +223,19 @@ impl Shared {
 /// The transport half of a connection: what is read, what is queued and who drains it.
 pub struct Wire {
     pub stream: SessionStream,
-    pub tx: Sender<Outbound>,
+    pub queue: Queue,
     writer: JoinHandle<()>,
 }
 
 impl Wire {
     fn new(ws: SessionSocket) -> Self {
         let (sink, stream) = ws.split();
-        let (tx, rx) = channel::<Outbound>(MAX_QUEUE_FRAMES);
+        let (queue, rx) = Queue::channel();
+        let queued = queue.queued_counter();
         Self {
             stream,
-            tx,
-            writer: tokio::spawn(write_outbound(sink, rx)),
+            queue,
+            writer: tokio::spawn(write_outbound(sink, rx, queued)),
         }
     }
 }
@@ -286,18 +287,27 @@ async fn pump(live: &mut Live, shared: &Shared) {
 impl Live {
     /// Sends one protocol-level ping. The keepalive never ends the session.
     fn heartbeat(&self) -> bool {
-        let _ = self.wire.tx.try_send(Outbound::Ping(Vec::new()));
+        let _ = self.wire.queue.try_queue(Outbound::Ping(Vec::new()));
         true
     }
 }
 
-/// Writes queued frames until the last sender is dropped or the socket fails.
-async fn write_outbound(mut sink: SessionSink, mut rx: Receiver<Outbound>) {
+/// Writes queued frames until the last sender is dropped or the socket fails. Each
+/// frame's bytes are released as it leaves the queue — written or not — so the byte
+/// count tracks what is still held for the peer.
+async fn write_outbound(
+    mut sink: SessionSink,
+    mut rx: Receiver<Outbound>,
+    queued: Arc<AtomicUsize>,
+) {
     while let Some(out) = rx.recv().await {
+        let len = out.payload_len();
         let closing = matches!(out, Outbound::Close(..));
         if sink.send(frame_of_outbound(out)).await.is_err() {
+            queued.fetch_sub(len, Ordering::Relaxed);
             return;
         }
+        queued.fetch_sub(len, Ordering::Relaxed);
         if closing {
             let _ = sink.close().await;
             return;
@@ -312,12 +322,12 @@ async fn refuse(wire: Wire, code: &'static str, message: String) {
         serde_json::json!({ "code": code, "message": message }),
     );
     if let Some(frame) = frame_of(&event) {
-        let _ = wire.tx.try_send(frame);
+        let _ = wire.queue.try_queue(frame);
     }
     let _ = wire
-        .tx
-        .try_send(Outbound::Close(proto::close_code_for(code), message));
-    drop(wire.tx);
+        .queue
+        .try_queue(Outbound::Close(proto::close_code_for(code), message));
+    drop(wire.queue);
     let _ = wire.writer.await;
 }
 
