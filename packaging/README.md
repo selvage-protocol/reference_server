@@ -174,8 +174,8 @@ it pulls the published tag.
 ## CI
 
 `.github/workflows/image.yml` has two jobs. `smoke` runs on every PR and on
-`main`: it proves the runner's Docker toolchain (`docker --version`,
-QEMU + buildx setup) and runs `scripts/image-smoke.sh` — no registry push, no
+`main`: it proves the runner's Docker toolchain (`docker info`, QEMU +
+Blacksmith builder setup) and runs `scripts/image-smoke.sh` — no registry push, no
 credentials beyond the checkout. `publish` needs `smoke`, carries the only
 elevated permission in the repo (`packages: write`), logs in to GHCR with the
 built-in `GITHUB_TOKEN`, and is gated on release tags (`refs/tags/v*`) — tags

@@ -5,10 +5,10 @@
 # `GET /meta` truthfulness. Nothing leaves the machine: the only registry
 # involved listens on 127.0.0.1 and is removed on exit.
 #
-# Needs: docker, a buildx builder on the docker-container driver (a stock
-# install's docker driver cannot build multi-arch —
-# .github/workflows/image.yml sets the driver up; see packaging/README.md),
-# and QEMU binfmt for the arm64 run. Run from the repository root.
+# Needs: docker, a working buildx builder that can build multi-arch (the CI
+# workflow sets one up with Blacksmith's builder action; a stock install's
+# docker driver cannot build multi-arch), and QEMU binfmt for the arm64 run.
+# Run from the repository root.
 set -euo pipefail
 
 VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
@@ -21,9 +21,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-driver="$(docker buildx inspect --format '{{.Driver}}')"
-if [ "$driver" != "docker-container" ]; then
-    echo "buildx driver is '$driver', want 'docker-container' for multi-arch" >&2
+if ! docker buildx inspect --bootstrap >/dev/null 2>&1; then
+    echo "no working buildx builder (needed for the multi-arch smoke)" >&2
+    docker buildx ls || true
     exit 1
 fi
 
