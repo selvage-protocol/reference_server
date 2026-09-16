@@ -4,7 +4,7 @@
 //! client library.
 
 use std::error::Error as StdError;
-use std::io::ErrorKind;
+use std::io::{Error as IoError, ErrorKind};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -220,6 +220,21 @@ impl RawSocket {
             }
         }
     }
+}
+
+/// Whether this failure is the socket ending underfoot: the server closes on an
+/// over-bound header, so a send whose payload outgrows the socket buffers can fail
+/// with a reset instead of completing.
+fn socket_ended(failed: &Failure) -> bool {
+    let Some(error) = failed.downcast_ref::<IoError>() else {
+        return false;
+    };
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionAborted
+    )
 }
 
 /// The payload length of a frame, reading the extended form when the short one says to.
@@ -2110,18 +2125,10 @@ async fn a_frame_over_the_bound_ends_the_connection() -> Result<(), Failure> {
     // nowhere.
     let huge = vec![0xA5u8; 9 * 1024 * 1024];
     if let Err(failed) = flood.send(0x2, &huge).await {
-        let ended =
-            failed
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| {
-                    matches!(
-                        error.kind(),
-                        ErrorKind::ConnectionReset
-                            | ErrorKind::BrokenPipe
-                            | ErrorKind::ConnectionAborted
-                    )
-                });
-        assert!(ended, "the oversize send ends the socket: {failed}");
+        assert!(
+            socket_ended(&failed),
+            "the oversize send ends the socket: {failed}"
+        );
     }
     match timeout(WAIT, flood.read_to_end())
         .await
@@ -2333,18 +2340,10 @@ async fn frame_boundaries_are_exact() -> Result<(), Failure> {
     // outgrows the socket buffers.
     let over = vec![0xA5u8; 8 * 1024 * 1024 + 1];
     if let Err(failed) = flood.send(0x2, &over).await {
-        let ended =
-            failed
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| {
-                    matches!(
-                        error.kind(),
-                        ErrorKind::ConnectionReset
-                            | ErrorKind::BrokenPipe
-                            | ErrorKind::ConnectionAborted
-                    )
-                });
-        assert!(ended, "the oversize send ends the socket: {failed}");
+        assert!(
+            socket_ended(&failed),
+            "the oversize send ends the socket: {failed}"
+        );
     }
     match timeout(WAIT, flood.read_to_end())
         .await
