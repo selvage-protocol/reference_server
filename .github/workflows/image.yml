@@ -21,6 +21,20 @@ permissions:
   contents: read
 
 jobs:
+  # Conclusion-readable probe: CI logs are not reachable from automation,
+  # so the runner's Docker state is reported through this job's conclusion.
+  # Green daemon + red smoke = the failure is past the daemon (setup/build);
+  # red daemon = the smoke needs the daemon-free nix/dockerTools fallback.
+  probe:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - name: docker daemon probe
+        run: |
+          docker --version
+          docker info
+          docker buildx version
+
   smoke:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
