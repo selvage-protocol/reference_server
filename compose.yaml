@@ -15,7 +15,11 @@ services:
     build: .
     image: ghcr.io/selvage-protocol/selvaged:0.1
     ports:
-      - "8080:8080"
+      # Loopback by default: a stranger evaluating locally reaches it, and
+      # nothing else does. Operators serving beyond their own machine rebind
+      # deliberately (e.g. "8080:8080"), the way the systemd unit names its
+      # reachable address explicitly.
+      - "127.0.0.1:8080:8080"
     # Inside the container the wildcard is correct: the port mapping supplies
     # the boundary. Override per host, e.g. `--listen 0.0.0.0:9000` with a
     # matching ports entry.
