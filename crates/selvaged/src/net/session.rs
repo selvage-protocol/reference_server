@@ -394,15 +394,17 @@ async fn eject_into(
     let Some(removed) = detached else {
         return;
     };
-    if let Some(left) = peer_left_frame(&removed.peer_id) {
-        pending.push((None, left));
-    }
+    // Queued host-first: `deliver` drains LIFO, so the room hears `peer.left`
+    // before `host.detached`, like a clean leave in `remove_peer`.
     if removed.was_host {
         let grace = grace_ms(&shared.config);
         if let Some(gone) = host_detached_frame(grace) {
             pending.push((None, gone));
         }
         reap_later(shared.clone(), room_id.to_string(), removed.generation);
+    }
+    if let Some(left) = peer_left_frame(&removed.peer_id) {
+        pending.push((None, left));
     }
     drop(removed.poison);
 }
@@ -643,9 +645,8 @@ pub struct Session {
     peer_id: String,
     room_id: String,
     queue: Queue,
-    /// Set when a reply found the queue full: the peer stopped reading. A dispatched
-    /// method acts on it at the end of the same frame; `alert` and `expire` return
-    /// before that check, so a session they mark ends on the next frame instead.
+    /// Set when a reply found the queue full: the peer stopped reading. `handle_text`
+    /// ends the session on the same frame the reply was dropped on.
     poisoned: AtomicBool,
 }
 
@@ -681,7 +682,19 @@ impl Session {
     }
 
     /// Handles one JSON envelope: a session method, or an error for anything else.
+    /// A reply the queue would not take means the peer stopped reading: the session
+    /// ends on this same frame rather than stacking more behind the unread frames,
+    /// whichever path marked it. The room learns of it as `peer.left`, like any drop.
     async fn handle_text(&self, text: &str, shared: &Shared) {
+        self.dispatch_text(text, shared).await;
+        if self.poisoned.swap(false, Ordering::Relaxed) {
+            remove_peer(shared, &self.room_id, &self.peer_id).await;
+        }
+    }
+
+    /// Runs one JSON envelope, queueing its reply. Marks the session when the queue
+    /// will not take the reply; the caller ends it on the same frame.
+    async fn dispatch_text(&self, text: &str, shared: &Shared) {
         let msg = match serde_json::from_str::<proto::ClientMessage>(text) {
             Ok(msg) => msg,
             Err(e) => return self.alert(code::BAD_MESSAGE, e.to_string()),
@@ -711,15 +724,6 @@ impl Session {
                 code::UNKNOWN_METHOD,
                 format!("no such method: {other}"),
             )),
-        }
-        // A reply the queue would not take means the peer stopped reading: end the
-        // session on this same frame rather than stack more behind the unread frames.
-        // The room learns of it as `peer.left`, like any other drop. The early-return
-        // paths above (`alert`, `expire`) skip this check, so a session they poison
-        // ends on the next frame — and with no next frame it lingers, which is the
-        // silent-holder residual the connection cap already accepts.
-        if self.poisoned.swap(false, Ordering::Relaxed) {
-            remove_peer(shared, &self.room_id, &self.peer_id).await;
         }
     }
 
@@ -911,8 +915,7 @@ impl Session {
 
     /// Tells a connection its wire version is not this server's, then closes it. When
     /// even the close cannot be queued the session is already over: the poison the
-    /// reply left ends it on the next frame, since this path returns before the
-    /// same-frame check in `handle_text`.
+    /// reply left ends it on the same frame at the end of `handle_text`.
     fn expire(&self, id: u64, version: &str) {
         self.reply(&proto::ServerMessage::error(
             id,
@@ -926,9 +929,8 @@ impl Session {
     }
 
     /// Queues a response or an error for the connection. A full queue means the peer
-    /// stopped reading: the frame is dropped and the session is marked. A dispatched
-    /// method ends the session on this same frame at the end of `handle_text`; the
-    /// early-return paths (`alert`, `expire`) end it on the next frame instead. The
+    /// stopped reading: the frame is dropped and the session is marked. `handle_text`
+    /// ends a marked session on this same frame, whichever path marked it. The
     /// room is told `peer.left`; nothing unsent is kept for the peer, and no reply is
     /// presented as delivered that was not queued.
     fn reply(&self, msg: &proto::ServerMessage) {

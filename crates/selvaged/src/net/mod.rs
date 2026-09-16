@@ -318,7 +318,9 @@ async fn write_outbound(
     }
 }
 
-/// Tells a connection why it was refused, then closes it.
+/// Tells a connection why it was refused, then closes it. The writer drains under
+/// the same grace as a seated session: a client that never reads must not hold the
+/// connection slot past it.
 async fn refuse(wire: Wire, code: &'static str, message: String) {
     let event = proto::ServerMessage::event(
         event::SESSION_ERROR,
@@ -331,7 +333,8 @@ async fn refuse(wire: Wire, code: &'static str, message: String) {
         .queue
         .try_queue(Outbound::Close(proto::close_code_for(code), message));
     drop(wire.queue);
-    let _ = wire.writer.await;
+    let mut writer = wire.writer;
+    join_writer(&mut writer).await;
 }
 
 /// Serializes a server message into an outbound text frame.
