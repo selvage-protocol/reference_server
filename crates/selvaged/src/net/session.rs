@@ -639,8 +639,9 @@ pub struct Session {
     peer_id: String,
     room_id: String,
     queue: Queue,
-    /// Set when a reply found the queue full: the peer stopped reading, and the next
-    /// inbound frame ends the session rather than stacking more behind the unread ones.
+    /// Set when a reply found the queue full: the peer stopped reading. A dispatched
+    /// method acts on it at the end of the same frame; `alert` and `expire` return
+    /// before that check, so a session they mark ends on the next frame instead.
     poisoned: AtomicBool,
 }
 
@@ -708,8 +709,11 @@ impl Session {
             )),
         }
         // A reply the queue would not take means the peer stopped reading: end the
-        // session rather than stack more behind the unread frames. The room learns of
-        // it as `peer.left`, like any other drop.
+        // session on this same frame rather than stack more behind the unread frames.
+        // The room learns of it as `peer.left`, like any other drop. The early-return
+        // paths above (`alert`, `expire`) skip this check, so a session they poison
+        // ends on the next frame — and with no next frame it lingers, which is the
+        // silent-holder residual the connection cap already accepts.
         if self.poisoned.swap(false, Ordering::Relaxed) {
             remove_peer(shared, &self.room_id, &self.peer_id).await;
         }
@@ -903,7 +907,8 @@ impl Session {
 
     /// Tells a connection its wire version is not this server's, then closes it. When
     /// even the close cannot be queued the session is already over: the poison the
-    /// reply left ends it on this very frame.
+    /// reply left ends it on the next frame, since this path returns before the
+    /// same-frame check in `handle_text`.
     fn expire(&self, id: u64, version: &str) {
         self.reply(&proto::ServerMessage::error(
             id,
@@ -917,9 +922,11 @@ impl Session {
     }
 
     /// Queues a response or an error for the connection. A full queue means the peer
-    /// stopped reading: the frame is dropped and the session is marked, and the next
-    /// inbound frame disconnects it. The room is told `peer.left`; nothing unsent is
-    /// kept for the peer, and no reply is presented as delivered that was not queued.
+    /// stopped reading: the frame is dropped and the session is marked. A dispatched
+    /// method ends the session on this same frame at the end of `handle_text`; the
+    /// early-return paths (`alert`, `expire`) end it on the next frame instead. The
+    /// room is told `peer.left`; nothing unsent is kept for the peer, and no reply is
+    /// presented as delivered that was not queued.
     fn reply(&self, msg: &proto::ServerMessage) {
         let Some(frame) = super::frame_of(msg) else {
             return;
