@@ -36,7 +36,7 @@ mod session;
 use session::{Applicant, Session, handshake};
 
 const MAX_HEAD_BYTES: usize = 16 * 1024;
-const NOT_FOUND: &str = r#"{"error":"not found"}"#;
+const NOT_FOUND: &str = r#"{"error":"not found","hint":"try /session (WebSocket) or /meta (HTTP)"}"#;
 
 /// The most one inbound WebSocket frame or message may carry, well under the
 /// library's 64 MiB default. A frame over the bound is a transport failure, not a

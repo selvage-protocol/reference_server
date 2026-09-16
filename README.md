@@ -27,6 +27,10 @@ specification remains the canonical source.
 
 ## Running it
 
+You need a Rust toolchain: [install Rust via rustup](https://www.rust-lang.org/tools/install)
+(any recent stable works). With Nix, `nix develop` provides the pinned toolchain instead —
+no other setup either way.
+
 ```sh
 cargo test                 # protocol unit tests, the vector replay, convergence and lifecycle
 
@@ -34,8 +38,27 @@ cargo run -p selvage-harness   # the whole slice, printed step by step
 cargo run -p selvaged -- --listen 127.0.0.1:8080
 ```
 
-`selvaged` serves `ws://…/session` and `http://…/meta`. It keeps nothing on disk: rooms die
-with the host, after a 30-second grace period.
+The two commands do different things. The harness runs a scripted demo transcript: it
+starts a server, mints a room, prints the invite link, walks two clients through it, and
+exits. `selvaged` is the server alone: it waits for a client to connect, and a client's
+output carries the invite link — the server itself mints nothing to share. To host a room
+for a friend you need a client connected to your server, not the harness transcript.
+
+`selvaged` serves `ws://HOST:PORT/session` and `http://HOST:PORT/meta`. It keeps nothing
+on disk: keep this process running — Ctrl-C ends all rooms. Rooms outlive a lost
+connection by a 30-second grace period (`--room-grace-ms`); keep your invite link, since
+rejoining with it inside the window reclaims the room.
+
+The loopback default above reaches only your own machine. For a friend to join, bind an
+address they can reach and hand them a URL that names *your* machine, not localhost:
+
+```sh
+cargo run -p selvaged -- --listen 0.0.0.0:8080
+```
+
+A free tunnel that forwards to your port works for a first test; beyond that you want a
+machine with a public address (a small VPS, the right firewall rules). There is no
+container image or service unit yet.
 
 The vector replay reads `vectors/`, or `SELVAGE_VECTORS` when that is set — the Nix build
 cannot see outside the Cargo workspace, so `flake.nix` hands the directory in explicitly.
