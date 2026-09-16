@@ -178,8 +178,9 @@ it pulls the published tag.
 `.github/workflows/image.yml` has three jobs. `probe` reports the runner's
 Docker daemon as green/red (CI logs are not automation-readable, so the
 conclusion carries it). `smoke` runs on every PR and on
-`main`: it proves the runner's Docker toolchain (`docker info`, QEMU +
-Blacksmith builder setup) and runs `scripts/image-smoke.sh` — no registry in
+`main`: it proves the runner's Docker toolchain, creates an explicit local
+buildx builder (docker-container driver) plus QEMU, and runs
+`scripts/image-smoke.sh` — no registry in
 the loop at all, no
 credentials beyond the checkout. `publish` needs `smoke`, carries the only
 elevated permission in the repo (`packages: write`), logs in to GHCR with the

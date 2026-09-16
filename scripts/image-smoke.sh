@@ -6,9 +6,9 @@
 # in the loop at all, loopback or otherwise.
 #
 # Needs: docker, a working buildx builder that can build multi-arch (the CI
-# workflow sets one up with Blacksmith's builder action; a stock install's
-# docker driver cannot build multi-arch), and QEMU binfmt for the arm64 run.
-# Run from the repository root.
+# workflow creates an explicit docker-container builder and selects it; a
+# stock install's default docker driver cannot build multi-arch), and QEMU
+# binfmt for the arm64 run. Run from the repository root.
 set -euo pipefail
 
 VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
