@@ -49,8 +49,9 @@ const NOT_FOUND: &str = r#"{"error":"not found"}"#;
 /// 4,000,031 wired bytes (update bytes track text bytes one-for-one plus ~30 B),
 /// and a tombstone-heavy document (9 KB live after 2000 inserts with 90% deleted)
 /// encodes to 34,663 wired bytes, ~3.9× its live text — so the bound clears bare
-/// pastes to ~8 MB and history-amplified documents to a few megabytes live.
-/// Measured in `crates/harness/tests/session.rs`.
+/// pastes to ~8 MB and history-amplified documents to a few megabytes live. Shapes
+/// measured in `crates/harness/tests/bounds.rs`, clearance pinned in
+/// `crates/harness/tests/session.rs`.
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// RFC 6455 allows 125 bytes in a control-frame payload, and a close frame spends two of

@@ -15,16 +15,17 @@ use tokio::sync::oneshot;
 /// How many frames one connection may have queued but unwritten. Past it the peer is
 /// slow: its frames are not dropped silently, the peer is disconnected and the room is
 /// told `peer.left`. Frames alone cannot bound memory — one full-set echo already
-/// wires to ~4.2 MiB — so `MAX_QUEUE_BYTES` bounds the bytes beside it and this stays
-/// as the backstop for a flood of small frames.
+/// wires to ~4.2 MiB (`crates/harness/tests/bounds.rs`) — so `MAX_QUEUE_BYTES` bounds
+/// the bytes beside it and this stays as the backstop for a flood of small frames.
 pub const MAX_QUEUE_FRAMES: usize = 32;
 
 /// How many payload bytes one connection may have queued but unwritten: 32 MiB, four
 /// times the largest frame a legitimate session sends (an 8 MiB update, measured in
 /// `crates/harness/tests/session.rs`), so a full-state sync plus concurrent traffic
 /// still fits. Past it the peer is slow, like past the frame cap. One slow peer holds
-/// at most this many queued bytes, plus the frame being written and the kernel's own
-/// buffers; the 33rd frame, or the byte past the cap, disconnects it instead.
+/// at most this many queued bytes, plus one frame being written (at most the 8 MiB
+/// frame bound) and the kernel's own buffers; the 33rd frame, or the byte past the
+/// cap, disconnects it instead.
 pub const MAX_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 
 /// A frame the connection task should write out.

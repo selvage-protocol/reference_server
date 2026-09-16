@@ -44,10 +44,12 @@ pub const MAX_GRANT_PATH_BYTES: usize = 4096;
 /// late joiner. What a late joiner can be sent is bounded by what could be published.
 ///
 /// 4 MiB clears measured real use with headroom: a 25,000-path working-tree listing is
-/// 893,750 path bytes, and 100,000 typical paths are ~3.5 MiB, both publishing whole;
-/// a contaminated tree (123,883 files, ~11.9 MiB of path bytes with build outputs
-/// included) is refused, which is the documented policy — the host excludes what it
-/// should not be sharing (`PROTOCOL.md` §5). Measured in
+/// 893,750 path bytes, and 100,000 typical paths are 3,575,000 bytes, both publishing
+/// whole; a contaminated tree (123,883 files, ~11.9 MiB of path bytes with build
+/// outputs included — a shell count of a working area, not a shape the tests seed) is
+/// refused, which is the documented policy — the host excludes what it should not be
+/// sharing (`PROTOCOL.md` §5). Shapes measured in
+/// `crates/harness/tests/bounds.rs`, clearance pinned in
 /// `crates/harness/tests/session.rs`.
 pub const MAX_GRANT_BYTES: usize = 4 * 1024 * 1024;
 
