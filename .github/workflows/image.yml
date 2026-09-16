@@ -35,21 +35,37 @@ jobs:
           docker info
           docker buildx version
 
-  # TEMPORARY probe (one CI round): every buildx build fails in seconds
-  # while bootstrap passes. Either `buildx create` itself is broken here
-  # (then the explicit-builder path is dead) or the Dockerfile is at fault.
-  # This job runs create+bootstrap and nothing else; green means create
-  # works and the Dockerfile is next under suspicion.
-  probe-create:
+  # TEMPORARY probes (one CI round): builder create+bootstrap is green while
+  # every real build dies in seconds. Either buildkit cannot even execute
+  # (scratch build, no network needed) or it cannot pull (hello-world
+  # through buildkit). Conclusions separate the two.
+  probe-buildkit-nonet:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - name: create and bootstrap an explicit builder
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: build FROM scratch with no pulls
         run: |
-          docker buildx create --name probe-builder \
-            --driver docker-container --use
+          docker buildx create --name probe-noniet --driver docker-container --use
           docker buildx inspect --bootstrap
-          docker buildx ls
+          printf 'FROM scratch\nCOPY README.md /proof\n' > .tmp/Dockerfile.probe
+          docker buildx build -f .tmp/Dockerfile.probe .
+
+  probe-buildkit-pull:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: pull a tiny image through buildkit
+        run: |
+          docker buildx create --name probe-pull --driver docker-container --use
+          docker buildx inspect --bootstrap
+          printf 'FROM hello-world\n' > .tmp/Dockerfile.probe-pull
+          docker buildx build -f .tmp/Dockerfile.probe-pull .
 
   smoke:
     runs-on: blacksmith-4vcpu-ubuntu-2404
