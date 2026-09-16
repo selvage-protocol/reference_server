@@ -23,6 +23,28 @@ permissions:
   contents: read
 
 jobs:
+  # TEMPORARY probes (one CI round): the arm leg builds the image green
+  # while both smoke legs fail fast, so each smoke phase gets isolated.
+  # probe-phase-build answers whether `nix build .#image` itself works on
+  # the amd64 runner; the smoke script phases follow from its conclusion.
+  probe-phase-build:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: restore and save the Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
+      - name: build the image on amd64
+        run: nix build .#image --no-link --print-build-logs
+
   smoke:
     strategy:
       # One leg's failure must never cancel the other's proof.
@@ -66,40 +88,6 @@ jobs:
 
       - name: smoke the image without publishing
         run: scripts/image-smoke.sh ${{ matrix.goarch }}
-
-  # TEMPORARY arm probes (one CI round): the arm64 smoke leg fails in ~2
-  # min, before any compile could finish. One job proves flake evaluation on
-  # aarch64, another proves the binary builds there. Conclusions localize.
-  probe-arm-eval:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - uses: cachix/install-nix-action@v31.11.1
-        with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
-      - name: evaluate the flake on aarch64
-        run: nix flake check --no-build .
-
-  probe-arm-build:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - uses: cachix/install-nix-action@v31.11.1
-        with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
-      - name: restore and save the Nix store
-        uses: nix-community/cache-nix-action@v7
-        with:
-          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
-      - name: build the image on aarch64
-        run: nix build .#image --no-link --print-build-logs
 
   publish:
     needs: [smoke]
