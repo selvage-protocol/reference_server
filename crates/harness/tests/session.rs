@@ -10,8 +10,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use selvage_harness::{
     EngineEvent, Error, Harness, Role, SelectionOffsets, ServerConfig,
-    SyncEngine, WAIT, wait_for, wait_for_described, wait_for_event,
-    wait_for_peer,
+    SyncEngine, WAIT, wait_for, wait_for_convergence, wait_for_described,
+    wait_for_event, wait_for_peer,
 };
 use selvage_protocol as proto;
 use selvage_protocol::{close, code, event, method};
@@ -2143,6 +2143,320 @@ async fn a_frame_over_the_bound_ends_the_connection() -> Result<(), Failure> {
     )
     .await;
     Ok(())
+}
+
+/// The grant byte budget is exact: 1024 paths of 4096 bytes are exactly 4 MiB and
+/// publish, one byte more is refused `bad_params`, and the connection stays seated
+/// throughout. Written out, not built from the constants, so the test pins the
+/// boundary instead of agreeing with it.
+#[tokio::test]
+async fn grant_byte_boundaries_are_exact() {
+    let harness = Harness::start(Duration::from_secs(30)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({"display_name": "Ada", "role": "host"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut raw, "room.created").await["event"],
+        event::ROOM_CREATED
+    );
+
+    // Exactly 4 MiB of path bytes publishes: the response precedes the event.
+    let at_limit = vec!["a".repeat(4096); 1024];
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 2,
+        "method": method::DOC_GRANT,
+        "params": {"paths": at_limit},
+    }))
+    .await
+    .expect("sends");
+    assert_eq!(
+        raw_response_for(&mut raw, 2).await["result"],
+        serde_json::json!({})
+    );
+    assert_eq!(
+        next_json_within(&mut raw, "doc.granted").await["event"],
+        event::DOC_GRANTED
+    );
+
+    // One byte more is refused, and the refusal leaves the connection seated: a
+    // listing within every bound publishes right after.
+    let mut over = vec!["a".repeat(4096); 1024];
+    over.push("b".to_string());
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 3,
+        "method": method::DOC_GRANT,
+        "params": {"paths": over},
+    }))
+    .await
+    .expect("sends");
+    assert_eq!(
+        raw_response_for(&mut raw, 3).await["error"]["code"],
+        code::BAD_PARAMS
+    );
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 4,
+        "method": method::DOC_GRANT,
+        "params": {"paths": ["src/main.rs"]},
+    }))
+    .await
+    .expect("sends");
+    assert_eq!(
+        raw_response_for(&mut raw, 4).await["result"],
+        serde_json::json!({})
+    );
+}
+
+/// A large-but-legitimate listing publishes whole. 25,000 working-tree paths carry
+/// 893,750 path bytes — the shape a large checkout shares — and 100,000 typical
+/// paths carry ~3.5 MiB, the most the count cap admits; both publish, and a late
+/// joiner inherits each whole. Past the old 1 MiB budget the second half fails.
+#[tokio::test]
+async fn a_large_checkout_listing_publishes_whole() {
+    let harness = Harness::start(Duration::from_secs(30)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let typical = [
+        "src/main.rs",
+        "crates/selvaged/src/net/session.rs",
+        "packages/foo/src/components/Thing.tsx",
+        "docs/studies/client-command-parity.md",
+    ];
+    let listing = |count: usize| {
+        (0..count)
+            .map(|n| format!("{}{n:06}", typical[n % typical.len()]))
+            .collect::<Vec<String>>()
+    };
+    let invite =
+        proto::session_url(&harness.ws_base(), Some(&room.id), Some(&room.token));
+
+    let large = listing(25_000);
+    host.grant(large.clone())
+        .await
+        .expect("the large listing publishes");
+    let late = harness.join_url(&invite, "Late").await.expect("late joins");
+    let held = wait_for("the late joiner to inherit the large listing", || async {
+        let held = late.granted_paths().await.ok()?;
+        (held == large).then_some(held)
+    })
+    .await;
+    let total: usize = held.iter().map(String::len).sum();
+    assert!(
+        total <= 4 * 1024 * 1024,
+        "the delivery stays within the budget: {total}"
+    );
+
+    let widest = listing(100_000);
+    host.grant(widest.clone())
+        .await
+        .expect("the widest listing publishes");
+    let later = harness.join_url(&invite, "Later").await.expect("later joins");
+    let held =
+        wait_for("the later joiner to inherit the widest listing", || async {
+            let held = later.granted_paths().await.ok()?;
+            (held == widest).then_some(held)
+        })
+        .await;
+    let total: usize = held.iter().map(String::len).sum();
+    assert!(
+        total <= 4 * 1024 * 1024,
+        "the delivery stays within the budget: {total}"
+    );
+}
+
+/// The frame bound is exact: an 8 MiB binary relays to the room byte-identical, and
+/// 8 MiB plus one byte ends the sender with nothing on the wire — the room learning
+/// of it as `peer.left`. Written out, not built from the constant.
+#[tokio::test]
+async fn frame_boundaries_are_exact() -> Result<(), Failure> {
+    let harness = Harness::start(Duration::from_secs(30)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let target = format!(
+        "{}?room={}&token={}",
+        proto::ENDPOINT_PATH,
+        proto::percent_encode(&room.id),
+        proto::percent_encode(&room.token)
+    );
+    let mut flood = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the sender joins");
+    flood
+        .hello(&serde_json::json!({"display_name": "Flo"}))
+        .await
+        .expect("says hello");
+    let joined = next_json_within(&mut flood, "room.joined").await;
+    assert_eq!(joined["event"], event::ROOM_JOINED);
+    let flo = joined["params"]["self"]["peer_id"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    wait_for_peer(&host, "Flo").await;
+
+    let mut watched = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the watcher joins");
+    watched
+        .hello(&serde_json::json!({"display_name": "Watch"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut watched, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+
+    // At the bound: 8 MiB relays byte-identical. Frames the host engine sent on
+    // joining come first, so the watcher reads past those.
+    let at_limit = vec![0xA5u8; 8 * 1024 * 1024];
+    flood.send(0x2, &at_limit).await.expect("sends 8 MiB");
+    let relayed = timeout(WAIT, read_binary_until(&mut watched.stream, &at_limit))
+        .await
+        .expect("the 8 MiB relay arrives")?;
+    assert_eq!(relayed.payload, at_limit);
+
+    // One byte over ends the sender with nothing on the wire to say why. The server
+    // closes on the over-bound header, so the send itself can fail once the payload
+    // outgrows the socket buffers.
+    let over = vec![0xA5u8; 8 * 1024 * 1024 + 1];
+    if let Err(failed) = flood.send(0x2, &over).await {
+        let ended = failed.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionAborted
+            )
+        });
+        assert!(ended, "the oversize send ends the socket: {failed}");
+    }
+    match timeout(WAIT, flood.read_to_end())
+        .await
+        .expect("the server ends the oversize connection")
+    {
+        None | Some(ErrorKind::ConnectionReset) => {}
+        Some(kind) => panic!("the socket ends; it does not linger: {kind:?}"),
+    }
+
+    // The room learned of it as a drop.
+    let left = next_json_within(&mut watched, "peer.left").await;
+    assert_eq!(left["event"], event::PEER_LEFT);
+    assert_eq!(left["params"]["peer_id"], flo.as_str());
+    wait_for_described(
+        "the host to stop seeing the dropped sender",
+        || async { format!("{:?}", host.peers().await) },
+        || async {
+            let peers = host.peers().await.ok()?;
+            (!peers.iter().any(|peer| peer.display_name == "Flo")).then_some(())
+        },
+    )
+    .await;
+    Ok(())
+}
+
+/// A large-but-legitimate document syncs whole. A 4 MB single insert converges — one
+/// ~4 MB delta frame — and after a 1 MB delete a late joiner still syncs the full
+/// ~3 MB state in one full-state frame. Both shapes fit the 8 MiB bound, and neither
+/// fit the old 2 MiB one, which killed the sender instead.
+#[tokio::test]
+async fn a_large_document_syncs_whole() -> Result<(), Failure> {
+    const LARGE: &str = "large.dat";
+    let harness = Harness::start(Duration::from_secs(30)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+    host.open(LARGE).await.expect("the host opens");
+    guest.open(LARGE).await.expect("the guest opens");
+
+    let big = "x".repeat(4 * 1024 * 1024);
+    host.insert(LARGE, 0, big.clone())
+        .await
+        .expect("the host writes big");
+    assert_eq!(wait_for_convergence(&host, &guest, LARGE).await, big);
+
+    host.delete(LARGE, 0, 1024 * 1024)
+        .await
+        .expect("the host trims");
+    let trimmed = big[1024 * 1024..].to_string();
+    assert_eq!(wait_for_convergence(&host, &guest, LARGE).await, trimmed);
+
+    let invite =
+        proto::session_url(&harness.ws_base(), Some(&room.id), Some(&room.token));
+    let late = harness.join_url(&invite, "Late").await.expect("late joins");
+    late.open(LARGE).await.expect("the late joiner opens");
+    assert_eq!(wait_for_convergence(&guest, &late, LARGE).await, trimmed);
+    Ok(())
+}
+
+/// Queued bytes past the cap eject a slow peer before the frame cap could: six 8 MiB
+/// frames are nowhere near 32 frames, but past 32 MiB the peer is slow all the same.
+/// The room is told `peer.left`, its task is stopped, and everyone else keeps being
+/// served.
+#[tokio::test]
+async fn queued_bytes_past_the_cap_eject_a_slow_peer() {
+    let harness = Harness::start(Duration::from_secs(30)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let target = format!(
+        "{}?room={}&token={}",
+        proto::ENDPOINT_PATH,
+        proto::percent_encode(&room.id),
+        proto::percent_encode(&room.token)
+    );
+
+    // The slow peer joins, proves it is seated, and then never reads again.
+    let mut slow = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the slow peer joins");
+    slow.hello(&serde_json::json!({"display_name": "Bob"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut slow, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+    wait_for_peer(&host, "Bob").await;
+
+    // A second raw peer floods the room: six 8 MiB frames are 48 MiB past the 32 MiB
+    // cap in 6 frames, where the 32-frame cap would see nothing wrong.
+    let mut flood = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the flooding peer joins");
+    flood
+        .hello(&serde_json::json!({"display_name": "Flo"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut flood, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+    let big = vec![0xA5u8; 8 * 1024 * 1024];
+    for _ in 0..6 {
+        flood.send(0x2, &big).await.expect("floods");
+    }
+
+    // The room announces the removal, and the slow socket ends.
+    wait_for_described(
+        "the host to see the slow peer leave",
+        || async { format!("{:?}", host.peers().await) },
+        || async {
+            let peers = host.peers().await.ok()?;
+            (!peers.iter().any(|peer| peer.display_name == "Bob")).then_some(())
+        },
+    )
+    .await;
+    match timeout(WAIT, slow.read_to_end())
+        .await
+        .expect("the server ends the slow connection")
+    {
+        None | Some(ErrorKind::ConnectionReset) => {}
+        Some(kind) => {
+            panic!("the slow socket ends; it does not linger: {kind:?}")
+        }
+    }
+
+    // The room keeps serving everyone else.
+    host.open(PATH).await.expect("the host still opens");
 }
 
 /// Opening documents stays linear in the set and stops at the cap: 1024 short paths
