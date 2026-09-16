@@ -1,12 +1,14 @@
 name: image
 
 # The smoke job runs on every PR and on main without pushing anything: it
-# builds the multi-arch image to a local OCI tarball, asserts the manifest
-# list from the tarball's index, and loads and runs each architecture to
-# check version truthfulness there. The publish job below pushes to GHCR, and only on
-# release tags — no tag has been cut, so it has never run. See
-# packaging/README.md (including the FSL-1.1-MIT redistribution review that
-# must happen before any future publish).
+# builds the image with nix/dockerTools (no Docker daemon involved), verifies
+# the manifest and container config with skopeo, and asserts version
+# truthfulness against the exact binary extracted from the image layers.
+# One leg per architecture, each building natively — no cross-compilation.
+# The publish job below pushes to GHCR, and only on release tags — no tag
+# has been cut, so it has never run. See packaging/README.md (including the
+# FSL-1.1-MIT redistribution review that must happen before any future
+# publish).
 on:
   pull_request:
   push:
@@ -21,54 +23,15 @@ permissions:
   contents: read
 
 jobs:
-  # Conclusion-readable probe: CI logs are not reachable from automation,
-  # so the runner's Docker state is reported through this job's conclusion.
-  # Green daemon + red smoke = the failure is past the daemon (setup/build);
-  # red daemon = the smoke needs the daemon-free nix/dockerTools fallback.
-  probe:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
-    steps:
-      - name: docker daemon probe
-        run: |
-          docker --version
-          docker info
-          docker buildx version
-
-  # TEMPORARY probes (one CI round): builder create+bootstrap is green while
-  # every real build dies in seconds. Either buildkit cannot even execute
-  # (scratch build, no network needed) or it cannot pull (hello-world
-  # through buildkit). Conclusions separate the two.
-  probe-buildkit-nonet:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - name: build FROM scratch with no pulls
-        run: |
-          docker buildx create --name probe-noniet --driver docker-container --use
-          docker buildx inspect --bootstrap
-          printf 'FROM scratch\nCOPY README.md /proof\n' > .tmp/Dockerfile.probe
-          docker buildx build -f .tmp/Dockerfile.probe .
-
-  probe-buildkit-pull:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - name: pull a tiny image through buildkit
-        run: |
-          docker buildx create --name probe-pull --driver docker-container --use
-          docker buildx inspect --bootstrap
-          printf 'FROM hello-world\n' > .tmp/Dockerfile.probe-pull
-          docker buildx build -f .tmp/Dockerfile.probe-pull .
-
   smoke:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    strategy:
+      matrix:
+        include:
+          - runner: blacksmith-4vcpu-ubuntu-2404
+            goarch: amd64
+          - runner: ubuntu-24.04-arm
+            goarch: arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7.0.1
@@ -76,7 +39,8 @@ jobs:
           persist-credentials: false
 
       # Same preamble as the checks job: the runner image guarantees only
-      # ~14 GB free, and this job pulls builder images plus a registry.
+      # ~14 GB free, and a cold nix store has to fit a rust-overlay
+      # toolchain plus crane's dependency artefacts.
       - name: free disk space
         run: |
           df -h /
@@ -88,33 +52,29 @@ jobs:
             /usr/share/dotnet || true
           df -h /
 
-      - name: docker toolchain
-        run: |
-          docker --version
-          docker buildx version
-          docker info
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-qemu-action@v3
-
-      # Explicit local builder. The stock docker driver cannot build
-      # multi-arch, and builder-setup actions leave default selection to
-      # chance — so the smoke creates its own builder and selects it.
-      - name: create the smoke builder
-        run: |
-          docker buildx create --name smoke-builder \
-            --driver docker-container --use
-          docker buildx inspect --bootstrap
-          docker buildx ls
+      - name: restore and save the Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
 
       - name: smoke the image without publishing
-        run: scripts/image-smoke.sh
+        run: scripts/image-smoke.sh ${{ matrix.goarch }}
 
   publish:
     needs: [smoke]
     # Release tags only. No `v*` tag has ever been cut, and none is cut here:
     # pushing the image to GHCR is redistribution of the FSL-1.1-MIT binary,
     # which needs the redistribution review recorded in packaging/README.md
-    # before any future publish.
+    # before any future publish. Note the publish leg builds with Docker
+    # while the smoke builds with nix: the runners that proved the smoke
+    # cannot execute buildx builds, so this leg must itself be re-proven
+    # (green on a real run) before any first publish — a tag cut is not
+    # permission to assume it works.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
