@@ -2110,14 +2110,17 @@ async fn a_frame_over_the_bound_ends_the_connection() -> Result<(), Failure> {
     // nowhere.
     let huge = vec![0xA5u8; 9 * 1024 * 1024];
     if let Err(failed) = flood.send(0x2, &huge).await {
-        let ended = failed.downcast_ref::<std::io::Error>().is_some_and(|error| {
-            matches!(
-                error.kind(),
-                ErrorKind::ConnectionReset
-                    | ErrorKind::BrokenPipe
-                    | ErrorKind::ConnectionAborted
-            )
-        });
+        let ended =
+            failed
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionReset
+                            | ErrorKind::BrokenPipe
+                            | ErrorKind::ConnectionAborted
+                    )
+                });
         assert!(ended, "the oversize send ends the socket: {failed}");
     }
     match timeout(WAIT, flood.read_to_end())
@@ -2231,19 +2234,23 @@ async fn a_large_checkout_listing_publishes_whole() {
             .map(|n| format!("{}{n:06}", typical[n % typical.len()]))
             .collect::<Vec<String>>()
     };
-    let invite =
-        proto::session_url(&harness.ws_base(), Some(&room.id), Some(&room.token));
+    let invite = proto::session_url(
+        &harness.ws_base(),
+        Some(&room.id),
+        Some(&room.token),
+    );
 
     let large = listing(25_000);
     host.grant(large.clone())
         .await
         .expect("the large listing publishes");
     let late = harness.join_url(&invite, "Late").await.expect("late joins");
-    let held = wait_for("the late joiner to inherit the large listing", || async {
-        let held = late.granted_paths().await.ok()?;
-        (held == large).then_some(held)
-    })
-    .await;
+    let held =
+        wait_for("the late joiner to inherit the large listing", || async {
+            let held = late.granted_paths().await.ok()?;
+            (held == large).then_some(held)
+        })
+        .await;
     let total: usize = held.iter().map(String::len).sum();
     assert!(
         total <= 4 * 1024 * 1024,
@@ -2254,7 +2261,10 @@ async fn a_large_checkout_listing_publishes_whole() {
     host.grant(widest.clone())
         .await
         .expect("the widest listing publishes");
-    let later = harness.join_url(&invite, "Later").await.expect("later joins");
+    let later = harness
+        .join_url(&invite, "Later")
+        .await
+        .expect("later joins");
     let held =
         wait_for("the later joiner to inherit the widest listing", || async {
             let held = later.granted_paths().await.ok()?;
@@ -2312,9 +2322,10 @@ async fn frame_boundaries_are_exact() -> Result<(), Failure> {
     // joining come first, so the watcher reads past those.
     let at_limit = vec![0xA5u8; 8 * 1024 * 1024];
     flood.send(0x2, &at_limit).await.expect("sends 8 MiB");
-    let relayed = timeout(WAIT, read_binary_until(&mut watched.stream, &at_limit))
-        .await
-        .expect("the 8 MiB relay arrives")?;
+    let relayed =
+        timeout(WAIT, read_binary_until(&mut watched.stream, &at_limit))
+            .await
+            .expect("the 8 MiB relay arrives")?;
     assert_eq!(relayed.payload, at_limit);
 
     // One byte over ends the sender with nothing on the wire to say why. The server
@@ -2322,14 +2333,17 @@ async fn frame_boundaries_are_exact() -> Result<(), Failure> {
     // outgrows the socket buffers.
     let over = vec![0xA5u8; 8 * 1024 * 1024 + 1];
     if let Err(failed) = flood.send(0x2, &over).await {
-        let ended = failed.downcast_ref::<std::io::Error>().is_some_and(|error| {
-            matches!(
-                error.kind(),
-                ErrorKind::ConnectionReset
-                    | ErrorKind::BrokenPipe
-                    | ErrorKind::ConnectionAborted
-            )
-        });
+        let ended =
+            failed
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionReset
+                            | ErrorKind::BrokenPipe
+                            | ErrorKind::ConnectionAborted
+                    )
+                });
         assert!(ended, "the oversize send ends the socket: {failed}");
     }
     match timeout(WAIT, flood.read_to_end())
@@ -2381,8 +2395,11 @@ async fn a_large_document_syncs_whole() -> Result<(), Failure> {
     let trimmed = big[1024 * 1024..].to_string();
     assert_eq!(wait_for_convergence(&host, &guest, LARGE).await, trimmed);
 
-    let invite =
-        proto::session_url(&harness.ws_base(), Some(&room.id), Some(&room.token));
+    let invite = proto::session_url(
+        &harness.ws_base(),
+        Some(&room.id),
+        Some(&room.token),
+    );
     let late = harness.join_url(&invite, "Late").await.expect("late joins");
     late.open(LARGE).await.expect("the late joiner opens");
     assert_eq!(wait_for_convergence(&guest, &late, LARGE).await, trimmed);

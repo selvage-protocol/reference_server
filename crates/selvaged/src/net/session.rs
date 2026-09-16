@@ -15,7 +15,9 @@ use selvage_protocol as proto;
 use selvage_protocol::{close, code, event, method};
 
 use crate::ServerConfig;
-use crate::room::{Claim, NewRoom, Outbound, Peer, Queue, Registry, Room, SeatError};
+use crate::room::{
+    Claim, NewRoom, Outbound, Peer, Queue, Registry, Room, SeatError,
+};
 use crate::{mint_room_id, mint_token};
 
 use super::{SessionStream, Shared, event_frame};

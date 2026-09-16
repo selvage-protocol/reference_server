@@ -214,7 +214,9 @@ impl Shared {
         live.session.leave(self).await;
         // The registry held a sender for this peer too; `leave` dropped it, so this is
         // the last one and the writer loop can finish.
-        let Wire { queue, mut writer, .. } = live.wire;
+        let Wire {
+            queue, mut writer, ..
+        } = live.wire;
         drop(queue);
         join_writer(&mut writer).await;
     }
