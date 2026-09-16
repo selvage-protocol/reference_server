@@ -468,6 +468,10 @@ fn as_suffix(observed: &str) -> String {
 
 /// Waits until both engines hold identical text for `path`, then returns it.
 ///
+/// Convergence is not text equality alone: the replicas must hold the same history
+/// too, so the wait covers the state vectors as well. Text-equal but
+/// history-divergent replicas keep waiting.
+///
 /// # Panics
 ///
 /// Panics when the replicas do not converge within [`WAIT`].
@@ -484,7 +488,9 @@ pub async fn wait_for_convergence(
         || async {
             let (left, right) =
                 (a.text(path).await.ok()?, b.text(path).await.ok()?);
-            (left == right).then_some(left)
+            let (a_vector, b_vector) =
+                (a.state_vector().await.ok()?, b.state_vector().await.ok()?);
+            (left == right && a_vector == b_vector).then_some(left)
         },
     )
     .await

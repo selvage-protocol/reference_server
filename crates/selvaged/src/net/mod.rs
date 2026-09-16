@@ -8,7 +8,9 @@ use std::io;
 use std::mem::take;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -16,18 +18,17 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::{
-    UnboundedReceiver, UnboundedSender, unbounded_channel,
-};
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, MissedTickBehavior, interval, timeout};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 
 use selvage_protocol as proto;
 use selvage_protocol::event;
 
-use crate::room::{Outbound, Registry};
+use crate::room::{Outbound, Queue, Registry};
 use crate::{ServerConfig, random_hex};
 
 mod session;
@@ -36,6 +37,22 @@ use session::{Applicant, Session, handshake};
 
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const NOT_FOUND: &str = r#"{"error":"not found"}"#;
+
+/// The most one inbound WebSocket frame or message may carry, well under the
+/// library's 64 MiB default. A frame over the bound is a transport failure, not a
+/// session fault: the connection ends the way a dropped socket ends, and the room
+/// learns of it as `peer.left` (`PROTOCOL.md` §2.1). Ending rather than refusing is
+/// structural, not policy: past the bound the transport cannot resync mid-message,
+/// so there is no session left to refuse on.
+///
+/// 8 MiB clears measured real use with headroom: a single 4 MiB insert encodes to
+/// 4,194,338 wired bytes (update bytes track text bytes one-for-one plus ~34 B),
+/// and a tombstone-heavy document (9 KB live after 2000 inserts with 90% deleted)
+/// encodes to 34,663 wired bytes, ~3.9× its live text — so the bound clears bare
+/// pastes to ~8 MiB and history-amplified documents to a few megabytes live. Shapes
+/// measured in `crates/harness/tests/bounds.rs`, clearance pinned in
+/// `crates/harness/tests/session.rs`.
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// RFC 6455 allows 125 bytes in a control-frame payload, and a close frame spends two of
 /// them on its status code.
@@ -52,26 +69,42 @@ pub type SessionStream = SplitStream<SessionSocket>;
 pub struct Shared {
     pub config: ServerConfig,
     pub registry: Arc<Mutex<Registry>>,
+    /// How many connections the server holds right now, seated or not. Past the
+    /// configured cap a new TCP connection is closed without an answer.
+    pub connections: Arc<AtomicUsize>,
 }
 
 impl Shared {
     #[must_use]
-    pub const fn new(
-        config: ServerConfig,
-        registry: Arc<Mutex<Registry>>,
-    ) -> Self {
-        Self { config, registry }
+    pub fn new(config: ServerConfig, registry: Arc<Mutex<Registry>>) -> Self {
+        Self {
+            config,
+            registry,
+            connections: Arc::new(AtomicUsize::new(0)),
+        }
     }
 }
 
-/// Serves connections until the listener itself fails.
+/// Serves connections until the listener itself fails. Past the configured cap a new
+/// connection is closed without an answer: the count covers handshakes as well as
+/// seats, so half-open sockets cannot pile up past it.
 pub async fn serve(listener: TcpListener, shared: Shared) {
     loop {
         let Ok(tcp) = accept_nodelay(&listener).await else {
             continue;
         };
+        if shared.connections.fetch_add(1, Ordering::SeqCst)
+            >= shared.config.max_connections
+        {
+            shared.connections.fetch_sub(1, Ordering::SeqCst);
+            continue;
+        }
         let connection = shared.clone();
-        tokio::spawn(connection.accept(tcp));
+        tokio::spawn(async move {
+            let live = Arc::clone(&connection.connections);
+            let _ = connection.accept(tcp).await;
+            live.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 }
 
@@ -108,7 +141,15 @@ impl Shared {
         }
         // The head we consumed while routing has to go back in front of the socket.
         let prefixed = PrefixedStream::new(take(&mut head.request), tcp);
-        let Ok(mut ws) = tokio_tungstenite::accept_async(prefixed).await else {
+        let framing = WebSocketConfig::default()
+            .max_message_size(Some(MAX_FRAME_BYTES))
+            .max_frame_size(Some(MAX_FRAME_BYTES));
+        let Ok(mut ws) = tokio_tungstenite::accept_async_with_config(
+            prefixed,
+            Some(framing),
+        )
+        .await
+        else {
             return Ok(());
         };
         // The upgrade refuses a request with anything behind it, so bytes that arrived
@@ -128,24 +169,38 @@ impl Shared {
                 .await;
         let seated = match greeted {
             Ok(hello) => {
+                let (poison_tx, poison_rx) = oneshot::channel();
                 let applicant = Applicant {
                     peer_id: format!("p-{}", random_hex(8)),
                     join,
                     hello,
-                    tx: wire.tx.clone(),
+                    queue: wire.queue.clone(),
+                    poison: poison_tx,
                 };
-                applicant.seat(&self.registry, &self.config).await
+                applicant
+                    .seat(self)
+                    .await
+                    .map(|session| (session, poison_rx))
             }
             Err(refusal) => Err(refusal),
         };
         match seated {
-            Ok(session) => self.drive(session, wire).await,
+            Ok((session, poison)) => self.drive(session, wire, poison).await,
             Err((code, message)) => refuse(wire, code, message).await,
         }
     }
 
     /// Runs a seated session until the connection ends, then lets the peers know.
-    async fn drive(&self, session: Session, wire: Wire) {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a drive names its session, transport and poison channel; all three move into the turn loop"
+    )]
+    async fn drive(
+        &self,
+        session: Session,
+        wire: Wire,
+        poison: oneshot::Receiver<()>,
+    ) {
         let mut ping = interval(self.config.ping_interval);
         ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
         ping.tick().await;
@@ -154,13 +209,16 @@ impl Shared {
             session,
             wire,
             ping,
+            poison,
         };
         pump(&mut live, self).await;
         live.session.leave(self).await;
         // The registry held a sender for this peer too; `leave` dropped it, so this is
         // the last one and the writer loop can finish.
-        let Wire { tx, mut writer, .. } = live.wire;
-        drop(tx);
+        let Wire {
+            queue, mut writer, ..
+        } = live.wire;
+        drop(queue);
         join_writer(&mut writer).await;
     }
 }
@@ -168,27 +226,39 @@ impl Shared {
 /// The transport half of a connection: what is read, what is queued and who drains it.
 pub struct Wire {
     pub stream: SessionStream,
-    pub tx: UnboundedSender<Outbound>,
+    pub queue: Queue,
     writer: JoinHandle<()>,
 }
 
 impl Wire {
     fn new(ws: SessionSocket) -> Self {
         let (sink, stream) = ws.split();
-        let (tx, rx) = unbounded_channel::<Outbound>();
+        let (queue, rx) = Queue::channel();
+        let queued = queue.queued_counter();
         Self {
             stream,
-            tx,
-            writer: tokio::spawn(write_outbound(sink, rx)),
+            queue,
+            writer: tokio::spawn(write_outbound(sink, rx, queued)),
         }
     }
 }
 
+/// How long a connection's writer may take to drain once the session is over. A peer
+/// that stopped reading holds the writer in its send; the frames it would have written
+/// were already dropped with the queue, so the wait is bounded and the socket goes
+/// with the writer.
+const WRITER_GRACE: Duration = Duration::from_secs(2);
+
 /// Waits for a writer task, unless the turn loop already observed it finish: a
-/// `JoinHandle` whose output the loop has taken panics when it is polled again.
+/// `JoinHandle` whose output the loop has taken panics when it is polled again. The
+/// wait is bounded: a writer stuck on a peer that stopped reading is stopped, and the
+/// socket with it.
 async fn join_writer(writer: &mut JoinHandle<()>) {
-    if !writer.is_finished() {
-        let _ = writer.await;
+    if writer.is_finished() {
+        return;
+    }
+    if timeout(WRITER_GRACE, &mut *writer).await.is_err() {
+        writer.abort();
     }
 }
 
@@ -197,6 +267,9 @@ struct Live {
     session: Session,
     wire: Wire,
     ping: Interval,
+    /// Ends the turn loop when the registry drops its sender: the peer was removed,
+    /// so there is nothing left to serve.
+    poison: oneshot::Receiver<()>,
 }
 
 /// The turn loop: protocol pings, session methods and inbound frames.
@@ -205,6 +278,7 @@ async fn pump(live: &mut Live, shared: &Shared) {
         let keep_going = tokio::select! {
             _ = live.ping.tick() => live.heartbeat(),
             _ = &mut live.wire.writer => false,
+            _ = &mut live.poison => false,
             incoming = live.wire.stream.next() => live.session.handle_frame(incoming, shared).await,
         };
         if !keep_going {
@@ -216,21 +290,27 @@ async fn pump(live: &mut Live, shared: &Shared) {
 impl Live {
     /// Sends one protocol-level ping. The keepalive never ends the session.
     fn heartbeat(&self) -> bool {
-        let _ = self.wire.tx.send(Outbound::Ping(Vec::new()));
+        let _ = self.wire.queue.try_queue(Outbound::Ping(Vec::new()));
         true
     }
 }
 
-/// Writes queued frames until the last sender is dropped or the socket fails.
+/// Writes queued frames until the last sender is dropped or the socket fails. Each
+/// frame's bytes are released after its send completes — written or not — so the byte
+/// count tracks what is still held for the peer.
 async fn write_outbound(
     mut sink: SessionSink,
-    mut rx: UnboundedReceiver<Outbound>,
+    mut rx: Receiver<Outbound>,
+    queued: Arc<AtomicUsize>,
 ) {
     while let Some(out) = rx.recv().await {
+        let len = out.payload_len();
         let closing = matches!(out, Outbound::Close(..));
         if sink.send(frame_of_outbound(out)).await.is_err() {
+            queued.fetch_sub(len, Ordering::Relaxed);
             return;
         }
+        queued.fetch_sub(len, Ordering::Relaxed);
         if closing {
             let _ = sink.close().await;
             return;
@@ -238,20 +318,23 @@ async fn write_outbound(
     }
 }
 
-/// Tells a connection why it was refused, then closes it.
+/// Tells a connection why it was refused, then closes it. The writer drains under
+/// the same grace as a seated session: a client that never reads must not hold the
+/// connection slot past it.
 async fn refuse(wire: Wire, code: &'static str, message: String) {
     let event = proto::ServerMessage::event(
         event::SESSION_ERROR,
         serde_json::json!({ "code": code, "message": message }),
     );
     if let Some(frame) = frame_of(&event) {
-        let _ = wire.tx.send(frame);
+        let _ = wire.queue.try_queue(frame);
     }
     let _ = wire
-        .tx
-        .send(Outbound::Close(proto::close_code_for(code), message));
-    drop(wire.tx);
-    let _ = wire.writer.await;
+        .queue
+        .try_queue(Outbound::Close(proto::close_code_for(code), message));
+    drop(wire.queue);
+    let mut writer = wire.writer;
+    join_writer(&mut writer).await;
 }
 
 /// Serializes a server message into an outbound text frame.

@@ -1201,7 +1201,13 @@ impl EngineTask {
         let kinds = kinds_in(frame);
         let Ok(replies) = DefaultProtocol.handle(&mut self.awareness, frame)
         else {
-            // A payload we cannot decode is a peer bug; keep serving the session.
+            // A payload no replica decodes is a peer bug or version skew, and the room
+            // never receives it. Say so on the session-error channel rather than drop
+            // it quietly: silent loss is the divergence nobody can see.
+            let _ = self.events.send(EngineEvent::SessionError {
+                code: code::BAD_MESSAGE.to_string(),
+                message: "a binary frame could not be decoded".to_string(),
+            });
             return;
         };
         for reply in replies {
@@ -1229,6 +1235,12 @@ impl EngineTask {
 
     fn handle_text(&mut self, text: &str) {
         let Ok(msg) = serde_json::from_str::<proto::ServerMessage>(text) else {
+            // A server frame that does not parse is corruption or version skew, not an
+            // event to ignore: it arrives on the same channel a server fault does.
+            let _ = self.events.send(EngineEvent::SessionError {
+                code: code::BAD_MESSAGE.to_string(),
+                message: "a text frame could not be parsed".to_string(),
+            });
             return;
         };
         if let Some(id) = msg.id {
@@ -1523,11 +1535,24 @@ fn now_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, VecDeque};
     use std::error::Error as StdError;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
+    use futures_util::StreamExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::{broadcast, mpsc};
+    use tokio::time::timeout;
+    use yrs::sync::Awareness;
     use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact};
 
-    use super::{fresh_doc, seed_update};
+    use super::{EngineTask, Sink, Stream, fresh_doc, seed_update};
+    use crate::editor::EngineEvent;
+    use crate::session::ReconnectPolicy;
+    use crate::{ConnectOptions, KeepaliveConfig, SessionInfo};
+    use selvage_protocol as proto;
+    use selvage_protocol::code;
 
     const PATH: &str = "src/main.rs";
 
@@ -1585,6 +1610,110 @@ mod tests {
         let txn = seated.transact();
         let restored = txn.get_text(PATH).map(|text| text.get_string(&txn));
         assert_eq!(restored.as_deref(), Some("fn main() {}"));
+        Ok(())
+    }
+
+    /// A loopback WebSocket pair: the engine end supplies a real sink and stream, and
+    /// nothing connects anywhere.
+    async fn loopback_pair() -> Result<(Sink, Stream), Box<dyn StdError>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let accept = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await?;
+            tokio_tungstenite::accept_async(tcp).await
+        });
+        let url = format!("ws://{addr}/session");
+        let (client, _) = tokio_tungstenite::connect_async(url).await?;
+        accept.await??;
+        Ok(client.split())
+    }
+
+    /// The smallest task that can receive frames: loopback transport, an empty room,
+    /// and an event channel the test reads.
+    async fn receiving_task()
+    -> Result<(EngineTask, broadcast::Receiver<EngineEvent>), Box<dyn StdError>>
+    {
+        let (sink, stream) = loopback_pair().await?;
+        let (events_tx, events_rx) = broadcast::channel(16);
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let session = SessionInfo {
+            room_id: "r-test".to_string(),
+            token: None,
+            role: proto::Role::Guest,
+            peer: proto::PeerInfo {
+                peer_id: "p-test".to_string(),
+                display_name: "Test".to_string(),
+                role: proto::Role::Guest,
+                awareness_client_id: None,
+            },
+            peers: Vec::new(),
+            documents: Vec::new(),
+            capabilities: Vec::new(),
+            keepalive: proto::Keepalive::default(),
+            base_url: "ws://127.0.0.1:9".to_string(),
+        };
+        let task = EngineTask {
+            policy: ReconnectPolicy::default(),
+            options: ConnectOptions::host("ws://127.0.0.1:9", "Test"),
+            sink,
+            stream,
+            awareness: Awareness::new(Doc::new()),
+            session: session.clone(),
+            session_slot: Arc::new(Mutex::new(session)),
+            room: None,
+            token: None,
+            terminal: false,
+            attempts: 0,
+            commands: commands_rx,
+            events: events_tx,
+            keepalive: KeepaliveConfig::from(proto::Keepalive::default()),
+            documents: Vec::new(),
+            granted_paths: Vec::new(),
+            open_documents: Vec::new(),
+            peers: HashMap::new(),
+            request_id: 0,
+            pending: HashMap::new(),
+            local_state: None,
+            queued: VecDeque::new(),
+            paused: false,
+        };
+        Ok((task, events_rx))
+    }
+
+    /// The next session error, or what arrived instead.
+    async fn next_session_error(
+        events: &mut broadcast::Receiver<EngineEvent>,
+    ) -> Result<String, Box<dyn StdError>> {
+        let event = timeout(Duration::from_secs(1), events.recv()).await??;
+        let EngineEvent::SessionError { code, .. } = event else {
+            return Err(
+                format!("a session error was expected, got {event:?}").into()
+            );
+        };
+        Ok(code)
+    }
+
+    /// An auth denial whose reason is not UTF-8: present on the wire but undecodable.
+    /// Truncation alone does not fail decoding — `yrs` reads it as end-of-messages —
+    /// so the failing shape has to be semantic, not short.
+    const UNDECODABLE: &[u8] = &[0x02, 0x00, 0x02, 0xFF, 0xFF];
+
+    /// An undecodable frame is reported, not dropped: binary garbage and unparsable
+    /// text each surface a session error, and the task still dispatches afterwards.
+    #[tokio::test]
+    async fn undecodable_frames_are_reported() -> Result<(), Box<dyn StdError>>
+    {
+        let (mut task, mut events) = receiving_task().await?;
+        task.handle_binary(UNDECODABLE);
+        task.handle_text("{not json");
+        assert_eq!(next_session_error(&mut events).await?, code::BAD_MESSAGE);
+        assert_eq!(next_session_error(&mut events).await?, code::BAD_MESSAGE);
+
+        // Dispatch still works: a well-formed server fault arrives with its own code.
+        task.handle_text(
+            r#"{"v":"selvage/1","event":"session.error","params":{"code":"x.test","message":"m"}}"#,
+        );
+        assert_eq!(next_session_error(&mut events).await?, "x.test");
         Ok(())
     }
 }

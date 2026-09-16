@@ -5,11 +5,28 @@
 //! peers are connected and which documents they have declared open.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use selvage_protocol::{Keepalive, PeerInfo, Role};
-use tokio::sync::mpsc::{
-    UnboundedReceiver, UnboundedSender, unbounded_channel,
-};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::oneshot;
+
+/// How many frames one connection may have queued but unwritten. Past it the peer is
+/// slow: its frames are not dropped silently, the peer is disconnected and the room is
+/// told `peer.left`. Frames alone cannot bound memory — one full-set echo already
+/// wires to ~4.2 MiB (`crates/harness/tests/bounds.rs`) — so `MAX_QUEUE_BYTES` bounds
+/// the bytes beside it and this stays as the backstop for a flood of small frames.
+pub const MAX_QUEUE_FRAMES: usize = 32;
+
+/// How many payload bytes one connection may have queued but unwritten: 32 MiB, four
+/// times the largest frame a legitimate session sends (an 8 MiB update, measured in
+/// `crates/harness/tests/session.rs`), so a full-state sync plus concurrent traffic
+/// still fits. Past it the peer is slow, like past the frame cap. One slow peer holds
+/// at most this many counted bytes — the count includes the frame being written,
+/// released only after its send completes — plus the kernel's own buffers; the 33rd
+/// frame, or the byte past the cap, disconnects it instead.
+pub const MAX_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 
 /// A frame the connection task should write out.
 #[derive(Debug, Clone)]
@@ -20,10 +37,90 @@ pub enum Outbound {
     Close(u16, String),
 }
 
+impl Outbound {
+    /// The payload bytes this frame holds queued: what the byte cap accounts. The
+    /// envelope around them (the enum, the channel slot) is tens of bytes per frame
+    /// and is not counted; 32 frames of it vanish beside a megabyte payload.
+    #[must_use]
+    pub const fn payload_len(&self) -> usize {
+        match self {
+            Self::Text(text) => text.len(),
+            Self::Binary(bytes) | Self::Ping(bytes) => bytes.len(),
+            Self::Close(_, reason) => reason.len(),
+        }
+    }
+}
+
+/// One connection's outbound queue: the channel its frames leave through and the
+/// count of payload bytes queued but unwritten. Bytes are reserved before queueing
+/// and released after the writer's send of the frame completes, written or not, so
+/// a frame being written stays counted and the count tracks what the server still
+/// holds for the peer rather than what it has ever sent.
+#[derive(Debug, Clone)]
+pub struct Queue {
+    tx: Sender<Outbound>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl Queue {
+    /// A fresh queue and its receiving end. The writer drains the receiver and
+    /// releases each frame's bytes after its send completes.
+    #[must_use]
+    pub fn channel() -> (Self, Receiver<Outbound>) {
+        let (tx, rx) = channel(MAX_QUEUE_FRAMES);
+        (
+            Self {
+                tx,
+                queued: Arc::new(AtomicUsize::new(0)),
+            },
+            rx,
+        )
+    }
+
+    /// Shares the byte count with the writer draining this queue.
+    #[must_use]
+    pub fn queued_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.queued)
+    }
+
+    /// Payload bytes currently held for the peer: queued, being written, or reserved
+    /// just before the channel refused the frame. Never above the cap.
+    #[must_use]
+    pub fn queued_bytes(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
+    }
+
+    /// Queues one frame, reporting whether it fit. Past either bound the peer is
+    /// slow and the caller disconnects it rather than queue without bound. The byte
+    /// reservation is atomic — reserved bytes never exceed the cap — and a
+    /// reservation whose frame the channel refuses is released outright. A closed
+    /// receiver means the connection task is already gone.
+    #[must_use]
+    pub fn try_queue(&self, out: Outbound) -> bool {
+        let len = out.payload_len();
+        if self
+            .queued
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current
+                    .checked_add(len)
+                    .filter(|reserved| *reserved <= MAX_QUEUE_BYTES)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        if self.tx.try_send(out).is_ok() {
+            return true;
+        }
+        self.queued.fetch_sub(len, Ordering::Relaxed);
+        false
+    }
+}
+
 #[derive(Clone)]
 pub struct Peer {
     pub info: PeerInfo,
-    pub tx: UnboundedSender<Outbound>,
+    pub queue: Queue,
     /// The room's arrival counter when this peer was seated. `peers` carries no order in the
     /// protocol (`PROTOCOL.md` §6.2), but the frame's bytes must not be a hash artifact either,
     /// so the list is written in join order and this is what says what that is.
@@ -32,17 +129,20 @@ pub struct Peer {
 
 impl Peer {
     #[must_use]
-    pub const fn new(info: PeerInfo, tx: UnboundedSender<Outbound>) -> Self {
+    pub const fn new(info: PeerInfo, queue: Queue) -> Self {
         Self {
             info,
-            tx,
+            queue,
             joined: 0,
         }
     }
 
-    pub fn send(&self, out: Outbound) {
-        // The receiver lives in the connection task; a send only fails once it is gone.
-        let _ = self.tx.send(out);
+    /// Queues one frame, reporting whether it fit. A full queue means the peer stopped
+    /// reading; the caller disconnects it rather than queue without bound. A closed
+    /// receiver means the connection task is already gone.
+    #[must_use]
+    pub fn send(&self, out: Outbound) -> bool {
+        self.queue.try_queue(out)
     }
 }
 
@@ -103,14 +203,21 @@ impl Room {
         self.peers.insert(peer.info.peer_id.clone(), peer);
     }
 
-    pub fn broadcast(&self, except: Option<&str>, out: &Outbound) {
-        let others = self
-            .peers
+    /// Queues a frame on every peer but one, returning the ids whose queue was full.
+    /// The room holds no unsent bytes for them; the caller removes them instead.
+    #[must_use]
+    pub fn broadcast(
+        &self,
+        except: Option<&str>,
+        out: &Outbound,
+    ) -> Vec<String> {
+        self.peers
             .values()
-            .filter(|peer| Some(peer.info.peer_id.as_str()) != except);
-        for peer in others {
-            peer.send(out.clone());
-        }
+            .filter(|peer| Some(peer.info.peer_id.as_str()) != except)
+            .map(|peer| (peer.send(out.clone()), peer))
+            .filter(|(queued, _)| !queued)
+            .map(|(_, peer)| peer.info.peer_id.clone())
+            .collect()
     }
 
     pub fn attach_host(&mut self, peer_id: &str) {
@@ -131,13 +238,29 @@ impl Room {
         self.generation
     }
 
-    pub fn open_document(&mut self, peer_id: &str, path: &str) -> bool {
-        self.claims_mut(peer_id).insert(path.to_string());
+    /// Records a peer's hold on a path, returning whether the path is newly in the
+    /// room's set — or `None` when the set is at its cap and the path is not in it. A
+    /// path the room already holds is always fine: re-opening one grows nothing.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an open names its peer, path and the cap it is checked against"
+    )]
+    pub fn open_document(
+        &mut self,
+        peer_id: &str,
+        path: &str,
+        max_documents: usize,
+    ) -> Option<bool> {
         if self.documents.iter().any(|p| p == path) {
-            return false;
+            self.claims_mut(peer_id).insert(path.to_string());
+            return Some(false);
         }
+        if self.documents.len() >= max_documents {
+            return None;
+        }
+        self.claims_mut(peer_id).insert(path.to_string());
         self.documents.push(path.to_string());
-        true
+        Some(true)
     }
 
     /// Releases one peer's hold on a path. The path leaves the room only when no peer
@@ -217,16 +340,36 @@ pub enum SeatError {
     Unknown,
     TokenMismatch,
     HostPresent,
+    RoomFull,
 }
 
 #[derive(Default)]
 pub struct Registry {
     rooms: HashMap<String, Room>,
+    /// How to end each seated connection's task, by peer id. Dropping the sender
+    /// completes the task's poison channel, so taking it here ends the task: a slow
+    /// peer's task is ended when it is removed, and a clean leave takes its sender
+    /// only so the map does not keep one for a task that is already ending.
+    tasks: HashMap<String, oneshot::Sender<()>>,
 }
 
 impl Registry {
     /// Mints a room and seats its host in it.
-    pub fn create(&mut self, new: NewRoom, host: Peer) {
+    /// Mints a room and seats its host in it, reporting whether there was room for
+    /// one more. `false` means the server is at its cap and nothing was minted.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a mint names its room, host and the cap it is checked against"
+    )]
+    pub fn create(
+        &mut self,
+        new: NewRoom,
+        host: Peer,
+        max_rooms: usize,
+    ) -> bool {
+        if self.rooms.len() >= max_rooms {
+            return false;
+        }
         let mut room = Room {
             id: new.id.clone(),
             token: new.token,
@@ -242,6 +385,7 @@ impl Registry {
         room.attach_host(&host.info.peer_id);
         room.seat(host);
         self.rooms.insert(new.id, room);
+        true
     }
 
     /// Seats a connection in an existing room. The claimed role is honoured only while
@@ -250,12 +394,19 @@ impl Registry {
     /// # Errors
     ///
     /// Returns [`SeatError::Unknown`] for a room that does not exist,
-    /// [`SeatError::TokenMismatch`] for a wrong token, and [`SeatError::HostPresent`]
-    /// when the host role is taken.
+    /// [`SeatError::TokenMismatch`] for a wrong token, [`SeatError::HostPresent`]
+    /// when the host role is taken, and [`SeatError::RoomFull`] when the room seats no
+    /// more peers. A host reclaiming a host-less room always seats: the room's owner
+    /// must be able to come back to a full room.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an admission names its claim, peer and the cap it is checked against"
+    )]
     pub fn admit(
         &mut self,
         claim: Claim<'_>,
         peer: Peer,
+        max_peers: usize,
     ) -> Result<(), SeatError> {
         let room = self
             .rooms
@@ -267,6 +418,10 @@ impl Registry {
         if claim.role == Role::Host && room.host_present() {
             return Err(SeatError::HostPresent);
         }
+        let reclaiming = claim.role == Role::Host && !room.host_present();
+        if room.peers.len() >= max_peers && !reclaiming {
+            return Err(SeatError::RoomFull);
+        }
         if claim.role == Role::Host {
             room.attach_host(&peer.info.peer_id);
         }
@@ -274,18 +429,25 @@ impl Registry {
         Ok(())
     }
 
-    #[must_use]
-    pub fn peer(&self, room_id: &str, peer_id: &str) -> Option<&Peer> {
-        self.rooms.get(room_id)?.peers.get(peer_id)
+    /// Remembers how to end a seated connection's task.
+    pub fn set_task(&mut self, peer_id: &str, poison: oneshot::Sender<()>) {
+        self.tasks.insert(peer_id.to_string(), poison);
+    }
+
+    /// Forgets a connection's task, returning how to end it. Dropping the sender ends
+    /// the task; `None` when the peer was never seated or its task was already taken.
+    pub fn take_task(&mut self, peer_id: &str) -> Option<oneshot::Sender<()>> {
+        self.tasks.remove(peer_id)
     }
 
     /// Detaches a peer. Returns whether it was the host, so the caller can announce
-    /// `host.detached`, and whether the room became empty.
+    /// `host.detached`. `None` when the room is gone or the peer was never in it:
+    /// detaching twice announces once.
     #[must_use]
     pub fn detach(&mut self, room_id: &str, peer_id: &str) -> Option<Detach> {
         let room = self.rooms.get_mut(room_id)?;
         let was_host = room.host.as_deref() == Some(peer_id);
-        room.peers.remove(peer_id);
+        room.peers.remove(peer_id)?;
         room.forget_claims(peer_id);
         let generation = if was_host {
             room.detach_host()
@@ -334,7 +496,103 @@ pub struct Detach {
 }
 
 #[must_use]
-pub fn peer_channel(info: PeerInfo) -> (Peer, UnboundedReceiver<Outbound>) {
-    let (tx, rx) = unbounded_channel();
-    (Peer::new(info, tx), rx)
+pub fn peer_channel(info: PeerInfo) -> (Peer, Receiver<Outbound>) {
+    let (queue, rx) = Queue::channel();
+    (Peer::new(info, queue), rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The queue bound is exact: a full queue's worth of frames fits, and the next
+    /// broadcast reports the peer slow instead of queueing without bound.
+    #[test]
+    fn a_full_queue_reports_the_peer_slow() {
+        let mut registry = Registry::default();
+        let info = PeerInfo {
+            peer_id: "p-slow".to_string(),
+            display_name: "Slow".to_string(),
+            role: Role::Guest,
+            awareness_client_id: None,
+        };
+        let (peer, _leftovers) = peer_channel(info);
+        registry.create(
+            NewRoom {
+                id: "r-1".to_string(),
+                token: "t".to_string(),
+                keepalive: Keepalive::default(),
+            },
+            peer,
+            usize::MAX,
+        );
+        let room = registry.room("r-1").expect("the room is minted");
+        let out = Outbound::Text("{}".to_string());
+        for _ in 0..MAX_QUEUE_FRAMES {
+            assert!(room.broadcast(None, &out).is_empty());
+        }
+        assert_eq!(room.broadcast(None, &out), vec!["p-slow".to_string()]);
+    }
+
+    /// The byte bound is exact beside the frame bound: payload bytes up to the cap
+    /// fit, and the next byte reports the peer slow — long before the 32nd frame.
+    #[test]
+    fn queued_bytes_past_the_cap_report_the_peer_slow() {
+        let mut registry = Registry::default();
+        let info = PeerInfo {
+            peer_id: "p-slow".to_string(),
+            display_name: "Slow".to_string(),
+            role: Role::Guest,
+            awareness_client_id: None,
+        };
+        let (peer, _leftovers) = peer_channel(info);
+        registry.create(
+            NewRoom {
+                id: "r-1".to_string(),
+                token: "t".to_string(),
+                keepalive: Keepalive::default(),
+            },
+            peer,
+            usize::MAX,
+        );
+        let room = registry.room("r-1").expect("the room is minted");
+        let chunk = Outbound::Binary(vec![0xA5u8; 8 * 1024 * 1024]);
+        for _ in 0..4 {
+            assert!(room.broadcast(None, &chunk).is_empty());
+        }
+        assert_eq!(
+            room.peers
+                .get("p-slow")
+                .map(|peer| peer.queue.queued_bytes()),
+            Some(MAX_QUEUE_BYTES)
+        );
+        let over = Outbound::Binary(vec![0xA5u8; 1]);
+        assert_eq!(room.broadcast(None, &over), vec!["p-slow".to_string()]);
+    }
+
+    /// Detaching a peer the room never seated announces nothing: the first detach of
+    /// a seated peer reports it, and detaching again — or one never there — is `None`.
+    #[test]
+    fn detaching_an_absent_peer_is_silent() {
+        let mut registry = Registry::default();
+        let info = PeerInfo {
+            peer_id: "p-ada".to_string(),
+            display_name: "Ada".to_string(),
+            role: Role::Host,
+            awareness_client_id: None,
+        };
+        let (peer, _leftovers) = peer_channel(info);
+        registry.create(
+            NewRoom {
+                id: "r-1".to_string(),
+                token: "t".to_string(),
+                keepalive: Keepalive::default(),
+            },
+            peer,
+            usize::MAX,
+        );
+        assert!(registry.detach("r-1", "p-ada").is_some());
+        assert!(registry.detach("r-1", "p-ada").is_none());
+        assert!(registry.detach("r-1", "p-never-there").is_none());
+    }
 }

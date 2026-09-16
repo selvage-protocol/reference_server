@@ -87,6 +87,9 @@ pub mod code {
     pub const ROOM_GONE: &str = "room_gone";
     pub const TOKEN_INVALID: &str = "token_invalid";
     pub const HOST_PRESENT: &str = "host_present";
+    /// Reserved and never produced by this slice (`PROTOCOL.md` §11,
+    /// `schema/errors.json`): named here so receivers and senders spell it the same
+    /// way, not because any frame carries it. Closing a path nobody holds succeeds.
     pub const DOC_NOT_OPEN: &str = "doc_not_open";
     pub const ALREADY_SEATED: &str = "already_seated";
 }
@@ -131,7 +134,8 @@ impl Role {
     }
 }
 
-/// A participant as seen by the session layer. Identity is the display name only.
+/// A participant as seen by the session layer. Peers are keyed by `peer_id`; the
+/// display name is a label, and nothing stops two peers sharing one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerInfo {
     /// Which y-protocols awareness client id this peer speaks with. Lets an editor
