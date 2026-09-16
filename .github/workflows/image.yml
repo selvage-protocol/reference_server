@@ -35,6 +35,28 @@ jobs:
           docker info
           docker buildx version
 
+  # One pull per job, so each image's reachability reads as a conclusion.
+  probe-hub-qemu:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - name: pull the qemu binfmt image
+        run: docker pull tonistiigi/binfmt
+
+  probe-hub-registry:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - name: pull the registry image
+        run: docker pull registry:2
+
+  probe-hub-builder:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - name: pull the musl cross image
+        run: docker pull messense/rust-musl-cross:x86_64-musl-amd64
+
   smoke:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
