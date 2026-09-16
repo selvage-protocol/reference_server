@@ -74,6 +74,38 @@
           }
         );
 
+        # The container image, assembled without a Docker daemon: the runners
+        # that build it cannot execute buildx builds, so CI smokes this
+        # instead of the Dockerfile. One architecture per builder — the
+        # expression is arch-agnostic and the workflow builds it natively on
+        # x86_64 and aarch64 runners, no cross-compilation anywhere.
+        # `copyToRoot` pulls the binary's whole closure (glibc and friends)
+        # along, so this image is nix-idiomatic rather than static-minimal.
+        # The Dockerfile stays the portable static variant for machines with
+        # a working Docker; both agree on entrypoint, port, user, licence
+        # label and the <version>-<sha> tag scheme (see packaging/README.md).
+        image = pkgs.dockerTools.buildImage {
+          name = "ghcr.io/selvage-protocol/selvaged";
+          tag = workspaceVersion;
+          copyToRoot = [package];
+          extraCommands = ''
+            cp ${./crates/selvaged/LICENSE} LICENSE
+          '';
+          config = {
+            Entrypoint = ["/bin/selvaged"];
+            Cmd = ["--listen" "0.0.0.0:8080"];
+            ExposedPorts = {"8080/tcp" = {};};
+            User = "65532";
+            Labels = {
+              "org.opencontainers.image.title" = "selvaged";
+              "org.opencontainers.image.description" = "Memory-only reference server for the Selvage Session Protocol";
+              "org.opencontainers.image.source" = "https://github.com/selvage-protocol/reference_server";
+              "org.opencontainers.image.licenses" = "FSL-1.1-MIT";
+              "org.opencontainers.image.version" = workspaceVersion;
+            };
+          };
+        };
+
         mkHook = name: entry: {
           enable = true;
           inherit name entry;
@@ -140,9 +172,12 @@
         binCargoPath = ./crates/selvaged/Cargo.toml;
         cargoToml = builtins.fromTOML (builtins.readFile binCargoPath);
         binName = cargoToml.package.name;
+        workspaceVersion =
+          (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
       in {
         formatter = pkgs.alejandra;
         packages.default = package;
+        packages.image = image;
 
         apps.default = {
           type = "app";
@@ -207,6 +242,7 @@
               bacon
               nodejs_22
               actionlint
+              skopeo
             ]
             ++ hooks.enabledPackages;
 
