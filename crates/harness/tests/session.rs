@@ -793,10 +793,14 @@ async fn a_grant_from_a_guest_is_refused_and_changes_nothing() {
         .grant(paths(&["only/guest.rs"]))
         .await
         .expect_err("only the room's host publishes");
-    let Error::Protocol { code, .. } = refused else {
+    let Error::Protocol { code, message } = refused else {
         panic!("expected bad_params, got {refused}");
     };
     assert_eq!(code, code::BAD_PARAMS);
+    assert!(
+        message.contains("may publish"),
+        "the refusal names the permission, not just the params: {message}"
+    );
 
     // The refusal changed nothing, and the refused connection is still usable.
     assert_eq!(
@@ -1724,6 +1728,18 @@ async fn http_get(url: &str) -> Result<String, Failure> {
         .split_once("\r\n\r\n")
         .ok_or("an HTTP body follows the headers")?;
     Ok(body.to_string())
+}
+
+/// A wrong HTTP path names the two paths that exist, so a newcomer pointing a
+/// browser at the server learns where to go instead of seeing a bare 404.
+#[tokio::test]
+async fn unknown_http_paths_name_the_two_real_ones() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let body = http_get(&format!("{}/nope", harness.http_base()))
+        .await
+        .expect("a wrong path still answers");
+    assert!(body.contains("/session"), "the WebSocket path: {body}");
+    assert!(body.contains("/meta"), "the HTTP path: {body}");
 }
 
 /// A peer that stops reading is disconnected, not buffered forever. Its queue is
