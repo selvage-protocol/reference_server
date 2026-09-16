@@ -999,3 +999,90 @@ fn tell_room_gone(room_id: &str, peers: Vec<Peer>) {
             .send(Outbound::Close(close::ROOM_GONE, "room gone".to_string()));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use selvage_protocol::{Keepalive, PeerInfo, Role};
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::room::{MAX_QUEUE_FRAMES, peer_channel};
+
+    /// Fills a fresh queue exactly: a full queue's worth of frames fits, so the
+    /// session holding it is alive — and the next frame past it is refused.
+    fn fill(queue: &Queue) {
+        for _ in 0..MAX_QUEUE_FRAMES {
+            assert!(queue.try_queue(Outbound::Text("x".to_string())));
+        }
+    }
+
+    /// A reply the queue will not take ends the session on the same frame even when
+    /// the poison came from an error path: with the queue exactly full, one malformed
+    /// frame detaches the peer without any further inbound.
+    #[tokio::test]
+    async fn a_rejected_alert_ends_the_session_on_the_same_frame() {
+        let mut registry = Registry::default();
+        let (host, _rx) = peer_channel(PeerInfo {
+            peer_id: "p-host".to_string(),
+            display_name: "Ada".to_string(),
+            role: Role::Host,
+            awareness_client_id: None,
+        });
+        registry.create(
+            NewRoom {
+                id: "r-1".to_string(),
+                token: "t".to_string(),
+                keepalive: Keepalive::default(),
+            },
+            host,
+            usize::MAX,
+        );
+        let (guest, _rx) = peer_channel(PeerInfo {
+            peer_id: "p-slow".to_string(),
+            display_name: "Bob".to_string(),
+            role: Role::Guest,
+            awareness_client_id: None,
+        });
+        let queue = guest.queue.clone();
+        registry
+            .admit(
+                Claim {
+                    room_id: "r-1",
+                    token: Some("t"),
+                    role: Role::Guest,
+                },
+                guest,
+                usize::MAX,
+            )
+            .expect("the guest seats");
+        // Exactly full, so the session is alive — and the alert for one malformed
+        // frame is the one past it.
+        fill(&queue);
+        let live = Arc::new(Mutex::new(registry));
+        let shared = Shared::new(
+            ServerConfig {
+                room_grace: Duration::from_millis(1),
+                ..ServerConfig::default()
+            },
+            Arc::clone(&live),
+        );
+        let session = Session {
+            peer_id: "p-slow".to_string(),
+            room_id: "r-1".to_string(),
+            queue,
+            poisoned: AtomicBool::new(false),
+        };
+        session.handle_text("{not json", &shared).await;
+        let guard = live.lock().await;
+        let room = guard.room("r-1").expect("the room survives");
+        assert!(
+            !room.peers.contains_key("p-slow"),
+            "the slow peer is detached"
+        );
+        assert!(room.peers.contains_key("p-host"), "the host is undisturbed");
+    }
+}

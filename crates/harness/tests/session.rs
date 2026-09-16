@@ -2475,6 +2475,86 @@ async fn queued_bytes_past_the_cap_eject_a_slow_peer() {
     host.open(PATH).await.expect("the host still opens");
 }
 
+/// Ejecting a slow host announces `peer.left` before `host.detached`, like a clean
+/// leave: `eject_into` queues host-first so the LIFO drain delivers the departure
+/// first. A watcher reading the wire in order sees the removal before the grace.
+#[tokio::test]
+async fn a_slow_host_is_ejected_departure_first() {
+    let harness = Harness::start(Duration::from_secs(30)).await;
+    let mut slow = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    slow.hello(&serde_json::json!({"display_name": "Ada", "role": "host"}))
+        .await
+        .expect("says hello");
+    let created = next_json_within(&mut slow, "room.created").await;
+    let room_id = created["params"]["room_id"].as_str().unwrap_or("");
+    let token = created["params"]["token"].as_str().unwrap_or("");
+    let target = format!(
+        "{}?room={}&token={}",
+        proto::ENDPOINT_PATH,
+        proto::percent_encode(room_id),
+        proto::percent_encode(token),
+    );
+
+    // A watching guest on the client library: it reads in the background, so the
+    // flood cannot eject it for not reading, and its event stream orders the
+    // ejection announcements the way the room sent them.
+    let invite =
+        proto::session_url(&harness.ws_base(), Some(room_id), Some(token));
+    let watcher = harness.join_url(&invite, "Wendy").await.expect("watches");
+
+    // The flood joins after the watcher, and the event subscription starts after
+    // both joins, so the only peer events it can see are the ejection pair.
+    let mut flood = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the flooding peer joins");
+    flood
+        .hello(&serde_json::json!({"display_name": "Flo"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut flood, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+    wait_for_peer(&watcher, "Flo").await;
+    let mut events = watcher.subscribe();
+
+    // Six 8 MiB frames are 48 MiB past the 32 MiB cap in 6 frames, where the
+    // 32-frame cap would see nothing wrong: the never-reading host is ejected.
+    let big = vec![0xA5u8; 8 * 1024 * 1024];
+    for _ in 0..6 {
+        flood.send(0x2, &big).await.expect("floods");
+    }
+
+    // Departure first, grace second — the clean-leave order. Relay noise is
+    // ignored; the wait stops at the grace announcement, reporting whether the
+    // removal announcement came before it.
+    let removal_first = timeout(WAIT, removal_before_grace(&mut events))
+        .await
+        .expect("the watcher hears the ejection");
+    assert!(removal_first, "peer.left is announced before host.detached");
+}
+
+/// Reads engine events until the grace announcement, reporting whether the removal
+/// announcement came before it.
+async fn removal_before_grace(
+    events: &mut broadcast::Receiver<EngineEvent>,
+) -> bool {
+    let mut saw_removal = false;
+    while let Ok(event) = events.recv().await {
+        if let EngineEvent::PeersChanged { peers } = &event
+            && !peers.iter().any(|peer| peer.display_name == "Ada")
+        {
+            saw_removal = true;
+        }
+        if matches!(event, EngineEvent::HostDetached { .. }) {
+            return saw_removal;
+        }
+    }
+    false
+}
+
 /// Opening documents stays linear in the set and stops at the cap: 1024 short paths
 /// open, and the 1025th is refused `x.room_full`. Every response carries the whole set,
 /// so the run is quadratic in it — bounded by the cap, not by a delta the wire does

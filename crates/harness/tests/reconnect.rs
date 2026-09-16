@@ -77,6 +77,11 @@ async fn a_dropped_guest_reconnects_and_reopens_its_document()
     let old_peer_id = before.peer.peer_id.clone();
     let old_client_id = before.peer.awareness_client_id;
 
+    // `PATH` closes before the drop, so `GUEST_ONLY` is the only document the
+    // reconnected client re-opens: the wait below then observes that re-open, not
+    // the `PATH` re-open whose full-set announcement already contains `GUEST_ONLY`.
+    guest.close(PATH).await?;
+
     // Subscribed before the drop: the re-open announcement must not slip past the
     // wait below.
     let mut host_events = host.subscribe();
