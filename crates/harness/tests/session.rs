@@ -140,9 +140,11 @@ impl RawSocket {
     ) -> Result<Self, Failure> {
         let addr = harness.ws_base().trim_start_matches("ws://").to_string();
         let mut stream = TcpStream::connect(&addr).await?;
+        // A fixed zero nonce: the handshake needs sixteen bytes, not secrecy, and a
+        // random-looking fixture trips the secret scanner.
         let mut request = format!(
             "GET {target} HTTP/1.1\r\nhost: {addr}\r\nupgrade: websocket\r\n\
-             connection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             connection: Upgrade\r\nsec-websocket-key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\
              sec-websocket-version: 13\r\n\r\n"
         )
         .into_bytes();
@@ -771,6 +773,41 @@ async fn a_joiner_receives_the_rooms_grant_and_a_republish_replaces_it() {
     assert_eq!(wait_for_paths(&host, &[]).await, Vec::<String>::new());
     assert_eq!(wait_for_paths(&guest, &[]).await, Vec::<String>::new());
     assert_eq!(wait_for_paths(&late, &[]).await, Vec::<String>::new());
+}
+/// A joiner hears its reply before the room's grant, in that order on the wire: the
+/// seat path serializes both after the registry lock is dropped, and reordering them
+/// would hand a client room state before its own identity. The grant here is wide
+/// enough that its serialization is the shape under test, not a degenerate one.
+#[tokio::test]
+async fn a_joiner_hears_its_reply_before_the_rooms_grant() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let listed: Vec<String> =
+        (0..5_000).map(|n| format!("src/file{n:05}.rs")).collect();
+    host.grant(listed.clone())
+        .await
+        .expect("the host publishes");
+    let target = format!(
+        "{}?room={}&token={}",
+        proto::ENDPOINT_PATH,
+        proto::percent_encode(&room.id),
+        proto::percent_encode(&room.token)
+    );
+    let mut raw = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({ "display_name": "Zoe" }))
+        .await
+        .expect("says hello");
+    let first = raw.next_json().await.expect("the reply");
+    assert_eq!(first["event"], event::ROOM_JOINED);
+    let second = raw.next_json().await.expect("the grant");
+    assert_eq!(second["event"], event::DOC_GRANTED);
+    assert_eq!(
+        second["params"]["paths"],
+        serde_json::json!(listed),
+        "the joiner inherits the whole listing"
+    );
 }
 
 /// Only the room's host may publish a grant. §11 has no code for "not permitted", so a

@@ -90,10 +90,15 @@ pub struct Hello {
     claims_host: bool,
 }
 
-/// What seating a newcomer produces: the reply for its own connection, and the frame
-/// the peers already in the room get when a host reclaims it — `None` for a mint and
-/// for a guest join, which announce nothing beyond `peer.joined`.
-type Placement = ((&'static str, proto::SessionParams), Option<Outbound>);
+/// What seating a newcomer produces: the reply for its own connection, and the peer
+/// record the room is told about when a host reclaims it — `None` for a mint and
+/// for a guest join, which announce nothing beyond `peer.joined`. Plain data only:
+/// every frame is built after the registry lock is dropped, since serializing the
+/// reply (peers plus the whole open-document set) must not sit under it.
+type Placement = (
+    (&'static str, proto::SessionParams),
+    Option<proto::PeerInfo>,
+);
 
 /// Everything that decides where a newcomer is seated.
 struct Seating<'a> {
@@ -441,9 +446,10 @@ fn capabilities() -> Vec<String> {
 /// The `doc.granted` a connection seated into a room receives right after its `room.joined`,
 /// or `None` when the room has no grant (`PROTOCOL.md` §6.3). It is a snapshot rather than a
 /// delta — the room already holds the listing — and a freshly minted room's grant is always
-/// empty, so a mint produces no frame.
-fn join_grant(room: Option<&Room>) -> Option<Outbound> {
-    let paths = room?.grant();
+/// empty, so a mint produces no frame. The paths arrive cloned from under the registry
+/// lock; serializing them here keeps megabytes of JSON out of the critical section.
+fn join_grant(grant: Option<&[String]>) -> Option<Outbound> {
+    let paths = grant?;
     if paths.is_empty() {
         return None;
     }
@@ -475,10 +481,11 @@ impl Applicant {
     }
 
     /// Mints a room or admits this connection to an existing one, then queues the
-    /// handshake response. The response is queued while the registry lock is held, so
-    /// it is the first frame on the connection's channel; the announcements to the
-    /// peers already in the room wait until the lock is dropped, since a slow one of
-    /// them is removed rather than written to.
+    /// handshake response. Only plain data moves under the registry lock; the reply,
+    /// the grant and both announcements are serialized and queued after it is
+    /// dropped. The reply is still this connection's first frame: its channel is
+    /// queued before any announcement is delivered, and the announcements exclude
+    /// the newcomer.
     ///
     /// # Errors
     ///
@@ -496,31 +503,38 @@ impl Applicant {
             peer: Peer::new(info.clone(), self.queue.clone()),
         };
         let mut guard = shared.registry.lock().await;
-        let ((event_name, params), attached) = seating.place(&mut guard)?;
+        let ((event_name, params), attached_peer) =
+            seating.place(&mut guard)?;
         guard.set_task(&self.peer_id, self.poison);
+        let granted = guard.room(&params.room_id).and_then(|room| {
+            (!room.grant().is_empty()).then(|| room.grant().to_vec())
+        });
+        let joined_peer = params.token.is_none().then(|| info.clone());
+        let room_id = params.room_id.clone();
+        let peer_id = self.peer_id.clone();
+        let queue = self.queue.clone();
+        drop(guard);
 
         let body = serde_json::to_value(&params).map_err(|e| bad_body(&e))?;
-        let response = event_frame(event_name, body);
-        if let Some(frame) = response {
+        if let Some(frame) = event_frame(event_name, body) {
             let _ = self.queue.try_queue(frame);
         }
         // A joining connection learns the room's grant straight after its `room.joined`, so
         // it needs no round trip and `room.joined` needs no fifth member. It is queued after
         // the reply, so the reply is still this connection's first frame.
-        let granted = join_grant(guard.room(&params.room_id));
-        if let Some(frame) = granted {
+        if let Some(frame) = join_grant(granted.as_deref()) {
             let _ = self.queue.try_queue(frame);
         }
         // Late arrivals must be announced to the peers already in the room.
-        let joined = if params.token.is_none() {
-            event_frame(event::PEER_JOINED, serde_json::json!({ "peer": info }))
-        } else {
-            None
-        };
-        let room_id = params.room_id.clone();
-        let peer_id = self.peer_id.clone();
-        let queue = self.queue.clone();
-        drop(guard);
+        let joined = joined_peer.and_then(|peer| {
+            event_frame(event::PEER_JOINED, serde_json::json!({ "peer": peer }))
+        });
+        let attached = attached_peer.and_then(|peer| {
+            event_frame(
+                event::HOST_ATTACHED,
+                serde_json::json!({ "peer": peer }),
+            )
+        });
         deliver(shared, &room_id, Some(&peer_id), attached).await;
         deliver(shared, &room_id, Some(&peer_id), joined).await;
         Ok(Session {
@@ -613,11 +627,9 @@ impl Seating<'_> {
             })?;
         // `host.attached` is a host reclaiming the room (§6, §9.1): a guest joining
         // while the room is between hosts is a `peer.joined` and nothing more.
+        // The record travels unserialized; the frame is built after the lock drops.
         let attached = if !host_was_present && self.role == proto::Role::Host {
-            event_frame(
-                event::HOST_ATTACHED,
-                serde_json::json!({ "peer": self.info }),
-            )
+            Some(self.info.clone())
         } else {
             None
         };
