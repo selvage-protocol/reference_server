@@ -706,6 +706,60 @@ async fn a_peer_renames_itself_mid_session() {
     );
 }
 
+/// Display names are stored trimmed: a padded `session.hello` seats as the name
+/// without its padding, and a padded `session.rename` is announced trimmed —
+/// padding would otherwise sit in `peers` and every surface quoting it. Blank stays
+/// `bad_params`: a blank hello closes, a blank rename answers with the connection
+/// open.
+#[tokio::test]
+async fn display_names_are_stored_trimmed() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({"display_name": " Ada "}))
+        .await
+        .expect("says hello");
+    let created = next_json_within(&mut raw, "room.created").await;
+    assert_eq!(created["event"], event::ROOM_CREATED);
+    assert_eq!(
+        created["params"]["self"]["display_name"], "Ada",
+        "the padded hello seats trimmed"
+    );
+
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 2,
+        "method": method::SESSION_RENAME,
+        "params": {"display_name": " Bob "},
+    }))
+    .await
+    .expect("sends");
+    let answered = raw_response_for(&mut raw, 2).await;
+    assert!(answered["error"].is_null(), "the rename stands: {answered}");
+    let renamed = raw.next_json().await.expect("the announcement");
+    assert_eq!(renamed["event"], event::PEER_RENAMED);
+    assert_eq!(
+        renamed["params"]["display_name"], "Bob",
+        "the padded rename is announced trimmed"
+    );
+
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 3,
+        "method": method::SESSION_RENAME,
+        "params": {"display_name": "   "},
+    }))
+    .await
+    .expect("sends");
+    let refused = raw_response_for(&mut raw, 3).await;
+    assert_eq!(
+        refused["error"]["code"],
+        code::BAD_PARAMS,
+        "a blank rename is refused: {refused}"
+    );
+}
+
 /// The paths of a listing, as a client sends them.
 fn paths(list: &[&str]) -> Vec<String> {
     list.iter().map(|path| (*path).to_string()).collect()

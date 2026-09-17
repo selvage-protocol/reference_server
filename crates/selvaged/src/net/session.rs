@@ -155,9 +155,13 @@ pub async fn handshake(
             format!("unsupported wire version {}", msg.v),
         ));
     }
-    let params: proto::HelloParams = serde_json::from_value(msg.params)
+    let mut params: proto::HelloParams = serde_json::from_value(msg.params)
         .map_err(|e| envelope_refusal("bad session.hello params", &e))?;
-    if params.display_name.trim().is_empty() {
+    // Stored trimmed: a padded name would otherwise sit in `peers` and every
+    // surface that quotes it, while blank and over-long are judged on the same
+    // trimmed value that is kept.
+    params.display_name = params.display_name.trim().to_string();
+    if params.display_name.is_empty() {
         return Err((
             code::BAD_PARAMS,
             "session.hello requires a display_name".to_string(),
@@ -249,10 +253,13 @@ fn document_path(raw: Value) -> Result<String, Refusal> {
 fn rename_name(raw: Value) -> Result<String, Refusal> {
     let params = serde_json::from_value::<proto::RenameParams>(raw)
         .map_err(|e| (code::BAD_PARAMS, e.to_string()))?;
-    if params.display_name.trim().is_empty() {
+    // Stored trimmed, like the handshake's: the rename is announced to the whole
+    // room, so padding would land in every peer's view under the mover's name.
+    let display_name = params.display_name.trim().to_string();
+    if display_name.is_empty() {
         return Err((code::BAD_PARAMS, "display_name is required".to_string()));
     }
-    if proto::display_name_over_limit(&params.display_name) {
+    if proto::display_name_over_limit(&display_name) {
         return Err((
             code::BAD_PARAMS,
             format!(
@@ -261,7 +268,7 @@ fn rename_name(raw: Value) -> Result<String, Refusal> {
             ),
         ));
     }
-    Ok(params.display_name)
+    Ok(display_name)
 }
 
 /// The `paths` of a `doc.grant` request (`PROTOCOL.md` §5): the host's whole listing, in the
