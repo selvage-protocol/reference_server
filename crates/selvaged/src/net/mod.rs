@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tokio::time::{Interval, MissedTickBehavior, interval, timeout};
+use tokio::time::{Interval, MissedTickBehavior, interval, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 
@@ -89,8 +89,16 @@ impl Shared {
 /// connection is closed without an answer: the count covers handshakes as well as
 /// seats, so half-open sockets cannot pile up past it.
 pub async fn serve(listener: TcpListener, shared: Shared) {
+    let mut errors: u32 = 0;
     loop {
-        let Ok(tcp) = accept_nodelay(&listener).await else {
+        let tcp = if let Ok(tcp) = accept_nodelay(&listener).await {
+            errors = 0;
+            tcp
+        } else {
+            // A failing listener — `EMFILE` at the connection cap — must not
+            // hot-spin: rest with a capped backoff before retrying.
+            errors = errors.saturating_add(1);
+            sleep(accept_backoff(errors)).await;
             continue;
         };
         if shared.connections.fetch_add(1, Ordering::SeqCst)
@@ -106,6 +114,20 @@ pub async fn serve(listener: TcpListener, shared: Shared) {
             live.fetch_sub(1, Ordering::SeqCst);
         });
     }
+}
+
+/// How long the accept loop rests after `errors` consecutive listener failures:
+/// 50 ms, doubling to a cap of 800 ms. A full server still reclaims a freed slot
+/// within a tick, without burning a core while there is none.
+const fn accept_backoff(errors: u32) -> Duration {
+    let millis: u64 = match errors {
+        0 | 1 => 50,
+        2 => 100,
+        3 => 200,
+        4 => 400,
+        _ => 800,
+    };
+    Duration::from_millis(millis)
 }
 
 /// Accepts one connection with Nagle's algorithm off.
@@ -558,6 +580,18 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
+
+    /// Listener failures rest before retrying: 50 ms first, doubling to a cap.
+    #[test]
+    fn accept_failures_rest_before_retrying() {
+        assert_eq!(accept_backoff(0), Duration::from_millis(50));
+        assert_eq!(accept_backoff(1), Duration::from_millis(50));
+        assert_eq!(accept_backoff(2), Duration::from_millis(100));
+        assert_eq!(accept_backoff(3), Duration::from_millis(200));
+        assert_eq!(accept_backoff(4), Duration::from_millis(400));
+        assert_eq!(accept_backoff(5), Duration::from_millis(800));
+        assert_eq!(accept_backoff(u32::MAX), Duration::from_millis(800));
+    }
 
     #[tokio::test]
     async fn an_accepted_socket_writes_without_nagle() {
