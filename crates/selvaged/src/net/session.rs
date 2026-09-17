@@ -560,25 +560,26 @@ impl Seating<'_> {
     }
 
     fn mint(self, registry: &mut Registry) -> Result<Placement, Refusal> {
-        let room_id = mint_room_id();
         let token = mint_token();
-        if !registry.create(
-            NewRoom {
-                id: room_id.clone(),
-                token: token.clone(),
-                keepalive: self.config.keepalive,
-            },
-            self.peer,
-            self.config.max_rooms,
-        ) {
-            return Err((
-                SERVER_FULL,
-                format!(
-                    "the server holds at most {} rooms",
-                    self.config.max_rooms
-                ),
-            ));
-        }
+        let room_id = registry
+            .create(
+                NewRoom {
+                    id: mint_room_id(),
+                    token: token.clone(),
+                    keepalive: self.config.keepalive,
+                },
+                self.peer,
+                self.config.max_rooms,
+            )
+            .ok_or_else(|| {
+                (
+                    SERVER_FULL,
+                    format!(
+                        "the server holds at most {} rooms",
+                        self.config.max_rooms
+                    ),
+                )
+            })?;
         Ok((
             (
                 event::ROOM_CREATED,
@@ -1046,14 +1047,19 @@ mod tests {
             role: Role::Host,
             awareness_client_id: None,
         });
-        registry.create(
-            NewRoom {
-                id: "r-1".to_string(),
-                token: "t".to_string(),
-                keepalive: Keepalive::default(),
-            },
-            host,
-            usize::MAX,
+        assert_eq!(
+            registry
+                .create(
+                    NewRoom {
+                        id: "r-1".to_string(),
+                        token: "t".to_string(),
+                        keepalive: Keepalive::default(),
+                    },
+                    host,
+                    usize::MAX,
+                )
+                .as_deref(),
+            Some("r-1")
         );
         let (guest, _rx) = peer_channel(PeerInfo {
             peer_id: "p-slow".to_string(),

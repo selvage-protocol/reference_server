@@ -364,22 +364,28 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Mints a room and seats its host in it.
-    /// Mints a room and seats its host in it, reporting whether there was room for
-    /// one more. `false` means the server is at its cap and nothing was minted.
+    /// Mints a room and seats its host in it, returning the room's id — or `None`
+    /// when the server is at its cap and nothing was minted. A colliding id is
+    /// regenerated, never overwritten: at 48 bits a collision needs on the order
+    /// of 2^24 rooms to become likely, but silently replacing a live room would
+    /// evict its peers while their tasks still point at the id.
     #[expect(
         clippy::too_many_arguments,
         reason = "a mint names its room, host and the cap it is checked against"
     )]
     pub fn create(
         &mut self,
-        new: NewRoom,
+        mut new: NewRoom,
         host: Peer,
         max_rooms: usize,
-    ) -> bool {
+    ) -> Option<String> {
         if self.rooms.len() >= max_rooms {
-            return false;
+            return None;
         }
+        while self.rooms.contains_key(&new.id) {
+            new.id = crate::mint_room_id();
+        }
+        let id = new.id.clone();
         let mut room = Room {
             id: new.id.clone(),
             token: new.token,
@@ -395,7 +401,7 @@ impl Registry {
         room.attach_host(&host.info.peer_id);
         room.seat(host);
         self.rooms.insert(new.id, room);
-        true
+        Some(id)
     }
 
     /// Seats a connection in an existing room. The claimed role is honoured only while
@@ -527,14 +533,19 @@ mod tests {
             awareness_client_id: None,
         };
         let (peer, _leftovers) = peer_channel(info);
-        registry.create(
-            NewRoom {
-                id: "r-1".to_string(),
-                token: "t".to_string(),
-                keepalive: Keepalive::default(),
-            },
-            peer,
-            usize::MAX,
+        assert_eq!(
+            registry
+                .create(
+                    NewRoom {
+                        id: "r-1".to_string(),
+                        token: "t".to_string(),
+                        keepalive: Keepalive::default(),
+                    },
+                    peer,
+                    usize::MAX,
+                )
+                .as_deref(),
+            Some("r-1")
         );
         let room = registry.room("r-1").expect("the room is minted");
         let out = Outbound::Text("{}".to_string());
@@ -559,14 +570,19 @@ mod tests {
             awareness_client_id: None,
         };
         let (peer, _leftovers) = peer_channel(info);
-        registry.create(
-            NewRoom {
-                id: "r-1".to_string(),
-                token: "t".to_string(),
-                keepalive: Keepalive::default(),
-            },
-            peer,
-            usize::MAX,
+        assert_eq!(
+            registry
+                .create(
+                    NewRoom {
+                        id: "r-1".to_string(),
+                        token: "t".to_string(),
+                        keepalive: Keepalive::default(),
+                    },
+                    peer,
+                    usize::MAX,
+                )
+                .as_deref(),
+            Some("r-1")
         );
         let room = registry.room("r-1").expect("the room is minted");
         let chunk = Outbound::Binary(vec![0xA5u8; 8 * 1024 * 1024]);
@@ -600,14 +616,19 @@ mod tests {
             awareness_client_id: None,
         };
         let (peer, mut leftovers) = peer_channel(info);
-        registry.create(
-            NewRoom {
-                id: "r-1".to_string(),
-                token: "t".to_string(),
-                keepalive: Keepalive::default(),
-            },
-            peer,
-            usize::MAX,
+        assert_eq!(
+            registry
+                .create(
+                    NewRoom {
+                        id: "r-1".to_string(),
+                        token: "t".to_string(),
+                        keepalive: Keepalive::default(),
+                    },
+                    peer,
+                    usize::MAX,
+                )
+                .as_deref(),
+            Some("r-1")
         );
         let queues = registry
             .room("r-1")
@@ -624,6 +645,53 @@ mod tests {
             .expect("the removed peer's queue holds the frame");
     }
 
+    /// A colliding room id is regenerated, never overwritten: minting into an
+    /// occupied id keeps both rooms, and the second mint reports the id it took.
+    #[test]
+    fn a_colliding_room_id_is_regenerated() {
+        let mut registry = Registry::default();
+        let (host, _leftovers) = peer_channel(PeerInfo {
+            peer_id: "p-ada".to_string(),
+            display_name: "Ada".to_string(),
+            role: Role::Host,
+            awareness_client_id: None,
+        });
+        assert_eq!(
+            registry
+                .create(
+                    NewRoom {
+                        id: "r-1".to_string(),
+                        token: "t".to_string(),
+                        keepalive: Keepalive::default(),
+                    },
+                    host,
+                    usize::MAX,
+                )
+                .as_deref(),
+            Some("r-1")
+        );
+        let (guest, _leftovers) = peer_channel(PeerInfo {
+            peer_id: "p-bob".to_string(),
+            display_name: "Bob".to_string(),
+            role: Role::Guest,
+            awareness_client_id: None,
+        });
+        let minted = registry
+            .create(
+                NewRoom {
+                    id: "r-1".to_string(),
+                    token: "t".to_string(),
+                    keepalive: Keepalive::default(),
+                },
+                guest,
+                usize::MAX,
+            )
+            .expect("a colliding mint still seats");
+        assert_ne!(minted, "r-1");
+        assert!(registry.room("r-1").is_some(), "the first room survives");
+        assert!(registry.room(&minted).is_some(), "the second room seats");
+    }
+
     /// Detaching a peer the room never seated announces nothing: the first detach of
     /// a seated peer reports it, and detaching again — or one never there — is `None`.
     #[test]
@@ -636,14 +704,19 @@ mod tests {
             awareness_client_id: None,
         };
         let (peer, _leftovers) = peer_channel(info);
-        registry.create(
-            NewRoom {
-                id: "r-1".to_string(),
-                token: "t".to_string(),
-                keepalive: Keepalive::default(),
-            },
-            peer,
-            usize::MAX,
+        assert_eq!(
+            registry
+                .create(
+                    NewRoom {
+                        id: "r-1".to_string(),
+                        token: "t".to_string(),
+                        keepalive: Keepalive::default(),
+                    },
+                    peer,
+                    usize::MAX,
+                )
+                .as_deref(),
+            Some("r-1")
         );
         assert!(registry.detach("r-1", "p-ada").is_some());
         assert!(registry.detach("r-1", "p-ada").is_none());
