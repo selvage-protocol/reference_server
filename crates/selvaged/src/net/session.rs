@@ -16,7 +16,7 @@ use selvage_protocol::{close, code, event, method};
 
 use crate::ServerConfig;
 use crate::room::{
-    Claim, NewRoom, Outbound, Peer, Queue, Registry, Room, SeatError,
+    Claim, NewRoom, Outbound, Peer, Queue, Registry, Room, SeatError, send_all,
 };
 use crate::{mint_room_id, mint_token};
 
@@ -90,10 +90,15 @@ pub struct Hello {
     claims_host: bool,
 }
 
-/// What seating a newcomer produces: the reply for its own connection, and the frame
-/// the peers already in the room get when a host reclaims it — `None` for a mint and
-/// for a guest join, which announce nothing beyond `peer.joined`.
-type Placement = ((&'static str, proto::SessionParams), Option<Outbound>);
+/// What seating a newcomer produces: the reply for its own connection, and the peer
+/// record the room is told about when a host reclaims it — `None` for a mint and
+/// for a guest join, which announce nothing beyond `peer.joined`. Plain data only:
+/// every frame is built after the registry lock is dropped, since serializing the
+/// reply (peers plus the whole open-document set) must not sit under it.
+type Placement = (
+    (&'static str, proto::SessionParams),
+    Option<proto::PeerInfo>,
+);
 
 /// Everything that decides where a newcomer is seated.
 struct Seating<'a> {
@@ -150,9 +155,13 @@ pub async fn handshake(
             format!("unsupported wire version {}", msg.v),
         ));
     }
-    let params: proto::HelloParams = serde_json::from_value(msg.params)
+    let mut params: proto::HelloParams = serde_json::from_value(msg.params)
         .map_err(|e| envelope_refusal("bad session.hello params", &e))?;
-    if params.display_name.trim().is_empty() {
+    // Stored trimmed: a padded name would otherwise sit in `peers` and every
+    // surface that quotes it, while blank and over-long are judged on the same
+    // trimmed value that is kept.
+    params.display_name = params.display_name.trim().to_string();
+    if params.display_name.is_empty() {
         return Err((
             code::BAD_PARAMS,
             "session.hello requires a display_name".to_string(),
@@ -196,6 +205,10 @@ fn envelope_refusal(what: &str, error: &serde_json::Error) -> Refusal {
     (code::BAD_MESSAGE, format!("{what}: {error}"))
 }
 
+/// Maps an admission failure to its refusal. `Unknown` and `TokenMismatch` stay
+/// distinct on purpose: guests reuse the difference, and the oracle is accepted —
+/// room ids carry 48 bits with 128-bit tokens behind them, so enumeration is
+/// infeasible, and handshake rate limiting belongs to the §12 proxy.
 fn refusal_for(error: SeatError, room_id: &str) -> Refusal {
     match error {
         SeatError::Unknown => {
@@ -244,10 +257,13 @@ fn document_path(raw: Value) -> Result<String, Refusal> {
 fn rename_name(raw: Value) -> Result<String, Refusal> {
     let params = serde_json::from_value::<proto::RenameParams>(raw)
         .map_err(|e| (code::BAD_PARAMS, e.to_string()))?;
-    if params.display_name.trim().is_empty() {
+    // Stored trimmed, like the handshake's: the rename is announced to the whole
+    // room, so padding would land in every peer's view under the mover's name.
+    let display_name = params.display_name.trim().to_string();
+    if display_name.is_empty() {
         return Err((code::BAD_PARAMS, "display_name is required".to_string()));
     }
-    if proto::display_name_over_limit(&params.display_name) {
+    if proto::display_name_over_limit(&display_name) {
         return Err((
             code::BAD_PARAMS,
             format!(
@@ -256,7 +272,7 @@ fn rename_name(raw: Value) -> Result<String, Refusal> {
             ),
         ));
     }
-    Ok(params.display_name)
+    Ok(display_name)
 }
 
 /// The `paths` of a `doc.grant` request (`PROTOCOL.md` §5): the host's whole listing, in the
@@ -346,7 +362,9 @@ fn grace_ms(config: &ServerConfig) -> u64 {
 /// Sends a frame to a room's peers, minus one. A peer whose queue is full is not kept
 /// and told nothing: it is removed, the room is told `peer.left`, and its task is
 /// stopped. Frames the departures themselves need join the same loop, so a burst of
-/// slow peers drains without recursing.
+/// slow peers drains without recursing. The snapshot holds only queue handles: the
+/// per-peer copies leave after the registry lock is dropped, so a large relay never
+/// stalls the other rooms.
 #[expect(
     clippy::too_many_arguments,
     reason = "a delivery names its server, room, exclusion and frame; a struct would hide one call site's meaning"
@@ -362,14 +380,14 @@ async fn deliver(
         pending.push((except.map(str::to_string), out));
     }
     while let Some((skip, out)) = pending.pop() {
-        let slow: Vec<String> = {
+        let queues: Vec<(String, Queue)> = {
             let guard = shared.registry.lock().await;
             guard
                 .room(room_id)
-                .map(|room| room.broadcast(skip.as_deref(), &out))
+                .map(|room| room.queues(skip.as_deref()))
                 .unwrap_or_default()
         };
-        for peer_id in slow {
+        for peer_id in send_all(&queues, &out) {
             eject_into(shared, room_id, &peer_id, &mut pending).await;
         }
     }
@@ -439,9 +457,10 @@ fn capabilities() -> Vec<String> {
 /// The `doc.granted` a connection seated into a room receives right after its `room.joined`,
 /// or `None` when the room has no grant (`PROTOCOL.md` §6.3). It is a snapshot rather than a
 /// delta — the room already holds the listing — and a freshly minted room's grant is always
-/// empty, so a mint produces no frame.
-fn join_grant(room: Option<&Room>) -> Option<Outbound> {
-    let paths = room?.grant();
+/// empty, so a mint produces no frame. The paths arrive cloned from under the registry
+/// lock; serializing them here keeps megabytes of JSON out of the critical section.
+fn join_grant(grant: Option<&[String]>) -> Option<Outbound> {
+    let paths = grant?;
     if paths.is_empty() {
         return None;
     }
@@ -473,10 +492,11 @@ impl Applicant {
     }
 
     /// Mints a room or admits this connection to an existing one, then queues the
-    /// handshake response. The response is queued while the registry lock is held, so
-    /// it is the first frame on the connection's channel; the announcements to the
-    /// peers already in the room wait until the lock is dropped, since a slow one of
-    /// them is removed rather than written to.
+    /// handshake response. Only plain data moves under the registry lock; the reply,
+    /// the grant and both announcements are serialized and queued after it is
+    /// dropped. The reply is still this connection's first frame: its channel is
+    /// queued before any announcement is delivered, and the announcements exclude
+    /// the newcomer.
     ///
     /// # Errors
     ///
@@ -494,31 +514,38 @@ impl Applicant {
             peer: Peer::new(info.clone(), self.queue.clone()),
         };
         let mut guard = shared.registry.lock().await;
-        let ((event_name, params), attached) = seating.place(&mut guard)?;
+        let ((event_name, params), attached_peer) =
+            seating.place(&mut guard)?;
         guard.set_task(&self.peer_id, self.poison);
+        let granted = guard.room(&params.room_id).and_then(|room| {
+            (!room.grant().is_empty()).then(|| room.grant().to_vec())
+        });
+        let joined_peer = params.token.is_none().then(|| info.clone());
+        let room_id = params.room_id.clone();
+        let peer_id = self.peer_id.clone();
+        let queue = self.queue.clone();
+        drop(guard);
 
         let body = serde_json::to_value(&params).map_err(|e| bad_body(&e))?;
-        let response = event_frame(event_name, body);
-        if let Some(frame) = response {
+        if let Some(frame) = event_frame(event_name, body) {
             let _ = self.queue.try_queue(frame);
         }
         // A joining connection learns the room's grant straight after its `room.joined`, so
         // it needs no round trip and `room.joined` needs no fifth member. It is queued after
         // the reply, so the reply is still this connection's first frame.
-        let granted = join_grant(guard.room(&params.room_id));
-        if let Some(frame) = granted {
+        if let Some(frame) = join_grant(granted.as_deref()) {
             let _ = self.queue.try_queue(frame);
         }
         // Late arrivals must be announced to the peers already in the room.
-        let joined = if params.token.is_none() {
-            event_frame(event::PEER_JOINED, serde_json::json!({ "peer": info }))
-        } else {
-            None
-        };
-        let room_id = params.room_id.clone();
-        let peer_id = self.peer_id.clone();
-        let queue = self.queue.clone();
-        drop(guard);
+        let joined = joined_peer.and_then(|peer| {
+            event_frame(event::PEER_JOINED, serde_json::json!({ "peer": peer }))
+        });
+        let attached = attached_peer.and_then(|peer| {
+            event_frame(
+                event::HOST_ATTACHED,
+                serde_json::json!({ "peer": peer }),
+            )
+        });
         deliver(shared, &room_id, Some(&peer_id), attached).await;
         deliver(shared, &room_id, Some(&peer_id), joined).await;
         Ok(Session {
@@ -544,25 +571,26 @@ impl Seating<'_> {
     }
 
     fn mint(self, registry: &mut Registry) -> Result<Placement, Refusal> {
-        let room_id = mint_room_id();
         let token = mint_token();
-        if !registry.create(
-            NewRoom {
-                id: room_id.clone(),
-                token: token.clone(),
-                keepalive: self.config.keepalive,
-            },
-            self.peer,
-            self.config.max_rooms,
-        ) {
-            return Err((
-                SERVER_FULL,
-                format!(
-                    "the server holds at most {} rooms",
-                    self.config.max_rooms
-                ),
-            ));
-        }
+        let room_id = registry
+            .create(
+                NewRoom {
+                    id: mint_room_id(),
+                    token: token.clone(),
+                    keepalive: self.config.keepalive,
+                },
+                self.peer,
+                self.config.max_rooms,
+            )
+            .ok_or_else(|| {
+                (
+                    SERVER_FULL,
+                    format!(
+                        "the server holds at most {} rooms",
+                        self.config.max_rooms
+                    ),
+                )
+            })?;
         Ok((
             (
                 event::ROOM_CREATED,
@@ -611,11 +639,9 @@ impl Seating<'_> {
             })?;
         // `host.attached` is a host reclaiming the room (§6, §9.1): a guest joining
         // while the room is between hosts is a `peer.joined` and nothing more.
+        // The record travels unserialized; the frame is built after the lock drops.
         let attached = if !host_was_present && self.role == proto::Role::Host {
-            event_frame(
-                event::HOST_ATTACHED,
-                serde_json::json!({ "peer": self.info }),
-            )
+            Some(self.info.clone())
         } else {
             None
         };
@@ -1032,14 +1058,19 @@ mod tests {
             role: Role::Host,
             awareness_client_id: None,
         });
-        registry.create(
-            NewRoom {
-                id: "r-1".to_string(),
-                token: "t".to_string(),
-                keepalive: Keepalive::default(),
-            },
-            host,
-            usize::MAX,
+        assert_eq!(
+            registry
+                .create(
+                    NewRoom {
+                        id: "r-1".to_string(),
+                        token: "t".to_string(),
+                        keepalive: Keepalive::default(),
+                    },
+                    host,
+                    usize::MAX,
+                )
+                .as_deref(),
+            Some("r-1")
         );
         let (guest, _rx) = peer_channel(PeerInfo {
             peer_id: "p-slow".to_string(),

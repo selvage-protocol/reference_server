@@ -19,6 +19,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
+use tokio::task::yield_now;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -140,9 +141,11 @@ impl RawSocket {
     ) -> Result<Self, Failure> {
         let addr = harness.ws_base().trim_start_matches("ws://").to_string();
         let mut stream = TcpStream::connect(&addr).await?;
+        // A fixed zero nonce: the handshake needs sixteen bytes, not secrecy, and a
+        // random-looking fixture trips the secret scanner.
         let mut request = format!(
             "GET {target} HTTP/1.1\r\nhost: {addr}\r\nupgrade: websocket\r\n\
-             connection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             connection: Upgrade\r\nsec-websocket-key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\
              sec-websocket-version: 13\r\n\r\n"
         )
         .into_bytes();
@@ -162,6 +165,23 @@ impl RawSocket {
         payload: &[u8],
     ) -> Result<(), Failure> {
         let frame = client_frame(opcode, payload);
+        self.stream.write_all(&frame).await?;
+        Ok(())
+    }
+
+    /// Sends one frame with the FIN bit chosen by the caller: fragments carry it
+    /// clear until the last, so the server reassembles before the bound bites.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a fragment names its opcode, FIN bit and payload; the shape is the pin"
+    )]
+    async fn send_fragment(
+        &mut self,
+        opcode: u8,
+        fin: bool,
+        payload: &[u8],
+    ) -> Result<(), Failure> {
+        let frame = client_fragment(opcode, fin, payload);
         self.stream.write_all(&frame).await?;
         Ok(())
     }
@@ -313,6 +333,16 @@ async fn read_binary_until(
             Some(relayed) => return Ok(relayed),
         }
     }
+}
+
+/// One masked client frame with the FIN bit chosen by the caller, for the
+/// fragmented-bound pin below.
+fn client_fragment(opcode: u8, fin: bool, payload: &[u8]) -> Vec<u8> {
+    let mut frame = client_frame(opcode, payload);
+    if let Some(first) = frame.first_mut() {
+        *first = if fin { 0x80 | opcode } else { opcode };
+    }
+    frame
 }
 
 /// One masked client frame, in whichever length form fits: seven bits, sixteen, or
@@ -703,6 +733,60 @@ async fn a_peer_renames_itself_mid_session() {
     );
 }
 
+/// Display names are stored trimmed: a padded `session.hello` seats as the name
+/// without its padding, and a padded `session.rename` is announced trimmed —
+/// padding would otherwise sit in `peers` and every surface quoting it. Blank stays
+/// `bad_params`: a blank hello closes, a blank rename answers with the connection
+/// open.
+#[tokio::test]
+async fn display_names_are_stored_trimmed() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({"display_name": " Ada "}))
+        .await
+        .expect("says hello");
+    let created = next_json_within(&mut raw, "room.created").await;
+    assert_eq!(created["event"], event::ROOM_CREATED);
+    assert_eq!(
+        created["params"]["self"]["display_name"], "Ada",
+        "the padded hello seats trimmed"
+    );
+
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 2,
+        "method": method::SESSION_RENAME,
+        "params": {"display_name": " Bob "},
+    }))
+    .await
+    .expect("sends");
+    let answered = raw_response_for(&mut raw, 2).await;
+    assert!(answered["error"].is_null(), "the rename stands: {answered}");
+    let renamed = raw.next_json().await.expect("the announcement");
+    assert_eq!(renamed["event"], event::PEER_RENAMED);
+    assert_eq!(
+        renamed["params"]["display_name"], "Bob",
+        "the padded rename is announced trimmed"
+    );
+
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 3,
+        "method": method::SESSION_RENAME,
+        "params": {"display_name": "   "},
+    }))
+    .await
+    .expect("sends");
+    let refused = raw_response_for(&mut raw, 3).await;
+    assert_eq!(
+        refused["error"]["code"],
+        code::BAD_PARAMS,
+        "a blank rename is refused: {refused}"
+    );
+}
+
 /// The paths of a listing, as a client sends them.
 fn paths(list: &[&str]) -> Vec<String> {
     list.iter().map(|path| (*path).to_string()).collect()
@@ -772,6 +856,41 @@ async fn a_joiner_receives_the_rooms_grant_and_a_republish_replaces_it() {
     assert_eq!(wait_for_paths(&guest, &[]).await, Vec::<String>::new());
     assert_eq!(wait_for_paths(&late, &[]).await, Vec::<String>::new());
 }
+/// A joiner hears its reply before the room's grant, in that order on the wire: the
+/// seat path serializes both after the registry lock is dropped, and reordering them
+/// would hand a client room state before its own identity. The grant here is wide
+/// enough that its serialization is the shape under test, not a degenerate one.
+#[tokio::test]
+async fn a_joiner_hears_its_reply_before_the_rooms_grant() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let listed: Vec<String> =
+        (0..5_000).map(|n| format!("src/file{n:05}.rs")).collect();
+    host.grant(listed.clone())
+        .await
+        .expect("the host publishes");
+    let target = format!(
+        "{}?room={}&token={}",
+        proto::ENDPOINT_PATH,
+        proto::percent_encode(&room.id),
+        proto::percent_encode(&room.token)
+    );
+    let mut raw = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({ "display_name": "Zoe" }))
+        .await
+        .expect("says hello");
+    let first = raw.next_json().await.expect("the reply");
+    assert_eq!(first["event"], event::ROOM_JOINED);
+    let second = raw.next_json().await.expect("the grant");
+    assert_eq!(second["event"], event::DOC_GRANTED);
+    assert_eq!(
+        second["params"]["paths"],
+        serde_json::json!(listed),
+        "the joiner inherits the whole listing"
+    );
+}
 
 /// Only the room's host may publish a grant. §11 has no code for "not permitted", so a
 /// grant from a guest is refused `bad_params`, it changes nothing, and the connection
@@ -839,6 +958,23 @@ async fn the_server_carries_the_grant_in_the_order_it_was_given() {
 /// listing is non-empty (`PROTOCOL.md` §6.3). The guest's next frame here is the
 /// `doc.opened` the host then produces, so a server that sent an empty listing would put a
 /// frame in front of it and fail.
+/// The server holds `..` and absolute paths without resolving them: §5 names them
+/// as values the server carries, and confinement is the clients' mirror business
+/// (§12). A grant naming them publishes whole, and a late joiner inherits them.
+#[tokio::test]
+async fn a_grant_naming_dotdot_and_absolute_paths_publishes_whole() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let wanted = ["..", "/etc/passwd", "../outside.rs", "src/main.rs"];
+    let listed = paths(&wanted);
+    host.grant(listed.clone())
+        .await
+        .expect("the host publishes");
+    assert_eq!(wait_for_paths(&host, &wanted).await, listed);
+    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+    assert_eq!(wait_for_paths(&guest, &wanted).await, listed);
+}
+
 #[tokio::test]
 async fn a_joiner_of_a_room_that_grants_nothing_gets_no_granted_event() {
     let harness = Harness::start(Duration::from_secs(5)).await;
@@ -1641,19 +1777,75 @@ async fn a_long_close_reason_is_cut_down_to_fit_a_control_frame() {
         "the reason still says what went wrong: {reason}"
     );
 }
-/// The negotiation endpoint does not look at the request method: `HEAD` answers `200` with
-/// a body, which is what the spec says it does and an RFC 9110 deviation worth pinning so
-/// that it is a choice rather than an accident.
+/// `HEAD /meta` answers like `GET` but headers-only: the status line and headers —
+/// including the body's length — arrive with no body after them (RFC 9110 §9.3.2).
+/// Anything besides `GET` and `HEAD` is `405`: `POST` creates nothing, so `200`
+/// with a body would be a lie.
 #[tokio::test]
-async fn the_negotiation_endpoint_ignores_the_request_method() {
+async fn the_negotiation_endpoint_checks_the_request_method() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let addr = harness.ws_base().trim_start_matches("ws://").to_string();
+    let get_body = http_get(&format!("{}/meta", harness.http_base()))
+        .await
+        .expect("meta answers");
+
+    let mut head_stream = TcpStream::connect(&addr).await.expect("connects");
+    head_stream
+        .write_all(b"HEAD /meta HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+        .await
+        .expect("sends a HEAD request");
+    let mut head_response = String::new();
+    head_stream
+        .read_to_string(&mut head_response)
+        .await
+        .expect("reads the response");
+    assert!(
+        head_response.starts_with("HTTP/1.1 200"),
+        "got {head_response:?}"
+    );
+    let (head, body) =
+        head_response.split_once("\r\n\r\n").expect("headers end");
+    assert!(body.is_empty(), "HEAD carries no body: {head_response:?}");
+    assert!(
+        head.contains(&format!("content-length: {}", get_body.len())),
+        "HEAD advertises the GET length: {head_response:?}"
+    );
+
+    let mut post_stream = TcpStream::connect(&addr).await.expect("connects");
+    post_stream
+        .write_all(b"POST /meta HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+        .await
+        .expect("sends a POST request");
+    let mut post_response = String::new();
+    post_stream
+        .read_to_string(&mut post_response)
+        .await
+        .expect("reads the response");
+    assert!(
+        post_response.starts_with("HTTP/1.1 405"),
+        "POST is refused: {post_response:?}"
+    );
+    assert!(
+        post_response.contains("allow: GET, HEAD"),
+        "the refusal names what it takes: {post_response:?}"
+    );
+}
+
+/// An absolute-form request target names the same resource: a proxy forwarding
+/// a `GET` with an absolute URI is legal HTTP, and §12 puts one in front of any
+/// public deployment, so the origin form it carries must route.
+#[tokio::test]
+async fn absolute_form_targets_route_like_origin_form() {
     let harness = Harness::start(Duration::from_secs(5)).await;
     let addr = harness.ws_base().trim_start_matches("ws://").to_string();
     let mut stream = TcpStream::connect(&addr).await.expect("connects");
     stream
-        .write_all(b"HEAD /meta HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+        .write_all(
+            format!("GET http://{addr}/meta HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n\r\n")
+                .as_bytes(),
+        )
         .await
-        .expect("sends a HEAD request");
-
+        .expect("sends an absolute-form request");
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
@@ -1786,6 +1978,11 @@ async fn a_peer_that_stops_reading_is_disconnected_and_announced() {
     let big = vec![0xA5u8; 1024 * 1024];
     for _ in 0..150 {
         flood.send(0x2, &big).await.expect("floods");
+        // Let the room drain between sends: the flood must fill the slow peer's
+        // queue, not win a scheduling race against the host's. Unpaced, a loaded
+        // machine ejects the host too and the final open fails — flakily, under
+        // coverage, on unmodified main as well as here.
+        yield_now().await;
     }
 
     // The room announces the removal, and the slow socket ends.
@@ -2159,6 +2356,73 @@ async fn a_frame_over_the_bound_ends_the_connection() -> Result<(), Failure> {
     let left = next_json_within(&mut watched, "peer.left").await;
     assert_eq!(left["event"], event::PEER_LEFT);
     assert_eq!(left["params"]["peer_id"], flo.as_str());
+    wait_for_described(
+        "the host to stop seeing the dropped sender",
+        || async { format!("{:?}", host.peers().await) },
+        || async {
+            let peers = host.peers().await.ok()?;
+            (!peers.iter().any(|peer| peer.display_name == "Flo")).then_some(())
+        },
+    )
+    .await;
+    Ok(())
+}
+
+/// Fragments reassemble before the bound bites: nine 1 MiB fragments of one binary
+/// message are 9 MiB past the 8 MiB bound, and the connection ends the way a
+/// single over-bound frame ends it — both knobs are set, but only the single
+/// frame was pinned. Binary, so no UTF-8 fault ends it first; the room learns of
+/// it as a drop, like any transport end.
+#[tokio::test]
+async fn fragments_past_the_bound_end_the_connection() -> Result<(), Failure> {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let target = format!(
+        "{}?room={}&token={}",
+        proto::ENDPOINT_PATH,
+        proto::percent_encode(&room.id),
+        proto::percent_encode(&room.token)
+    );
+    let mut flood = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the sender joins");
+    flood
+        .hello(&serde_json::json!({"display_name": "Flo"}))
+        .await
+        .expect("says hello");
+    let joined = next_json_within(&mut flood, "room.joined").await;
+    assert_eq!(joined["event"], event::ROOM_JOINED);
+    wait_for_peer(&host, "Flo").await;
+
+    // Nine 1 MiB fragments, FIN clear but the last: the message is 9 MiB, past the
+    // bound no single frame breaks. The final send can fail once the payload
+    // outgrows the socket buffers, like the single-frame pin.
+    let big = vec![0xA5u8; 1024 * 1024];
+    flood
+        .send_fragment(0x2, false, &big)
+        .await
+        .expect("the first fragment");
+    for _ in 0..7 {
+        flood
+            .send_fragment(0x0, false, &big)
+            .await
+            .expect("a middle fragment");
+    }
+    if let Err(failed) = flood.send_fragment(0x0, true, &big).await {
+        assert!(
+            socket_ended(&failed),
+            "the oversize send ends the socket: {failed}"
+        );
+    }
+    match timeout(WAIT, flood.read_to_end())
+        .await
+        .expect("the server ends the fragmented connection")
+    {
+        None | Some(ErrorKind::ConnectionReset) => {}
+        Some(kind) => panic!("the socket ends; it does not linger: {kind:?}"),
+    }
+
+    // The room learned of it as a drop, and the host stops seeing the sender.
     wait_for_described(
         "the host to stop seeing the dropped sender",
         || async { format!("{:?}", host.peers().await) },
@@ -2592,9 +2856,12 @@ async fn open_cost_grows_with_the_set_and_stops_at_the_cap() {
     assert_eq!(code, "x.room_full");
 }
 
-/// Past the connection cap a new TCP connection is closed without an answer. The count
-/// covers handshakes as well as seats; what it does not cover is silence after the
-/// handshake, which the protocol forbids policing (`PROTOCOL.md` §2.1).
+/// Past the connection cap a new connection is turned away with a signal, not
+/// silence: plain HTTP gets `503` plus `retry-after`, a WebSocket upgrade gets its
+/// handshake answered and a `1013` close — so a reconnect storm can tell "full"
+/// from "dead". The count covers handshakes as well as seats; what it does not
+/// cover is silence after the handshake, which the protocol forbids policing
+/// (`PROTOCOL.md` §2.1).
 #[tokio::test]
 async fn connections_past_the_cap_are_turned_away() {
     let harness = Harness::start_with(ServerConfig {
@@ -2605,19 +2872,83 @@ async fn connections_past_the_cap_are_turned_away() {
     let (ada, room) = harness.host("Ada").await.expect("connects");
     let _bob = harness.join(&room, "Bob").await.expect("joins");
 
-    let refused = timeout(
-        WAIT,
-        connect(&proto::session_url(&harness.ws_base(), None, None)),
-    )
-    .await
-    .expect("the refused attempt resolves");
+    // Plain HTTP hears 503 with a retry hint.
+    let addr = harness.ws_base().trim_start_matches("ws://").to_string();
+    let mut plain = TcpStream::connect(&addr).await.expect("connects");
+    plain
+        .write_all(
+            format!(
+                "GET /meta HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("sends a request");
+    let mut refused = String::new();
+    plain
+        .read_to_string(&mut refused)
+        .await
+        .expect("reads the refusal");
+    assert!(refused.starts_with("HTTP/1.1 503"), "got {refused:?}");
     assert!(
-        refused.is_err(),
-        "past the cap the server closes without answering"
+        refused.to_ascii_lowercase().contains("retry-after"),
+        "the refusal says when to come back: {refused:?}"
     );
 
-    // The seated pair is undisturbed by the refusal.
+    // A WebSocket upgrade hears 1013 after its handshake is answered.
+    let mut upgrade =
+        connect(&proto::session_url(&harness.ws_base(), None, None))
+            .await
+            .expect("the handshake is answered");
+    let outcome = timeout(WAIT, upgrade.next())
+        .await
+        .expect("the server answers the upgrade");
+    let Some(Ok(Message::Close(Some(frame)))) = outcome else {
+        panic!("past the cap the upgrade ends in a close: {outcome:?}");
+    };
+    assert_eq!(u16::from(frame.code), 1013, "try again later");
+
+    // The seated pair is undisturbed by the refusals.
     ada.open(PATH).await.expect("the room keeps serving");
+}
+
+/// A request head that runs past the bound with no blank line is refused `431`,
+/// not dropped silently: the client hears that its head — not the server — is the
+/// problem. One write past the 16 KiB bound always fits the socket buffers, so the
+/// server always has the bytes it needs to decide before the client waits.
+#[tokio::test]
+async fn an_oversized_request_head_is_refused() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let addr = harness.ws_base().trim_start_matches("ws://").to_string();
+    let mut stream = TcpStream::connect(&addr).await.expect("connects");
+    stream
+        .write_all(&vec![b'x'; 17 * 1024])
+        .await
+        .expect("sends a headless flood");
+    let head = read_http_head(&mut stream).await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 431"), "got {head:?}");
+}
+
+// A head whose blank line ends past the bound is oversize too, even though it
+// terminates: the bound limits the head, not just the hunt for its end.
+#[tokio::test]
+async fn a_terminated_head_past_the_bound_is_refused() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let addr = harness.ws_base().trim_start_matches("ws://").to_string();
+    // The terminator lands inside the old fuzz window: past 16 KiB, within one
+    // 1 KiB server read past it — where the hunt accepted the head without
+    // judging its length.
+    let prefix = format!("GET /meta HTTP/1.1\r\nhost: {addr}\r\nx-pad: ");
+    let padded = format!("{} {}\r\n\r\n", prefix, "a".repeat(16_400));
+    assert!(padded.len() > 16 * 1024, "the head clears the bound");
+    assert!(padded.len() < 17 * 1024, "within one read past it");
+    let mut stream = TcpStream::connect(&addr).await.expect("connects");
+    stream
+        .write_all(padded.as_bytes())
+        .await
+        .expect("sends a fat head");
+    let head = read_http_head(&mut stream).await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 431"), "got {head:?}");
 }
 
 /// Closing a path nobody holds is a no-op success: the set is unchanged, and no
