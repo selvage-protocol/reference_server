@@ -4,6 +4,7 @@
 //! owns rooms, membership and the open-document set, but never decodes a document or
 //! awareness payload — binary frames are routed to the rest of the room untouched.
 
+use std::fmt::Write as _;
 use std::io;
 use std::mem::take;
 use std::pin::Pin;
@@ -38,6 +39,9 @@ use session::{Applicant, Session, handshake};
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const NOT_FOUND: &str = r#"{"error":"not found","hint":"try /session (WebSocket) or /meta (HTTP)"}"#;
 const METHOD_NOT_ALLOWED: &str = r#"{"error":"method not allowed","hint":"GET answers, HEAD answers headers-only"}"#;
+const SERVER_FULL_BODY: &str =
+    r#"{"error":"server full","hint":"try again later"}"#;
+const HEAD_TOO_LARGE_BODY: &str = r#"{"error":"request head too large","hint":"send a shorter request head"}"#;
 
 /// The most one inbound WebSocket frame or message may carry, well under the
 /// library's 64 MiB default. A frame over the bound is a transport failure, not a
@@ -71,7 +75,8 @@ pub struct Shared {
     pub config: ServerConfig,
     pub registry: Arc<Mutex<Registry>>,
     /// How many connections the server holds right now, seated or not. Past the
-    /// configured cap a new TCP connection is closed without an answer.
+    /// configured cap a new connection is turned away with a signal — `503` for
+    /// plain HTTP, a `1013` close for a WebSocket upgrade — rather than silence.
     pub connections: Arc<AtomicUsize>,
 }
 
@@ -86,8 +91,10 @@ impl Shared {
     }
 }
 
-/// Serves connections until the listener itself fails. Past the configured cap a new
-/// connection is closed without an answer: the count covers handshakes as well as
+/// Serves connections until the listener itself fails. Each accepted socket gets
+/// its own task; past the configured cap a connection is turned away with a
+/// signal (`503` for plain HTTP, a `1013` close for a WebSocket upgrade) rather
+/// than silence, once its head is read. The count covers handshakes as well as
 /// seats, so half-open sockets cannot pile up past it.
 pub async fn serve(listener: TcpListener, shared: Shared) {
     let mut errors: u32 = 0;
@@ -102,17 +109,9 @@ pub async fn serve(listener: TcpListener, shared: Shared) {
             sleep(accept_backoff(errors)).await;
             continue;
         };
-        if shared.connections.fetch_add(1, Ordering::SeqCst)
-            >= shared.config.max_connections
-        {
-            shared.connections.fetch_sub(1, Ordering::SeqCst);
-            continue;
-        }
         let connection = shared.clone();
         tokio::spawn(async move {
-            let live = Arc::clone(&connection.connections);
             let _ = connection.accept(tcp).await;
-            live.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
@@ -129,6 +128,18 @@ const fn accept_backoff(errors: u32) -> Duration {
         _ => 800,
     };
     Duration::from_millis(millis)
+}
+
+/// A held connection slot: admitted past the head, released when the connection
+/// ends. Releasing on drop keeps every early return after admission honest.
+struct Slot {
+    count: Arc<AtomicUsize>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Accepts one connection with Nagle's algorithm off.
@@ -153,8 +164,33 @@ impl Shared {
         let Ok(request) = reading.await else {
             return Ok(());
         };
-        let Some(mut head) = request? else {
-            return Ok(());
+        let mut head = match request? {
+            // The client went away before finishing: nothing to answer.
+            HeadRead::Gone => return Ok(()),
+            // Past the head bound with no blank line: the request is unanswerable,
+            // and the method never parsed, so the answer carries a body.
+            HeadRead::TooLarge => {
+                return respond_status(
+                    &mut tcp,
+                    Status::RequestHeaderFieldsTooLarge,
+                    HEAD_TOO_LARGE_BODY,
+                    "GET",
+                )
+                .await;
+            }
+            HeadRead::Ready(head) => head,
+        };
+        // Admitted past the head: the count covers handshakes as well as seats, so
+        // half-open sockets cannot pile up past it, and a refused connection hears
+        // why instead of silence.
+        if self.connections.fetch_add(1, Ordering::SeqCst)
+            >= self.config.max_connections
+        {
+            self.connections.fetch_sub(1, Ordering::SeqCst);
+            return self.refuse_full(tcp, head).await;
+        }
+        let _slot = Slot {
+            count: Arc::clone(&self.connections),
         };
         // The WebSocket handshake is a `GET` (RFC 6455 §4.1): anything else, upgrade
         // headers or not, is a plain request and answered as one.
@@ -187,6 +223,50 @@ impl Shared {
         // in the same read as the head wait here until the frame parser asks for them.
         ws.get_mut().push_back(take(&mut head.tail));
         self.serve_session(ws, proto::parse_join_query(&head.query))
+            .await;
+        Ok(())
+    }
+
+    /// Turns a connection away past the cap, with a signal instead of silence:
+    /// plain HTTP gets `503` plus `retry-after`; a WebSocket upgrade gets its
+    /// handshake answered and a `1013` close. A reconnect storm can tell "full"
+    /// from "dead" either way.
+    async fn refuse_full(
+        self,
+        mut tcp: TcpStream,
+        head: Head,
+    ) -> io::Result<()> {
+        let upgrade = head.method == "GET"
+            && head.is_websocket_upgrade
+            && head.path == proto::ENDPOINT_PATH;
+        if !upgrade {
+            return respond_status(
+                &mut tcp,
+                Status::ServiceUnavailable,
+                SERVER_FULL_BODY,
+                &head.method,
+            )
+            .await;
+        }
+        let prefixed = PrefixedStream::new(head.request, tcp);
+        let framing = WebSocketConfig::default()
+            .max_message_size(Some(MAX_FRAME_BYTES))
+            .max_frame_size(Some(MAX_FRAME_BYTES));
+        let Ok(mut ws) = tokio_tungstenite::accept_async_with_config(
+            prefixed,
+            Some(framing),
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        ws.get_mut().push_back(head.tail);
+        // 1013: try again later. The reason fits a control frame many times over.
+        let _ = ws
+            .send(Message::Close(Some(CloseFrame {
+                code: 1013u16.into(),
+                reason: "server full, try again later".to_string().into(),
+            })))
             .await;
         Ok(())
     }
@@ -413,6 +493,8 @@ enum Status {
     Ok,
     NotFound,
     MethodNotAllowed,
+    ServiceUnavailable,
+    RequestHeaderFieldsTooLarge,
 }
 
 impl Status {
@@ -421,6 +503,8 @@ impl Status {
             Self::Ok => 200,
             Self::NotFound => 404,
             Self::MethodNotAllowed => 405,
+            Self::ServiceUnavailable => 503,
+            Self::RequestHeaderFieldsTooLarge => 431,
         }
     }
 
@@ -429,6 +513,21 @@ impl Status {
             Self::Ok => "OK",
             Self::NotFound => "Not Found",
             Self::MethodNotAllowed => "Method Not Allowed",
+            Self::ServiceUnavailable => "Service Unavailable",
+            Self::RequestHeaderFieldsTooLarge => {
+                "Request Header Fields Too Large"
+            }
+        }
+    }
+
+    /// `retry-after` seconds for the statuses that ask the client to come back.
+    const fn retry_after_secs(self) -> Option<u64> {
+        match self {
+            Self::ServiceUnavailable => Some(1),
+            Self::Ok
+            | Self::NotFound
+            | Self::MethodNotAllowed
+            | Self::RequestHeaderFieldsTooLarge => None,
         }
     }
 }
@@ -446,23 +545,33 @@ struct Head {
     is_websocket_upgrade: bool,
 }
 
-async fn read_http_head(tcp: &mut TcpStream) -> io::Result<Option<Head>> {
+/// What reading the request head produced: the head itself, the client going
+/// away before finishing, or a head that ran past the bound with no blank line.
+/// The last two look alike on the socket — both end the read with no head — but
+/// only the first is silence: an oversize head is refused `431`.
+enum HeadRead {
+    Ready(Head),
+    Gone,
+    TooLarge,
+}
+
+async fn read_http_head(tcp: &mut TcpStream) -> io::Result<HeadRead> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     let end = loop {
         let n = tcp.read(&mut chunk).await?;
         if n == 0 {
-            return Ok(None);
+            return Ok(HeadRead::Gone);
         }
         let Some(part) = chunk.get(..n) else {
-            return Ok(None);
+            return Ok(HeadRead::Gone);
         };
         buf.extend_from_slice(part);
         if let Some(pos) = find(&buf, b"\r\n\r\n") {
             break pos.saturating_add(4);
         }
         if buf.len() > MAX_HEAD_BYTES {
-            return Ok(None);
+            return Ok(HeadRead::TooLarge);
         }
     };
 
@@ -477,7 +586,7 @@ async fn read_http_head(tcp: &mut TcpStream) -> io::Result<Option<Head>> {
         None => (origin_form(target), ""),
     };
 
-    Ok(Some(Head {
+    Ok(HeadRead::Ready(Head {
         // Everything the read returned, split where the head ends: bytes behind it are
         // frames a client pipelined, and they still have to reach the frame parser.
         request: buf,
@@ -539,11 +648,15 @@ async fn respond_status(
     method: &str,
 ) -> io::Result<()> {
     let mut response = format!(
-        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
         status.code(),
         status.reason(),
         body.len()
     );
+    if let Some(secs) = status.retry_after_secs() {
+        let _ = write!(response, "retry-after: {secs}\r\n");
+    }
+    response.push_str("\r\n");
     if method != "HEAD" {
         response.push_str(body);
     }

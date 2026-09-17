@@ -2687,9 +2687,12 @@ async fn open_cost_grows_with_the_set_and_stops_at_the_cap() {
     assert_eq!(code, "x.room_full");
 }
 
-/// Past the connection cap a new TCP connection is closed without an answer. The count
-/// covers handshakes as well as seats; what it does not cover is silence after the
-/// handshake, which the protocol forbids policing (`PROTOCOL.md` §2.1).
+/// Past the connection cap a new connection is turned away with a signal, not
+/// silence: plain HTTP gets `503` plus `retry-after`, a WebSocket upgrade gets its
+/// handshake answered and a `1013` close — so a reconnect storm can tell "full"
+/// from "dead". The count covers handshakes as well as seats; what it does not
+/// cover is silence after the handshake, which the protocol forbids policing
+/// (`PROTOCOL.md` §2.1).
 #[tokio::test]
 async fn connections_past_the_cap_are_turned_away() {
     let harness = Harness::start_with(ServerConfig {
@@ -2700,19 +2703,61 @@ async fn connections_past_the_cap_are_turned_away() {
     let (ada, room) = harness.host("Ada").await.expect("connects");
     let _bob = harness.join(&room, "Bob").await.expect("joins");
 
-    let refused = timeout(
-        WAIT,
-        connect(&proto::session_url(&harness.ws_base(), None, None)),
-    )
-    .await
-    .expect("the refused attempt resolves");
+    // Plain HTTP hears 503 with a retry hint.
+    let addr = harness.ws_base().trim_start_matches("ws://").to_string();
+    let mut plain = TcpStream::connect(&addr).await.expect("connects");
+    plain
+        .write_all(
+            format!(
+                "GET /meta HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("sends a request");
+    let mut refused = String::new();
+    plain
+        .read_to_string(&mut refused)
+        .await
+        .expect("reads the refusal");
+    assert!(refused.starts_with("HTTP/1.1 503"), "got {refused:?}");
     assert!(
-        refused.is_err(),
-        "past the cap the server closes without answering"
+        refused.to_ascii_lowercase().contains("retry-after"),
+        "the refusal says when to come back: {refused:?}"
     );
 
-    // The seated pair is undisturbed by the refusal.
+    // A WebSocket upgrade hears 1013 after its handshake is answered.
+    let mut upgrade =
+        connect(&proto::session_url(&harness.ws_base(), None, None))
+            .await
+            .expect("the handshake is answered");
+    let outcome = timeout(WAIT, upgrade.next())
+        .await
+        .expect("the server answers the upgrade");
+    let Some(Ok(Message::Close(Some(frame)))) = outcome else {
+        panic!("past the cap the upgrade ends in a close: {outcome:?}");
+    };
+    assert_eq!(u16::from(frame.code), 1013, "try again later");
+
+    // The seated pair is undisturbed by the refusals.
     ada.open(PATH).await.expect("the room keeps serving");
+}
+
+/// A request head that runs past the bound with no blank line is refused `431`,
+/// not dropped silently: the client hears that its head — not the server — is the
+/// problem. One write past the 16 KiB bound always fits the socket buffers, so the
+/// server always has the bytes it needs to decide before the client waits.
+#[tokio::test]
+async fn an_oversized_request_head_is_refused() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let addr = harness.ws_base().trim_start_matches("ws://").to_string();
+    let mut stream = TcpStream::connect(&addr).await.expect("connects");
+    stream
+        .write_all(&vec![b'x'; 17 * 1024])
+        .await
+        .expect("sends a headless flood");
+    let head = read_http_head(&mut stream).await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 431"), "got {head:?}");
 }
 
 /// Closing a path nobody holds is a no-op success: the set is unchanged, and no

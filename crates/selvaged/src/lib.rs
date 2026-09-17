@@ -34,9 +34,11 @@ pub struct ServerConfig {
     /// Keepalive values advertised to clients.
     pub keepalive: Keepalive,
     /// How many connections the server holds at once, seated or not. Past it, a new
-    /// TCP connection is closed without an answer. Silence after the handshake is not
-    /// policed here: `PROTOCOL.md` §2.1 forbids timing a session out for inactivity,
-    /// so a deployment that needs an idle deadline puts it in front (§12).
+    /// connection is turned away with a signal — `503` for plain HTTP, a `1013`
+    /// close for a WebSocket upgrade — once its head is read. Silence after the
+    /// handshake is not policed here: `PROTOCOL.md` §2.1 forbids timing a session
+    /// out for inactivity, so a deployment that needs an idle deadline puts it in
+    /// front (§12).
     ///
     /// The process needs file descriptors for more than these sockets: keep
     /// `RLIMIT_NOFILE` at `max_connections + 64` or above (listener, stdio and a
