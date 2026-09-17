@@ -602,10 +602,13 @@ async fn read_http_head(tcp: &mut TcpStream) -> io::Result<HeadRead> {
     let mut words = request_line.split_whitespace();
     let method = words.next().unwrap_or_default();
     let target = words.next().unwrap_or_default();
-    let (path, query) = match origin_form(target).split_once('?') {
+    let origin = origin_form(target);
+    let (raw_path, query) = match origin.split_once('?') {
         Some((path, query)) => (path, query),
-        None => (origin_form(target), ""),
+        None => (origin, ""),
     };
+    // An absolute URI with no path carries an empty one; `?` alone still split.
+    let path = if raw_path.is_empty() { "/" } else { raw_path };
 
     Ok(HeadRead::Ready(Head {
         // Everything the read returned, split where the head ends: bytes behind it are
@@ -624,14 +627,20 @@ async fn read_http_head(tcp: &mut TcpStream) -> io::Result<HeadRead> {
 /// Strips an absolute-form request target down to its origin form: a proxy
 /// forwarding a `GET` with an absolute URI is legal HTTP, and §12 puts one in
 /// front of any public deployment, so comparing the target verbatim 404s it.
+/// A target with no path keeps its query (a query-only absolute target still
+/// joins once routed): the boundary is the first `/` or `?`, whichever comes
+/// first.
 fn origin_form(target: &str) -> &str {
     let Some((_, after_scheme)) = target.split_once("://") else {
         return target;
     };
-    let Some(slash) = after_scheme.find('/') else {
-        return "/";
+    let boundary = match (after_scheme.find('/'), after_scheme.find('?')) {
+        (Some(slash), Some(query)) => slash.min(query),
+        (Some(slash), None) => slash,
+        (None, Some(query)) => query,
+        (None, None) => return "/",
     };
-    after_scheme.get(slash..).unwrap_or("/")
+    after_scheme.get(boundary..).unwrap_or("/")
 }
 
 async fn respond_plain(tcp: &mut TcpStream, head: &Head) -> io::Result<()> {
@@ -804,6 +813,10 @@ mod tests {
             "/session?room=r-1&token=t"
         );
         assert_eq!(origin_form(&format!("http://{host}")), "/");
+        assert_eq!(
+            origin_form(&format!("http://{host}?room=r-1&token=t")),
+            "?room=r-1&token=t"
+        );
         assert_eq!(origin_form("*"), "*");
     }
 
