@@ -94,8 +94,9 @@ impl Shared {
 /// Serves connections until the listener itself fails. Each accepted socket gets
 /// its own task; past the configured cap a connection is turned away with a
 /// signal (`503` for plain HTTP, a `1013` close for a WebSocket upgrade) rather
-/// than silence, once its head is read. The count covers handshakes as well as
-/// seats, so half-open sockets cannot pile up past it.
+/// than silence, once its head is read. The count covers everything past the
+/// head — handshakes as well as seats — while half-sent heads are bounded by
+/// `head_timeout` instead.
 pub async fn serve(listener: TcpListener, shared: Shared) {
     let mut errors: u32 = 0;
     loop {
@@ -631,6 +632,11 @@ async fn read_http_head(tcp: &mut TcpStream) -> io::Result<HeadRead> {
 /// joins once routed): the boundary is the first `/` or `?`, whichever comes
 /// first.
 fn origin_form(target: &str) -> &str {
+    if target.starts_with('/') {
+        return target;
+    }
+    // Origin-form targets pass through untouched — even one holding `://` in a
+    // query value. Only a target that does not start with `/` can be absolute.
     let Some((_, after_scheme)) = target.split_once("://") else {
         return target;
     };
@@ -818,6 +824,16 @@ mod tests {
             "?room=r-1&token=t"
         );
         assert_eq!(origin_form("*"), "*");
+    }
+
+    /// An origin-form target carrying `://` in its query still routes: only a
+    /// target that does not start with `/` can be absolute.
+    #[test]
+    fn origin_form_with_scheme_in_query() {
+        assert_eq!(
+            origin_form("/session?token=ab://cd"),
+            "/session?token=ab://cd"
+        );
     }
 
     #[tokio::test]
