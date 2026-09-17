@@ -222,6 +222,7 @@ impl Shared {
         // The upgrade refuses a request with anything behind it, so bytes that arrived
         // in the same read as the head wait here until the frame parser asks for them.
         ws.get_mut().push_back(take(&mut head.tail));
+        ws.get_mut().drop_head();
         self.serve_session(ws, proto::parse_join_query(&head.query))
             .await;
         Ok(())
@@ -387,7 +388,10 @@ struct Live {
 async fn pump(live: &mut Live, shared: &Shared) {
     loop {
         let keep_going = tokio::select! {
-            _ = live.ping.tick() => live.heartbeat(),
+            _ = live.ping.tick() => {
+                live.heartbeat();
+                true
+            }
             _ = &mut live.wire.writer => false,
             _ = &mut live.poison => false,
             incoming = live.wire.stream.next() => live.session.handle_frame(incoming, shared).await,
@@ -400,9 +404,8 @@ async fn pump(live: &mut Live, shared: &Shared) {
 
 impl Live {
     /// Sends one protocol-level ping. The keepalive never ends the session.
-    fn heartbeat(&self) -> bool {
+    fn heartbeat(&self) {
         let _ = self.wire.queue.try_queue(Outbound::Ping(Vec::new()));
-        true
     }
 }
 
@@ -689,6 +692,15 @@ impl<T> PrefixedStream<T> {
     /// Queues more bytes to be read after everything already queued.
     fn push_back(&mut self, mut bytes: Vec<u8>) {
         self.prefix.append(&mut bytes);
+    }
+
+    /// Drops the HTTP head bytes the upgrade consumed, keeping any frames that
+    /// arrived behind them. The head lingers otherwise — up to ~17 KiB per
+    /// connection, ~17 MiB at the cap — for no reader that will ever ask again.
+    fn drop_head(&mut self) {
+        self.prefix.drain(..self.pos.min(self.prefix.len()));
+        self.prefix.shrink_to_fit();
+        self.pos = 0;
     }
 }
 
