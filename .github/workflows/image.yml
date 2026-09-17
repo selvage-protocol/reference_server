@@ -114,6 +114,13 @@ jobs:
         run: |
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           sha="$(git rev-parse --short HEAD)"
+          # The registry tags derive from Cargo, so the release tag that
+          # triggered this job must name the same version — otherwise a tag
+          # cut from the wrong commit would publish a mismatched version.
+          if [ "${GITHUB_REF_NAME:?}" != "v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo version $version" >&2
+            exit 1
+          fi
           {
             echo "version=$version"
             echo "sha=$sha"

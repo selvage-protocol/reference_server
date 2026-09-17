@@ -57,6 +57,8 @@ ENTRYPOINT ["/selvaged"]
 CMD ["--listen", "0.0.0.0:8080"]
 
 FROM runtime-${RUNTIME} AS final
+ARG VERSION
+ARG REVISION
 # The FSL-1.1-MIT licence travels inside the image (see /LICENSE) and in its
 # annotations. Pushing this image anywhere is redistribution of the binary:
 # review the Competing Use scope before publishing — see packaging/README.md.
