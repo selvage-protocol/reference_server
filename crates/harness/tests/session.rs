@@ -2929,6 +2929,28 @@ async fn an_oversized_request_head_is_refused() {
     assert!(head.starts_with("HTTP/1.1 431"), "got {head:?}");
 }
 
+// A head whose blank line ends past the bound is oversize too, even though it
+// terminates: the bound limits the head, not just the hunt for its end.
+#[tokio::test]
+async fn a_terminated_head_past_the_bound_is_refused() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let addr = harness.ws_base().trim_start_matches("ws://").to_string();
+    // The terminator lands inside the old fuzz window: past 16 KiB, within one
+    // 1 KiB server read past it — where the hunt accepted the head without
+    // judging its length.
+    let prefix = format!("GET /meta HTTP/1.1\r\nhost: {addr}\r\nx-pad: ");
+    let padded = format!("{} {}\r\n\r\n", prefix, "a".repeat(16_400));
+    assert!(padded.len() > 16 * 1024, "the head clears the bound");
+    assert!(padded.len() < 17 * 1024, "within one read past it");
+    let mut stream = TcpStream::connect(&addr).await.expect("connects");
+    stream
+        .write_all(padded.as_bytes())
+        .await
+        .expect("sends a fat head");
+    let head = read_http_head(&mut stream).await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 431"), "got {head:?}");
+}
+
 /// Closing a path nobody holds is a no-op success: the set is unchanged, and no
 /// `doc_not_open` arrives, because the protocol reserves that code without producing
 /// it (`PROTOCOL.md` §11). A client written from the vocabulary list must not wait for

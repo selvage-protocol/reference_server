@@ -560,9 +560,10 @@ struct Head {
 }
 
 /// What reading the request head produced: the head itself, the client going
-/// away before finishing, or a head that ran past the bound with no blank line.
-/// The last two look alike on the socket — both end the read with no head — but
-/// only the first is silence: an oversize head is refused `431`.
+/// away before finishing, or a head that ran past the bound — no blank line in
+/// the first bound bytes, or the blank line ending past it. The last two look
+/// alike on the socket, but only the first is silence: an oversize head is
+/// refused `431`.
 enum HeadRead {
     Ready(Head),
     Gone,
@@ -588,6 +589,12 @@ async fn read_http_head(tcp: &mut TcpStream) -> io::Result<HeadRead> {
             return Ok(HeadRead::TooLarge);
         }
     };
+    // The terminator was found, but past the bound its head is still oversize:
+    // the bound limits the head, not just the hunt for its end. An end exactly
+    // at the limit is accepted.
+    if end > MAX_HEAD_BYTES {
+        return Ok(HeadRead::TooLarge);
+    }
 
     let tail = buf.split_off(end);
     let head_text = String::from_utf8_lossy(&buf).into_owned();
