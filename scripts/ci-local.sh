@@ -6,6 +6,9 @@
 #   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval, lint
 #   scripts/ci-local.sh nightly   # coverage, the rest of cargo-deny and cargo-audit (slow)
 #   scripts/ci-local.sh lint      # actionlint over the workflow files, on its own
+#   scripts/ci-local.sh image     # the `image` workflow's smoke: nix-built image,
+#                                 # skopeo manifest/config checks, version
+#                                 # assertions — no Docker, runs anywhere nix does
 #   scripts/ci-local.sh all       # everything the `checks` job runs (nightly is opt-in: it is slow)
 #
 # Keep this in step with the workflow — it runs the same commands, so that a red job is found
@@ -59,13 +62,19 @@ job_lint() {
   nix develop . -c actionlint
 }
 
+job_image() {
+  say "image: nix-built image smoke without publishing"
+  scripts/image-smoke.sh
+}
+
 case "${1:-all}" in
   checks) job_checks ;;
   nightly) job_nightly ;;
   lint) job_lint ;;
+  image) job_image ;;
   all) job_checks ;;
   *)
-    printf 'usage: %s [checks|nightly|lint|all]\n' "$0" >&2
+    printf 'usage: %s [checks|nightly|lint|all|image]\n' "$0" >&2
     exit 2
     ;;
 esac

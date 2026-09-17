@@ -1,0 +1,29 @@
+# selvaged.service — user unit for the Selvage reference server.
+#
+# The Pi demo's hand-written unit, generalized: an absolute binary path, an
+# explicit bind address, an explicit grace period, file-append logging, and
+# `Restart=always`. `%h` expands to the installing user's home, so this file
+# installs as-is — no per-machine editing. See packaging/README.md.
+[Unit]
+Description=Selvage session server (selvaged)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Defaults live here; `selvaged.env` overrides them. systemd expands
+# `$VAR`/`${VAR}` but has no `:-` fallback syntax, hence this split rather
+# than defaults inside ExecStart.
+Environment=LISTEN_ADDR=127.0.0.1:8080
+Environment=ROOM_GRACE_MS=30000
+EnvironmentFile=-%h/selvage/selvaged.env
+ExecStart=%h/selvage/selvaged --listen ${LISTEN_ADDR} --room-grace-ms ${ROOM_GRACE_MS}
+WorkingDirectory=%h/selvage
+# The log file — not the journal — is the record. The demo Pi's journal keeps
+# no user-unit output, so the unit appends stdout here instead.
+StandardOutput=append:%h/selvage/selvaged.log
+StandardError=inherit
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

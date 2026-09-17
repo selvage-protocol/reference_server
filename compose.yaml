@@ -1,0 +1,27 @@
+# One-command self-host for strangers evaluating selvage on their own
+# machine (and, later, optionally the VPS demo) — emphatically not the Pi,
+# which already runs the native binary under packaging/systemd/.
+#
+# No volumes: the server is memory-only and keeps nothing on disk, so there
+# is nothing to persist. No companion services: the server needs no database,
+# no TLS proxy, no idle-timeout policing in front of it beyond what the
+# operator's own edge already does.
+#
+# Until the first image is published to GHCR (no tag has been cut — see
+# packaging/README.md), `compose up` builds locally via `build:`. After that,
+# the same file pulls the published image.
+services:
+  selvaged:
+    build: .
+    image: ghcr.io/selvage-protocol/selvaged:0.1
+    ports:
+      # Loopback by default: a stranger evaluating locally reaches it, and
+      # nothing else does. Operators serving beyond their own machine rebind
+      # deliberately (e.g. "8080:8080"), the way the systemd unit names its
+      # reachable address explicitly.
+      - "127.0.0.1:8080:8080"
+    # Inside the container the wildcard is correct: the port mapping supplies
+    # the boundary. Override per host, e.g. `--listen 0.0.0.0:9000` with a
+    # matching ports entry.
+    command: ["--listen", "0.0.0.0:8080"]
+    restart: unless-stopped

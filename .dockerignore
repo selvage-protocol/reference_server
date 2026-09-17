@@ -1,0 +1,6 @@
+target/
+.git/
+.worktrees/
+.tmp/
+result
+result-*

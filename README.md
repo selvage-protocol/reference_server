@@ -57,8 +57,10 @@ cargo run -p selvaged -- --listen 0.0.0.0:8080
 ```
 
 A free tunnel that forwards to your port works for a first test; beyond that you want a
-machine with a public address (a small VPS, the right firewall rules). There is no
-container image or service unit yet.
+machine with a public address (a small VPS, the right firewall rules). To run the server
+beyond a shell — a systemd user unit, or a multi-arch container image with a
+one-service compose file — see `packaging/` (install docs, upgrade flow, version
+truthfulness, and the licence review that must precede any image publish).
 
 The vector replay reads `vectors/`, or `SELVAGE_VECTORS` when that is set — the Nix build
 cannot see outside the Cargo workspace, so `flake.nix` hands the directory in explicitly.
