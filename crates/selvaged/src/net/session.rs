@@ -205,6 +205,10 @@ fn envelope_refusal(what: &str, error: &serde_json::Error) -> Refusal {
     (code::BAD_MESSAGE, format!("{what}: {error}"))
 }
 
+/// Maps an admission failure to its refusal. `Unknown` and `TokenMismatch` stay
+/// distinct on purpose: guests reuse the difference, and the oracle is accepted —
+/// room ids carry 48 bits with 128-bit tokens behind them, so enumeration is
+/// infeasible, and handshake rate limiting belongs to the §12 proxy.
 fn refusal_for(error: SeatError, room_id: &str) -> Refusal {
     match error {
         SeatError::Unknown => {

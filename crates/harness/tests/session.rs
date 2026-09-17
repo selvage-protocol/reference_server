@@ -169,6 +169,23 @@ impl RawSocket {
         Ok(())
     }
 
+    /// Sends one frame with the FIN bit chosen by the caller: fragments carry it
+    /// clear until the last, so the server reassembles before the bound bites.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a fragment names its opcode, FIN bit and payload; the shape is the pin"
+    )]
+    async fn send_fragment(
+        &mut self,
+        opcode: u8,
+        fin: bool,
+        payload: &[u8],
+    ) -> Result<(), Failure> {
+        let frame = client_fragment(opcode, fin, payload);
+        self.stream.write_all(&frame).await?;
+        Ok(())
+    }
+
     /// Sends a text frame carrying JSON.
     async fn send_json(&mut self, value: &Value) -> Result<(), Failure> {
         self.send(0x1, value.to_string().as_bytes()).await
@@ -316,6 +333,16 @@ async fn read_binary_until(
             Some(relayed) => return Ok(relayed),
         }
     }
+}
+
+/// One masked client frame with the FIN bit chosen by the caller, for the
+/// fragmented-bound pin below.
+fn client_fragment(opcode: u8, fin: bool, payload: &[u8]) -> Vec<u8> {
+    let mut frame = client_frame(opcode, payload);
+    if let Some(first) = frame.first_mut() {
+        *first = if fin { 0x80 | opcode } else { opcode };
+    }
+    frame
 }
 
 /// One masked client frame, in whichever length form fits: seven bits, sixteen, or
@@ -931,6 +958,23 @@ async fn the_server_carries_the_grant_in_the_order_it_was_given() {
 /// listing is non-empty (`PROTOCOL.md` §6.3). The guest's next frame here is the
 /// `doc.opened` the host then produces, so a server that sent an empty listing would put a
 /// frame in front of it and fail.
+/// The server holds `..` and absolute paths without resolving them: §5 names them
+/// as values the server carries, and confinement is the clients' mirror business
+/// (§12). A grant naming them publishes whole, and a late joiner inherits them.
+#[tokio::test]
+async fn a_grant_naming_dotdot_and_absolute_paths_publishes_whole() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let wanted = ["..", "/etc/passwd", "../outside.rs", "src/main.rs"];
+    let listed = paths(&wanted);
+    host.grant(listed.clone())
+        .await
+        .expect("the host publishes");
+    assert_eq!(wait_for_paths(&host, &wanted).await, listed);
+    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+    assert_eq!(wait_for_paths(&guest, &wanted).await, listed);
+}
+
 #[tokio::test]
 async fn a_joiner_of_a_room_that_grants_nothing_gets_no_granted_event() {
     let harness = Harness::start(Duration::from_secs(5)).await;
@@ -2308,6 +2352,73 @@ async fn a_frame_over_the_bound_ends_the_connection() -> Result<(), Failure> {
     let left = next_json_within(&mut watched, "peer.left").await;
     assert_eq!(left["event"], event::PEER_LEFT);
     assert_eq!(left["params"]["peer_id"], flo.as_str());
+    wait_for_described(
+        "the host to stop seeing the dropped sender",
+        || async { format!("{:?}", host.peers().await) },
+        || async {
+            let peers = host.peers().await.ok()?;
+            (!peers.iter().any(|peer| peer.display_name == "Flo")).then_some(())
+        },
+    )
+    .await;
+    Ok(())
+}
+
+/// Fragments reassemble before the bound bites: nine 1 MiB fragments of one binary
+/// message are 9 MiB past the 8 MiB bound, and the connection ends the way a
+/// single over-bound frame ends it — both knobs are set, but only the single
+/// frame was pinned. Binary, so no UTF-8 fault ends it first; the room learns of
+/// it as a drop, like any transport end.
+#[tokio::test]
+async fn fragments_past_the_bound_end_the_connection() -> Result<(), Failure> {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let target = format!(
+        "{}?room={}&token={}",
+        proto::ENDPOINT_PATH,
+        proto::percent_encode(&room.id),
+        proto::percent_encode(&room.token)
+    );
+    let mut flood = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the sender joins");
+    flood
+        .hello(&serde_json::json!({"display_name": "Flo"}))
+        .await
+        .expect("says hello");
+    let joined = next_json_within(&mut flood, "room.joined").await;
+    assert_eq!(joined["event"], event::ROOM_JOINED);
+    wait_for_peer(&host, "Flo").await;
+
+    // Nine 1 MiB fragments, FIN clear but the last: the message is 9 MiB, past the
+    // bound no single frame breaks. The final send can fail once the payload
+    // outgrows the socket buffers, like the single-frame pin.
+    let big = vec![0xA5u8; 1024 * 1024];
+    flood
+        .send_fragment(0x2, false, &big)
+        .await
+        .expect("the first fragment");
+    for _ in 0..7 {
+        flood
+            .send_fragment(0x0, false, &big)
+            .await
+            .expect("a middle fragment");
+    }
+    if let Err(failed) = flood.send_fragment(0x0, true, &big).await {
+        assert!(
+            socket_ended(&failed),
+            "the oversize send ends the socket: {failed}"
+        );
+    }
+    match timeout(WAIT, flood.read_to_end())
+        .await
+        .expect("the server ends the fragmented connection")
+    {
+        None | Some(ErrorKind::ConnectionReset) => {}
+        Some(kind) => panic!("the socket ends; it does not linger: {kind:?}"),
+    }
+
+    // The room learned of it as a drop, and the host stops seeing the sender.
     wait_for_described(
         "the host to stop seeing the dropped sender",
         || async { format!("{:?}", host.peers().await) },
