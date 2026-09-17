@@ -1825,6 +1825,10 @@ async fn the_negotiation_endpoint_checks_the_request_method() {
         post_response.starts_with("HTTP/1.1 405"),
         "POST is refused: {post_response:?}"
     );
+    assert!(
+        post_response.contains("allow: GET, HEAD"),
+        "the refusal names what it takes: {post_response:?}"
+    );
 }
 
 /// An absolute-form request target names the same resource: a proxy forwarding

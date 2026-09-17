@@ -533,6 +533,17 @@ impl Status {
             | Self::RequestHeaderFieldsTooLarge => None,
         }
     }
+
+    /// The methods a refusal takes: `405` names what the server implements.
+    const fn allow(self) -> Option<&'static str> {
+        match self {
+            Self::MethodNotAllowed => Some("GET, HEAD"),
+            Self::Ok
+            | Self::NotFound
+            | Self::ServiceUnavailable
+            | Self::RequestHeaderFieldsTooLarge => None,
+        }
+    }
 }
 
 struct Head {
@@ -658,6 +669,9 @@ async fn respond_status(
     );
     if let Some(secs) = status.retry_after_secs() {
         let _ = write!(response, "retry-after: {secs}\r\n");
+    }
+    if let Some(methods) = status.allow() {
+        let _ = write!(response, "allow: {methods}\r\n");
     }
     response.push_str("\r\n");
     if method != "HEAD" {
