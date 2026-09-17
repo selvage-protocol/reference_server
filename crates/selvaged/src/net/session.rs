@@ -16,7 +16,7 @@ use selvage_protocol::{close, code, event, method};
 
 use crate::ServerConfig;
 use crate::room::{
-    Claim, NewRoom, Outbound, Peer, Queue, Registry, Room, SeatError,
+    Claim, NewRoom, Outbound, Peer, Queue, Registry, Room, SeatError, send_all,
 };
 use crate::{mint_room_id, mint_token};
 
@@ -346,7 +346,9 @@ fn grace_ms(config: &ServerConfig) -> u64 {
 /// Sends a frame to a room's peers, minus one. A peer whose queue is full is not kept
 /// and told nothing: it is removed, the room is told `peer.left`, and its task is
 /// stopped. Frames the departures themselves need join the same loop, so a burst of
-/// slow peers drains without recursing.
+/// slow peers drains without recursing. The snapshot holds only queue handles: the
+/// per-peer copies leave after the registry lock is dropped, so a large relay never
+/// stalls the other rooms.
 #[expect(
     clippy::too_many_arguments,
     reason = "a delivery names its server, room, exclusion and frame; a struct would hide one call site's meaning"
@@ -362,14 +364,14 @@ async fn deliver(
         pending.push((except.map(str::to_string), out));
     }
     while let Some((skip, out)) = pending.pop() {
-        let slow: Vec<String> = {
+        let queues: Vec<(String, Queue)> = {
             let guard = shared.registry.lock().await;
             guard
                 .room(room_id)
-                .map(|room| room.broadcast(skip.as_deref(), &out))
+                .map(|room| room.queues(skip.as_deref()))
                 .unwrap_or_default()
         };
-        for peer_id in slow {
+        for peer_id in send_all(&queues, &out) {
             eject_into(shared, room_id, &peer_id, &mut pending).await;
         }
     }

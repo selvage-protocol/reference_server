@@ -203,20 +203,17 @@ impl Room {
         self.peers.insert(peer.info.peer_id.clone(), peer);
     }
 
-    /// Queues a frame on every peer but one, returning the ids whose queue was full.
-    /// The room holds no unsent bytes for them; the caller removes them instead.
+    /// Snapshots the queues of every peer but one: cheap `Sender` plus `Arc` clones
+    /// taken under the lock, sent on after it is dropped. Queueing a large frame
+    /// copies its bytes once per peer; that copy must not sit inside the critical
+    /// section, or one relay stalls every room. A peer removed after the snapshot
+    /// keeps its own queue, so sending through it stays safe.
     #[must_use]
-    pub fn broadcast(
-        &self,
-        except: Option<&str>,
-        out: &Outbound,
-    ) -> Vec<String> {
+    pub fn queues(&self, except: Option<&str>) -> Vec<(String, Queue)> {
         self.peers
             .values()
             .filter(|peer| Some(peer.info.peer_id.as_str()) != except)
-            .map(|peer| (peer.send(out.clone()), peer))
-            .filter(|(queued, _)| !queued)
-            .map(|(_, peer)| peer.info.peer_id.clone())
+            .map(|peer| (peer.info.peer_id.clone(), peer.queue.clone()))
             .collect()
     }
 
@@ -333,6 +330,19 @@ pub struct Claim<'a> {
     pub room_id: &'a str,
     pub token: Option<&'a str>,
     pub role: Role,
+}
+
+/// Queues one frame on every snapshotted queue, returning the ids whose queue
+/// was full. Runs after the registry lock is dropped: the per-peer copies leave
+/// outside the critical section, and the room holds no unsent bytes for the slow
+/// ones — the caller removes them instead.
+#[must_use]
+pub fn send_all(queues: &[(String, Queue)], out: &Outbound) -> Vec<String> {
+    queues
+        .iter()
+        .filter(|(_, queue)| !queue.try_queue(out.clone()))
+        .map(|(peer_id, _)| peer_id.clone())
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -506,7 +516,7 @@ mod tests {
     use super::*;
 
     /// The queue bound is exact: a full queue's worth of frames fits, and the next
-    /// broadcast reports the peer slow instead of queueing without bound.
+    /// send past it reports the peer slow instead of queueing without bound.
     #[test]
     fn a_full_queue_reports_the_peer_slow() {
         let mut registry = Registry::default();
@@ -529,9 +539,12 @@ mod tests {
         let room = registry.room("r-1").expect("the room is minted");
         let out = Outbound::Text("{}".to_string());
         for _ in 0..MAX_QUEUE_FRAMES {
-            assert!(room.broadcast(None, &out).is_empty());
+            assert!(send_all(&room.queues(None), &out).is_empty());
         }
-        assert_eq!(room.broadcast(None, &out), vec!["p-slow".to_string()]);
+        assert_eq!(
+            send_all(&room.queues(None), &out),
+            vec!["p-slow".to_string()]
+        );
     }
 
     /// The byte bound is exact beside the frame bound: payload bytes up to the cap
@@ -558,7 +571,7 @@ mod tests {
         let room = registry.room("r-1").expect("the room is minted");
         let chunk = Outbound::Binary(vec![0xA5u8; 8 * 1024 * 1024]);
         for _ in 0..4 {
-            assert!(room.broadcast(None, &chunk).is_empty());
+            assert!(send_all(&room.queues(None), &chunk).is_empty());
         }
         assert_eq!(
             room.peers
@@ -567,7 +580,48 @@ mod tests {
             Some(MAX_QUEUE_BYTES)
         );
         let over = Outbound::Binary(vec![0xA5u8; 1]);
-        assert_eq!(room.broadcast(None, &over), vec!["p-slow".to_string()]);
+        assert_eq!(
+            send_all(&room.queues(None), &over),
+            vec!["p-slow".to_string()]
+        );
+    }
+
+    /// A snapshot outlives the seat it was taken from: a peer removed after the
+    /// snapshot keeps its own queue, so sending through the snapshot still lands.
+    /// That is what makes eject-after-send safe — the slow peer's frames go
+    /// nowhere the room still owns.
+    #[test]
+    fn a_snapshot_outlives_the_seat_it_was_taken_from() {
+        let mut registry = Registry::default();
+        let info = PeerInfo {
+            peer_id: "p-ada".to_string(),
+            display_name: "Ada".to_string(),
+            role: Role::Host,
+            awareness_client_id: None,
+        };
+        let (peer, mut leftovers) = peer_channel(info);
+        registry.create(
+            NewRoom {
+                id: "r-1".to_string(),
+                token: "t".to_string(),
+                keepalive: Keepalive::default(),
+            },
+            peer,
+            usize::MAX,
+        );
+        let queues = registry
+            .room("r-1")
+            .expect("the room is minted")
+            .queues(None);
+        assert!(registry.detach("r-1", "p-ada").is_some());
+        let out = Outbound::Text("{}".to_string());
+        for (peer_id, queue) in &queues {
+            assert_eq!(peer_id, "p-ada");
+            assert!(queue.try_queue(out.clone()));
+        }
+        leftovers
+            .try_recv()
+            .expect("the removed peer's queue holds the frame");
     }
 
     /// Detaching a peer the room never seated announces nothing: the first detach of
