@@ -19,6 +19,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
+use tokio::task::yield_now;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -1678,19 +1679,71 @@ async fn a_long_close_reason_is_cut_down_to_fit_a_control_frame() {
         "the reason still says what went wrong: {reason}"
     );
 }
-/// The negotiation endpoint does not look at the request method: `HEAD` answers `200` with
-/// a body, which is what the spec says it does and an RFC 9110 deviation worth pinning so
-/// that it is a choice rather than an accident.
+/// `HEAD /meta` answers like `GET` but headers-only: the status line and headers —
+/// including the body's length — arrive with no body after them (RFC 9110 §9.3.2).
+/// Anything besides `GET` and `HEAD` is `405`: `POST` creates nothing, so `200`
+/// with a body would be a lie.
 #[tokio::test]
-async fn the_negotiation_endpoint_ignores_the_request_method() {
+async fn the_negotiation_endpoint_checks_the_request_method() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let addr = harness.ws_base().trim_start_matches("ws://").to_string();
+    let get_body = http_get(&format!("{}/meta", harness.http_base()))
+        .await
+        .expect("meta answers");
+
+    let mut head_stream = TcpStream::connect(&addr).await.expect("connects");
+    head_stream
+        .write_all(b"HEAD /meta HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+        .await
+        .expect("sends a HEAD request");
+    let mut head_response = String::new();
+    head_stream
+        .read_to_string(&mut head_response)
+        .await
+        .expect("reads the response");
+    assert!(
+        head_response.starts_with("HTTP/1.1 200"),
+        "got {head_response:?}"
+    );
+    let (head, body) =
+        head_response.split_once("\r\n\r\n").expect("headers end");
+    assert!(body.is_empty(), "HEAD carries no body: {head_response:?}");
+    assert!(
+        head.contains(&format!("content-length: {}", get_body.len())),
+        "HEAD advertises the GET length: {head_response:?}"
+    );
+
+    let mut post_stream = TcpStream::connect(&addr).await.expect("connects");
+    post_stream
+        .write_all(b"POST /meta HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+        .await
+        .expect("sends a POST request");
+    let mut post_response = String::new();
+    post_stream
+        .read_to_string(&mut post_response)
+        .await
+        .expect("reads the response");
+    assert!(
+        post_response.starts_with("HTTP/1.1 405"),
+        "POST is refused: {post_response:?}"
+    );
+}
+
+/// An absolute-form request target names the same resource: a proxy forwarding
+/// a `GET` with an absolute URI is legal HTTP, and §12 puts one in front of any
+/// public deployment, so the origin form it carries must route.
+#[tokio::test]
+async fn absolute_form_targets_route_like_origin_form() {
     let harness = Harness::start(Duration::from_secs(5)).await;
     let addr = harness.ws_base().trim_start_matches("ws://").to_string();
     let mut stream = TcpStream::connect(&addr).await.expect("connects");
     stream
-        .write_all(b"HEAD /meta HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+        .write_all(
+            format!("GET http://{addr}/meta HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n\r\n")
+                .as_bytes(),
+        )
         .await
-        .expect("sends a HEAD request");
-
+        .expect("sends an absolute-form request");
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
@@ -1823,6 +1876,11 @@ async fn a_peer_that_stops_reading_is_disconnected_and_announced() {
     let big = vec![0xA5u8; 1024 * 1024];
     for _ in 0..150 {
         flood.send(0x2, &big).await.expect("floods");
+        // Let the room drain between sends: the flood must fill the slow peer's
+        // queue, not win a scheduling race against the host's. Unpaced, a loaded
+        // machine ejects the host too and the final open fails — flakily, under
+        // coverage, on unmodified main as well as here.
+        yield_now().await;
     }
 
     // The room announces the removal, and the slow socket ends.

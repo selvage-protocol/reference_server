@@ -37,6 +37,7 @@ use session::{Applicant, Session, handshake};
 
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const NOT_FOUND: &str = r#"{"error":"not found","hint":"try /session (WebSocket) or /meta (HTTP)"}"#;
+const METHOD_NOT_ALLOWED: &str = r#"{"error":"method not allowed","hint":"GET answers, HEAD answers headers-only"}"#;
 
 /// The most one inbound WebSocket frame or message may carry, well under the
 /// library's 64 MiB default. A frame over the bound is a transport failure, not a
@@ -155,11 +156,19 @@ impl Shared {
         let Some(mut head) = request? else {
             return Ok(());
         };
-        if !head.is_websocket_upgrade {
+        // The WebSocket handshake is a `GET` (RFC 6455 §4.1): anything else, upgrade
+        // headers or not, is a plain request and answered as one.
+        if !head.is_websocket_upgrade || head.method != "GET" {
             return respond_plain(&mut tcp, &head).await;
         }
         if head.path != proto::ENDPOINT_PATH {
-            return respond_status(&mut tcp, Status::NotFound, NOT_FOUND).await;
+            return respond_status(
+                &mut tcp,
+                Status::NotFound,
+                NOT_FOUND,
+                &head.method,
+            )
+            .await;
         }
         // The head we consumed while routing has to go back in front of the socket.
         let prefixed = PrefixedStream::new(take(&mut head.request), tcp);
@@ -403,6 +412,7 @@ fn truncate_reason(mut reason: String) -> String {
 enum Status {
     Ok,
     NotFound,
+    MethodNotAllowed,
 }
 
 impl Status {
@@ -410,6 +420,7 @@ impl Status {
         match self {
             Self::Ok => 200,
             Self::NotFound => 404,
+            Self::MethodNotAllowed => 405,
         }
     }
 
@@ -417,6 +428,7 @@ impl Status {
         match self {
             Self::Ok => "OK",
             Self::NotFound => "Not Found",
+            Self::MethodNotAllowed => "Method Not Allowed",
         }
     }
 }
@@ -427,6 +439,8 @@ struct Head {
     /// Whatever the same read returned behind the head, which a client that pipelines
     /// its handshake puts there.
     tail: Vec<u8>,
+    /// The request method, verbatim: only `GET` answers with a body.
+    method: String,
     path: String,
     query: String,
     is_websocket_upgrade: bool,
@@ -455,10 +469,12 @@ async fn read_http_head(tcp: &mut TcpStream) -> io::Result<Option<Head>> {
     let tail = buf.split_off(end);
     let head_text = String::from_utf8_lossy(&buf).into_owned();
     let request_line = head_text.lines().next().unwrap_or_default();
-    let target = request_line.split_whitespace().nth(1).unwrap_or_default();
-    let (path, query) = match target.split_once('?') {
+    let mut words = request_line.split_whitespace();
+    let method = words.next().unwrap_or_default();
+    let target = words.next().unwrap_or_default();
+    let (path, query) = match origin_form(target).split_once('?') {
         Some((path, query)) => (path, query),
-        None => (target, ""),
+        None => (origin_form(target), ""),
     };
 
     Ok(Some(Head {
@@ -466,6 +482,7 @@ async fn read_http_head(tcp: &mut TcpStream) -> io::Result<Option<Head>> {
         // frames a client pipelined, and they still have to reach the frame parser.
         request: buf,
         tail,
+        method: method.to_string(),
         path: path.to_string(),
         query: query.to_string(),
         is_websocket_upgrade: head_text
@@ -474,28 +491,62 @@ async fn read_http_head(tcp: &mut TcpStream) -> io::Result<Option<Head>> {
     }))
 }
 
+/// Strips an absolute-form request target down to its origin form: a proxy
+/// forwarding a `GET` with an absolute URI is legal HTTP, and §12 puts one in
+/// front of any public deployment, so comparing the target verbatim 404s it.
+fn origin_form(target: &str) -> &str {
+    let Some((_, after_scheme)) = target.split_once("://") else {
+        return target;
+    };
+    let Some(slash) = after_scheme.find('/') else {
+        return "/";
+    };
+    after_scheme.get(slash..).unwrap_or("/")
+}
+
 async fn respond_plain(tcp: &mut TcpStream, head: &Head) -> io::Result<()> {
+    if head.method != "GET" && head.method != "HEAD" {
+        return respond_status(
+            tcp,
+            Status::MethodNotAllowed,
+            METHOD_NOT_ALLOWED,
+            &head.method,
+        )
+        .await;
+    }
     if head.path != proto::META_PATH {
-        return respond_status(tcp, Status::NotFound, NOT_FOUND).await;
+        return respond_status(tcp, Status::NotFound, NOT_FOUND, &head.method)
+            .await;
     }
     // Canonical (`CANONICAL.md`), so that the negotiation body has the same bytes for
     // every implementation.
     let meta = serde_json::to_string(&proto::Meta::reference())
         .map_err(io::Error::other)?;
-    respond_status(tcp, Status::Ok, &meta).await
+    respond_status(tcp, Status::Ok, &meta, &head.method).await
 }
 
+/// Answers a plain HTTP request. `HEAD` gets the status line and the headers a
+/// `GET` would have — including the body's length — with no body after them;
+/// anything else gets the body too.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a plain answer names its socket, status, body and the method that decides the body"
+)]
 async fn respond_status(
     tcp: &mut TcpStream,
     status: Status,
     body: &str,
+    method: &str,
 ) -> io::Result<()> {
-    let response = format!(
-        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+    let mut response = format!(
+        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         status.code(),
         status.reason(),
         body.len()
     );
+    if method != "HEAD" {
+        response.push_str(body);
+    }
     tcp.write_all(response.as_bytes()).await?;
     tcp.shutdown().await
 }
@@ -591,6 +642,23 @@ mod tests {
         assert_eq!(accept_backoff(4), Duration::from_millis(400));
         assert_eq!(accept_backoff(5), Duration::from_millis(800));
         assert_eq!(accept_backoff(u32::MAX), Duration::from_millis(800));
+    }
+
+    /// An absolute-form target names the same resource: the scheme and authority
+    /// fall away before routing, and the query still splits off after. (Built with
+    /// `format!`: a literal URL here would send the link checker fetching.)
+    #[test]
+    fn absolute_form_targets_route_like_origin_form() {
+        assert_eq!(origin_form("/meta"), "/meta");
+        assert_eq!(origin_form("/session?room=r-1"), "/session?room=r-1");
+        let host = "localhost:8080";
+        assert_eq!(origin_form(&format!("http://{host}/meta")), "/meta");
+        assert_eq!(
+            origin_form(&format!("http://{host}/session?room=r-1&token=t")),
+            "/session?room=r-1&token=t"
+        );
+        assert_eq!(origin_form(&format!("http://{host}")), "/");
+        assert_eq!(origin_form("*"), "*");
     }
 
     #[tokio::test]
