@@ -1022,7 +1022,7 @@ async fn a_joiner_receives_the_rooms_grant_and_a_republish_replaces_it() {
     assert_eq!(wait_for_paths(&late, &[]).await, Vec::<String>::new());
 }
 /// A joiner hears its reply before the room's grant, in that order on the wire: the
-/// seat path serializes both after the registry lock is dropped, and reordering them
+/// seat path queues both in one step under the registry lock, and reordering them
 /// would hand a client room state before its own identity. The grant here is wide
 /// enough that its serialization is the shape under test, not a degenerate one.
 #[tokio::test]

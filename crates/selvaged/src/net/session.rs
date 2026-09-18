@@ -92,9 +92,9 @@ pub struct Hello {
 
 /// What seating a newcomer produces: the reply for its own connection, and the peer
 /// record the room is told about when a host reclaims it — `None` for a mint and
-/// for a guest join, which announce nothing beyond `peer.joined`. Plain data only:
-/// every frame is built after the registry lock is dropped, since serializing the
-/// reply (peers plus the whole open-document set) must not sit under it.
+/// for a guest join, which announce nothing beyond `peer.joined`. Plain data only: the
+/// reply is serialized by the caller while it still holds the registry lock, because the
+/// order of the newcomer's first frames is part of what seating decides (see `seat`).
 type Placement = (
     (&'static str, proto::SessionParams),
     Option<proto::PeerInfo>,
@@ -517,11 +517,14 @@ impl Applicant {
     }
 
     /// Mints a room or admits this connection to an existing one, then queues the
-    /// handshake response. Only plain data moves under the registry lock; the reply,
-    /// the grant and both announcements are serialized and queued after it is
-    /// dropped. The reply is still this connection's first frame: its channel is
-    /// queued before any announcement is delivered, and the announcements exclude
-    /// the newcomer.
+    /// handshake response. The seating, the reply and the join-time grant are one step
+    /// under the registry lock: a publication that takes the lock after this seating takes
+    /// it after the snapshot has been queued, which is what makes every publication after
+    /// the snapshot follow it on the joining connection (`PROTOCOL.md` §6.3); one that took
+    /// the lock before this seating is already in the snapshot. Serializing the reply and
+    /// the listing under the lock is what that costs — once per join — against a joiner
+    /// left holding a grant the room has already replaced. The announcements exclude the
+    /// newcomer, so the reply is still this connection's first frame.
     ///
     /// # Errors
     ///
@@ -549,18 +552,19 @@ impl Applicant {
         let room_id = params.room_id.clone();
         let peer_id = self.peer_id.clone();
         let queue = self.queue.clone();
-        drop(guard);
 
         let body = serde_json::to_value(&params).map_err(|e| bad_body(&e))?;
         if let Some(frame) = event_frame(event_name, body) {
             let _ = self.queue.try_queue(frame);
         }
         // A joining connection learns the room's grant straight after its `room.joined`, so
-        // it needs no round trip and `room.joined` needs no fifth member. It is queued after
-        // the reply, so the reply is still this connection's first frame.
+        // it needs no round trip and `room.joined` needs no fifth member. Both go out under
+        // the lock: see this method's comment.
         if let Some(frame) = join_grant(granted.as_deref()) {
             let _ = self.queue.try_queue(frame);
         }
+        drop(guard);
+
         // Late arrivals must be announced to the peers already in the room.
         let joined = joined_peer.and_then(|peer| {
             event_frame(event::PEER_JOINED, serde_json::json!({ "peer": peer }))
@@ -1055,7 +1059,10 @@ fn tell_room_gone(room_id: &str, peers: Vec<Peer>) {
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::thread;
     use std::time::Duration;
+    use tokio::runtime::Handle;
+    use tokio::sync::mpsc;
 
     use selvage_protocol::{Keepalive, PeerInfo, Role};
     use tokio::sync::Mutex;
@@ -1140,5 +1147,200 @@ mod tests {
             "the slow peer is detached"
         );
         assert!(room.peers.contains_key("p-host"), "the host is undisturbed");
+    }
+
+    /// A server holding one room whose grant is `listing`, plus the peer record a newcomer
+    /// to it will be seated with and the queue that peer's frames arrive on.
+    fn room_with_a_grant(
+        listing: Vec<String>,
+    ) -> (Shared, Peer, mpsc::Receiver<Outbound>) {
+        let mut registry = Registry::default();
+        let (host, _host_rx) = peer_channel(PeerInfo {
+            peer_id: "p-host".to_string(),
+            display_name: "Ada".to_string(),
+            role: Role::Host,
+            awareness_client_id: None,
+        });
+        assert!(
+            registry
+                .create(
+                    NewRoom {
+                        id: "r-1".to_string(),
+                        token: "t".to_string(),
+                        keepalive: Keepalive::default(),
+                    },
+                    host,
+                    usize::MAX,
+                )
+                .is_some()
+        );
+        registry
+            .room_mut("r-1")
+            .expect("the room is minted")
+            .set_grant(listing);
+        let (newcomer, frames) = peer_channel(PeerInfo {
+            peer_id: "p-new".to_string(),
+            display_name: "Zoe".to_string(),
+            role: Role::Guest,
+            awareness_client_id: None,
+        });
+        let shared = Shared::new(
+            ServerConfig::default(),
+            Arc::new(Mutex::new(registry)),
+        );
+        (shared, newcomer, frames)
+    }
+
+    /// The newcomer of [`room_with_a_grant`], asking to join room `r-1` with its token.
+    fn guest_applicant(newcomer: &Peer) -> Applicant {
+        let (poison, _poison_rx) = oneshot::channel();
+        Applicant {
+            peer_id: "p-new".to_string(),
+            join: proto::JoinQuery {
+                room: Some("r-1".to_string()),
+                token: Some("t".to_string()),
+            },
+            hello: Hello {
+                params: proto::HelloParams {
+                    awareness_client_id: None,
+                    capabilities: Vec::new(),
+                    client: None,
+                    display_name: "Zoe".to_string(),
+                    role: None,
+                },
+                claims_host: false,
+            },
+            queue: newcomer.queue.clone(),
+            poison,
+        }
+    }
+
+    /// The event a queued frame carries: `None` for a frame that is not a text envelope.
+    fn as_event(frame: Outbound) -> Option<(String, Value)> {
+        let Outbound::Text(text) = frame else {
+            return None;
+        };
+        let msg: proto::ServerMessage =
+            serde_json::from_str(&text).expect("a server frame");
+        Some((
+            msg.event.unwrap_or_default(),
+            msg.params.unwrap_or_default(),
+        ))
+    }
+
+    /// Every event the newcomer's queue holds, in the order it holds them, until it has
+    /// been quiet for a moment.
+    async fn announced(
+        frames: &mut mpsc::Receiver<Outbound>,
+    ) -> Vec<(String, Value)> {
+        let mut seen: Vec<(String, Value)> = Vec::new();
+        while let Ok(Some(frame)) =
+            timeout(Duration::from_millis(200), frames.recv()).await
+        {
+            seen.extend(as_event(frame));
+        }
+        seen
+    }
+
+    /// Seats `applicant` on the server it was built for: what the connection task does with
+    /// it.
+    async fn seat(
+        applicant: Applicant,
+        shared: Shared,
+    ) -> Result<Session, Refusal> {
+        applicant.seat(&shared).await
+    }
+
+    /// Starts [`publish_blocking`] on a thread of its own, which is the point of it: a
+    /// woken worker queue is not the same interleaving as a thread already waiting.
+    fn publish_in_background(
+        shared: Shared,
+        handle: Handle,
+        listing: Vec<String>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || publish_blocking(&shared, &handle, &listing))
+    }
+
+    /// Publishes `listing` as room `r-1`'s grant and announces it: the two steps
+    /// `Session::grant` takes, without a connection to answer. It blocks on the registry
+    /// lock, so a caller can make it a waiter behind a seating.
+    fn publish_blocking(shared: &Shared, handle: &Handle, listed: &[String]) {
+        {
+            let mut guard = shared.registry.blocking_lock();
+            guard
+                .room_mut("r-1")
+                .expect("the room survives")
+                .set_grant(listed.to_vec());
+        }
+        handle.block_on(deliver(
+            shared,
+            "r-1",
+            None,
+            event_frame(
+                event::DOC_GRANTED,
+                serde_json::json!({ "paths": listed }),
+            ),
+        ));
+    }
+
+    /// The join-time `doc.granted` is the snapshot taken under the seating lock, and a
+    /// publication that takes that lock afterwards is queued after it (`PROTOCOL.md` §6.3).
+    /// The seat is held at the lock here with a publication queued behind it, and the
+    /// snapshot's own listing is wide enough that serializing it is a window a publisher
+    /// could otherwise enqueue inside: the newcomer's frames must still read reply,
+    /// snapshot, republish — never a snapshot queued after the listing that replaced it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_publication_cannot_overtake_the_join_snapshot() {
+        let wide: Vec<String> =
+            (0..60_000).map(|n| format!("src/file{n:05}.rs")).collect();
+        let listed = vec!["README.md".to_string()];
+        let (shared, newcomer, mut frames) = room_with_a_grant(wide.clone());
+        let applicant = guest_applicant(&newcomer);
+
+        // Holding the lock makes both waiters, the seat first: the publication waits on the
+        // same lock from a thread of its own, so it is woken the moment the seating releases
+        // it rather than whenever a worker gets round to it. That is what makes the
+        // interleaving a property of the code instead of one of this machine.
+        let guard = shared.registry.lock().await;
+        let seat_shared = shared.clone();
+        let seating = tokio::spawn(seat(applicant, seat_shared));
+        sleep(Duration::from_millis(20)).await;
+        let publish_shared = shared.clone();
+        let publishing = publish_in_background(
+            publish_shared,
+            Handle::current(),
+            listed.clone(),
+        );
+        sleep(Duration::from_millis(20)).await;
+        drop(guard);
+        seating
+            .await
+            .expect("the seat task runs")
+            .expect("the guest is seated");
+        publishing.join().expect("the publishing thread runs");
+
+        let seen = announced(&mut frames).await;
+        let names: Vec<&str> =
+            seen.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names.first().copied(),
+            Some(event::ROOM_JOINED),
+            "the reply is the newcomer's first frame: {names:?}"
+        );
+        let grants: Vec<Value> = seen
+            .iter()
+            .filter(|(name, _)| name == event::DOC_GRANTED)
+            .map(|(_, params)| params["paths"].clone())
+            .collect();
+        assert_eq!(
+            grants.first(),
+            Some(&serde_json::json!(wide)),
+            "the join snapshot is the listing the room held: {names:?}"
+        );
+        assert_eq!(
+            grants.last(),
+            Some(&serde_json::json!(listed)),
+            "the publication follows the snapshot instead of overtaking it: {names:?}"
+        );
     }
 }
