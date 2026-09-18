@@ -34,7 +34,7 @@ use crate::{ServerConfig, random_hex};
 
 mod session;
 
-use session::{Applicant, Session, handshake};
+use session::{Applicant, Session, grace_ms, handshake};
 
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const NOT_FOUND: &str = r#"{"error":"not found","hint":"try /session (WebSocket) or /meta (HTTP)"}"#;
@@ -196,7 +196,7 @@ impl Shared {
         // The WebSocket handshake is a `GET` (RFC 6455 §4.1): anything else, upgrade
         // headers or not, is a plain request and answered as one.
         if !head.is_websocket_upgrade || head.method != "GET" {
-            return respond_plain(&mut tcp, &head).await;
+            return respond_plain(&mut tcp, &head, &self.config).await;
         }
         if head.path != proto::ENDPOINT_PATH {
             return respond_status(
@@ -658,7 +658,11 @@ fn origin_form(target: &str) -> &str {
     after_scheme.get(boundary..).unwrap_or("/")
 }
 
-async fn respond_plain(tcp: &mut TcpStream, head: &Head) -> io::Result<()> {
+async fn respond_plain(
+    tcp: &mut TcpStream,
+    head: &Head,
+    config: &ServerConfig,
+) -> io::Result<()> {
     if head.method != "GET" && head.method != "HEAD" {
         return respond_status(
             tcp,
@@ -673,9 +677,14 @@ async fn respond_plain(tcp: &mut TcpStream, head: &Head) -> io::Result<()> {
             .await;
     }
     // Canonical (`CANONICAL.md`), so that the negotiation body has the same bytes for
-    // every implementation.
-    let meta = serde_json::to_string(&proto::Meta::reference())
-        .map_err(io::Error::other)?;
+    // every implementation. The grace is this server's configured value: it is the one
+    // number a client needs before it has a session, since `host.detached` never reaches
+    // the host whose budget has to fit inside it.
+    let meta = serde_json::to_string(&proto::Meta::reference(
+        config.keepalive,
+        grace_ms(config),
+    ))
+    .map_err(io::Error::other)?;
     respond_status(tcp, Status::Ok, &meta, &head.method).await
 }
 

@@ -428,13 +428,44 @@ pub struct RoomGoneParams {
     pub room_id: String,
 }
 
+/// What this implementation calls itself in `GET /meta` (`PROTOCOL.md` §2). Free-form and
+/// not stable: a peer **MUST NOT** depend on it.
+pub const SERVER_NAME: &str = concat!("selvaged/", env!("CARGO_PKG_VERSION"));
+
+/// `GET /meta`'s `keepalive`: the session's clocks plus the room's grace period, which the
+/// handshake reply has no place for. A host learns the grace only from `host.detached`,
+/// which reaches the peers it *left behind* — the one connection that has to size its retry
+/// budget to the grace is the one that is gone, so it has to be advertised before the
+/// session exists. Members are in the canonical order of `CANONICAL.md` §2.1.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+pub struct MetaKeepalive {
+    pub awareness_expire_ms: u64,
+    pub awareness_renew_ms: u64,
+    pub ping_interval_ms: u64,
+    /// How long a room survives its host's connection ending (`PROTOCOL.md` §2, §9).
+    pub room_grace_ms: u64,
+}
+
+impl From<(Keepalive, u64)> for MetaKeepalive {
+    fn from((keepalive, room_grace_ms): (Keepalive, u64)) -> Self {
+        Self {
+            awareness_expire_ms: keepalive.awareness_expire_ms,
+            awareness_renew_ms: keepalive.awareness_renew_ms,
+            ping_interval_ms: keepalive.ping_interval_ms,
+            room_grace_ms,
+        }
+    }
+}
+
 /// `GET /meta` response body. Members are in the canonical order of
 /// `CANONICAL.md` §2.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub capabilities: Vec<String>,
     #[serde(default)]
-    pub keepalive: Keepalive,
+    pub keepalive: MetaKeepalive,
     #[serde(default)]
     pub roles: Vec<String>,
     pub server: String,
@@ -442,16 +473,18 @@ pub struct Meta {
 }
 
 impl Meta {
+    /// What this reference server advertises, with `keepalive` and the room grace it is
+    /// actually configured with.
     #[must_use]
-    pub fn reference() -> Self {
+    pub fn reference(keepalive: Keepalive, room_grace_ms: u64) -> Self {
         Self {
             capabilities: CAPABILITIES
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
-            keepalive: Keepalive::default(),
+            keepalive: MetaKeepalive::from((keepalive, room_grace_ms)),
             roles: vec!["host".to_string(), "guest".to_string()],
-            server: concat!("selvaged/", env!("CARGO_PKG_VERSION")).to_string(),
+            server: SERVER_NAME.to_string(),
             wire_versions: vec![WIRE_VERSION.to_string()],
         }
     }

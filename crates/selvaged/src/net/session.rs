@@ -379,8 +379,9 @@ fn host_detached_frame(grace_ms: u64) -> Option<Outbound> {
     )
 }
 
-/// The room grace period in whole milliseconds, as `host.detached` carries it.
-fn grace_ms(config: &ServerConfig) -> u64 {
+/// The room grace period in whole milliseconds, as `host.detached` carries it and as
+/// `GET /meta` advertises it before a session exists.
+pub(super) fn grace_ms(config: &ServerConfig) -> u64 {
     u64::try_from(config.room_grace.as_millis()).unwrap_or(u64::MAX)
 }
 

@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::process::exit;
 use std::time::Duration;
 
-use selvage_protocol::Meta;
+use selvage_protocol::SERVER_NAME;
 use selvaged::{Server, ServerConfig};
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:8080";
@@ -25,7 +25,7 @@ async fn main() -> io::Result<()> {
             return Ok(());
         }
         Action::Version => {
-            println!("{}", Meta::reference().server);
+            println!("{SERVER_NAME}");
             return Ok(());
         }
         Action::Run(addr, room_grace) => run(addr, room_grace).await,
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn version_matches_what_meta_serves() {
         assert_eq!(
-            Meta::reference().server,
+            SERVER_NAME,
             "selvaged/".to_owned() + env!("CARGO_PKG_VERSION")
         );
     }

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use selvage_harness::{
-    EngineEvent, Error, Harness, Role, SelectionOffsets, ServerConfig,
+    EngineEvent, Error, Harness, Role, Room, SelectionOffsets, ServerConfig,
     SyncEngine, WAIT, wait_for, wait_for_convergence, wait_for_described,
     wait_for_event, wait_for_peer,
 };
@@ -497,6 +497,50 @@ async fn meta_negotiates_the_wire_version() {
     assert_eq!(meta.keepalive.awareness_renew_ms, 15_000);
     assert_eq!(meta.keepalive.awareness_expire_ms, 30_000);
     assert_eq!(meta.roles, vec!["host", "guest"]);
+}
+
+/// The room's grace period is advertised before a session exists (`PROTOCOL.md` §2): a host
+/// learns it from `host.detached` only if it is still connected, and the connection that
+/// has to size its retry budget to the grace is the one that is gone. The value here is the
+/// server's configured one, so a deployment that moves the clock says so.
+#[tokio::test]
+async fn meta_advertises_the_configured_room_grace() {
+    let configured = Duration::from_millis(4_321);
+    let harness = Harness::start_with(ServerConfig {
+        room_grace: configured,
+        ..ServerConfig::default()
+    })
+    .await;
+    let body = http_get(&format!("{}/meta", harness.http_base()))
+        .await
+        .expect("meta answers");
+    let meta: proto::Meta = serde_json::from_str(&body).expect("meta is JSON");
+    assert_eq!(meta.keepalive.room_grace_ms, 4_321);
+
+    // The grace a peer actually gets is the same number: the default host detach carries
+    // it, and a server whose two answers disagreed would be lying to one of them.
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let mut invited =
+        RawSocket::open(&harness, &guest_target(&room.id, &room.token), &[])
+            .await
+            .expect("the upgrade succeeds");
+    invited
+        .hello(&serde_json::json!({"display_name": "Bob"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut invited, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+    drop(host);
+    // The room announces `peer.left` before `host.detached`, so the wait is for the event
+    // rather than for the next frame.
+    let mut frame =
+        next_json_within(&mut invited, "a frame after the host left").await;
+    while frame["event"] != event::HOST_DETACHED {
+        frame = next_json_within(&mut invited, "host.detached").await;
+    }
+    assert_eq!(frame["params"]["grace_ms"], 4_321);
 }
 
 #[tokio::test]
