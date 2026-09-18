@@ -1400,7 +1400,7 @@ impl EngineTask {
         if let Some(peer) = self.peers.remove(&peer_id)
             && let Some(client_id) = peer.awareness_client_id
         {
-            self.awareness.remove_state(ClientID::new(client_id));
+            self.free_awareness(client_id);
         }
         let _ = self.events.send(EngineEvent::PeersChanged {
             peers: self.peer_list(),
@@ -1408,6 +1408,22 @@ impl EngineTask {
         let _ = self.events.send(EngineEvent::PresenceChanged {
             presence: self.presence(),
         });
+    }
+
+    /// §8.4: a departed peer's awareness state is dropped — but only while no other seated
+    /// peer still claims the id. Nothing requires an id to be unique in a room, so a client
+    /// that reuses one after reconnecting makes two peers speak for one replica, and
+    /// removing the state on the first departure would erase a cursor the peer that is
+    /// still present is holding.
+    fn free_awareness(&mut self, client_id: u64) {
+        let claimed = self
+            .peers
+            .values()
+            .any(|peer| peer.awareness_client_id == Some(client_id));
+        if claimed {
+            return;
+        }
+        self.awareness.remove_state(ClientID::new(client_id));
     }
 
     /// `peer.renamed` (`PROTOCOL.md` §5): the peer keeps its role and its awareness client
@@ -1630,7 +1646,10 @@ mod tests {
     use tokio::sync::{broadcast, mpsc, oneshot};
     use tokio::time::timeout;
     use tokio_tungstenite::tungstenite::Message;
+    use yrs::ClientID;
     use yrs::sync::Awareness;
+    use yrs::sync::AwarenessUpdate;
+    use yrs::sync::awareness::AwarenessUpdateEntry;
     use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact};
 
     use super::{
@@ -1638,6 +1657,7 @@ mod tests {
         is_terminal_code, seed_update,
     };
     use crate::editor::EngineEvent;
+    use crate::presence::PeerInfo;
     use crate::session::ReconnectPolicy;
     use crate::{ConnectOptions, Error, KeepaliveConfig, SessionInfo};
     use selvage_protocol as proto;
@@ -1872,6 +1892,75 @@ mod tests {
         task.handle_binary(UNDECODABLE);
         assert_eq!(next_session_error(&mut events).await?, code::BAD_MESSAGE);
         Ok(())
+    }
+
+    /// A remote awareness state under `client_id`, as a frame from that peer would leave
+    /// it: what a receiver holds for an id before it learns who spoke for it.
+    fn inject_state(task: &mut EngineTask, client_id: u64, state: &str) {
+        let entry = AwarenessUpdateEntry {
+            clock: 1,
+            json: state.into(),
+        };
+        let clients = HashMap::from([(ClientID::new(client_id), entry)]);
+        task.awareness
+            .apply_update(AwarenessUpdate { clients })
+            .expect("the state applies to the replica");
+    }
+
+    /// §8.4: an awareness id is freed only once no other seated peer still claims it. Two
+    /// peers can speak for one id — a client that reuses one after reconnecting, a claim
+    /// that is not validated at all in this slice — and removing the state on the first
+    /// departure erases a cursor the peer that is still present is holding.
+    #[tokio::test]
+    async fn a_departure_keeps_an_awareness_id_another_peer_still_claims()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, _events) = receiving_task().await?;
+        let shared_id = 42;
+        let claimants = two_claimants(&mut task, shared_id);
+        inject_state(&mut task, shared_id, "{}");
+        assert!(
+            holds(&task, shared_id),
+            "the state arrived before anyone left"
+        );
+
+        // One of the two leaves: the other still claims the id, so its state stays.
+        task.peer_left(Some(&serde_json::json!({ "peer_id": claimants[0] })));
+        assert!(
+            holds(&task, shared_id),
+            "the peer that is still here keeps the state it speaks for"
+        );
+
+        // The last claimant leaves: only now is the id free.
+        task.peer_left(Some(&serde_json::json!({ "peer_id": claimants[1] })));
+        assert!(
+            !holds(&task, shared_id),
+            "the id is freed once nobody claims it"
+        );
+        Ok(())
+    }
+
+    /// Seats two peers that both claim `client_id`, returning their ids: the room one id
+    /// has two speakers in.
+    fn two_claimants(
+        task: &mut EngineTask,
+        client_id: u64,
+    ) -> [&'static str; 2] {
+        let ids = ["p-one", "p-two"];
+        for peer_id in ids {
+            let peer = PeerInfo {
+                peer_id: peer_id.to_string(),
+                display_name: peer_id.to_string(),
+                role: proto::Role::Guest,
+                awareness_client_id: Some(client_id),
+            };
+            task.peers.insert(peer_id.to_string(), peer);
+        }
+        ids
+    }
+
+    /// Whether this replica still holds an awareness state for `client_id`.
+    fn holds(task: &EngineTask, client_id: u64) -> bool {
+        task.presence().iter().any(|p| p.client_id == client_id)
     }
 
     /// A loopback WebSocket pair: the engine end supplies a real sink and stream, and
