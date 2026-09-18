@@ -2075,7 +2075,8 @@ async fn a_frame_with_a_repeated_member_is_refused() {
 /// A join query that names `room` or `token` twice is refused (`PROTOCOL.md` §5.1): a
 /// connection whose room depended on which of two values was read last is not one a server
 /// may seat, and the client cannot tell which room it asked for. It is a pre-seat fault, so
-/// it is a `session.error` and close 4000 like every other one (`PROTOCOL.md` §11).
+/// it is the refusal the spec names for a malformed URL — the join refusal `token_invalid`,
+/// the code a room whose named token is not the room's already gets — and close 4002 (§11).
 #[tokio::test]
 async fn a_join_query_naming_a_parameter_twice_is_refused() {
     let harness = Harness::start(Duration::from_secs(5)).await;
@@ -2105,12 +2106,12 @@ async fn a_join_query_naming_a_parameter_twice_is_refused() {
         assert_eq!(refused["event"], event::SESSION_ERROR);
         assert_eq!(
             refused["params"]["code"],
-            code::BAD_MESSAGE,
-            "a query read twice is a bad message, not a bad room: {refused}"
+            code::TOKEN_INVALID,
+            "a malformed join URL takes the join refusal §5.1 names: {refused}"
         );
         assert_eq!(
             raw.read_to_close().await.expect("a close").close_code(),
-            Some(close::PROTOCOL_ERROR)
+            Some(close::TOKEN_INVALID)
         );
     }
 

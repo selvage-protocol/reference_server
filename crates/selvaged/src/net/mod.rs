@@ -275,14 +275,16 @@ impl Shared {
 
     /// Runs one connection: handshake, seat, then relay frames until it ends. The join
     /// query is read here rather than while routing, so that one naming `room` or `token`
-    /// twice is refused on the wire like any other fault: `bad_message`, then a close
-    /// (`PROTOCOL.md` §5.1, §11).
+    /// twice is refused on the wire like any other fault. §5.1 gives that refusal the join
+    /// code: a repeated `room` or `token` is a malformed URL, §11 has no code of its own for
+    /// one, and `token_invalid` is what a room whose named token is not the room's already
+    /// answers with — so the close is 4002 (§11).
     async fn serve_session(&self, ws: SessionSocket, query: &str) {
         let mut wire = Wire::new(ws);
         let join = match proto::parse_join_query(query) {
             Ok(join) => join,
             Err(error) => {
-                return refuse(wire, code::BAD_MESSAGE, error.to_string())
+                return refuse(wire, code::TOKEN_INVALID, error.to_string())
                     .await;
             }
         };
