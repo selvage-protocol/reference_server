@@ -161,20 +161,21 @@ pub async fn handshake(
     }
     let mut params: proto::HelloParams = serde_json::from_value(msg.params)
         .map_err(|e| envelope_refusal("bad session.hello params", &e))?;
-    // Stored trimmed: a padded name would otherwise sit in `peers` and every
-    // surface that quotes it, while blank, control-bearing and over-long are judged
-    // on the same trimmed value that is kept.
+    // A control character is judged on the received value, before the trim: `"\tAda"`
+    // would otherwise be seated as `"Ada"`, a name its owner did not choose. Blankness
+    // and the bound are judged on the trimmed value that is kept, so `"  "` stays
+    // blank and a padded name is stored as it will be echoed.
+    if proto::has_control_characters(&params.display_name) {
+        return Err((
+            code::BAD_PARAMS,
+            "display_name contains control characters".to_string(),
+        ));
+    }
     params.display_name = params.display_name.trim().to_string();
     if params.display_name.is_empty() {
         return Err((
             code::BAD_PARAMS,
             "session.hello requires a display_name".to_string(),
-        ));
-    }
-    if proto::has_control_characters(&params.display_name) {
-        return Err((
-            code::BAD_PARAMS,
-            "display_name contains control characters".to_string(),
         ));
     }
     if proto::display_name_over_limit(&params.display_name) {
@@ -274,17 +275,19 @@ fn document_path(raw: Value) -> Result<String, Refusal> {
 fn rename_name(raw: Value) -> Result<String, Refusal> {
     let params = serde_json::from_value::<proto::RenameParams>(raw)
         .map_err(|e| (code::BAD_PARAMS, e.to_string()))?;
+    // A control character is judged on the received value, before the trim, as in the
+    // handshake: a padded `"\tAda"` would otherwise be announced as `"Ada"`.
+    if proto::has_control_characters(&params.display_name) {
+        return Err((
+            code::BAD_PARAMS,
+            "display_name contains control characters".to_string(),
+        ));
+    }
     // Stored trimmed, like the handshake's: the rename is announced to the whole
     // room, so padding would land in every peer's view under the mover's name.
     let display_name = params.display_name.trim().to_string();
     if display_name.is_empty() {
         return Err((code::BAD_PARAMS, "display_name is required".to_string()));
-    }
-    if proto::has_control_characters(&display_name) {
-        return Err((
-            code::BAD_PARAMS,
-            "display_name contains control characters".to_string(),
-        ));
     }
     if proto::display_name_over_limit(&display_name) {
         return Err((

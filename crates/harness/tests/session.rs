@@ -847,46 +847,86 @@ async fn display_name_is_bounded_in_utf16_code_units() {
 /// `peers` list of every later joiner and whatever terminal an adapter prints it to, so an
 /// ANSI escape in it is a sequence this protocol never agreed to carry. A raw socket sends
 /// the bytes a client library would not, which is what makes the shape reachable here.
+///
+/// The value judged is the one received, before the trim: `"\tAda"` and `"Ada\n"` carry a
+/// `Cc` character that `trim` removes, and seating one would store `"Ada"` — a name its
+/// owner did not choose, the rewrite §5 refuses.
 #[tokio::test]
 async fn a_display_name_with_control_characters_is_refused() {
     let harness = Harness::start(Duration::from_secs(5)).await;
-    let escape = "\u{1b}[31mAda\u{1b}[0m";
-    assert!(escape.chars().any(char::is_control));
-    let mut refused =
-        connect(&proto::session_url(&harness.ws_base(), None, None))
-            .await
-            .expect("connects");
-    hello(
-        &mut refused,
-        &serde_json::json!({ "display_name": escape, "role": "host" }),
-    )
-    .await
-    .expect("says hello");
-    let refusal = next_json(&mut refused).await.expect("refusal");
-    assert_eq!(refusal["event"], event::SESSION_ERROR);
-    assert_eq!(refusal["params"]["code"], code::BAD_PARAMS);
-    let message = refusal["params"]["message"]
-        .as_str()
-        .expect("a message")
-        .to_string();
-    assert!(
-        message.contains("control"),
-        "the refusal names the reason: {message}"
-    );
-    assert!(
-        !message.contains('\u{1b}'),
-        "the refusal does not echo the escape back: {message:?}"
-    );
-    assert_eq!(
-        close_code(&mut refused).await.expect("close frame"),
-        close::PROTOCOL_ERROR
-    );
+    for name in [
+        "\u{1b}[31mAda\u{1b}[0m",
+        "\tAda",
+        "Ada\n",
+        "\u{85}Ada",
+        "Ada\u{0}",
+        "Cyd\u{9b}",
+    ] {
+        assert!(name.chars().any(char::is_control));
+        let mut refused =
+            connect(&proto::session_url(&harness.ws_base(), None, None))
+                .await
+                .expect("connects");
+        hello(
+            &mut refused,
+            &serde_json::json!({ "display_name": name, "role": "host" }),
+        )
+        .await
+        .expect("says hello");
+        let refusal = next_json(&mut refused).await.expect("refusal");
+        assert_eq!(
+            refusal["event"],
+            event::SESSION_ERROR,
+            "{name:?} was seated instead of refused: {refusal}"
+        );
+        assert_eq!(refusal["params"]["code"], code::BAD_PARAMS);
+        let message = refusal["params"]["message"]
+            .as_str()
+            .expect("a message")
+            .to_string();
+        assert!(
+            message.contains("control"),
+            "the refusal of {name:?} names the reason: {message}"
+        );
+        assert!(
+            !message.contains(name),
+            "the refusal does not echo {name:?} back: {message:?}"
+        );
+        assert_eq!(
+            close_code(&mut refused).await.expect("close frame"),
+            close::PROTOCOL_ERROR
+        );
+    }
+}
+
+/// The name a seated peer is stored and echoed under is the bytes its owner sent: §5's
+/// refusals are about values a server will not carry, and a server that rewrites an
+/// accepted one leaves a peer drawn under a name its person did not choose. Whitespace
+/// inside the name is what `trim` must leave alone.
+#[tokio::test]
+async fn an_accepted_display_name_is_stored_and_echoed_verbatim() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    for name in ["Ada", "Ada Lovelace", "Ada  Lovelace"] {
+        let (host, room) = harness.host(name).await.expect("host connects");
+        assert_eq!(
+            host.session().peer.display_name,
+            name,
+            "the seated name is the one sent"
+        );
+        let guest = harness.join(&room, "Bob").await.expect("guest connects");
+        assert_eq!(guest.session().peer.display_name, "Bob");
+        let seen = wait_for_peer(&guest, name).await;
+        assert_eq!(
+            seen.display_name, name,
+            "the guest reads the host's name verbatim"
+        );
+    }
 }
 
 /// A seated `session.rename` carrying one is the error response `bad_params` and the
 /// connection stays open, exactly as a blank rename is: a seated fault is not a close
-/// (`PROTOCOL.md` §5, §9.2, §11). A control character is judged after trimming, like
-/// blankness and the length, so padding cannot hide one.
+/// (`PROTOCOL.md` §5, §9.2, §11). A control character is judged on the value received,
+/// before the trim, so an edge padding cannot hide one.
 #[tokio::test]
 async fn a_rename_with_control_characters_is_refused_and_the_session_survives()
 {
@@ -907,6 +947,9 @@ async fn a_rename_with_control_characters_is_refused_and_the_session_survives()
         (3, " Ada\u{7} "),
         (4, "Bob\u{0}"),
         (5, "Cyd\u{9b}"),
+        (6, "\tAda"),
+        (7, "Ada\n"),
+        (8, "\u{85}Ada"),
     ] {
         raw.send_json(&serde_json::json!({
             "v": proto::WIRE_VERSION,
@@ -924,20 +967,21 @@ async fn a_rename_with_control_characters_is_refused_and_the_session_survives()
         );
     }
 
-    // The connection is still seated, and a name without one still moves.
+    // The connection is still seated, and a name without one still moves — the bytes
+    // its owner sent, with no whitespace inside it rewritten.
     raw.send_json(&serde_json::json!({
         "v": proto::WIRE_VERSION,
-        "id": 6,
+        "id": 9,
         "method": method::SESSION_RENAME,
-        "params": {"display_name": "Ada Lovelace"},
+        "params": {"display_name": "Ada  Lovelace"},
     }))
     .await
     .expect("sends");
-    let answered = raw_response_for(&mut raw, 6).await;
+    let answered = raw_response_for(&mut raw, 9).await;
     assert!(answered["error"].is_null(), "the rename stands: {answered}");
     assert_eq!(
         raw.next_json().await.expect("the announcement")["params"]["display_name"],
-        "Ada Lovelace"
+        "Ada  Lovelace"
     );
 }
 
