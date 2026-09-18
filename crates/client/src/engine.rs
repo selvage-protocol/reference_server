@@ -20,6 +20,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use selvage_protocol as proto;
 use selvage_protocol::{code, event, method};
+use yrs::Observable;
+use yrs::Subscription;
 use yrs::block::ClientID;
 use yrs::encoding::read::Cursor;
 use yrs::sync::protocol::{
@@ -31,7 +33,7 @@ use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{
     Assoc, BranchID, Doc, GetString, IndexedSequence, OffsetKind, Options,
     ReadTxn, StateVector, StickyIndex, Text as YText, TextRef, Transact,
-    Update,
+    TransactionMut, Update,
 };
 
 use crate::editor::EngineEvent;
@@ -41,9 +43,27 @@ use crate::presence::{
 use crate::session::ReconnectPolicy;
 use crate::{ConnectOptions, Error, KeepaliveConfig, SessionInfo};
 
+/// The origin this client tags its own document writes with. A remote frame is applied by
+/// `yrs`'s protocol implementation with no origin at all, so an observer tells an adapter's
+/// own edit from a peer's by this, and reports only the peer's.
+const LOCAL_ORIGIN: &str = "selvage:local";
+
 /// How long a handshake may take before the attempt is abandoned, first connect and
 /// reconnect alike.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The largest inbound binary frame this client will apply, in bytes: the transport's own
+/// bound (`PROTOCOL.md` §2.1, informative 16 MiB), and the same number the TypeScript
+/// engine's `MAX_INBOUND_BINARY_BYTES` carries — the two are one behaviour and move
+/// together.
+///
+/// A frame over it never arrives from a conforming transport — the reference server's own
+/// bound is 8 MiB and a frame past it ends the connection — so refusing one here changes no
+/// session that obeys the wire, and bounds what an unbounded y-protocols update can allocate
+/// or do. Refusal is drop-and-continue, never fail: an over-bound frame is ignored and the
+/// session goes on with the grant, documents and replica it holds, stale rather than ended,
+/// because ending it would hand any sender a kill switch.
+pub const MAX_INBOUND_BINARY_BYTES: usize = 16 * 1024 * 1024;
 
 type Socket = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = SplitSink<Socket, Message>;
@@ -143,62 +163,79 @@ pub async fn connect(
     options: ConnectOptions,
 ) -> Result<(Channel, SessionInfo), Error> {
     let local_state = serde_json::to_string(&options.initial_awareness)?;
-    let replica = handshake(&options, None, &local_state).await?;
+    let replica = handshake(&options, fresh_awareness(None)?, &local_state)
+        .await
+        .map_err(|(error, _replica)| error)?;
     let session = replica.session.clone();
     Ok((spawn(options, replica, local_state), session))
 }
 
-/// Opens the socket, seeds a fresh `Y.Doc` and sends `session.hello`.
+/// Opens the socket for `awareness` and sends `session.hello`.
 ///
-/// Every attempt gets a fresh replica: a reconnecting client is a new peer, and `yrs`
-/// keeps a tombstone for an awareness client id whose state was removed, so reusing one
-/// drops the first republish. `previous` carries the outgoing replica's state into the
-/// new one, so what the client already holds is not lost with the socket.
+/// The replica is built by the caller, so a reconnect that retries seats the same one
+/// rather than encoding this client's state into a new `Y.Doc` for every attempt. An error
+/// hands the replica back with it: nothing is applied before `room.joined`, so a replica a
+/// failed attempt built is the one it started with.
+#[expect(
+    clippy::result_large_err,
+    reason = "the error hands the replica back so the next attempt seats it instead of encoding the client's state again; boxing it would move that allocation, not remove it"
+)]
 async fn handshake(
     options: &ConnectOptions,
-    previous: Option<Vec<u8>>,
+    mut awareness: Awareness,
     local_state: &str,
-) -> Result<Replica, Error> {
-    // A text offset on this API is a UTF-16 code unit, the unit `yjs`, every editor's
-    // `offsetAt` and every peer on the wire use (PROTOCOL.md §8.1). `yrs` defaults to
-    // UTF-8 byte offsets, which would put a cursor after the first non-BMP character
-    // somewhere else than every other implementation does.
-    let doc = fresh_doc(previous)?;
-    let awareness_client_id = doc.client_id().get();
-    let mut awareness = Awareness::new(doc);
+) -> Result<Replica, (Error, Awareness)> {
     awareness.set_local_state_raw(local_state.to_string());
-
-    let url = proto::session_url(
-        &options.base_url,
-        options.room.as_deref(),
-        options.token.as_deref(),
-    );
-    let (ws, _) = tokio_tungstenite::connect_async(url)
-        .await
-        .map_err(Error::Wire)?;
-    let (mut sink, mut stream) = ws.split();
-
     let hello = proto::ClientMessage::new(
         1,
         method::SESSION_HELLO,
         serde_json::json!(proto::HelloParams {
             display_name: options.display_name.clone(),
             role: options.role,
-            awareness_client_id: Some(awareness_client_id),
+            awareness_client_id: Some(awareness.client_id().get()),
             capabilities: options.capabilities.clone(),
             client: options.client.clone(),
         }),
     );
-    sink.send(Message::text(hello.to_text()?))
-        .await
-        .map_err(Error::Wire)?;
-    let session = await_session(&mut stream, &options.base_url).await?;
-    Ok(Replica {
-        sink,
-        stream,
-        awareness,
-        session,
-    })
+
+    let url = proto::session_url(
+        &options.base_url,
+        options.room.as_deref(),
+        options.token.as_deref(),
+    );
+    let socket = match tokio_tungstenite::connect_async(url).await {
+        Ok((ws, _)) => ws,
+        Err(e) => return Err((Error::Wire(e), awareness)),
+    };
+    let (mut sink, mut stream) = socket.split();
+    let text = match hello.to_text() {
+        Ok(text) => text,
+        Err(e) => return Err((Error::Json(e), awareness)),
+    };
+    if let Err(e) = sink.send(Message::text(text)).await {
+        return Err((Error::Wire(e), awareness));
+    }
+    match await_session(&mut stream, &options.base_url).await {
+        Ok(session) => Ok(Replica {
+            sink,
+            stream,
+            awareness,
+            session,
+        }),
+        Err(error) => Err((error, awareness)),
+    }
+}
+
+/// A fresh replica to seat: a new `Y.Doc` — a reconnecting client is a new peer, and `yrs`
+/// keeps a tombstone for an awareness client id whose state was removed, so reusing one
+/// drops the first republish — carrying what this client already holds, so nothing is lost
+/// with the socket.
+fn fresh_awareness(previous: Option<Vec<u8>>) -> Result<Awareness, Error> {
+    // A text offset on this API is a UTF-16 code unit, the unit `yjs`, every editor's
+    // `offsetAt` and every peer on the wire use (PROTOCOL.md §8.1). `yrs` defaults to
+    // UTF-8 byte offsets, which would put a cursor after the first non-BMP character
+    // somewhere else than every other implementation does.
+    Ok(Awareness::new(fresh_doc(previous)?))
 }
 
 /// A new replica carrying `previous`'s state, if any. The fresh client id is what a
@@ -223,8 +260,10 @@ fn fresh_doc(previous: Option<Vec<u8>>) -> Result<Doc, Error> {
 /// The state a fresh replica is seated with, or `None` when there is nothing to carry.
 ///
 /// A replica that has integrated nothing encodes to the encoding of nothing, which
-/// [`fresh_doc`] would decode and apply for no effect at all — and the encode is O(document),
-/// once per attempt. The state vector is O(clients), which is why it is what decides.
+/// [`fresh_doc`] would decode and apply for no effect at all — and the encode is O(document).
+/// The state vector is O(clients), which is why it is what decides; the encode itself
+/// happens once per reconnect rather than once per attempt, because every attempt after the
+/// first seats the replica the one before it built.
 fn seed_update(doc: &Doc) -> Option<Vec<u8>> {
     let txn = doc.transact();
     if txn.state_vector().is_empty() {
@@ -264,7 +303,10 @@ fn session_event(
     text: &str,
     base_url: &str,
 ) -> Result<Option<SessionInfo>, Error> {
-    let msg: proto::ServerMessage = serde_json::from_str(text)?;
+    // A frame that repeats a member name anywhere is refused here as it is by the server:
+    // one frame that reads two ways is one the receiver must not pick a meaning for
+    // (`PROTOCOL.md` §4).
+    let msg: proto::ServerMessage = proto::ServerMessage::from_text(text)?;
     match msg.event.as_deref() {
         Some(event::ROOM_CREATED | event::ROOM_JOINED) => {
             let body = msg.params.unwrap_or_else(|| serde_json::json!({}));
@@ -340,7 +382,10 @@ fn spawn(
         open_documents: Vec::new(),
         peers: HashMap::new(),
         request_id: 1,
-        pending: HashMap::new(),
+        inflight: None,
+        waiting: VecDeque::new(),
+        pending: None,
+        watched: HashMap::new(),
         local_state: Some(local_state),
         queued: VecDeque::new(),
         paused: false,
@@ -389,15 +434,22 @@ enum Attempt {
 }
 
 /// Refusals after which retrying the same URL cannot help (`PROTOCOL.md` §9.1, §11).
+///
+/// A code in the reserved `x.` namespace is one this document does not define, and §9.1
+/// makes every one of them a stop: a handshake refused with one **MUST NOT** be re-helloed
+/// automatically, whether or not this client knows the code. Recognising only the bare
+/// five would re-hello a `x.server_full` or `x.room_full` refusal until the retries ran
+/// out, which is the one behaviour §9.1 names as forbidden.
 fn is_terminal_code(name: &str) -> bool {
-    matches!(
-        name,
-        code::ROOM_UNKNOWN
-            | code::TOKEN_INVALID
-            | code::HOST_PRESENT
-            | code::UNSUPPORTED_VERSION
-            | code::ROOM_GONE
-    )
+    name.starts_with("x.")
+        || matches!(
+            name,
+            code::ROOM_UNKNOWN
+                | code::TOKEN_INVALID
+                | code::HOST_PRESENT
+                | code::UNSUPPORTED_VERSION
+                | code::ROOM_GONE
+        )
 }
 
 /// Runs the turn loop until the session ends.
@@ -524,8 +576,21 @@ struct EngineTask {
     open_documents: Vec<String>,
     peers: HashMap<String, PeerInfo>,
     request_id: u64,
-    /// Requests the server has not answered yet, by request id.
-    pending: HashMap<u64, Pending>,
+    /// The request the server has not answered yet, with its id. At most one is in flight
+    /// on a connection (`PROTOCOL.md` §5): a seated `session.error` carries no `id`, so a
+    /// client that pipelined could not tell which request it sank.
+    inflight: Option<(u64, Pending)>,
+    /// Requests made while another was in flight, in the order they were made. Each goes
+    /// out when the one before it is answered; none of them is on the wire before then.
+    waiting: VecDeque<Pending>,
+    /// The replica a failed reconnect attempt built, for the next one to seat: nothing is
+    /// applied before `room.joined`, so it is exactly the state the attempt started with.
+    pending: Option<Awareness>,
+    /// The documents whose changes reach an adapter, by path: the handle whose observer
+    /// reports them. A document that has not arrived has no text to watch — creating one
+    /// would make an unreceived document look like an empty one, which §8.1 forbids a
+    /// sender to anchor against — so it is watched when it arrives.
+    watched: HashMap<String, Subscription>,
     /// The JSON published for the local client, replayed on every renewal.
     local_state: Option<String>,
     /// Frames produced while outbound is paused, flushed on resume. Text frames carry
@@ -587,6 +652,12 @@ impl EngineTask {
     /// handshake, and this client's own documents re-opened. Runs for the first seat and
     /// for every reconnect alike.
     fn seat(&mut self) {
+        // Every attempt seats a fresh replica, so the observers taken from the last one go
+        // with it. The documents it already carries are watched again — silently, because
+        // the adapter has their content and nothing about it changed — and one that only
+        // arrives later is reported as it arrives.
+        self.watched.clear();
+        let _ = self.attach_arrivals();
         // §9.1: the documents this client still holds open are re-opened, which is what
         // puts them back in the room's set when nobody else had them. Content is not
         // replayed: the sync handshake brings it back from the peers.
@@ -654,9 +725,18 @@ impl EngineTask {
     /// §9.1). Returns whether the session was reseated, given up on, or shut down while
     /// waiting.
     async fn reconnect(&mut self) -> Reconnect {
-        if self.terminal || !self.policy.enabled {
+        // Nothing to retry, or nothing left to retry with: the drop is the end, and saying
+        // `reconnecting` first would announce a retry that is not going to run.
+        if self.terminal
+            || !self.policy.enabled
+            || self.attempts >= self.policy.max_attempts
+        {
             return Reconnect::GivenUp;
         }
+        // Said out loud, so an adapter can show the retry without inferring it from
+        // silence (`PROTOCOL.md` §9.1): the re-seat or the give-up follows as its own
+        // event.
+        let _ = self.events.send(EngineEvent::Reconnecting);
         self.retry_until_seated().await
     }
 
@@ -720,22 +800,25 @@ impl EngineTask {
 
     /// One bounded reconnect attempt. The replica this client already holds is carried
     /// into the fresh one, so what it knows is not lost with the socket; a terminal
-    /// refusal stops the retries, every other failure is retried.
-    async fn attempt(&self) -> Attempt {
+    /// refusal stops the retries, every other failure is retried — on the replica it built,
+    /// so the state is encoded once for the reconnect rather than once per attempt.
+    async fn attempt(&mut self) -> Attempt {
         let mut options = self.options.clone();
         options.room.clone_from(&self.room);
         options.token.clone_from(&self.token);
         let local_state =
             self.local_state.clone().unwrap_or_else(|| "{}".to_string());
-        let previous = seed_update(self.awareness.doc());
+        let Ok(awareness) = self.replica_for_attempt() else {
+            return Attempt::Retry;
+        };
         let outcome = timeout(
             HANDSHAKE_TIMEOUT,
-            handshake(&options, previous, &local_state),
+            handshake(&options, awareness, &local_state),
         )
         .await;
         match outcome {
             Ok(Ok(replica)) => Attempt::Seated(Box::new(replica)),
-            Ok(Err(Error::Protocol { code, message }))
+            Ok(Err((Error::Protocol { code, message }, _replica)))
                 if is_terminal_code(&code) =>
             {
                 let _ = self
@@ -743,8 +826,21 @@ impl EngineTask {
                     .send(EngineEvent::SessionError { code, message });
                 Attempt::Refused
             }
-            _ => Attempt::Retry,
+            Ok(Err((_error, awareness))) => {
+                self.pending = Some(awareness);
+                Attempt::Retry
+            }
+            Err(_elapsed) => Attempt::Retry,
         }
+    }
+
+    /// The replica the next attempt seats: the one the last failed attempt built, or a
+    /// fresh one carrying this client's state. An attempt that timed out took its replica
+    /// with it, so the one it built is not always here.
+    fn replica_for_attempt(&mut self) -> Result<Awareness, Error> {
+        self.pending
+            .take()
+            .map_or_else(|| fresh_awareness(seed_update(self.doc())), Ok)
     }
 
     /// Handles one inbound frame.
@@ -873,6 +969,9 @@ impl EngineTask {
             txn.state_vector()
         };
         self.mutate_text(path, op);
+        // A document this client is the first to touch is watched from now on; its arrival
+        // is its own edit, which the adapter already has.
+        let _ = self.attach_arrivals();
         let update = {
             let txn = self.doc().transact();
             txn.encode_state_as_update_v1(&before)
@@ -887,7 +986,9 @@ impl EngineTask {
     /// Applies `op` to a document's text, inside one write transaction.
     fn mutate_text(&mut self, path: &str, op: EditOp) {
         let text = self.doc().get_or_insert_text(path);
-        let mut txn = self.doc().transact_mut();
+        // Tagged as this client's own: an observer tells an adapter's edit from a peer's by
+        // the origin, and only the peer's is news to the adapter that made the other.
+        let mut txn = self.doc().transact_mut_with(LOCAL_ORIGIN);
         match op {
             EditOp::Insert { index, text: chunk } => {
                 text.insert(&mut txn, index, &chunk);
@@ -919,6 +1020,45 @@ impl EngineTask {
 
     fn doc(&mut self) -> &mut Doc {
         self.awareness.doc_mut()
+    }
+
+    /// Attaches an observer to every held document that has arrived and is not watched
+    /// yet, returning the paths it attached: their arrival is a change an adapter has to
+    /// hear about, and no transaction reports it — `yrs` gives a root type an update
+    /// creates no kind of its own, so nothing fires for the very update that brings a
+    /// document this replica did not have.
+    fn attach_arrivals(&mut self) -> Vec<String> {
+        let arrived: Vec<String> = self
+            .open_documents
+            .clone()
+            .into_iter()
+            .filter(|path| !self.watched.contains_key(path))
+            .filter(|path| self.has_text(path))
+            .collect();
+        for path in &arrived {
+            self.watch(path);
+        }
+        arrived
+    }
+
+    /// Watches `path`: the document is here, so its text is there to be observed. The
+    /// observer reports the document a transaction changed, and only that one — a remote
+    /// keystroke costs one event for the document it typed into, not one per document this
+    /// client has open.
+    fn watch(&mut self, path: &str) {
+        let events = self.events.clone();
+        let watched: Arc<str> = Arc::from(path);
+        let text = self.doc().get_or_insert_text(path);
+        let subscription = text
+            .observe(move |txn, _event| report_change(&events, &watched, txn));
+        self.watched.insert(path.to_string(), subscription);
+    }
+
+    /// Whether this replica holds the text for `path` at all. Reading never creates one.
+    fn has_text(&self, path: &str) -> bool {
+        let doc = self.awareness.doc();
+        let txn = doc.transact();
+        txn.get_text(path).is_some()
     }
 
     /// The text of a document this replica holds, empty for one it does not hold or that
@@ -1089,15 +1229,26 @@ impl EngineTask {
     // --- wire ----------------------------------------------------------------
 
     /// Sends a request and keeps its caller waiting: the response with this id answers
-    /// it, and the session ending answers it with `Error::Closed`.
+    /// it, and the session ending answers it with `Error::Closed`. A request made while
+    /// another is outstanding waits for its turn rather than going on the wire behind it
+    /// (`PROTOCOL.md` §5).
     fn request(&mut self, pending: Pending) {
+        if self.inflight.is_some() {
+            self.waiting.push_back(pending);
+            return;
+        }
+        self.send_request(pending);
+    }
+
+    /// Puts one request on the wire as the only one in flight.
+    fn send_request(&mut self, pending: Pending) {
         self.request_id = self.request_id.wrapping_add(1);
         let id = self.request_id;
         let msg =
             proto::ClientMessage::new(id, pending.method(), pending.params());
         match msg.to_text() {
             Ok(text) => {
-                self.pending.insert(id, pending);
+                self.inflight = Some((id, pending));
                 self.enqueue(Message::text(text));
             }
             Err(e) => {
@@ -1107,13 +1258,27 @@ impl EngineTask {
         }
     }
 
-    /// Answers the caller of a request the server has now answered.
+    /// Sends the request next in line, if there is one: the slot the answered request just
+    /// left is the next request's, and only one is ever on the wire.
+    fn send_next(&mut self) {
+        if let Some(next) = self.waiting.pop_front() {
+            self.send_request(next);
+        }
+    }
+
+    /// Answers the caller of a request the server has now answered. An id that is not the
+    /// one in flight answers nothing: this client never puts two on the wire, so it can
+    /// only be a server frame about a request this connection does not have.
     fn resolve(&mut self, id: u64, msg: &proto::ServerMessage) {
-        let Some(pending) = self.pending.remove(&id) else {
+        let Some((inflight, answered)) = self.inflight.take() else {
             return;
         };
+        if inflight != id {
+            self.inflight = Some((inflight, answered));
+            return;
+        }
         let outcome = msg.error.as_ref().map_or_else(
-            || self.accept(&pending, msg.result.as_ref()),
+            || self.accept(&answered, msg.result.as_ref()),
             |error| {
                 Err(Error::Protocol {
                     code: error.code.clone(),
@@ -1121,7 +1286,8 @@ impl EngineTask {
                 })
             },
         );
-        pending.answer(outcome);
+        answered.answer(outcome);
+        self.send_next();
     }
 
     /// Moves local state to what the server accepted. The room's open-document set comes
@@ -1156,16 +1322,27 @@ impl EngineTask {
         if self.open_documents.iter().all(|p| p != path) {
             self.open_documents.push(path.to_string());
         }
+        // A document this replica already holds is watched silently: the adapter is being
+        // told the open set right now and can read the text from it. One that has not
+        // arrived is watched when it does.
+        let _ = self.attach_arrivals();
     }
 
-    /// Removes a path from this client's own open set.
+    /// Removes a path from this client's own open set, and stops watching it: an adapter
+    /// that no longer presents a document is not told about it.
     fn release(&mut self, path: &str) {
         self.open_documents.retain(|p| p != path);
+        let _ = self.watched.remove(path);
     }
 
     /// Fails every request still waiting: the session ended before the server answered.
+    /// The requests queued behind the in-flight one were never sent and are failed too —
+    /// their callers are waiting, and no answer can arrive on a socket that is gone.
     fn fail_pending(&mut self) {
-        for (_, pending) in self.pending.drain() {
+        if let Some((_, pending)) = self.inflight.take() {
+            pending.answer(Err(Error::Closed));
+        }
+        for pending in self.waiting.drain(..) {
             pending.answer(Err(Error::Closed));
         }
     }
@@ -1198,7 +1375,13 @@ impl EngineTask {
     /// Handles one y-protocols frame. Decoding, applying and the replies are all done
     /// by `yrs`'s reference protocol implementation.
     fn handle_binary(&mut self, frame: &[u8]) {
-        let kinds = kinds_in(frame);
+        if frame.len() > MAX_INBOUND_BINARY_BYTES {
+            // A payload this large never arrives from a conforming transport; applying it
+            // would grow this replica without bound on a peer's word. Dropped, and the
+            // session continues stale rather than ending.
+            return;
+        }
+        let awareness = carries_awareness(frame);
         let Ok(replies) = DefaultProtocol.handle(&mut self.awareness, frame)
         else {
             // A payload no replica decodes is a peer bug or version skew, and the room
@@ -1215,26 +1398,18 @@ impl EngineTask {
         }
         // A cursor move is not a text change: an adapter must not re-reconcile every
         // buffer because somebody else's caret moved.
-        if kinds.has(FrameKinds::TEXT) {
-            self.notify_documents();
+        for path in self.attach_arrivals() {
+            let _ = self.events.send(EngineEvent::DocumentChanged { path });
         }
-        if kinds.has(FrameKinds::AWARENESS) {
+        if awareness {
             let _ = self.events.send(EngineEvent::PresenceChanged {
                 presence: self.presence(),
             });
         }
     }
 
-    /// Tells the adapter that the documents this client has open may have changed, because
-    /// a frame carried text.
-    fn notify_documents(&self) {
-        for path in self.open_documents.clone() {
-            let _ = self.events.send(EngineEvent::DocumentChanged { path });
-        }
-    }
-
     fn handle_text(&mut self, text: &str) {
-        let Ok(msg) = serde_json::from_str::<proto::ServerMessage>(text) else {
+        let Ok(msg) = proto::ServerMessage::from_text(text) else {
             // A server frame that does not parse is corruption or version skew, not an
             // event to ignore: it arrives on the same channel a server fault does.
             let _ = self.events.send(EngineEvent::SessionError {
@@ -1271,7 +1446,10 @@ impl EngineTask {
 
     /// A fault the server could not attach to a request id. There is nobody to return it
     /// to, so it goes to the adapter. A terminal code also ends the retries: the same
-    /// refusal would greet the next connection.
+    /// refusal would greet the next connection. The request in flight is failed on the way
+    /// (`PROTOCOL.md` §5): an id-less fault cannot be attributed, and a caller left holding
+    /// a request that never completes cannot tell that from a slow server. The one behind
+    /// it goes out, so a queue never stalls on a fault that did not end the session.
     fn session_error(&mut self, params: Option<&serde_json::Value>) {
         let code = params
             .and_then(|p| p.get("code"))
@@ -1285,6 +1463,13 @@ impl EngineTask {
             .to_string();
         if is_terminal_code(&code) {
             self.terminal = true;
+        }
+        if let Some((_, outstanding)) = self.inflight.take() {
+            outstanding.answer(Err(Error::Protocol {
+                code: code.clone(),
+                message: message.clone(),
+            }));
+            self.send_next();
         }
         let _ = self
             .events
@@ -1315,7 +1500,7 @@ impl EngineTask {
         if let Some(peer) = self.peers.remove(&peer_id)
             && let Some(client_id) = peer.awareness_client_id
         {
-            self.awareness.remove_state(ClientID::new(client_id));
+            self.free_awareness(client_id);
         }
         let _ = self.events.send(EngineEvent::PeersChanged {
             peers: self.peer_list(),
@@ -1323,6 +1508,22 @@ impl EngineTask {
         let _ = self.events.send(EngineEvent::PresenceChanged {
             presence: self.presence(),
         });
+    }
+
+    /// §8.4: a departed peer's awareness state is dropped — but only while no other seated
+    /// peer still claims the id. Nothing requires an id to be unique in a room, so a client
+    /// that reuses one after reconnecting makes two peers speak for one replica, and
+    /// removing the state on the first departure would erase a cursor the peer that is
+    /// still present is holding.
+    fn free_awareness(&mut self, client_id: u64) {
+        let claimed = self
+            .peers
+            .values()
+            .any(|peer| peer.awareness_client_id == Some(client_id));
+        if claimed {
+            return;
+        }
+        self.awareness.remove_state(ClientID::new(client_id));
     }
 
     /// `peer.renamed` (`PROTOCOL.md` §5): the peer keeps its role and its awareness client
@@ -1471,48 +1672,38 @@ fn resolve_anchor<T: ReadTxn>(
         .then_some(offset.index)
 }
 
-/// What a binary frame told this session about, one bit per kind: a frame may hold several
-/// concatenated y-protocols messages, so it can be more than one thing at once.
-#[derive(Debug, Default, Clone, Copy)]
-struct FrameKinds(u8);
-
-impl FrameKinds {
-    /// A message that can change the document text: a sync update, or a sync step 2.
-    const TEXT: u8 = 1;
-    /// A message that can change awareness: a state update, or a query.
-    const AWARENESS: u8 = 2;
-
-    const fn has(self, kind: u8) -> bool {
-        self.0 & kind != 0
+/// Reports a remote change to `path`. A transaction this client started itself is the
+/// adapter's own edit and is not news to it; `yrs` tells the two apart by the origin a write
+/// transaction carries.
+fn report_change(
+    events: &broadcast::Sender<EngineEvent>,
+    path: &str,
+    txn: &TransactionMut,
+) {
+    let mine = txn
+        .origin()
+        .is_some_and(|origin| origin.as_ref() == LOCAL_ORIGIN.as_bytes());
+    if mine {
+        return;
     }
-
-    const fn add(self, kind: u8) -> Self {
-        Self(self.0 | kind)
-    }
+    let _ = events.send(EngineEvent::DocumentChanged {
+        path: path.to_string(),
+    });
 }
 
-/// Reads the message types out of a frame. A frame that cannot be read reports neither
-/// kind; the protocol handler rejects it too, so nothing is lost.
-fn kinds_in(frame: &[u8]) -> FrameKinds {
-    let mut kinds = FrameKinds::default();
+/// Whether a frame carries an awareness message: a state update, or a query. A frame may
+/// hold several concatenated y-protocols messages, so this is asked of the whole frame.
+///
+/// A text message needs no flag of its own: the document it changes reports itself, through
+/// the observer a held document carries (`EngineTask::watch`).
+fn carries_awareness(frame: &[u8]) -> bool {
     let mut decoder = DecoderV1::new(Cursor::new(frame));
-    for message in MessageReader::new(&mut decoder) {
-        kinds = match message {
-            Ok(YMessage::Sync(
-                SyncMessage::SyncStep2(_) | SyncMessage::Update(_),
-            )) => kinds.add(FrameKinds::TEXT),
-            Ok(YMessage::Awareness(_) | YMessage::AwarenessQuery) => {
-                kinds.add(FrameKinds::AWARENESS)
-            }
-            Ok(
-                YMessage::Sync(SyncMessage::SyncStep1(_))
-                | YMessage::Auth(_)
-                | YMessage::Custom(..),
-            )
-            | Err(_) => kinds,
-        };
-    }
-    kinds
+    MessageReader::new(&mut decoder).any(|message| {
+        matches!(
+            message,
+            Ok(YMessage::Awareness(_) | YMessage::AwarenessQuery)
+        )
+    })
 }
 
 fn encode_y_message(message: &YMessage) -> Vec<u8> {
@@ -1537,24 +1728,70 @@ fn now_millis() -> u64 {
 mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::error::Error as StdError;
+    use std::iter;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use futures_util::StreamExt;
     use tokio::net::TcpListener;
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::{broadcast, mpsc, oneshot};
     use tokio::time::timeout;
+    use tokio_tungstenite::tungstenite::Message;
+    use yrs::ClientID;
     use yrs::sync::Awareness;
+    use yrs::sync::AwarenessUpdate;
+    use yrs::sync::Message as YMessage;
+    use yrs::sync::awareness::AwarenessUpdateEntry;
+    use yrs::sync::protocol::SyncMessage;
     use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact};
 
-    use super::{EngineTask, Sink, Stream, fresh_doc, seed_update};
+    use super::{
+        EngineTask, MAX_INBOUND_BINARY_BYTES, Sink, Stream, encode_y_message,
+        fresh_doc, is_terminal_code, seed_update,
+    };
     use crate::editor::EngineEvent;
+    use crate::engine::EditOp;
+    use crate::presence::PeerInfo;
     use crate::session::ReconnectPolicy;
-    use crate::{ConnectOptions, KeepaliveConfig, SessionInfo};
+    use crate::{ConnectOptions, Error, KeepaliveConfig, SessionInfo};
     use selvage_protocol as proto;
     use selvage_protocol::code;
 
     const PATH: &str = "src/main.rs";
+    const OTHER: &str = "src/other.rs";
+    const THIRD: &str = "src/third.rs";
+
+    /// The ids of the request envelopes the engine has put on the wire since the last call:
+    /// the queue is drained the way the run loop's flush drains it. One id at most is the
+    /// one-slot rule of §5.
+    fn sent_requests(task: &mut EngineTask) -> Vec<u64> {
+        task.queued
+            .drain(..)
+            .filter_map(|frame| match frame {
+                Message::Text(text) => {
+                    serde_json::from_str::<proto::ClientMessage>(&text)
+                        .ok()
+                        .and_then(|msg| msg.id)
+                }
+                Message::Binary(_)
+                | Message::Ping(_)
+                | Message::Pong(_)
+                | Message::Close(_)
+                | Message::Frame(_) => None,
+            })
+            .collect()
+    }
+
+    /// What a caller heard, as the session error it was: `None` when the request was
+    /// accepted or failed some other way.
+    fn refusal(outcome: &Result<(), Error>) -> Option<(String, String)> {
+        match outcome {
+            Err(Error::Protocol { code, message }) => {
+                Some((code.clone(), message.clone()))
+            }
+            _ => None,
+        }
+    }
 
     /// The state vector of a replica, in the shape the engine reports it.
     fn vector(doc: &Doc) -> Vec<(u64, u32)> {
@@ -1610,6 +1847,400 @@ mod tests {
         let txn = seated.transact();
         let restored = txn.get_text(PATH).map(|text| text.get_string(&txn));
         assert_eq!(restored.as_deref(), Some("fn main() {}"));
+        Ok(())
+    }
+
+    /// A refusal a retry cannot change stops the retries (`PROTOCOL.md` §9.1). Every `x.`
+    /// code is one of them, known or not: the namespace is reserved for exactly this —
+    /// capacity, in this slice — and §9.1 forbids re-helloing a handshake refused with one.
+    #[test]
+    fn a_refusal_is_terminal_for_every_stopping_code() {
+        for name in [
+            code::ROOM_UNKNOWN,
+            code::TOKEN_INVALID,
+            code::HOST_PRESENT,
+            code::UNSUPPORTED_VERSION,
+            code::ROOM_GONE,
+            "x.server_full",
+            "x.room_full",
+            "x.something.invented.later",
+            "x.",
+        ] {
+            assert!(is_terminal_code(name), "{name} stops the retries");
+        }
+        for name in [
+            "",
+            "bad_message",
+            "bad_params",
+            "unknown_method",
+            "X.room_full",
+        ] {
+            assert!(!is_terminal_code(name), "{name} may be retried");
+        }
+    }
+
+    /// A refused request is the one in flight and nothing else: the answer is the caller's,
+    /// the request behind it goes out, and the connection stays usable.
+    #[tokio::test]
+    async fn a_response_answers_its_request_and_promotes_the_next()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, _events) = receiving_task().await?;
+        let (first, first_reply) = oneshot::channel();
+        let (second, mut second_reply) = oneshot::channel();
+        task.open(PATH, first);
+        task.open(OTHER, second);
+        assert_eq!(
+            sent_requests(&mut task),
+            vec![1],
+            "only one request goes out"
+        );
+
+        // The server refuses the first: the caller hears it, and the second goes out.
+        task.handle_text(
+            r#"{"v":"selvage/1","id":1,"error":{"code":"bad_params","message":"no"}}"#,
+        );
+        let outcome = first_reply.await?;
+        assert_eq!(
+            refusal(&outcome).map(|(code, _)| code),
+            Some(code::BAD_PARAMS.to_string()),
+            "the refusal reaches the caller"
+        );
+        assert_eq!(
+            sent_requests(&mut task),
+            vec![2],
+            "the request behind it goes out, and still only one"
+        );
+        assert!(
+            second_reply.try_recv().is_err(),
+            "the second request has not been answered"
+        );
+
+        // And its own answer reaches it.
+        task.handle_text(
+            r#"{"v":"selvage/1","id":2,"result":{"documents":["src/main.rs","src/other.rs"]}}"#,
+        );
+        second_reply.await??;
+        assert_eq!(
+            task.open_documents,
+            vec![OTHER.to_string()],
+            "the refused open left nothing behind; the answered one is held"
+        );
+        assert!(sent_requests(&mut task).is_empty());
+        Ok(())
+    }
+
+    /// `PROTOCOL.md` §5: a seated `session.error` carries no `id`, so it cannot be
+    /// attributed to a request. The one in flight is failed rather than left hanging, and
+    /// the queue moves on — the fault did not end the session.
+    #[tokio::test]
+    async fn an_idless_session_error_fails_the_outstanding_request()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, mut events) = receiving_task().await?;
+        let (first, first_reply) = oneshot::channel();
+        let (second, mut second_reply) = oneshot::channel();
+        task.open(PATH, first);
+        task.open(OTHER, second);
+        assert_eq!(sent_requests(&mut task), vec![1]);
+        task.handle_text(
+            r#"{"v":"selvage/1","event":"session.error","params":{"code":"bad_message","message":"that frame was not an envelope"}}"#,
+        );
+        let outcome = first_reply.await?;
+        let (code, message) =
+            refusal(&outcome).expect("the in-flight request to fail");
+        assert_eq!(code, code::BAD_MESSAGE);
+        assert!(
+            message.contains("envelope"),
+            "the fault is the server's: {message}"
+        );
+        assert_eq!(next_session_error(&mut events).await?, code::BAD_MESSAGE);
+        assert_eq!(
+            sent_requests(&mut task),
+            vec![2],
+            "the request behind it goes out rather than stalling"
+        );
+        assert!(second_reply.try_recv().is_err());
+        Ok(())
+    }
+
+    /// The paths the engine has reported as changed, as far as it has already said so.
+    fn changed_documents(
+        events: &mut broadcast::Receiver<EngineEvent>,
+    ) -> Vec<String> {
+        iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                EngineEvent::DocumentChanged { path } => Some(path),
+                EngineEvent::DocumentsChanged { .. }
+                | EngineEvent::GrantChanged { .. }
+                | EngineEvent::PeersChanged { .. }
+                | EngineEvent::PresenceChanged { .. }
+                | EngineEvent::HostDetached { .. }
+                | EngineEvent::HostAttached { .. }
+                | EngineEvent::RoomGone { .. }
+                | EngineEvent::SessionError { .. }
+                | EngineEvent::Reconnecting
+                | EngineEvent::Disconnected => None,
+            })
+            .collect()
+    }
+
+    /// A held document that arrives, and one that changed, reach the adapter; and a
+    /// document the replica already had does not arrive twice.
+    #[tokio::test]
+    async fn a_remote_change_reports_only_the_document_it_changed()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, mut events) = receiving_task().await?;
+        task.open_documents =
+            vec![PATH.to_string(), OTHER.to_string(), THIRD.to_string()];
+        // Two of the three are already here — as a re-seat finds the documents it carried —
+        // and the third arrives with the frame below.
+        let _ = task.doc().get_or_insert_text(PATH);
+        let _ = task.doc().get_or_insert_text(OTHER);
+        assert_eq!(
+            task.attach_arrivals(),
+            vec![PATH.to_string(), OTHER.to_string()],
+            "what is already here is watched when the seat looks"
+        );
+        assert!(changed_documents(&mut events).is_empty(), "and is not news");
+
+        // A peer's edit of PATH, as the wire carries it: one sync update.
+        let peer = fresh_doc(None)?;
+        let text = peer.get_or_insert_text(PATH);
+        let mut txn = peer.transact_mut();
+        text.insert(&mut txn, 0, "fn main() {}\n");
+        drop(txn);
+        task.handle_binary(&peer_frame(&peer));
+
+        assert_eq!(
+            changed_documents(&mut events),
+            vec![PATH.to_string()],
+            "one change, for the document that changed"
+        );
+        assert_eq!(
+            task.read_text(PATH),
+            "fn main() {}\n",
+            "and the frame was applied"
+        );
+        Ok(())
+    }
+
+    /// A document that arrives is announced, and it keeps being announced after: `yrs`
+    /// gives the root type an update creates no kind of its own, so nothing fires for the
+    /// very update that brings a document a replica did not have, and the observer it needs
+    /// is attached when it arrives.
+    #[tokio::test]
+    async fn a_document_that_arrives_is_announced_once_and_then_watched()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, mut events) = receiving_task().await?;
+        task.open_documents = vec![PATH.to_string()];
+        assert!(
+            task.attach_arrivals().is_empty(),
+            "a document that has not arrived cannot be watched"
+        );
+
+        let peer = fresh_doc(None)?;
+        let text = peer.get_or_insert_text(PATH);
+        let mut txn = peer.transact_mut();
+        text.insert(&mut txn, 0, "one\n");
+        drop(txn);
+        task.handle_binary(&peer_frame(&peer));
+        assert_eq!(
+            changed_documents(&mut events),
+            vec![PATH.to_string()],
+            "the arrival is announced"
+        );
+
+        // A later edit from the same peer is announced too — the case the replica cannot
+        // report for a root type it never materialized itself.
+        let mut later = peer.transact_mut();
+        text.insert(&mut later, 0, "two\n");
+        drop(later);
+        task.handle_binary(&peer_frame(&peer));
+        assert_eq!(
+            changed_documents(&mut events),
+            vec![PATH.to_string()],
+            "and so is the edit after it"
+        );
+        assert_eq!(task.read_text(PATH), "two\none\n");
+        Ok(())
+    }
+
+    /// A frame that changes nothing, and an edit this client made itself, reach nobody:
+    /// the observer reports a peer's transaction and not the adapter's own.
+    #[tokio::test]
+    async fn a_local_edit_is_not_reported_back_to_the_adapter()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, mut events) = receiving_task().await?;
+        task.open_documents = vec![PATH.to_string()];
+
+        // An empty update: a peer with nothing this replica is missing.
+        let peer = fresh_doc(None)?;
+        task.handle_binary(&peer_frame(&peer));
+        assert!(changed_documents(&mut events).is_empty());
+        assert!(
+            task.attach_arrivals().is_empty(),
+            "an empty update brings no document to watch"
+        );
+
+        // A local edit is applied, and reported to nobody: the adapter made it.
+        task.apply_edit(
+            PATH,
+            EditOp::Insert {
+                index: 0,
+                text: "local\n".to_string(),
+            },
+        );
+        assert!(changed_documents(&mut events).is_empty());
+        assert_eq!(task.read_text(PATH), "local\n");
+        Ok(())
+    }
+
+    /// `doc` as a peer would put it on the wire: one sync update carrying everything it has.
+    fn peer_frame(doc: &Doc) -> Vec<u8> {
+        let update = {
+            let txn = doc.transact();
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+        encode_y_message(&YMessage::Sync(SyncMessage::Update(update)))
+    }
+
+    /// An over-bound binary frame is dropped, not applied and not reported
+    /// (`PROTOCOL.md` §2.1): a payload that large never arrives from a conforming
+    /// transport, and applying it would grow the replica without bound on a peer's word.
+    /// The session goes on stale rather than ending — ending it would hand any sender a
+    /// kill switch — so the next frame still dispatches.
+    #[tokio::test]
+    async fn an_over_bound_binary_frame_is_dropped()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, mut events) = receiving_task().await?;
+        let over = vec![0xA5u8; MAX_INBOUND_BINARY_BYTES.saturating_add(1)];
+        task.handle_binary(&over);
+        assert!(
+            events.try_recv().is_err(),
+            "an over-bound frame is dropped in silence"
+        );
+        assert!(
+            task.open_documents.is_empty(),
+            "and nothing was held for it"
+        );
+
+        // Still dispatching: a frame under the bound is read as it always was, and an
+        // undecodable one is still reported.
+        task.handle_binary(UNDECODABLE);
+        assert_eq!(next_session_error(&mut events).await?, code::BAD_MESSAGE);
+        Ok(())
+    }
+
+    /// A remote awareness state under `client_id`, as a frame from that peer would leave
+    /// it: what a receiver holds for an id before it learns who spoke for it.
+    fn inject_state(task: &mut EngineTask, client_id: u64, state: &str) {
+        let entry = AwarenessUpdateEntry {
+            clock: 1,
+            json: state.into(),
+        };
+        let clients = HashMap::from([(ClientID::new(client_id), entry)]);
+        task.awareness
+            .apply_update(AwarenessUpdate { clients })
+            .expect("the state applies to the replica");
+    }
+
+    /// §8.4: an awareness id is freed only once no other seated peer still claims it. Two
+    /// peers can speak for one id — a client that reuses one after reconnecting, a claim
+    /// that is not validated at all in this slice — and removing the state on the first
+    /// departure erases a cursor the peer that is still present is holding.
+    #[tokio::test]
+    async fn a_departure_keeps_an_awareness_id_another_peer_still_claims()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, _events) = receiving_task().await?;
+        let shared_id = 42;
+        let claimants = two_claimants(&mut task, shared_id);
+        inject_state(&mut task, shared_id, "{}");
+        assert!(
+            holds(&task, shared_id),
+            "the state arrived before anyone left"
+        );
+
+        // One of the two leaves: the other still claims the id, so its state stays.
+        task.peer_left(Some(&serde_json::json!({ "peer_id": claimants[0] })));
+        assert!(
+            holds(&task, shared_id),
+            "the peer that is still here keeps the state it speaks for"
+        );
+
+        // The last claimant leaves: only now is the id free.
+        task.peer_left(Some(&serde_json::json!({ "peer_id": claimants[1] })));
+        assert!(
+            !holds(&task, shared_id),
+            "the id is freed once nobody claims it"
+        );
+        Ok(())
+    }
+
+    /// Seats two peers that both claim `client_id`, returning their ids: the room one id
+    /// has two speakers in.
+    fn two_claimants(
+        task: &mut EngineTask,
+        client_id: u64,
+    ) -> [&'static str; 2] {
+        let ids = ["p-one", "p-two"];
+        for peer_id in ids {
+            let peer = PeerInfo {
+                peer_id: peer_id.to_string(),
+                display_name: peer_id.to_string(),
+                role: proto::Role::Guest,
+                awareness_client_id: Some(client_id),
+            };
+            task.peers.insert(peer_id.to_string(), peer);
+        }
+        ids
+    }
+
+    /// Whether this replica still holds an awareness state for `client_id`.
+    fn holds(task: &EngineTask, client_id: u64) -> bool {
+        task.presence().iter().any(|p| p.client_id == client_id)
+    }
+
+    /// The text a replica holds for `path`, if any.
+    fn carried(awareness: &Awareness) -> Option<String> {
+        let doc = awareness.doc();
+        let txn = doc.transact();
+        txn.get_text(PATH).map(|text| text.get_string(&txn))
+    }
+
+    /// A failed attempt's replica is the one the next attempt seats: a reconnect that
+    /// retries encodes this client's state once for the whole reconnect rather than once
+    /// per attempt, which is the entire cost of an attempt that cannot reach the server.
+    #[tokio::test]
+    async fn a_failed_attempt_hands_its_replica_to_the_next()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, _events) = receiving_task().await?;
+        task.mutate_text(
+            PATH,
+            EditOp::Insert {
+                index: 0,
+                text: "carried\n".to_string(),
+            },
+        );
+
+        // The first attempt builds a replica carrying what this client holds.
+        let first = task.replica_for_attempt()?;
+        let client_id = first.client_id();
+        assert!(task.pending.is_none(), "nothing was left over");
+
+        // The attempt fails, and hands its replica back; the next one seats that replica,
+        // not another built from the state all over again.
+        task.pending = Some(first);
+        let second = task.replica_for_attempt()?;
+        assert_eq!(
+            second.client_id(),
+            client_id,
+            "the same replica, and so the same awareness client id"
+        );
+        assert_eq!(
+            carried(&second).as_deref(),
+            Some("carried\n"),
+            "and it still holds what the client holds"
+        );
+        assert!(task.pending.is_none(), "and it is not kept twice");
         Ok(())
     }
 
@@ -1672,7 +2303,10 @@ mod tests {
             open_documents: Vec::new(),
             peers: HashMap::new(),
             request_id: 0,
-            pending: HashMap::new(),
+            inflight: None,
+            waiting: VecDeque::new(),
+            pending: None,
+            watched: HashMap::new(),
             local_state: None,
             queued: VecDeque::new(),
             paused: false,

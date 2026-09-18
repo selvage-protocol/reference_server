@@ -139,7 +139,13 @@
             check-yaml.enable = true;
             check-executables-have-shebangs.enable = true;
             check-shebang-scripts-are-executable.enable = true;
-            check-added-large-files.enable = true;
+            check-added-large-files = {
+              enable = true;
+              # The wire vectors are vendored test data, and one is a full-room
+              # transcript with every peer seated: megabytes on purpose. The guard
+              # is for source and assets, not for the corpus.
+              excludes = ["^vectors/"];
+            };
             check-symlinks.enable = true;
             trim-trailing-whitespace = {
               enable = true;

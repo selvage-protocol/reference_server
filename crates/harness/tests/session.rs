@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use selvage_harness::{
-    EngineEvent, Error, Harness, Role, SelectionOffsets, ServerConfig,
+    EngineEvent, Error, Harness, Role, Room, SelectionOffsets, ServerConfig,
     SyncEngine, WAIT, wait_for, wait_for_convergence, wait_for_described,
     wait_for_event, wait_for_peer,
 };
@@ -499,6 +499,134 @@ async fn meta_negotiates_the_wire_version() {
     assert_eq!(meta.roles, vec!["host", "guest"]);
 }
 
+/// A host whose socket stops answering is ended, so the room can move on: a peer that
+/// answers no ping is not idle but gone — a roaming client whose TCP end died unobserved,
+/// a hung relay — and leaving it seated strands the room, since it stays the host, no grace
+/// is armed, and every guest waits for a `host.detached` that cannot come. Here the host is
+/// a raw socket that completes the handshake and then never reads, so it never answers the
+/// server's pings (`PROTOCOL.md` §2.1).
+#[tokio::test]
+async fn a_host_that_stops_answering_its_pings_is_detached()
+-> Result<(), Failure> {
+    let harness = Harness::start_with(ServerConfig {
+        ping_interval: Duration::from_millis(20),
+        room_grace: Duration::from_secs(30),
+        ..ServerConfig::default()
+    })
+    .await;
+    let mut host = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    host.hello(&serde_json::json!({"display_name": "Ada", "role": "host"}))
+        .await
+        .expect("says hello");
+    let created = next_json_within(&mut host, "room.created").await;
+    assert_eq!(created["event"], event::ROOM_CREATED);
+    let room = Room {
+        id: created["params"]["room_id"]
+            .as_str()
+            .expect("a room id")
+            .to_string(),
+        token: created["params"]["token"]
+            .as_str()
+            .expect("a token")
+            .to_string(),
+        invite_url: String::new(),
+    };
+
+    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+    let detached = wait_for_event(&guest, "host.detached", |event| {
+        matches!(event, EngineEvent::HostDetached { .. })
+    });
+    let EngineEvent::HostDetached { grace_ms } = detached.await else {
+        panic!("host.detached");
+    };
+    assert_eq!(grace_ms, 30_000, "the grace starts as it does on any drop");
+
+    // The room is alive, not destroyed: a host that comes back inside the grace reclaims it.
+    let _reclaimed = harness
+        .reclaim(&room, "Ada")
+        .await
+        .expect("the room waits for its host");
+    Ok(())
+}
+
+/// A merely slow link is untouched. The server's ping interval here is 20 ms and the
+/// session runs for fifteen of them; a client that answers its pings (every conforming one
+/// does, as it reads) is never mistaken for a dead socket, and no reconnect happens at all.
+#[tokio::test]
+async fn a_slow_link_is_not_killed_by_the_liveness_bound() -> Result<(), Failure>
+{
+    let harness = Harness::start_with(ServerConfig {
+        ping_interval: Duration::from_millis(20),
+        room_grace: Duration::from_secs(30),
+        ..ServerConfig::default()
+    })
+    .await;
+    let (host, room) = harness.host("Ada").await?;
+    let guest = harness.join(&room, "Bob").await?;
+    let before = guest.session().peer.peer_id.clone();
+
+    sleep(Duration::from_millis(300)).await;
+
+    guest.open(PATH).await.expect("the session is still seated");
+    assert_eq!(
+        guest.session().peer.peer_id,
+        before,
+        "no reconnect stands in for a session that never dropped"
+    );
+    assert_eq!(
+        host.documents().await?,
+        vec![PATH.to_string()],
+        "the room still holds the guest's document"
+    );
+    Ok(())
+}
+
+/// The room's grace period is advertised before a session exists (`PROTOCOL.md` §2): a host
+/// learns it from `host.detached` only if it is still connected, and the connection that
+/// has to size its retry budget to the grace is the one that is gone. The value here is the
+/// server's configured one, so a deployment that moves the clock says so.
+#[tokio::test]
+async fn meta_advertises_the_configured_room_grace() {
+    let configured = Duration::from_millis(4_321);
+    let harness = Harness::start_with(ServerConfig {
+        room_grace: configured,
+        ..ServerConfig::default()
+    })
+    .await;
+    let body = http_get(&format!("{}/meta", harness.http_base()))
+        .await
+        .expect("meta answers");
+    let meta: proto::Meta = serde_json::from_str(&body).expect("meta is JSON");
+    assert_eq!(meta.keepalive.room_grace_ms, 4_321);
+
+    // The grace a peer actually gets is the same number: the default host detach carries
+    // it, and a server whose two answers disagreed would be lying to one of them.
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let mut invited =
+        RawSocket::open(&harness, &guest_target(&room.id, &room.token), &[])
+            .await
+            .expect("the upgrade succeeds");
+    invited
+        .hello(&serde_json::json!({"display_name": "Bob"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut invited, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+    drop(host);
+    // The room announces `peer.left` before `host.detached`, so the wait is for the event
+    // rather than for the next frame.
+    let mut frame =
+        next_json_within(&mut invited, "a frame after the host left").await;
+    while frame["event"] != event::HOST_DETACHED {
+        frame = next_json_within(&mut invited, "host.detached").await;
+    }
+    assert_eq!(frame["params"]["grace_ms"], 4_321);
+}
+
 #[tokio::test]
 async fn unknown_methods_return_an_error_and_unknown_fields_are_ignored() {
     let harness = Harness::start(Duration::from_secs(5)).await;
@@ -617,6 +745,57 @@ async fn joining_needs_the_room_and_the_token() {
     assert_eq!(host.peers().await.unwrap().len(), 0);
 }
 
+/// A first frame that is wrong in two ways is refused for the first one §11 orders: the
+/// envelope and its id, then `v`, then the method. The handshake used to judge the method
+/// first, so a frame that was both a non-hello method and an incompatible version was
+/// answered `hello_required` — a client that reads the code rather than the message would
+/// try again with a hello it still could not seat.
+#[tokio::test]
+async fn an_incompatible_first_frame_is_refused_for_its_version() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.send_json(&serde_json::json!({
+        "v": "selvage/2",
+        "id": 1,
+        "method": method::DOC_OPEN,
+        "params": {"path": PATH},
+    }))
+    .await
+    .expect("sends");
+    let refused = next_json_within(&mut raw, "the refusal").await;
+    assert_eq!(refused["event"], event::SESSION_ERROR);
+    assert_eq!(
+        refused["params"]["code"],
+        code::UNSUPPORTED_VERSION,
+        "the version is judged before the method: {refused}"
+    );
+    assert_eq!(
+        raw.read_to_close().await.expect("a close").close_code(),
+        Some(close::UNSUPPORTED_VERSION)
+    );
+
+    // A compatible version with a non-hello method is still `hello_required`, and a frame
+    // with no id is still `bad_message` before either of them.
+    let mut second = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    second
+        .send_json(&serde_json::json!({
+            "v": proto::WIRE_VERSION,
+            "id": 1,
+            "method": method::DOC_OPEN,
+            "params": {"path": PATH},
+        }))
+        .await
+        .expect("sends");
+    assert_eq!(
+        next_json_within(&mut second, "the refusal").await["params"]["code"],
+        code::HELLO_REQUIRED
+    );
+}
+
 /// `display_name` is bounded at 32 UTF-16 code units (`PROTOCOL.md` §5), so an astral
 /// character costs two. A name of exactly 32 code units — one of them astral — seats; one code
 /// unit over is refused `bad_params` before seating. Counting bytes or code points answers both
@@ -661,6 +840,171 @@ async fn display_name_is_bounded_in_utf16_code_units() {
         close_code(&mut refused).await.expect("close frame"),
         close::PROTOCOL_ERROR
     );
+}
+
+/// A `display_name` carrying a control character is refused `bad_params`, like a blank or
+/// over-long one (`PROTOCOL.md` §5): the name is echoed into every peer's roster, the
+/// `peers` list of every later joiner and whatever terminal an adapter prints it to, so an
+/// ANSI escape in it is a sequence this protocol never agreed to carry. A raw socket sends
+/// the bytes a client library would not, which is what makes the shape reachable here.
+#[tokio::test]
+async fn a_display_name_with_control_characters_is_refused() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let escape = "\u{1b}[31mAda\u{1b}[0m";
+    assert!(escape.chars().any(char::is_control));
+    let mut refused =
+        connect(&proto::session_url(&harness.ws_base(), None, None))
+            .await
+            .expect("connects");
+    hello(
+        &mut refused,
+        &serde_json::json!({ "display_name": escape, "role": "host" }),
+    )
+    .await
+    .expect("says hello");
+    let refusal = next_json(&mut refused).await.expect("refusal");
+    assert_eq!(refusal["event"], event::SESSION_ERROR);
+    assert_eq!(refusal["params"]["code"], code::BAD_PARAMS);
+    let message = refusal["params"]["message"]
+        .as_str()
+        .expect("a message")
+        .to_string();
+    assert!(
+        message.contains("control"),
+        "the refusal names the reason: {message}"
+    );
+    assert!(
+        !message.contains('\u{1b}'),
+        "the refusal does not echo the escape back: {message:?}"
+    );
+    assert_eq!(
+        close_code(&mut refused).await.expect("close frame"),
+        close::PROTOCOL_ERROR
+    );
+}
+
+/// A seated `session.rename` carrying one is the error response `bad_params` and the
+/// connection stays open, exactly as a blank rename is: a seated fault is not a close
+/// (`PROTOCOL.md` §5, §9.2, §11). A control character is judged after trimming, like
+/// blankness and the length, so padding cannot hide one.
+#[tokio::test]
+async fn a_rename_with_control_characters_is_refused_and_the_session_survives()
+{
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({ "display_name": "Ada" }))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut raw, "room.created").await["event"],
+        event::ROOM_CREATED
+    );
+
+    for (id, name) in [
+        (2_u64, "Ada\u{1b}[31m"),
+        (3, " Ada\u{7} "),
+        (4, "Bob\u{0}"),
+        (5, "Cyd\u{9b}"),
+    ] {
+        raw.send_json(&serde_json::json!({
+            "v": proto::WIRE_VERSION,
+            "id": id,
+            "method": method::SESSION_RENAME,
+            "params": {"display_name": name},
+        }))
+        .await
+        .expect("sends");
+        let refused = raw_response_for(&mut raw, id).await;
+        assert_eq!(
+            refused["error"]["code"],
+            code::BAD_PARAMS,
+            "a control character was accepted in {name:?}: {refused}"
+        );
+    }
+
+    // The connection is still seated, and a name without one still moves.
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 6,
+        "method": method::SESSION_RENAME,
+        "params": {"display_name": "Ada Lovelace"},
+    }))
+    .await
+    .expect("sends");
+    let answered = raw_response_for(&mut raw, 6).await;
+    assert!(answered["error"].is_null(), "the rename stands: {answered}");
+    assert_eq!(
+        raw.next_json().await.expect("the announcement")["params"]["display_name"],
+        "Ada Lovelace"
+    );
+}
+
+/// A `doc.open` or `doc.close` path carrying a control character is refused `bad_params`
+/// with the connection open, and nothing is announced: the path used to be stored in the
+/// room's set and broadcast verbatim to every peer's document set — and, through it, to a
+/// file tree and a terminal (`PROTOCOL.md` §5, §12). `..` and an absolute path stay legal:
+/// §5 leaves confinement to whoever reads a name, and this rule is about bytes a surface
+/// cannot render, not about traversal. A grant path is the same kind of value and is
+/// refused the same way.
+#[tokio::test]
+async fn a_path_with_control_characters_is_refused() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let mut raw =
+        RawSocket::open(&harness, &guest_target(&room.id, &room.token), &[])
+            .await
+            .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({ "display_name": "Bob" }))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut raw, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+
+    for (id, name, path) in [
+        (2_u64, method::DOC_OPEN, "src/\u{0}main.rs"),
+        (3, method::DOC_OPEN, "src/main.rs\n"),
+        (4, method::DOC_CLOSE, "src/\u{7}main.rs"),
+        (5, method::DOC_CLOSE, "src/\u{9b}main.rs"),
+    ] {
+        raw.send_json(&serde_json::json!({
+            "v": proto::WIRE_VERSION,
+            "id": id,
+            "method": name,
+            "params": {"path": path},
+        }))
+        .await
+        .expect("sends");
+        let refused = raw_response_for(&mut raw, id).await;
+        assert_eq!(
+            refused["error"]["code"],
+            code::BAD_PARAMS,
+            "{name} accepted {path:?}: {refused}"
+        );
+    }
+
+    // A host's grant carries paths of the same kind, and an escape in one is refused too.
+    let refused = host
+        .grant(vec!["src/main.rs\u{1b}[0m".to_string()])
+        .await
+        .expect_err("a control character is refused");
+    let Error::Protocol { code, .. } = refused else {
+        panic!("expected bad_params, got {refused}");
+    };
+    assert_eq!(code, code::BAD_PARAMS);
+
+    // Nothing was stored or announced on the guest's connection: `..` and an absolute path
+    // are still carried whole, so the next frame it sees is the grant for them.
+    let listed = paths(&["..", "/etc/passwd"]);
+    host.grant(listed.clone())
+        .await
+        .expect("the host publishes");
+    let announced = next_json_within(&mut raw, "doc.granted").await;
+    assert_eq!(announced["event"], event::DOC_GRANTED);
+    assert_eq!(announced["params"]["paths"], serde_json::json!(listed));
 }
 
 /// A seated connection renames itself mid-session (`session.rename`, `PROTOCOL.md` §5): the
@@ -857,7 +1201,7 @@ async fn a_joiner_receives_the_rooms_grant_and_a_republish_replaces_it() {
     assert_eq!(wait_for_paths(&late, &[]).await, Vec::<String>::new());
 }
 /// A joiner hears its reply before the room's grant, in that order on the wire: the
-/// seat path serializes both after the registry lock is dropped, and reordering them
+/// seat path queues both in one step under the registry lock, and reordering them
 /// would hand a client room state before its own identity. The grant here is wide
 /// enough that its serialization is the shape under test, not a degenerate one.
 #[tokio::test]
@@ -1668,6 +2012,121 @@ async fn doc_open_and_doc_close_validate_the_path_the_same_way() {
     assert_eq!(
         raw_response_for(&mut raw, 7).await["result"]["documents"],
         serde_json::json!([])
+    );
+}
+
+/// A frame that repeats a member name anywhere in it is `bad_message` (`PROTOCOL.md` §4).
+/// The envelope's own members were always refused by the struct parse, but a member of
+/// `params`, or of anything nested below it, is last-wins to a JSON reader: one frame
+/// meant two things and two implementations could take different ones. A seated fault is
+/// a `session.error` with the connection open, and the connection still serves afterwards.
+#[tokio::test]
+async fn a_frame_with_a_repeated_member_is_refused() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({"display_name": "Ada", "role": "host"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut raw, "room.created").await["event"],
+        event::ROOM_CREATED
+    );
+
+    for body in [
+        // A member of `params` twice.
+        r#"{"v":"selvage/1","id":2,"method":"doc.open","params":{"path":"a.rs","path":"b.rs"}}"#,
+        // A member of an object nested below `params`.
+        r#"{"v":"selvage/1","id":3,"method":"doc.open","params":{"path":"a.rs","extra":{"x":1,"x":2}}}"#,
+        // The envelope's own member twice, which `serde` refuses as well.
+        r#"{"v":"selvage/1","id":4,"method":"doc.open","params":{"path":"a.rs"},"v":"selvage/1"}"#,
+    ] {
+        raw.send(0x1, body.as_bytes()).await.expect("sends");
+        let refused = next_json_within(&mut raw, "the refusal").await;
+        assert_eq!(
+            refused["event"],
+            event::SESSION_ERROR,
+            "one frame with two readings is refused: {refused}"
+        );
+        assert_eq!(refused["params"]["code"], code::BAD_MESSAGE);
+        let message = refused["params"]["message"].as_str().expect("a message");
+        assert!(
+            message.contains("duplicate"),
+            "the refusal names the repetition: {message}"
+        );
+    }
+
+    // The connection is still seated and still answers: a refused frame changed nothing.
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 5,
+        "method": method::DOC_OPEN,
+        "params": {"path": PATH},
+    }))
+    .await
+    .expect("sends");
+    assert_eq!(
+        raw_response_for(&mut raw, 5).await["result"]["documents"],
+        serde_json::json!([PATH])
+    );
+}
+
+/// A join query that names `room` or `token` twice is refused (`PROTOCOL.md` §5.1): a
+/// connection whose room depended on which of two values was read last is not one a server
+/// may seat, and the client cannot tell which room it asked for. It is a pre-seat fault, so
+/// it is the refusal the spec names for a malformed URL — the join refusal `token_invalid`,
+/// the code a room whose named token is not the room's already gets — and close 4002 (§11).
+#[tokio::test]
+async fn a_join_query_naming_a_parameter_twice_is_refused() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    assert_eq!(host.session().room_id, room.id);
+
+    for target in [
+        format!(
+            "{}?room={}&room={}&token={}",
+            proto::ENDPOINT_PATH,
+            room.id,
+            proto::percent_encode("r-other"),
+            proto::percent_encode(&room.token)
+        ),
+        format!(
+            "{}?room={}&token={}&token={}",
+            proto::ENDPOINT_PATH,
+            proto::percent_encode(&room.id),
+            proto::percent_encode(&room.token),
+            proto::percent_encode(&room.token)
+        ),
+    ] {
+        let mut raw = RawSocket::open(&harness, &target, &[])
+            .await
+            .expect("the upgrade succeeds");
+        let refused = next_json_within(&mut raw, "the refusal").await;
+        assert_eq!(refused["event"], event::SESSION_ERROR);
+        assert_eq!(
+            refused["params"]["code"],
+            code::TOKEN_INVALID,
+            "a malformed join URL takes the join refusal §5.1 names: {refused}"
+        );
+        assert_eq!(
+            raw.read_to_close().await.expect("a close").close_code(),
+            Some(close::TOKEN_INVALID)
+        );
+    }
+
+    // A query naming each once is still the invite it looks like.
+    let mut guest =
+        RawSocket::open(&harness, &guest_target(&room.id, &room.token), &[])
+            .await
+            .expect("the upgrade succeeds");
+    guest
+        .hello(&serde_json::json!({"display_name": "Bob"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut guest, "room.joined").await["event"],
+        event::ROOM_JOINED
     );
 }
 

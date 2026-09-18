@@ -14,7 +14,7 @@
     },
     {
       "op": "expectBody",
-      "text": "{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"roles\":[\"host\",\"guest\"],\"server\":\"$server\",\"wire_versions\":[\"selvage/1\"]}"
+      "text": "{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000,\"room_grace_ms\":30000},\"roles\":[\"host\",\"guest\"],\"server\":\"$server\",\"wire_versions\":[\"selvage/1\"]}"
     },
     {
       "op": "http",

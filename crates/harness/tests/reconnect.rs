@@ -6,9 +6,11 @@
 use std::error::Error as StdError;
 use std::time::Duration;
 
+use selvage_client::{ConnectOptions, ReconnectPolicy, SyncEngine};
 use selvage_harness::{
     DropProxy, EngineEvent, Error, Harness, Presence, Role, SelectionOffsets,
-    WAIT, wait_for, wait_for_described, wait_for_event,
+    ServerConfig, WAIT, wait_for, wait_for_described, wait_for_event,
+    wait_for_peer,
 };
 use selvage_protocol::code;
 use tokio::sync::broadcast;
@@ -378,10 +380,104 @@ async fn a_reseated_guest_drops_a_grant_the_room_no_longer_has()
     Ok(())
 }
 
+/// A drop the client is going to retry is said out loud (`PROTOCOL.md` §9.1): an adapter
+/// shows `reconnecting` rather than inferring the retry from silence, and the re-seat
+/// follows as its own event. The subscription is taken before the cut, and the loop reads past
+/// the awareness renewals that arrive in between.
+#[tokio::test]
+async fn a_retrying_drop_is_announced_as_reconnecting() -> Result<(), Failure> {
+    let harness = Harness::start(Duration::from_secs(30)).await;
+    let proxy = DropProxy::start(&harness.upstream()).await?;
+    let (host, room) = harness.host("Ada").await?;
+    let guest = harness.join_at(&proxy.ws_base(), &room, "Bob").await?;
+    host.open(PATH).await?;
+    guest.open(PATH).await?;
+    let old_peer_id = guest.session().peer.peer_id.clone();
+
+    let mut events = guest.subscribe();
+    proxy.drop_all();
+    let mut announced = timeout(WAIT, events.recv())
+        .await?
+        .map_err(|_| "the engine stream closed")?;
+    while !matches!(announced, EngineEvent::Reconnecting) {
+        announced = timeout(WAIT, events.recv())
+            .await
+            .map_err(|_| "no `reconnecting` arrived before the deadline")?
+            .map_err(|_| "the engine stream closed")?;
+    }
+
+    // The retry then runs: its outcome is the event that follows a `reconnecting`, and the
+    // guest is seated as a fresh peer rather than dropped.
+    wait_for_described(
+        "the guest to be reseated",
+        || async { format!("{:?}", guest.session()) },
+        || async {
+            let session = guest.session();
+            (session.peer.peer_id != old_peer_id).then_some(session)
+        },
+    )
+    .await;
+    Ok(())
+}
+
 /// Bob's cursor where this test put it, under the awareness client id `wanted` — or under any
 /// of them, when the caller has no id in mind yet.
 fn bobs_cursor(presence: &Presence, wanted: Option<u64>) -> bool {
     presence.display_name() == Some("Bob")
         && presence.selection() == Some(SelectionOffsets::caret(3))
         && wanted.is_none_or(|client_id| presence.client_id == client_id)
+}
+
+/// A handshake refused with an `x.*` code is not re-helloed (`PROTOCOL.md` §9.1): the code
+/// is one the document does not define, and every one of them is a stop, whether or not the
+/// client knows it. A full room is the reachable case — the room this client left refilled
+/// under it — and the count of connections through its relay is what makes "one attempt"
+/// observable rather than inferred from a clock.
+#[tokio::test]
+async fn a_reconnect_into_a_full_room_makes_one_attempt() -> Result<(), Failure>
+{
+    let harness = Harness::start_with(ServerConfig {
+        room_grace: Duration::from_secs(30),
+        max_peers_per_room: 2,
+        ..ServerConfig::default()
+    })
+    .await;
+    let host_proxy = DropProxy::start(&harness.upstream()).await?;
+    let guest_proxy = DropProxy::start(&harness.upstream()).await?;
+    let (host, room) = harness.host_at(&host_proxy.ws_base(), "Ada").await?;
+    // A first retry later than any join below, so the room is deterministically full when
+    // the client re-hellos rather than racing a local join against a 500 ms backoff.
+    let options =
+        ConnectOptions::guest(guest_proxy.ws_base(), "Bob", room.invite())
+            .with_reconnect(ReconnectPolicy {
+                initial_delay: Duration::from_secs(2),
+                ..ReconnectPolicy::default()
+            });
+    let guest = SyncEngine::connect(options).await?;
+    assert_eq!(guest_proxy.accepted(), 1, "the first connection is relayed");
+    // Wait for the seat to be taken before taking it away: a roster that has not yet heard
+    // `peer.joined` is empty for the same reason one that has heard `peer.left` is, and the
+    // wait below would return before the drop had happened at all.
+    wait_for_peer(&host, "Bob").await;
+
+    guest_proxy.drop_all();
+    // The seat the drop frees is taken before the client retries: the room seats two.
+    wait_for("the room to notice the dropped guest", || async {
+        host.peers().await.ok()?.is_empty().then_some(())
+    })
+    .await;
+    let _filler = harness.join(&room, "Cyd").await?;
+
+    wait_for_event(
+        &guest,
+        "the refused reconnect to end the session",
+        |event| matches!(event, EngineEvent::Disconnected),
+    )
+    .await;
+    assert_eq!(
+        guest_proxy.accepted(),
+        2,
+        "one reconnect attempt, refused `x.room_full`"
+    );
+    Ok(())
 }

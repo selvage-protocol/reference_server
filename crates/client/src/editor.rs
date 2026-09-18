@@ -37,7 +37,11 @@ pub enum EngineEvent {
     RoomGone { reason: String },
     /// The server reported a fault it could not attach to a request: `session.error`.
     SessionError { code: String, message: String },
-    /// The connection ended for another reason.
+    /// The socket dropped mid-session and the bounded retry (`PROTOCOL.md` §9.1) is
+    /// running. An adapter shows this instead of inferring it from silence; the re-seat or
+    /// the give-up follows as its own event.
+    Reconnecting,
+    /// The connection ended for another reason, or the retry gave up.
     Disconnected,
 }
 
@@ -53,6 +57,9 @@ pub trait EditorAdapter: Send + Sync + 'static {
     fn host_attached(&self, _peer: &PeerInfo) {}
     fn room_gone(&self, _reason: &str) {}
     fn session_error(&self, _code: &str, _message: &str) {}
+    /// The socket dropped and the bounded retry is running. The re-seat or the give-up
+    /// arrives as its own call.
+    fn reconnecting(&self) {}
     fn disconnected(&self) {}
 }
 
@@ -130,6 +137,7 @@ async fn deliver(
         EngineEvent::SessionError { code, message } => {
             adapter.session_error(&code, &message);
         }
+        EngineEvent::Reconnecting => adapter.reconnecting(),
         EngineEvent::Disconnected => {
             adapter.disconnected();
             return false;

@@ -16,10 +16,15 @@
 //! payloads are *not* described here — they are y-protocols binary frames
 //! (`yrs::sync::protocol::Message`) and are opaque to the server.
 
+use std::collections::HashSet;
+use std::fmt;
 use std::fmt::Write as _;
 use std::str;
 
-use serde::{Deserialize, Serialize};
+use std::error::Error as StdError;
+
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// Wire version carried in every session envelope.
@@ -49,6 +54,17 @@ pub const DISPLAY_NAME_MAX_UTF16: usize = 32;
 #[must_use]
 pub fn display_name_over_limit(name: &str) -> bool {
     name.encode_utf16().count() > DISPLAY_NAME_MAX_UTF16
+}
+
+/// Whether `text` carries a control character: C0, DEL or C1, the Unicode `Cc` category.
+///
+/// A `display_name` is echoed into every peer's roster and a `path` into every peer's
+/// document set, its file tree and any terminal a peer prints it to, so a control
+/// character in one — an ANSI escape, a carriage return, a NUL — reaches a surface that
+/// never asked for it. §5 refuses both kinds of value `bad_params` for exactly that.
+#[must_use]
+pub fn has_control_characters(text: &str) -> bool {
+    text.chars().any(char::is_control)
 }
 
 /// Client -> server method names.
@@ -205,6 +221,20 @@ impl ClientMessage {
     pub fn to_text(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
+
+    /// Parses a client frame, refusing one that repeats a member name anywhere inside it
+    /// (§4) — the `to_text` half of the same rule, in the other direction. `serde` refuses
+    /// a repeated member of the envelope itself, but a repeated member of `params`, or of
+    /// anything nested in one, is last-wins to a `serde_json::Value` and is caught here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse error of the frame, or the error naming the first repeated
+    /// member, which is `bad_message` to a server.
+    pub fn from_text(text: &str) -> Result<Self, serde_json::Error> {
+        no_duplicate_members(text)?;
+        serde_json::from_str(text)
+    }
 }
 
 /// A server -> client message. A response carries `id` and exactly one of
@@ -275,6 +305,18 @@ impl ServerMessage {
     /// send means.
     pub fn to_text(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
+    }
+
+    /// Parses a server frame, refusing one that repeats a member name anywhere inside it
+    /// (§4), exactly as [`ClientMessage::from_text`] does in the other direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse error of the frame, or the error naming the first repeated
+    /// member.
+    pub fn from_text(text: &str) -> Result<Self, serde_json::Error> {
+        no_duplicate_members(text)?;
+        serde_json::from_str(text)
     }
 }
 
@@ -386,13 +428,44 @@ pub struct RoomGoneParams {
     pub room_id: String,
 }
 
+/// What this implementation calls itself in `GET /meta` (`PROTOCOL.md` §2). Free-form and
+/// not stable: a peer **MUST NOT** depend on it.
+pub const SERVER_NAME: &str = concat!("selvaged/", env!("CARGO_PKG_VERSION"));
+
+/// `GET /meta`'s `keepalive`: the session's clocks plus the room's grace period, which the
+/// handshake reply has no place for. A host learns the grace only from `host.detached`,
+/// which reaches the peers it *left behind* — the one connection that has to size its retry
+/// budget to the grace is the one that is gone, so it has to be advertised before the
+/// session exists. Members are in the canonical order of `CANONICAL.md` §2.1.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+pub struct MetaKeepalive {
+    pub awareness_expire_ms: u64,
+    pub awareness_renew_ms: u64,
+    pub ping_interval_ms: u64,
+    /// How long a room survives its host's connection ending (`PROTOCOL.md` §2, §9).
+    pub room_grace_ms: u64,
+}
+
+impl From<(Keepalive, u64)> for MetaKeepalive {
+    fn from((keepalive, room_grace_ms): (Keepalive, u64)) -> Self {
+        Self {
+            awareness_expire_ms: keepalive.awareness_expire_ms,
+            awareness_renew_ms: keepalive.awareness_renew_ms,
+            ping_interval_ms: keepalive.ping_interval_ms,
+            room_grace_ms,
+        }
+    }
+}
+
 /// `GET /meta` response body. Members are in the canonical order of
 /// `CANONICAL.md` §2.1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub capabilities: Vec<String>,
     #[serde(default)]
-    pub keepalive: Keepalive,
+    pub keepalive: MetaKeepalive,
     #[serde(default)]
     pub roles: Vec<String>,
     pub server: String,
@@ -400,19 +473,146 @@ pub struct Meta {
 }
 
 impl Meta {
+    /// What this reference server advertises, with `keepalive` and the room grace it is
+    /// actually configured with.
     #[must_use]
-    pub fn reference() -> Self {
+    pub fn reference(keepalive: Keepalive, room_grace_ms: u64) -> Self {
         Self {
             capabilities: CAPABILITIES
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
-            keepalive: Keepalive::default(),
+            keepalive: MetaKeepalive::from((keepalive, room_grace_ms)),
             roles: vec!["host".to_string(), "guest".to_string()],
-            server: concat!("selvaged/", env!("CARGO_PKG_VERSION")).to_string(),
+            server: SERVER_NAME.to_string(),
             wire_versions: vec![WIRE_VERSION.to_string()],
         }
     }
+}
+
+/// Whether `text` repeats a member name inside any object it holds.
+///
+/// `serde` refuses a repeated member of a *struct* — two `v` members never make it past
+/// [`ClientMessage`] — but a member of a `params` object, or of anything nested in one,
+/// is last-wins: the object is a `serde_json::Value`, and JSON's own reading of a
+/// repeated name is that the last one is the value. One frame must not mean two things,
+/// so §4 refuses a repetition anywhere in a frame, and this is the reading that finds it.
+///
+/// # Errors
+///
+/// Returns the parse error of the frame, or the error naming the first repeated member.
+fn no_duplicate_members(text: &str) -> Result<(), serde_json::Error> {
+    let mut de = serde_json::Deserializer::from_str(text);
+    UniqueMembers::deserialize(&mut de)?;
+    de.end()
+}
+
+/// A JSON document read only to find a repeated member name, anywhere inside it.
+struct UniqueMembers;
+
+impl<'de> Deserialize<'de> for UniqueMembers {
+    fn deserialize<D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(UniqueVisitor)
+    }
+}
+
+/// Remembers `member`, reporting a name this object has already carried.
+fn note_member<E: de::Error>(
+    seen: &mut HashSet<String>,
+    member: &str,
+) -> Result<(), E> {
+    if seen.insert(member.to_string()) {
+        return Ok(());
+    }
+    Err(E::custom(format!("duplicate member: {member}")))
+}
+
+struct UniqueVisitor;
+
+impl<'de> Visitor<'de> for UniqueVisitor {
+    type Value = UniqueMembers;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> Result<Self::Value, A::Error> {
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(member) = map.next_key::<String>()? {
+            note_member(&mut seen, &member)?;
+            map.next_value::<UniqueMembers>()?;
+        }
+        Ok(UniqueMembers)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> Result<Self::Value, A::Error> {
+        while seq.next_element::<UniqueMembers>()?.is_some() {}
+        Ok(UniqueMembers)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(UniqueMembers)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(UniqueMembers)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(UniqueMembers)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(UniqueMembers)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(UniqueMembers)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueMembers)
+    }
+}
+
+/// A join query that names `room` or `token` more than once (`PROTOCOL.md` §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinQueryError {
+    /// The parameter, named twice.
+    Duplicate(&'static str),
+}
+
+impl fmt::Display for JoinQueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Duplicate(name) => {
+                write!(f, "the join query names {name} twice")
+            }
+        }
+    }
+}
+
+impl StdError for JoinQueryError {}
+
+/// The value a join query carries for `name`, or the refusal of a second one: a query that
+/// names a parameter twice names two rooms, and a connection has to be one of them.
+fn join_value(
+    name: &'static str,
+    already: bool,
+    value: &str,
+) -> Result<String, JoinQueryError> {
+    if already {
+        return Err(JoinQueryError::Duplicate(name));
+    }
+    Ok(percent_decode(value))
 }
 
 /// The room/token part of a join URL. `room` absent means "mint a new room".
@@ -422,9 +622,14 @@ pub struct JoinQuery {
     pub token: Option<String>,
 }
 
-/// Parses a URL query string into a room/token pair. Unknown parameters are ignored.
-#[must_use]
-pub fn parse_join_query(query: &str) -> JoinQuery {
+/// Parses a URL query string into a room/token pair. Unknown parameters are ignored, and
+/// one named more than once is refused rather than silently overwritten: which of two
+/// `room` values a connection joins must not depend on their order.
+///
+/// # Errors
+///
+/// Returns [`JoinQueryError::Duplicate`] when `room` or `token` appears twice.
+pub fn parse_join_query(query: &str) -> Result<JoinQuery, JoinQueryError> {
     let mut out = JoinQuery::default();
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -435,12 +640,16 @@ pub fn parse_join_query(query: &str) -> JoinQuery {
             None => (pair, ""),
         };
         match k {
-            "room" => out.room = Some(percent_decode(v)),
-            "token" => out.token = Some(percent_decode(v)),
+            "room" => {
+                out.room = Some(join_value("room", out.room.is_some(), v)?);
+            }
+            "token" => {
+                out.token = Some(join_value("token", out.token.is_some(), v)?);
+            }
             _ => {}
         }
     }
-    out
+    Ok(out)
 }
 
 /// A connection URL split into the server base and the room/token it carries.
@@ -461,10 +670,14 @@ pub fn parse_session_url(url: &str) -> Option<SessionUrl> {
         Some((endpoint, query)) => (endpoint, query),
         None => (url, ""),
     };
+    // A URL that names `room` or `token` twice is not one this client can resolve to a
+    // connection: the server refuses the query, and a client that guessed which of the two
+    // values was meant would connect to a room the link did not name.
+    let join = parse_join_query(query).ok()?;
     let base = endpoint.strip_suffix(ENDPOINT_PATH)?;
     Some(SessionUrl {
         base: base.to_string(),
-        join: parse_join_query(query),
+        join,
     })
 }
 
@@ -519,6 +732,13 @@ fn take_escaped(rest: &[u8]) -> Option<(u8, &[u8])> {
     Some((byte, rest.get(2..)?))
 }
 
+/// Decodes the percent escapes in a URL component.
+///
+/// A query is RFC 3986, not `application/x-www-form-urlencoded`: `+` is a literal plus in
+/// it, and the reference's own [`percent_encode`] writes one as `%2B` for exactly that
+/// reason. Treating it as a space would read a second implementation's literal `+` as a
+/// different value — a different room, a different token — while both meant the same
+/// thing.
 #[must_use]
 pub fn percent_decode(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(s.len());
@@ -534,7 +754,7 @@ pub fn percent_decode(s: &str) -> String {
             rest = after;
             continue;
         }
-        out.push(if *first == b'+' { b' ' } else { *first });
+        out.push(*first);
         rest = tail;
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -728,6 +948,129 @@ mod tests {
         assert_eq!(at_limit.len(), 34);
     }
 
+    /// The control characters §5 refuses are the Unicode `Cc` category: C0 (`\u{0}`,
+    /// `\u{1b}`), DEL, and C1 (`\u{9b}`) — not the printable characters that sit beside
+    /// them, and not the non-breaking space a name may be padded with.
+    #[test]
+    fn control_characters_are_the_cc_category() {
+        for text in [
+            "a\u{0}b",
+            "\u{1b}[31m",
+            "a\u{7f}b",
+            "a\u{9b}b",
+            "a\tb",
+            "a\nb",
+        ] {
+            assert!(has_control_characters(text), "{text:?} is refused");
+        }
+        for text in ["Ada", " Ada ", "𝄞", "a\u{a0}b", "ｆ"] {
+            assert!(!has_control_characters(text), "{text:?} is carried");
+        }
+    }
+
+    #[test]
+    fn a_plus_in_a_query_is_a_literal_plus() {
+        // RFC 3986: `+` is a sub-delimiter, legal in a query and not a space. The two
+        // spellings of one value must read the same, or a second implementation writing
+        // the literal one is talking about a different room.
+        let q = parse_join_query("room=r+1&token=a+b").expect("a query");
+        assert_eq!(q.room.as_deref(), Some("r+1"));
+        assert_eq!(q.token.as_deref(), Some("a+b"));
+        assert_eq!(percent_decode("%2B"), "+");
+        assert_eq!(percent_encode("a+b"), "a%2Bb");
+        assert_eq!(percent_decode(&percent_encode("a+b")), "a+b");
+
+        // A space still arrives as one, percent-encoded, which is the only way it can.
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(
+            parse_join_query("room=a%20b")
+                .expect("a query")
+                .room
+                .as_deref(),
+            Some("a b")
+        );
+    }
+
+    /// §4: a repeated member name anywhere in a frame is one frame that means two things,
+    /// and a receiver refuses it rather than picking one. `serde` already refuses a repeat
+    /// in the envelope's own members; the case that needed a rule here is a repeat inside
+    /// `params`, or nested below it, where a `serde_json::Value` is last-wins.
+    #[test]
+    fn a_repeated_member_anywhere_in_a_frame_is_refused() {
+        let repeated = [
+            // The envelope itself, which `serde` catches as well.
+            r#"{"v":"selvage/1","id":1,"method":"doc.open","params":{"path":"a"},"v":"selvage/1"}"#,
+            // A member of `params`: the shape a duplicate could silently win before.
+            r#"{"v":"selvage/1","id":1,"method":"doc.open","params":{"path":"a","path":"b"}}"#,
+            // A member of an object nested below `params`.
+            r#"{"v":"selvage/1","id":1,"method":"doc.open","params":{"path":"a","x":{"y":1,"y":2}}}"#,
+            // And inside an array of objects.
+            r#"{"v":"selvage/1","id":1,"method":"doc.grant","params":{"paths":[],"extra":[{"z":1,"z":2}]}}"#,
+        ];
+        for text in repeated {
+            let error = ClientMessage::from_text(text)
+                .expect_err("a repeated member is refused");
+            assert!(
+                error.to_string().contains("duplicate"),
+                "the refusal names the repetition: {error}"
+            );
+        }
+
+        // The same rule reads a server frame in the other direction.
+        let error = ServerMessage::from_text(
+            r#"{"v":"selvage/1","id":1,"result":{},"result":{}}"#,
+        )
+        .expect_err("a repeated member is refused");
+        assert!(error.to_string().contains("duplicate"), "{error}");
+
+        // And an ordinary frame is not refused: the same member twice in *different*
+        // objects is not a repetition, and numbers, strings and arrays carry none.
+        let msg = ClientMessage::from_text(
+            r#"{"v":"selvage/1","id":1,"method":"doc.open","params":{"path":"a","same":1,"other":{"same":2},"list":[1,"x",null,true,1.5]}}"#,
+        )
+        .expect("a frame with no repetition parses");
+        assert_eq!(msg.id, Some(1));
+        assert_eq!(msg.params["path"], "a");
+    }
+
+    /// §5.1: a join query names `room` and `token` once. Which of two values a connection
+    /// joined must not depend on the order they were written in, so a repetition is refused
+    /// outright. An unknown parameter may repeat: it is ignored, and nothing reads it.
+    #[test]
+    fn a_repeated_join_parameter_is_refused() {
+        assert_eq!(
+            parse_join_query("room=a&room=b"),
+            Err(JoinQueryError::Duplicate("room"))
+        );
+        assert_eq!(
+            parse_join_query("token=a&token=b"),
+            Err(JoinQueryError::Duplicate("token"))
+        );
+        assert_eq!(
+            parse_join_query("room=a&token=b&token=c"),
+            Err(JoinQueryError::Duplicate("token"))
+        );
+        assert_eq!(
+            parse_join_query("room=a&room=a"),
+            Err(JoinQueryError::Duplicate("room")),
+            "even two equal values are a repetition"
+        );
+        let repeated_unknown =
+            parse_join_query("x=1&x=2&room=r").expect("a query");
+        assert_eq!(repeated_unknown.room.as_deref(), Some("r"));
+        assert_eq!(
+            JoinQueryError::Duplicate("room").to_string(),
+            "the join query names room twice"
+        );
+
+        // A URL that names a room twice is not a connection URL at all: a client that
+        // guessed would join a room the link did not name.
+        assert_eq!(
+            parse_session_url("ws://h/session?room=a&room=b&token=t"),
+            None
+        );
+    }
+
     #[test]
     fn join_query_round_trip() {
         let url =
@@ -736,15 +1079,19 @@ mod tests {
             url,
             "ws://127.0.0.1:8080/session?room=room%201&token=t%2Fk"
         );
-        let q = parse_join_query(url.split_once('?').unwrap().1);
+        let q =
+            parse_join_query(url.split_once('?').unwrap().1).expect("a query");
         assert_eq!(q.room.as_deref(), Some("room 1"));
         assert_eq!(q.token.as_deref(), Some("t/k"));
 
         let host = session_url("ws://127.0.0.1:8080/", None, None);
         assert_eq!(host, "ws://127.0.0.1:8080/session");
-        assert_eq!(parse_join_query(""), JoinQuery::default());
         assert_eq!(
-            parse_join_query("extra=1&room=r"),
+            parse_join_query("").expect("a query"),
+            JoinQuery::default()
+        );
+        assert_eq!(
+            parse_join_query("extra=1&room=r").expect("a query"),
             JoinQuery {
                 room: Some("r".into()),
                 token: None

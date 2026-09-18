@@ -9,7 +9,7 @@ use std::io;
 use std::mem::take;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -23,18 +23,19 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, MissedTickBehavior, interval, sleep, timeout};
+use tokio_tungstenite::tungstenite::Error as WireError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 
 use selvage_protocol as proto;
-use selvage_protocol::event;
+use selvage_protocol::{code, event};
 
 use crate::room::{Outbound, Queue, Registry};
 use crate::{ServerConfig, random_hex};
 
 mod session;
 
-use session::{Applicant, Session, handshake};
+use session::{Applicant, Session, grace_ms, handshake};
 
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const NOT_FOUND: &str = r#"{"error":"not found","hint":"try /session (WebSocket) or /meta (HTTP)"}"#;
@@ -196,7 +197,7 @@ impl Shared {
         // The WebSocket handshake is a `GET` (RFC 6455 §4.1): anything else, upgrade
         // headers or not, is a plain request and answered as one.
         if !head.is_websocket_upgrade || head.method != "GET" {
-            return respond_plain(&mut tcp, &head).await;
+            return respond_plain(&mut tcp, &head, &self.config).await;
         }
         if head.path != proto::ENDPOINT_PATH {
             return respond_status(
@@ -224,8 +225,7 @@ impl Shared {
         // in the same read as the head wait here until the frame parser asks for them.
         ws.get_mut().push_back(take(&mut head.tail));
         ws.get_mut().drop_head();
-        self.serve_session(ws, proto::parse_join_query(&head.query))
-            .await;
+        self.serve_session(ws, &head.query).await;
         Ok(())
     }
 
@@ -273,9 +273,21 @@ impl Shared {
         Ok(())
     }
 
-    /// Runs one connection: handshake, seat, then relay frames until it ends.
-    async fn serve_session(&self, ws: SessionSocket, join: proto::JoinQuery) {
+    /// Runs one connection: handshake, seat, then relay frames until it ends. The join
+    /// query is read here rather than while routing, so that one naming `room` or `token`
+    /// twice is refused on the wire like any other fault. §5.1 gives that refusal the join
+    /// code: a repeated `room` or `token` is a malformed URL, §11 has no code of its own for
+    /// one, and `token_invalid` is what a room whose named token is not the room's already
+    /// answers with — so the close is 4002 (§11).
+    async fn serve_session(&self, ws: SessionSocket, query: &str) {
         let mut wire = Wire::new(ws);
+        let join = match proto::parse_join_query(query) {
+            Ok(join) => join,
+            Err(error) => {
+                return refuse(wire, code::TOKEN_INVALID, error.to_string())
+                    .await;
+            }
+        };
         let claims_host = join.room.is_none();
         let greeted =
             handshake(&mut wire.stream, claims_host, self.config.hello_timeout)
@@ -323,6 +335,7 @@ impl Shared {
             wire,
             ping,
             poison,
+            missed_pings: AtomicU32::new(0),
         };
         pump(&mut live, self).await;
         live.session.leave(self).await;
@@ -375,6 +388,20 @@ async fn join_writer(writer: &mut JoinHandle<()>) {
     }
 }
 
+/// How many of the server's own pings may go unanswered before the connection is ended.
+///
+/// §2.1 forbids timing a session out for *inactivity*, and this is not that: every
+/// conforming WebSocket peer answers a Ping (RFC 6455 §5.5.2, and both reference clients'
+/// libraries do it as they read), so a peer that has not answered two successive pings by
+/// the time the third is due is not idle, it is gone — a roaming client whose socket died
+/// without its TCP end noticing, or a hung relay. Leaving it seated is what strands a room:
+/// the connection stays the room's host, no grace period is ever armed, and the host that
+/// comes back is refused `host_present` while every guest waits for a `host.detached` that
+/// cannot come. Ending it is what any dropped socket does: `peer.left`, `host.detached`,
+/// the grace period. At the reference `ping_interval` of 30 s a peer has two intervals —
+/// 60 s of complete silence — before anything happens to it.
+const MAX_MISSED_PINGS: u32 = 2;
+
 /// A seated session plus the plumbing that keeps it alive.
 struct Live {
     session: Session,
@@ -383,19 +410,19 @@ struct Live {
     /// Ends the turn loop when the registry drops its sender: the peer was removed,
     /// so there is nothing left to serve.
     poison: oneshot::Receiver<()>,
+    /// The server's pings since the last Pong: what [`Live::heartbeat`] bounds. Atomic
+    /// because the turn loop is a spawned task and the counter rides in its future.
+    missed_pings: AtomicU32,
 }
 
 /// The turn loop: protocol pings, session methods and inbound frames.
 async fn pump(live: &mut Live, shared: &Shared) {
     loop {
         let keep_going = tokio::select! {
-            _ = live.ping.tick() => {
-                live.heartbeat();
-                true
-            }
+            _ = live.ping.tick() => live.heartbeat(),
             _ = &mut live.wire.writer => false,
             _ = &mut live.poison => false,
-            incoming = live.wire.stream.next() => live.session.handle_frame(incoming, shared).await,
+            incoming = live.wire.stream.next() => live.handle(incoming, shared).await,
         };
         if !keep_going {
             break;
@@ -404,9 +431,33 @@ async fn pump(live: &mut Live, shared: &Shared) {
 }
 
 impl Live {
-    /// Sends one protocol-level ping. The keepalive never ends the session.
-    fn heartbeat(&self) {
+    /// Sends one protocol-level ping, and reports whether the session outlives the tick.
+    /// A peer that has not answered `MAX_MISSED_PINGS` of them is gone: the connection
+    /// ends the way a dropped socket ends, which is what starts the room's grace period.
+    fn heartbeat(&self) -> bool {
+        let missed = self
+            .missed_pings
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if missed > MAX_MISSED_PINGS {
+            return false;
+        }
         let _ = self.wire.queue.try_queue(Outbound::Ping(Vec::new()));
+        true
+    }
+
+    /// One inbound frame. A Pong is the answer to this connection's own ping and nothing
+    /// else; every other frame belongs to the session.
+    async fn handle(
+        &self,
+        incoming: Option<Result<Message, WireError>>,
+        shared: &Shared,
+    ) -> bool {
+        if matches!(incoming, Some(Ok(Message::Pong(_)))) {
+            self.missed_pings.store(0, Ordering::Relaxed);
+            return true;
+        }
+        self.session.handle_frame(incoming, shared).await
     }
 }
 
@@ -649,7 +700,11 @@ fn origin_form(target: &str) -> &str {
     after_scheme.get(boundary..).unwrap_or("/")
 }
 
-async fn respond_plain(tcp: &mut TcpStream, head: &Head) -> io::Result<()> {
+async fn respond_plain(
+    tcp: &mut TcpStream,
+    head: &Head,
+    config: &ServerConfig,
+) -> io::Result<()> {
     if head.method != "GET" && head.method != "HEAD" {
         return respond_status(
             tcp,
@@ -664,9 +719,14 @@ async fn respond_plain(tcp: &mut TcpStream, head: &Head) -> io::Result<()> {
             .await;
     }
     // Canonical (`CANONICAL.md`), so that the negotiation body has the same bytes for
-    // every implementation.
-    let meta = serde_json::to_string(&proto::Meta::reference())
-        .map_err(io::Error::other)?;
+    // every implementation. The grace is this server's configured value: it is the one
+    // number a client needs before it has a session, since `host.detached` never reaches
+    // the host whose budget has to fit inside it.
+    let meta = serde_json::to_string(&proto::Meta::reference(
+        config.keepalive,
+        grace_ms(config),
+    ))
+    .map_err(io::Error::other)?;
     respond_status(tcp, Status::Ok, &meta, &head.method).await
 }
 
