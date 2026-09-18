@@ -82,6 +82,15 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 With no page directory the server still answers `/meta` and `/session`; `/` is `404`.
 `compose.yaml` mounts `./page` and passes the flag already.
 
+Served files carry the policy a browser needs: a media type from a pinned table
+(never the host's mime database), `Cache-Control: no-cache` for a stable name and
+`public, max-age=31536000, immutable` for a content-hashed one, `Referrer-Policy:
+no-referrer` — an invite URL carries the room token, which must not travel on in a
+`Referer` header — `X-Content-Type-Options: nosniff`, and a `Content-Security-Policy`.
+`scripts/container-smoke.sh` builds the image with Docker, runs it with a page mounted,
+and joins a room in it with the harness's client engine; `scripts/ci-local.sh container`
+runs the same where a Docker daemon exists.
+
 **Not secure by default.** `ws://`/`http://` is plaintext: the invite token travels in
 the clear, so it is for a tailnet, a VPN or loopback. The protocol's transport security
 is the deployer's to supply; put a TLS terminator in front — `tailscale serve`, caddy,

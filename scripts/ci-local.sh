@@ -9,6 +9,8 @@
 #   scripts/ci-local.sh image     # the `image` workflow's smoke: nix-built image,
 #                                 # skopeo manifest/config checks, version
 #                                 # assertions — no Docker, runs anywhere nix does
+#   scripts/ci-local.sh container # the `image` workflow's container job: docker
+#                                 # build/run plus a room join (needs Docker)
 #   scripts/ci-local.sh all       # everything the `checks` job runs (nightly is opt-in: it is slow)
 #
 # Keep this in step with the workflow — it runs the same commands, so that a red job is found
@@ -67,14 +69,20 @@ job_image() {
   scripts/image-smoke.sh
 }
 
+job_container() {
+  say "container: docker build, docker run, a room joined in the container"
+  scripts/container-smoke.sh
+}
+
 case "${1:-all}" in
   checks) job_checks ;;
   nightly) job_nightly ;;
   lint) job_lint ;;
   image) job_image ;;
+  container) job_container ;;
   all) job_checks ;;
   *)
-    printf 'usage: %s [checks|nightly|lint|all|image]\n' "$0" >&2
+    printf 'usage: %s [checks|nightly|lint|all|image|container]\n' "$0" >&2
     exit 2
     ;;
 esac

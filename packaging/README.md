@@ -8,9 +8,10 @@ Two ways to run `selvaged` beyond `cargo run`, for two audiences:
 | `Dockerfile` + `compose.yaml` | Strangers self-hosting on their own machines | A multi-arch image and a one-service compose file — never the Pi |
 
 The server is memory-only under both: restarts end all rooms, and there is
-nothing to persist — hence no volumes anywhere here. `DESIGN.md` §9 names the
-missing deployment story; this directory is that story's first half (the
-second half, a live VPS, is still unordered spend).
+nothing to persist — hence no data volume anywhere here. The one mount is the
+page directory, read-only, which the server only ever reads. `DESIGN.md` §9
+names the missing deployment story; this directory is that story's first half
+(the second half, a live VPS, is still unordered spend).
 
 ## FSL-1.1-MIT redistribution review — required before any future publish
 
@@ -169,10 +170,10 @@ against it. `scripts/ci-local.sh image` runs that smoke anywhere nix does.
 ### Compose
 
 `compose.yaml` is one service, one port mapping, `restart: unless-stopped`,
-an overridable `command`, and no volumes — the server keeps nothing on disk.
-`docker compose up`, then `curl /meta`, then host a room from an editor. Until
-the first image is published the file builds locally (`build:`); after that
-it pulls the published tag.
+an overridable `command`, and one read-only page mount — the server keeps
+nothing on disk of its own. `docker compose up`, then `curl /meta`, then host a
+room from an editor. Until the first image is published the file builds locally
+(`build:`); after that it pulls the published tag.
 
 ### One origin: the page
 
@@ -200,7 +201,7 @@ origin as the socket is what makes that one terminator enough.
 
 ## CI
 
-`.github/workflows/image.yml` has two jobs. `smoke` runs on every PR and on
+`.github/workflows/image.yml` has three jobs. `smoke` runs on every PR and on
 `main`, one leg per architecture (`amd64` on the usual Blacksmith runners,
 `arm64` on GitHub-hosted ARM — each building natively, no cross-compilation): the
 same nix preamble as the checks job, then `scripts/image-smoke.sh`, which
@@ -213,6 +214,19 @@ skopeo. The `Dockerfile` above stays the portable static variant for
 machines with a working Docker; both agree on entrypoint, port, user,
 licence label and tag scheme, and the smoke asserts exactly those fields.
 
+`container` is the other half, and the only job that runs the image:
+GitHub-hosted `ubuntu-24.04` (chosen for its Docker daemon and unrestricted
+egress — the Blacksmith runners proved only github-scoped egress and could not
+execute buildx builds), a plain `docker build` of the `Dockerfile`, `docker
+run` with a page mounted, and `scripts/container-smoke.sh`: it asserts the
+container's `--version` and `/meta` against `Cargo.toml`, asserts the page's
+headers and bytes over the container's port, and then mints a room in the
+container and joins it as a guest with the harness's client engine
+(`crates/harness/examples/join_room.rs`), converging on an edit. A `--version`
+or `/meta` check is not that proof: no client had ever completed a handshake
+against the image. `scripts/ci-local.sh container` runs the same script where a
+Docker daemon exists.
+
 `publish` needs `smoke`, carries the only
 elevated permission in the repo (`packages: write`), logs in to GHCR with the
 built-in `GITHUB_TOKEN`, and is gated on release tags (`refs/tags/v*`) — tags
@@ -221,15 +235,14 @@ builds with nix, so it must itself be re-proven green on a real run before
 any first publish. FSL review stays open until the owner
 closes it; the code merges, the artifacts do not.
 
-### Not yet: the container smoke that joins a room
+### The page in a container
 
-The `--serve-page` work has no container-level proof yet. What exists: the
-local binary was run against a real `web_client/dist` copy and answered `/`,
-`/app.js`, `/meta`, `HEAD /` and two traversal shapes (`404`) on one origin,
-and `crates/harness/tests/page.rs` pins that behaviour. What is missing is a
-workflow job that builds the `Dockerfile` on a Docker-capable runner, starts
-the container with a page mounted, `GET /meta`, and joins a room with a real
-client engine. The engine is not yet reachable from the build: it needs either
-a small `selvage-harness` example driven against the container's base URL, or
-the dev shell in the job. That job is the next step, and it is the only thing
-that can prove `docker run` — this host has no Docker.
+The page is not baked into the image (above), so a container that serves one
+mounts it; `scripts/container-smoke.sh` does exactly that with a three-file
+page and asserts the header policy a browser depends on: the pinned media type,
+`no-cache` for a stable name and `public, max-age=31536000, immutable` for a
+content-hashed one, `Referrer-Policy: no-referrer`, `X-Content-Type-Options:
+nosniff`, and the content security policy. Those headers are the static
+handler's own (`crates/selvaged/src/page.rs`) and pinned in
+`crates/harness/tests/page.rs` as well, so the container job proves them where
+they are actually served rather than only in-process.
