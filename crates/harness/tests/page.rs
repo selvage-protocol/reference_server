@@ -25,6 +25,7 @@ struct PageDir {
 }
 
 impl PageDir {
+    /// A page root of this test's own, under the system's temporary directory.
     fn new() -> Result<Self, Failure> {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -35,11 +36,13 @@ impl PageDir {
         Ok(Self { path })
     }
 
+    /// Writes one file into the root.
     fn write(&self, name: &str, body: &str) -> Result<(), Failure> {
         fs::write(self.path.join(name), body)?;
         Ok(())
     }
 
+    /// Starts a harness whose page root is this directory.
     async fn start(&self) -> Harness {
         Harness::start_with(ServerConfig {
             page_root: Some(self.path.clone()),
@@ -50,6 +53,7 @@ impl PageDir {
 }
 
 impl Drop for PageDir {
+    /// Removes the page root with the test.
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }

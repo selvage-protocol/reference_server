@@ -200,6 +200,7 @@ mod tests {
         headers, resolve,
     };
 
+    /// The path a request line resolves to under `/page`.
     fn resolved(path: &str) -> String {
         resolve(Path::new("/page"), path)
             .expect("the path stays under the root")
