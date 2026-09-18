@@ -663,6 +663,171 @@ async fn display_name_is_bounded_in_utf16_code_units() {
     );
 }
 
+/// A `display_name` carrying a control character is refused `bad_params`, like a blank or
+/// over-long one (`PROTOCOL.md` §5): the name is echoed into every peer's roster, the
+/// `peers` list of every later joiner and whatever terminal an adapter prints it to, so an
+/// ANSI escape in it is a sequence this protocol never agreed to carry. A raw socket sends
+/// the bytes a client library would not, which is what makes the shape reachable here.
+#[tokio::test]
+async fn a_display_name_with_control_characters_is_refused() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let escape = "\u{1b}[31mAda\u{1b}[0m";
+    assert!(escape.chars().any(char::is_control));
+    let mut refused =
+        connect(&proto::session_url(&harness.ws_base(), None, None))
+            .await
+            .expect("connects");
+    hello(
+        &mut refused,
+        &serde_json::json!({ "display_name": escape, "role": "host" }),
+    )
+    .await
+    .expect("says hello");
+    let refusal = next_json(&mut refused).await.expect("refusal");
+    assert_eq!(refusal["event"], event::SESSION_ERROR);
+    assert_eq!(refusal["params"]["code"], code::BAD_PARAMS);
+    let message = refusal["params"]["message"]
+        .as_str()
+        .expect("a message")
+        .to_string();
+    assert!(
+        message.contains("control"),
+        "the refusal names the reason: {message}"
+    );
+    assert!(
+        !message.contains('\u{1b}'),
+        "the refusal does not echo the escape back: {message:?}"
+    );
+    assert_eq!(
+        close_code(&mut refused).await.expect("close frame"),
+        close::PROTOCOL_ERROR
+    );
+}
+
+/// A seated `session.rename` carrying one is the error response `bad_params` and the
+/// connection stays open, exactly as a blank rename is: a seated fault is not a close
+/// (`PROTOCOL.md` §5, §9.2, §11). A control character is judged after trimming, like
+/// blankness and the length, so padding cannot hide one.
+#[tokio::test]
+async fn a_rename_with_control_characters_is_refused_and_the_session_survives()
+{
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({ "display_name": "Ada" }))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut raw, "room.created").await["event"],
+        event::ROOM_CREATED
+    );
+
+    for (id, name) in [
+        (2_u64, "Ada\u{1b}[31m"),
+        (3, " Ada\u{7} "),
+        (4, "Bob\u{0}"),
+        (5, "Cyd\u{9b}"),
+    ] {
+        raw.send_json(&serde_json::json!({
+            "v": proto::WIRE_VERSION,
+            "id": id,
+            "method": method::SESSION_RENAME,
+            "params": {"display_name": name},
+        }))
+        .await
+        .expect("sends");
+        let refused = raw_response_for(&mut raw, id).await;
+        assert_eq!(
+            refused["error"]["code"],
+            code::BAD_PARAMS,
+            "a control character was accepted in {name:?}: {refused}"
+        );
+    }
+
+    // The connection is still seated, and a name without one still moves.
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 6,
+        "method": method::SESSION_RENAME,
+        "params": {"display_name": "Ada Lovelace"},
+    }))
+    .await
+    .expect("sends");
+    let answered = raw_response_for(&mut raw, 6).await;
+    assert!(answered["error"].is_null(), "the rename stands: {answered}");
+    assert_eq!(
+        raw.next_json().await.expect("the announcement")["params"]["display_name"],
+        "Ada Lovelace"
+    );
+}
+
+/// A `doc.open` or `doc.close` path carrying a control character is refused `bad_params`
+/// with the connection open, and nothing is announced: the path used to be stored in the
+/// room's set and broadcast verbatim to every peer's document set — and, through it, to a
+/// file tree and a terminal (`PROTOCOL.md` §5, §12). `..` and an absolute path stay legal:
+/// §5 leaves confinement to whoever reads a name, and this rule is about bytes a surface
+/// cannot render, not about traversal. A grant path is the same kind of value and is
+/// refused the same way.
+#[tokio::test]
+async fn a_path_with_control_characters_is_refused() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let mut raw =
+        RawSocket::open(&harness, &guest_target(&room.id, &room.token), &[])
+            .await
+            .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({ "display_name": "Bob" }))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut raw, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+
+    for (id, name, path) in [
+        (2_u64, method::DOC_OPEN, "src/\u{0}main.rs"),
+        (3, method::DOC_OPEN, "src/main.rs\n"),
+        (4, method::DOC_CLOSE, "src/\u{7}main.rs"),
+        (5, method::DOC_CLOSE, "src/\u{9b}main.rs"),
+    ] {
+        raw.send_json(&serde_json::json!({
+            "v": proto::WIRE_VERSION,
+            "id": id,
+            "method": name,
+            "params": {"path": path},
+        }))
+        .await
+        .expect("sends");
+        let refused = raw_response_for(&mut raw, id).await;
+        assert_eq!(
+            refused["error"]["code"],
+            code::BAD_PARAMS,
+            "{name} accepted {path:?}: {refused}"
+        );
+    }
+
+    // A host's grant carries paths of the same kind, and an escape in one is refused too.
+    let refused = host
+        .grant(vec!["src/main.rs\u{1b}[0m".to_string()])
+        .await
+        .expect_err("a control character is refused");
+    let Error::Protocol { code, .. } = refused else {
+        panic!("expected bad_params, got {refused}");
+    };
+    assert_eq!(code, code::BAD_PARAMS);
+
+    // Nothing was stored or announced on the guest's connection: `..` and an absolute path
+    // are still carried whole, so the next frame it sees is the grant for them.
+    let listed = paths(&["..", "/etc/passwd"]);
+    host.grant(listed.clone())
+        .await
+        .expect("the host publishes");
+    let announced = next_json_within(&mut raw, "doc.granted").await;
+    assert_eq!(announced["event"], event::DOC_GRANTED);
+    assert_eq!(announced["params"]["paths"], serde_json::json!(listed));
+}
+
 /// A seated connection renames itself mid-session (`session.rename`, `PROTOCOL.md` §5): the
 /// mover and every other peer are told with `peer.renamed`, an out-of-bound name is a
 /// non-fatal `bad_params` that leaves the session usable, and a rename to the name already

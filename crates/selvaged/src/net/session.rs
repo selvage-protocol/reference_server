@@ -158,13 +158,19 @@ pub async fn handshake(
     let mut params: proto::HelloParams = serde_json::from_value(msg.params)
         .map_err(|e| envelope_refusal("bad session.hello params", &e))?;
     // Stored trimmed: a padded name would otherwise sit in `peers` and every
-    // surface that quotes it, while blank and over-long are judged on the same
-    // trimmed value that is kept.
+    // surface that quotes it, while blank, control-bearing and over-long are judged
+    // on the same trimmed value that is kept.
     params.display_name = params.display_name.trim().to_string();
     if params.display_name.is_empty() {
         return Err((
             code::BAD_PARAMS,
             "session.hello requires a display_name".to_string(),
+        ));
+    }
+    if proto::has_control_characters(&params.display_name) {
+        return Err((
+            code::BAD_PARAMS,
+            "display_name contains control characters".to_string(),
         ));
     }
     if proto::display_name_over_limit(&params.display_name) {
@@ -234,13 +240,19 @@ fn doc_set(documents: &[String]) -> Value {
 
 /// The `path` of a `doc.open` or `doc.close` request. The two params are the same shape
 /// (§5) — a path and nothing else — so one type reads either and the rule that a path is
-/// non-blank lives here for both. Params that do not parse and a path that is empty or
-/// all whitespace are both `bad_params`.
+/// non-blank and carries no control character lives here for both. Params that do not
+/// parse and a path that is empty, all whitespace or control-bearing are all `bad_params`.
 fn document_path(raw: Value) -> Result<String, Refusal> {
     let params = serde_json::from_value::<proto::DocOpenParams>(raw)
         .map_err(|e| (code::BAD_PARAMS, e.to_string()))?;
     if params.path.trim().is_empty() {
         return Err((code::BAD_PARAMS, "path is required".to_string()));
+    }
+    if proto::has_control_characters(&params.path) {
+        return Err((
+            code::BAD_PARAMS,
+            "path contains control characters".to_string(),
+        ));
     }
     if params.path.len() > MAX_DOC_PATH_BYTES {
         return Err((
@@ -252,8 +264,9 @@ fn document_path(raw: Value) -> Result<String, Refusal> {
 }
 
 /// The `display_name` of a `session.rename` request, which carries the handshake's bound
-/// (`PROTOCOL.md` §5). Params that do not parse and a name that is blank or over-long are
-/// all `bad_params`; unlike the handshake the refusal is a response, not a close.
+/// (`PROTOCOL.md` §5). Params that do not parse and a name that is blank, control-bearing
+/// or over-long are all `bad_params`; unlike the handshake the refusal is a response, not a
+/// close.
 fn rename_name(raw: Value) -> Result<String, Refusal> {
     let params = serde_json::from_value::<proto::RenameParams>(raw)
         .map_err(|e| (code::BAD_PARAMS, e.to_string()))?;
@@ -262,6 +275,12 @@ fn rename_name(raw: Value) -> Result<String, Refusal> {
     let display_name = params.display_name.trim().to_string();
     if display_name.is_empty() {
         return Err((code::BAD_PARAMS, "display_name is required".to_string()));
+    }
+    if proto::has_control_characters(&display_name) {
+        return Err((
+            code::BAD_PARAMS,
+            "display_name contains control characters".to_string(),
+        ));
     }
     if proto::display_name_over_limit(&display_name) {
         return Err((
@@ -294,6 +313,12 @@ fn grant_paths(raw: Value) -> Result<Vec<String>, Refusal> {
             return Err((
                 code::BAD_PARAMS,
                 "a grant path is required".to_string(),
+            ));
+        }
+        if proto::has_control_characters(path) {
+            return Err((
+                code::BAD_PARAMS,
+                "a grant path contains control characters".to_string(),
             ));
         }
         if path.len() > MAX_GRANT_PATH_BYTES {

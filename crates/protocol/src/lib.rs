@@ -51,6 +51,17 @@ pub fn display_name_over_limit(name: &str) -> bool {
     name.encode_utf16().count() > DISPLAY_NAME_MAX_UTF16
 }
 
+/// Whether `text` carries a control character: C0, DEL or C1, the Unicode `Cc` category.
+///
+/// A `display_name` is echoed into every peer's roster and a `path` into every peer's
+/// document set, its file tree and any terminal a peer prints it to, so a control
+/// character in one — an ANSI escape, a carriage return, a NUL — reaches a surface that
+/// never asked for it. §5 refuses both kinds of value `bad_params` for exactly that.
+#[must_use]
+pub fn has_control_characters(text: &str) -> bool {
+    text.chars().any(char::is_control)
+}
+
 /// Client -> server method names.
 pub mod method {
     pub const SESSION_HELLO: &str = "session.hello";
@@ -726,6 +737,26 @@ mod tests {
 
         // Bytes answer the other way: the at-limit name is already 34 of them.
         assert_eq!(at_limit.len(), 34);
+    }
+
+    /// The control characters §5 refuses are the Unicode `Cc` category: C0 (`\u{0}`,
+    /// `\u{1b}`), DEL, and C1 (`\u{9b}`) — not the printable characters that sit beside
+    /// them, and not the non-breaking space a name may be padded with.
+    #[test]
+    fn control_characters_are_the_cc_category() {
+        for text in [
+            "a\u{0}b",
+            "\u{1b}[31m",
+            "a\u{7f}b",
+            "a\u{9b}b",
+            "a\tb",
+            "a\nb",
+        ] {
+            assert!(has_control_characters(text), "{text:?} is refused");
+        }
+        for text in ["Ada", " Ada ", "𝄞", "a\u{a0}b", "ｆ"] {
+            assert!(!has_control_characters(text), "{text:?} is carried");
+        }
     }
 
     #[test]
