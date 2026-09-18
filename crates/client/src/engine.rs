@@ -670,9 +670,18 @@ impl EngineTask {
     /// §9.1). Returns whether the session was reseated, given up on, or shut down while
     /// waiting.
     async fn reconnect(&mut self) -> Reconnect {
-        if self.terminal || !self.policy.enabled {
+        // Nothing to retry, or nothing left to retry with: the drop is the end, and saying
+        // `reconnecting` first would announce a retry that is not going to run.
+        if self.terminal
+            || !self.policy.enabled
+            || self.attempts >= self.policy.max_attempts
+        {
             return Reconnect::GivenUp;
         }
+        // Said out loud, so an adapter can show the retry without inferring it from
+        // silence (`PROTOCOL.md` §9.1): the re-seat or the give-up follows as its own
+        // event.
+        let _ = self.events.send(EngineEvent::Reconnecting);
         self.retry_until_seated().await
     }
 

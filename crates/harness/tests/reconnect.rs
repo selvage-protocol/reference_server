@@ -379,6 +379,46 @@ async fn a_reseated_guest_drops_a_grant_the_room_no_longer_has()
     Ok(())
 }
 
+/// A drop the client is going to retry is said out loud (`PROTOCOL.md` §9.1): an adapter
+/// shows `reconnecting` rather than inferring the retry from silence, and the re-seat
+/// follows as its own event. The subscription is taken before the cut, and the loop reads past
+/// the awareness renewals that arrive in between.
+#[tokio::test]
+async fn a_retrying_drop_is_announced_as_reconnecting() -> Result<(), Failure> {
+    let harness = Harness::start(Duration::from_secs(30)).await;
+    let proxy = DropProxy::start(&harness.upstream()).await?;
+    let (host, room) = harness.host("Ada").await?;
+    let guest = harness.join_at(&proxy.ws_base(), &room, "Bob").await?;
+    host.open(PATH).await?;
+    guest.open(PATH).await?;
+    let old_peer_id = guest.session().peer.peer_id.clone();
+
+    let mut events = guest.subscribe();
+    proxy.drop_all();
+    let mut announced = timeout(WAIT, events.recv())
+        .await?
+        .map_err(|_| "the engine stream closed")?;
+    while !matches!(announced, EngineEvent::Reconnecting) {
+        announced = timeout(WAIT, events.recv())
+            .await
+            .map_err(|_| "no `reconnecting` arrived before the deadline")?
+            .map_err(|_| "the engine stream closed")?;
+    }
+
+    // The retry then runs: its outcome is the event that follows a `reconnecting`, and the
+    // guest is seated as a fresh peer rather than dropped.
+    wait_for_described(
+        "the guest to be reseated",
+        || async { format!("{:?}", guest.session()) },
+        || async {
+            let session = guest.session();
+            (session.peer.peer_id != old_peer_id).then_some(session)
+        },
+    )
+    .await;
+    Ok(())
+}
+
 /// Bob's cursor where this test put it, under the awareness client id `wanted` — or under any
 /// of them, when the caller has no id in mind yet.
 fn bobs_cursor(presence: &Presence, wanted: Option<u64>) -> bool {
