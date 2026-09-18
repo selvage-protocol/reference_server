@@ -10,6 +10,7 @@ use selvage_client::{ConnectOptions, ReconnectPolicy, SyncEngine};
 use selvage_harness::{
     DropProxy, EngineEvent, Error, Harness, Presence, Role, SelectionOffsets,
     ServerConfig, WAIT, wait_for, wait_for_described, wait_for_event,
+    wait_for_peer,
 };
 use selvage_protocol::code;
 use tokio::sync::broadcast;
@@ -454,6 +455,10 @@ async fn a_reconnect_into_a_full_room_makes_one_attempt() -> Result<(), Failure>
             });
     let guest = SyncEngine::connect(options).await?;
     assert_eq!(guest_proxy.accepted(), 1, "the first connection is relayed");
+    // Wait for the seat to be taken before taking it away: a roster that has not yet heard
+    // `peer.joined` is empty for the same reason one that has heard `peer.left` is, and the
+    // wait below would return before the drop had happened at all.
+    wait_for_peer(&host, "Bob").await;
 
     guest_proxy.drop_all();
     // The seat the drop frees is taken before the client retries: the room seats two.
