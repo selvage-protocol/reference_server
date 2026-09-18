@@ -340,7 +340,8 @@ fn spawn(
         open_documents: Vec::new(),
         peers: HashMap::new(),
         request_id: 1,
-        pending: HashMap::new(),
+        inflight: None,
+        waiting: VecDeque::new(),
         local_state: Some(local_state),
         queued: VecDeque::new(),
         paused: false,
@@ -531,8 +532,13 @@ struct EngineTask {
     open_documents: Vec<String>,
     peers: HashMap<String, PeerInfo>,
     request_id: u64,
-    /// Requests the server has not answered yet, by request id.
-    pending: HashMap<u64, Pending>,
+    /// The request the server has not answered yet, with its id. At most one is in flight
+    /// on a connection (`PROTOCOL.md` §5): a seated `session.error` carries no `id`, so a
+    /// client that pipelined could not tell which request it sank.
+    inflight: Option<(u64, Pending)>,
+    /// Requests made while another was in flight, in the order they were made. Each goes
+    /// out when the one before it is answered; none of them is on the wire before then.
+    waiting: VecDeque<Pending>,
     /// The JSON published for the local client, replayed on every renewal.
     local_state: Option<String>,
     /// Frames produced while outbound is paused, flushed on resume. Text frames carry
@@ -1096,15 +1102,26 @@ impl EngineTask {
     // --- wire ----------------------------------------------------------------
 
     /// Sends a request and keeps its caller waiting: the response with this id answers
-    /// it, and the session ending answers it with `Error::Closed`.
+    /// it, and the session ending answers it with `Error::Closed`. A request made while
+    /// another is outstanding waits for its turn rather than going on the wire behind it
+    /// (`PROTOCOL.md` §5).
     fn request(&mut self, pending: Pending) {
+        if self.inflight.is_some() {
+            self.waiting.push_back(pending);
+            return;
+        }
+        self.send_request(pending);
+    }
+
+    /// Puts one request on the wire as the only one in flight.
+    fn send_request(&mut self, pending: Pending) {
         self.request_id = self.request_id.wrapping_add(1);
         let id = self.request_id;
         let msg =
             proto::ClientMessage::new(id, pending.method(), pending.params());
         match msg.to_text() {
             Ok(text) => {
-                self.pending.insert(id, pending);
+                self.inflight = Some((id, pending));
                 self.enqueue(Message::text(text));
             }
             Err(e) => {
@@ -1114,13 +1131,27 @@ impl EngineTask {
         }
     }
 
-    /// Answers the caller of a request the server has now answered.
+    /// Sends the request next in line, if there is one: the slot the answered request just
+    /// left is the next request's, and only one is ever on the wire.
+    fn send_next(&mut self) {
+        if let Some(next) = self.waiting.pop_front() {
+            self.send_request(next);
+        }
+    }
+
+    /// Answers the caller of a request the server has now answered. An id that is not the
+    /// one in flight answers nothing: this client never puts two on the wire, so it can
+    /// only be a server frame about a request this connection does not have.
     fn resolve(&mut self, id: u64, msg: &proto::ServerMessage) {
-        let Some(pending) = self.pending.remove(&id) else {
+        let Some((inflight, answered)) = self.inflight.take() else {
             return;
         };
+        if inflight != id {
+            self.inflight = Some((inflight, answered));
+            return;
+        }
         let outcome = msg.error.as_ref().map_or_else(
-            || self.accept(&pending, msg.result.as_ref()),
+            || self.accept(&answered, msg.result.as_ref()),
             |error| {
                 Err(Error::Protocol {
                     code: error.code.clone(),
@@ -1128,7 +1159,8 @@ impl EngineTask {
                 })
             },
         );
-        pending.answer(outcome);
+        answered.answer(outcome);
+        self.send_next();
     }
 
     /// Moves local state to what the server accepted. The room's open-document set comes
@@ -1171,8 +1203,13 @@ impl EngineTask {
     }
 
     /// Fails every request still waiting: the session ended before the server answered.
+    /// The requests queued behind the in-flight one were never sent and are failed too —
+    /// their callers are waiting, and no answer can arrive on a socket that is gone.
     fn fail_pending(&mut self) {
-        for (_, pending) in self.pending.drain() {
+        if let Some((_, pending)) = self.inflight.take() {
+            pending.answer(Err(Error::Closed));
+        }
+        for pending in self.waiting.drain(..) {
             pending.answer(Err(Error::Closed));
         }
     }
@@ -1278,7 +1315,10 @@ impl EngineTask {
 
     /// A fault the server could not attach to a request id. There is nobody to return it
     /// to, so it goes to the adapter. A terminal code also ends the retries: the same
-    /// refusal would greet the next connection.
+    /// refusal would greet the next connection. The request in flight is failed on the way
+    /// (`PROTOCOL.md` §5): an id-less fault cannot be attributed, and a caller left holding
+    /// a request that never completes cannot tell that from a slow server. The one behind
+    /// it goes out, so a queue never stalls on a fault that did not end the session.
     fn session_error(&mut self, params: Option<&serde_json::Value>) {
         let code = params
             .and_then(|p| p.get("code"))
@@ -1292,6 +1332,13 @@ impl EngineTask {
             .to_string();
         if is_terminal_code(&code) {
             self.terminal = true;
+        }
+        if let Some((_, outstanding)) = self.inflight.take() {
+            outstanding.answer(Err(Error::Protocol {
+                code: code.clone(),
+                message: message.clone(),
+            }));
+            self.send_next();
         }
         let _ = self
             .events
@@ -1549,8 +1596,9 @@ mod tests {
 
     use futures_util::StreamExt;
     use tokio::net::TcpListener;
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::{broadcast, mpsc, oneshot};
     use tokio::time::timeout;
+    use tokio_tungstenite::tungstenite::Message;
     use yrs::sync::Awareness;
     use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact};
 
@@ -1559,11 +1607,44 @@ mod tests {
     };
     use crate::editor::EngineEvent;
     use crate::session::ReconnectPolicy;
-    use crate::{ConnectOptions, KeepaliveConfig, SessionInfo};
+    use crate::{ConnectOptions, Error, KeepaliveConfig, SessionInfo};
     use selvage_protocol as proto;
     use selvage_protocol::code;
 
     const PATH: &str = "src/main.rs";
+    const OTHER: &str = "src/other.rs";
+
+    /// The ids of the request envelopes the engine has put on the wire since the last call:
+    /// the queue is drained the way the run loop's flush drains it. One id at most is the
+    /// one-slot rule of §5.
+    fn sent_requests(task: &mut EngineTask) -> Vec<u64> {
+        task.queued
+            .drain(..)
+            .filter_map(|frame| match frame {
+                Message::Text(text) => {
+                    serde_json::from_str::<proto::ClientMessage>(&text)
+                        .ok()
+                        .and_then(|msg| msg.id)
+                }
+                Message::Binary(_)
+                | Message::Ping(_)
+                | Message::Pong(_)
+                | Message::Close(_)
+                | Message::Frame(_) => None,
+            })
+            .collect()
+    }
+
+    /// What a caller heard, as the session error it was: `None` when the request was
+    /// accepted or failed some other way.
+    fn refusal(outcome: &Result<(), Error>) -> Option<(String, String)> {
+        match outcome {
+            Err(Error::Protocol { code, message }) => {
+                Some((code.clone(), message.clone()))
+            }
+            _ => None,
+        }
+    }
 
     /// The state vector of a replica, in the shape the engine reports it.
     fn vector(doc: &Doc) -> Vec<(u64, u32)> {
@@ -1651,6 +1732,89 @@ mod tests {
         }
     }
 
+    /// A refused request is the one in flight and nothing else: the answer is the caller's,
+    /// the request behind it goes out, and the connection stays usable.
+    #[tokio::test]
+    async fn a_response_answers_its_request_and_promotes_the_next()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, _events) = receiving_task().await?;
+        let (first, first_reply) = oneshot::channel();
+        let (second, mut second_reply) = oneshot::channel();
+        task.open(PATH, first);
+        task.open(OTHER, second);
+        assert_eq!(
+            sent_requests(&mut task),
+            vec![1],
+            "only one request goes out"
+        );
+
+        // The server refuses the first: the caller hears it, and the second goes out.
+        task.handle_text(
+            r#"{"v":"selvage/1","id":1,"error":{"code":"bad_params","message":"no"}}"#,
+        );
+        let outcome = first_reply.await?;
+        assert_eq!(
+            refusal(&outcome).map(|(code, _)| code),
+            Some(code::BAD_PARAMS.to_string()),
+            "the refusal reaches the caller"
+        );
+        assert_eq!(
+            sent_requests(&mut task),
+            vec![2],
+            "the request behind it goes out, and still only one"
+        );
+        assert!(
+            second_reply.try_recv().is_err(),
+            "the second request has not been answered"
+        );
+
+        // And its own answer reaches it.
+        task.handle_text(
+            r#"{"v":"selvage/1","id":2,"result":{"documents":["src/main.rs","src/other.rs"]}}"#,
+        );
+        second_reply.await??;
+        assert_eq!(
+            task.open_documents,
+            vec![OTHER.to_string()],
+            "the refused open left nothing behind; the answered one is held"
+        );
+        assert!(sent_requests(&mut task).is_empty());
+        Ok(())
+    }
+
+    /// `PROTOCOL.md` §5: a seated `session.error` carries no `id`, so it cannot be
+    /// attributed to a request. The one in flight is failed rather than left hanging, and
+    /// the queue moves on — the fault did not end the session.
+    #[tokio::test]
+    async fn an_idless_session_error_fails_the_outstanding_request()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, mut events) = receiving_task().await?;
+        let (first, first_reply) = oneshot::channel();
+        let (second, mut second_reply) = oneshot::channel();
+        task.open(PATH, first);
+        task.open(OTHER, second);
+        assert_eq!(sent_requests(&mut task), vec![1]);
+        task.handle_text(
+            r#"{"v":"selvage/1","event":"session.error","params":{"code":"bad_message","message":"that frame was not an envelope"}}"#,
+        );
+        let outcome = first_reply.await?;
+        let (code, message) =
+            refusal(&outcome).expect("the in-flight request to fail");
+        assert_eq!(code, code::BAD_MESSAGE);
+        assert!(
+            message.contains("envelope"),
+            "the fault is the server's: {message}"
+        );
+        assert_eq!(next_session_error(&mut events).await?, code::BAD_MESSAGE);
+        assert_eq!(
+            sent_requests(&mut task),
+            vec![2],
+            "the request behind it goes out rather than stalling"
+        );
+        assert!(second_reply.try_recv().is_err());
+        Ok(())
+    }
+
     /// A loopback WebSocket pair: the engine end supplies a real sink and stream, and
     /// nothing connects anywhere.
     async fn loopback_pair() -> Result<(Sink, Stream), Box<dyn StdError>> {
@@ -1710,7 +1874,8 @@ mod tests {
             open_documents: Vec::new(),
             peers: HashMap::new(),
             request_id: 0,
-            pending: HashMap::new(),
+            inflight: None,
+            waiting: VecDeque::new(),
             local_state: None,
             queued: VecDeque::new(),
             paused: false,
