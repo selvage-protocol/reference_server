@@ -45,6 +45,19 @@ use crate::{ConnectOptions, Error, KeepaliveConfig, SessionInfo};
 /// reconnect alike.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The largest inbound binary frame this client will apply, in bytes: the transport's own
+/// bound (`PROTOCOL.md` §2.1, informative 16 MiB), and the same number the TypeScript
+/// engine's `MAX_INBOUND_BINARY_BYTES` carries — the two are one behaviour and move
+/// together.
+///
+/// A frame over it never arrives from a conforming transport — the reference server's own
+/// bound is 8 MiB and a frame past it ends the connection — so refusing one here changes no
+/// session that obeys the wire, and bounds what an unbounded y-protocols update can allocate
+/// or do. Refusal is drop-and-continue, never fail: an over-bound frame is ignored and the
+/// session goes on with the grant, documents and replica it holds, stale rather than ended,
+/// because ending it would hand any sender a kill switch.
+pub const MAX_INBOUND_BINARY_BYTES: usize = 16 * 1024 * 1024;
+
 type Socket = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = SplitSink<Socket, Message>;
 type Stream = SplitStream<Socket>;
@@ -1254,6 +1267,12 @@ impl EngineTask {
     /// Handles one y-protocols frame. Decoding, applying and the replies are all done
     /// by `yrs`'s reference protocol implementation.
     fn handle_binary(&mut self, frame: &[u8]) {
+        if frame.len() > MAX_INBOUND_BINARY_BYTES {
+            // A payload this large never arrives from a conforming transport; applying it
+            // would grow this replica without bound on a peer's word. Dropped, and the
+            // session continues stale rather than ending.
+            return;
+        }
         let kinds = kinds_in(frame);
         let Ok(replies) = DefaultProtocol.handle(&mut self.awareness, frame)
         else {
@@ -1615,7 +1634,8 @@ mod tests {
     use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact};
 
     use super::{
-        EngineTask, Sink, Stream, fresh_doc, is_terminal_code, seed_update,
+        EngineTask, MAX_INBOUND_BINARY_BYTES, Sink, Stream, fresh_doc,
+        is_terminal_code, seed_update,
     };
     use crate::editor::EngineEvent;
     use crate::session::ReconnectPolicy;
@@ -1824,6 +1844,33 @@ mod tests {
             "the request behind it goes out rather than stalling"
         );
         assert!(second_reply.try_recv().is_err());
+        Ok(())
+    }
+
+    /// An over-bound binary frame is dropped, not applied and not reported
+    /// (`PROTOCOL.md` §2.1): a payload that large never arrives from a conforming
+    /// transport, and applying it would grow the replica without bound on a peer's word.
+    /// The session goes on stale rather than ending — ending it would hand any sender a
+    /// kill switch — so the next frame still dispatches.
+    #[tokio::test]
+    async fn an_over_bound_binary_frame_is_dropped()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, mut events) = receiving_task().await?;
+        let over = vec![0xA5u8; MAX_INBOUND_BINARY_BYTES.saturating_add(1)];
+        task.handle_binary(&over);
+        assert!(
+            events.try_recv().is_err(),
+            "an over-bound frame is dropped in silence"
+        );
+        assert!(
+            task.open_documents.is_empty(),
+            "and nothing was held for it"
+        );
+
+        // Still dispatching: a frame under the bound is read as it always was, and an
+        // undecodable one is still reported.
+        task.handle_binary(UNDECODABLE);
+        assert_eq!(next_session_error(&mut events).await?, code::BAD_MESSAGE);
         Ok(())
     }
 
