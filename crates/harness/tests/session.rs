@@ -1836,6 +1836,120 @@ async fn doc_open_and_doc_close_validate_the_path_the_same_way() {
     );
 }
 
+/// A frame that repeats a member name anywhere in it is `bad_message` (`PROTOCOL.md` §4).
+/// The envelope's own members were always refused by the struct parse, but a member of
+/// `params`, or of anything nested below it, is last-wins to a JSON reader: one frame
+/// meant two things and two implementations could take different ones. A seated fault is
+/// a `session.error` with the connection open, and the connection still serves afterwards.
+#[tokio::test]
+async fn a_frame_with_a_repeated_member_is_refused() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({"display_name": "Ada", "role": "host"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut raw, "room.created").await["event"],
+        event::ROOM_CREATED
+    );
+
+    for body in [
+        // A member of `params` twice.
+        r#"{"v":"selvage/1","id":2,"method":"doc.open","params":{"path":"a.rs","path":"b.rs"}}"#,
+        // A member of an object nested below `params`.
+        r#"{"v":"selvage/1","id":3,"method":"doc.open","params":{"path":"a.rs","extra":{"x":1,"x":2}}}"#,
+        // The envelope's own member twice, which `serde` refuses as well.
+        r#"{"v":"selvage/1","id":4,"method":"doc.open","params":{"path":"a.rs"},"v":"selvage/1"}"#,
+    ] {
+        raw.send(0x1, body.as_bytes()).await.expect("sends");
+        let refused = next_json_within(&mut raw, "the refusal").await;
+        assert_eq!(
+            refused["event"],
+            event::SESSION_ERROR,
+            "one frame with two readings is refused: {refused}"
+        );
+        assert_eq!(refused["params"]["code"], code::BAD_MESSAGE);
+        let message = refused["params"]["message"].as_str().expect("a message");
+        assert!(
+            message.contains("duplicate"),
+            "the refusal names the repetition: {message}"
+        );
+    }
+
+    // The connection is still seated and still answers: a refused frame changed nothing.
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 5,
+        "method": method::DOC_OPEN,
+        "params": {"path": PATH},
+    }))
+    .await
+    .expect("sends");
+    assert_eq!(
+        raw_response_for(&mut raw, 5).await["result"]["documents"],
+        serde_json::json!([PATH])
+    );
+}
+
+/// A join query that names `room` or `token` twice is refused (`PROTOCOL.md` §5.1): a
+/// connection whose room depended on which of two values was read last is not one a server
+/// may seat, and the client cannot tell which room it asked for. It is a pre-seat fault, so
+/// it is a `session.error` and close 4000 like every other one (`PROTOCOL.md` §11).
+#[tokio::test]
+async fn a_join_query_naming_a_parameter_twice_is_refused() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    assert_eq!(host.session().room_id, room.id);
+
+    for target in [
+        format!(
+            "{}?room={}&room={}&token={}",
+            proto::ENDPOINT_PATH,
+            room.id,
+            proto::percent_encode("r-other"),
+            proto::percent_encode(&room.token)
+        ),
+        format!(
+            "{}?room={}&token={}&token={}",
+            proto::ENDPOINT_PATH,
+            proto::percent_encode(&room.id),
+            proto::percent_encode(&room.token),
+            proto::percent_encode(&room.token)
+        ),
+    ] {
+        let mut raw = RawSocket::open(&harness, &target, &[])
+            .await
+            .expect("the upgrade succeeds");
+        let refused = next_json_within(&mut raw, "the refusal").await;
+        assert_eq!(refused["event"], event::SESSION_ERROR);
+        assert_eq!(
+            refused["params"]["code"],
+            code::BAD_MESSAGE,
+            "a query read twice is a bad message, not a bad room: {refused}"
+        );
+        assert_eq!(
+            raw.read_to_close().await.expect("a close").close_code(),
+            Some(close::PROTOCOL_ERROR)
+        );
+    }
+
+    // A query naming each once is still the invite it looks like.
+    let mut guest =
+        RawSocket::open(&harness, &guest_target(&room.id, &room.token), &[])
+            .await
+            .expect("the upgrade succeeds");
+    guest
+        .hello(&serde_json::json!({"display_name": "Bob"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut guest, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+}
+
 /// A `doc.open` path is bounded like a grant path: 4096 bytes, the grant's own bound
 /// (`PROTOCOL.md` §5). A megabyte path was accepted, stored in the room's set and
 /// broadcast whole to every peer; both methods now refuse it `bad_params` with the

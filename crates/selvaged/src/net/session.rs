@@ -132,8 +132,8 @@ pub async fn handshake(
             ));
         }
     };
-    let msg: proto::ClientMessage =
-        serde_json::from_str(&text).map_err(|e| {
+    let msg: proto::ClientMessage = proto::ClientMessage::from_text(&text)
+        .map_err(|e| {
             envelope_refusal("first message is not a session envelope", &e)
         })?;
     if msg.id.is_none() {
@@ -748,9 +748,12 @@ impl Session {
     }
 
     /// Runs one JSON envelope, queueing its reply. Marks the session when the queue
-    /// will not take the reply; the caller ends it on the same frame.
+    /// will not take the reply; the caller ends it on the same frame. An envelope that
+    /// repeats a member name anywhere is `bad_message` like one that does not parse:
+    /// a `params` object with two of one member is last-wins to a JSON reader, and one
+    /// frame must not mean two things (`PROTOCOL.md` §4).
     async fn dispatch_text(&self, text: &str, shared: &Shared) {
-        let msg = match serde_json::from_str::<proto::ClientMessage>(text) {
+        let msg = match proto::ClientMessage::from_text(text) {
             Ok(msg) => msg,
             Err(e) => return self.alert(code::BAD_MESSAGE, e.to_string()),
         };

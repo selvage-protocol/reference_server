@@ -264,7 +264,10 @@ fn session_event(
     text: &str,
     base_url: &str,
 ) -> Result<Option<SessionInfo>, Error> {
-    let msg: proto::ServerMessage = serde_json::from_str(text)?;
+    // A frame that repeats a member name anywhere is refused here as it is by the server:
+    // one frame that reads two ways is one the receiver must not pick a meaning for
+    // (`PROTOCOL.md` §4).
+    let msg: proto::ServerMessage = proto::ServerMessage::from_text(text)?;
     match msg.event.as_deref() {
         Some(event::ROOM_CREATED | event::ROOM_JOINED) => {
             let body = msg.params.unwrap_or_else(|| serde_json::json!({}));
@@ -1278,7 +1281,7 @@ impl EngineTask {
     }
 
     fn handle_text(&mut self, text: &str) {
-        let Ok(msg) = serde_json::from_str::<proto::ServerMessage>(text) else {
+        let Ok(msg) = proto::ServerMessage::from_text(text) else {
             // A server frame that does not parse is corruption or version skew, not an
             // event to ignore: it arrives on the same channel a server fault does.
             let _ = self.events.send(EngineEvent::SessionError {

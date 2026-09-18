@@ -27,7 +27,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 
 use selvage_protocol as proto;
-use selvage_protocol::event;
+use selvage_protocol::{code, event};
 
 use crate::room::{Outbound, Queue, Registry};
 use crate::{ServerConfig, random_hex};
@@ -224,8 +224,7 @@ impl Shared {
         // in the same read as the head wait here until the frame parser asks for them.
         ws.get_mut().push_back(take(&mut head.tail));
         ws.get_mut().drop_head();
-        self.serve_session(ws, proto::parse_join_query(&head.query))
-            .await;
+        self.serve_session(ws, &head.query).await;
         Ok(())
     }
 
@@ -273,9 +272,19 @@ impl Shared {
         Ok(())
     }
 
-    /// Runs one connection: handshake, seat, then relay frames until it ends.
-    async fn serve_session(&self, ws: SessionSocket, join: proto::JoinQuery) {
+    /// Runs one connection: handshake, seat, then relay frames until it ends. The join
+    /// query is read here rather than while routing, so that one naming `room` or `token`
+    /// twice is refused on the wire like any other fault: `bad_message`, then a close
+    /// (`PROTOCOL.md` §5.1, §11).
+    async fn serve_session(&self, ws: SessionSocket, query: &str) {
         let mut wire = Wire::new(ws);
+        let join = match proto::parse_join_query(query) {
+            Ok(join) => join,
+            Err(error) => {
+                return refuse(wire, code::BAD_MESSAGE, error.to_string())
+                    .await;
+            }
+        };
         let claims_host = join.room.is_none();
         let greeted =
             handshake(&mut wire.stream, claims_host, self.config.hello_timeout)

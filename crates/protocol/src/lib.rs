@@ -16,10 +16,15 @@
 //! payloads are *not* described here — they are y-protocols binary frames
 //! (`yrs::sync::protocol::Message`) and are opaque to the server.
 
+use std::collections::HashSet;
+use std::fmt;
 use std::fmt::Write as _;
 use std::str;
 
-use serde::{Deserialize, Serialize};
+use std::error::Error as StdError;
+
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// Wire version carried in every session envelope.
@@ -216,6 +221,20 @@ impl ClientMessage {
     pub fn to_text(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
+
+    /// Parses a client frame, refusing one that repeats a member name anywhere inside it
+    /// (§4) — the `to_text` half of the same rule, in the other direction. `serde` refuses
+    /// a repeated member of the envelope itself, but a repeated member of `params`, or of
+    /// anything nested in one, is last-wins to a `serde_json::Value` and is caught here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse error of the frame, or the error naming the first repeated
+    /// member, which is `bad_message` to a server.
+    pub fn from_text(text: &str) -> Result<Self, serde_json::Error> {
+        no_duplicate_members(text)?;
+        serde_json::from_str(text)
+    }
 }
 
 /// A server -> client message. A response carries `id` and exactly one of
@@ -286,6 +305,18 @@ impl ServerMessage {
     /// send means.
     pub fn to_text(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
+    }
+
+    /// Parses a server frame, refusing one that repeats a member name anywhere inside it
+    /// (§4), exactly as [`ClientMessage::from_text`] does in the other direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse error of the frame, or the error naming the first repeated
+    /// member.
+    pub fn from_text(text: &str) -> Result<Self, serde_json::Error> {
+        no_duplicate_members(text)?;
+        serde_json::from_str(text)
     }
 }
 
@@ -426,6 +457,131 @@ impl Meta {
     }
 }
 
+/// Whether `text` repeats a member name inside any object it holds.
+///
+/// `serde` refuses a repeated member of a *struct* — two `v` members never make it past
+/// [`ClientMessage`] — but a member of a `params` object, or of anything nested in one,
+/// is last-wins: the object is a `serde_json::Value`, and JSON's own reading of a
+/// repeated name is that the last one is the value. One frame must not mean two things,
+/// so §4 refuses a repetition anywhere in a frame, and this is the reading that finds it.
+///
+/// # Errors
+///
+/// Returns the parse error of the frame, or the error naming the first repeated member.
+fn no_duplicate_members(text: &str) -> Result<(), serde_json::Error> {
+    let mut de = serde_json::Deserializer::from_str(text);
+    UniqueMembers::deserialize(&mut de)?;
+    de.end()
+}
+
+/// A JSON document read only to find a repeated member name, anywhere inside it.
+struct UniqueMembers;
+
+impl<'de> Deserialize<'de> for UniqueMembers {
+    fn deserialize<D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(UniqueVisitor)
+    }
+}
+
+/// Remembers `member`, reporting a name this object has already carried.
+fn note_member<E: de::Error>(
+    seen: &mut HashSet<String>,
+    member: &str,
+) -> Result<(), E> {
+    if seen.insert(member.to_string()) {
+        return Ok(());
+    }
+    Err(E::custom(format!("duplicate member: {member}")))
+}
+
+struct UniqueVisitor;
+
+impl<'de> Visitor<'de> for UniqueVisitor {
+    type Value = UniqueMembers;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> Result<Self::Value, A::Error> {
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(member) = map.next_key::<String>()? {
+            note_member(&mut seen, &member)?;
+            map.next_value::<UniqueMembers>()?;
+        }
+        Ok(UniqueMembers)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> Result<Self::Value, A::Error> {
+        while seq.next_element::<UniqueMembers>()?.is_some() {}
+        Ok(UniqueMembers)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(UniqueMembers)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(UniqueMembers)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(UniqueMembers)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(UniqueMembers)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(UniqueMembers)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueMembers)
+    }
+}
+
+/// A join query that names `room` or `token` more than once (`PROTOCOL.md` §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinQueryError {
+    /// The parameter, named twice.
+    Duplicate(&'static str),
+}
+
+impl fmt::Display for JoinQueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Duplicate(name) => {
+                write!(f, "the join query names {name} twice")
+            }
+        }
+    }
+}
+
+impl StdError for JoinQueryError {}
+
+/// The value a join query carries for `name`, or the refusal of a second one: a query that
+/// names a parameter twice names two rooms, and a connection has to be one of them.
+fn join_value(
+    name: &'static str,
+    already: bool,
+    value: &str,
+) -> Result<String, JoinQueryError> {
+    if already {
+        return Err(JoinQueryError::Duplicate(name));
+    }
+    Ok(percent_decode(value))
+}
+
 /// The room/token part of a join URL. `room` absent means "mint a new room".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JoinQuery {
@@ -433,9 +589,14 @@ pub struct JoinQuery {
     pub token: Option<String>,
 }
 
-/// Parses a URL query string into a room/token pair. Unknown parameters are ignored.
-#[must_use]
-pub fn parse_join_query(query: &str) -> JoinQuery {
+/// Parses a URL query string into a room/token pair. Unknown parameters are ignored, and
+/// one named more than once is refused rather than silently overwritten: which of two
+/// `room` values a connection joins must not depend on their order.
+///
+/// # Errors
+///
+/// Returns [`JoinQueryError::Duplicate`] when `room` or `token` appears twice.
+pub fn parse_join_query(query: &str) -> Result<JoinQuery, JoinQueryError> {
     let mut out = JoinQuery::default();
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -446,12 +607,16 @@ pub fn parse_join_query(query: &str) -> JoinQuery {
             None => (pair, ""),
         };
         match k {
-            "room" => out.room = Some(percent_decode(v)),
-            "token" => out.token = Some(percent_decode(v)),
+            "room" => {
+                out.room = Some(join_value("room", out.room.is_some(), v)?);
+            }
+            "token" => {
+                out.token = Some(join_value("token", out.token.is_some(), v)?);
+            }
             _ => {}
         }
     }
-    out
+    Ok(out)
 }
 
 /// A connection URL split into the server base and the room/token it carries.
@@ -472,10 +637,14 @@ pub fn parse_session_url(url: &str) -> Option<SessionUrl> {
         Some((endpoint, query)) => (endpoint, query),
         None => (url, ""),
     };
+    // A URL that names `room` or `token` twice is not one this client can resolve to a
+    // connection: the server refuses the query, and a client that guessed which of the two
+    // values was meant would connect to a room the link did not name.
+    let join = parse_join_query(query).ok()?;
     let base = endpoint.strip_suffix(ENDPOINT_PATH)?;
     Some(SessionUrl {
         base: base.to_string(),
-        join: parse_join_query(query),
+        join,
     })
 }
 
@@ -771,7 +940,7 @@ mod tests {
         // RFC 3986: `+` is a sub-delimiter, legal in a query and not a space. The two
         // spellings of one value must read the same, or a second implementation writing
         // the literal one is talking about a different room.
-        let q = parse_join_query("room=r+1&token=a+b");
+        let q = parse_join_query("room=r+1&token=a+b").expect("a query");
         assert_eq!(q.room.as_deref(), Some("r+1"));
         assert_eq!(q.token.as_deref(), Some("a+b"));
         assert_eq!(percent_decode("%2B"), "+");
@@ -780,7 +949,93 @@ mod tests {
 
         // A space still arrives as one, percent-encoded, which is the only way it can.
         assert_eq!(percent_decode("a%20b"), "a b");
-        assert_eq!(parse_join_query("room=a%20b").room.as_deref(), Some("a b"));
+        assert_eq!(
+            parse_join_query("room=a%20b")
+                .expect("a query")
+                .room
+                .as_deref(),
+            Some("a b")
+        );
+    }
+
+    /// §4: a repeated member name anywhere in a frame is one frame that means two things,
+    /// and a receiver refuses it rather than picking one. `serde` already refuses a repeat
+    /// in the envelope's own members; the case that needed a rule here is a repeat inside
+    /// `params`, or nested below it, where a `serde_json::Value` is last-wins.
+    #[test]
+    fn a_repeated_member_anywhere_in_a_frame_is_refused() {
+        let repeated = [
+            // The envelope itself, which `serde` catches as well.
+            r#"{"v":"selvage/1","id":1,"method":"doc.open","params":{"path":"a"},"v":"selvage/1"}"#,
+            // A member of `params`: the shape a duplicate could silently win before.
+            r#"{"v":"selvage/1","id":1,"method":"doc.open","params":{"path":"a","path":"b"}}"#,
+            // A member of an object nested below `params`.
+            r#"{"v":"selvage/1","id":1,"method":"doc.open","params":{"path":"a","x":{"y":1,"y":2}}}"#,
+            // And inside an array of objects.
+            r#"{"v":"selvage/1","id":1,"method":"doc.grant","params":{"paths":[],"extra":[{"z":1,"z":2}]}}"#,
+        ];
+        for text in repeated {
+            let error = ClientMessage::from_text(text)
+                .expect_err("a repeated member is refused");
+            assert!(
+                error.to_string().contains("duplicate"),
+                "the refusal names the repetition: {error}"
+            );
+        }
+
+        // The same rule reads a server frame in the other direction.
+        let error = ServerMessage::from_text(
+            r#"{"v":"selvage/1","id":1,"result":{},"result":{}}"#,
+        )
+        .expect_err("a repeated member is refused");
+        assert!(error.to_string().contains("duplicate"), "{error}");
+
+        // And an ordinary frame is not refused: the same member twice in *different*
+        // objects is not a repetition, and numbers, strings and arrays carry none.
+        let msg = ClientMessage::from_text(
+            r#"{"v":"selvage/1","id":1,"method":"doc.open","params":{"path":"a","same":1,"other":{"same":2},"list":[1,"x",null,true,1.5]}}"#,
+        )
+        .expect("a frame with no repetition parses");
+        assert_eq!(msg.id, Some(1));
+        assert_eq!(msg.params["path"], "a");
+    }
+
+    /// §5.1: a join query names `room` and `token` once. Which of two values a connection
+    /// joined must not depend on the order they were written in, so a repetition is refused
+    /// outright. An unknown parameter may repeat: it is ignored, and nothing reads it.
+    #[test]
+    fn a_repeated_join_parameter_is_refused() {
+        assert_eq!(
+            parse_join_query("room=a&room=b"),
+            Err(JoinQueryError::Duplicate("room"))
+        );
+        assert_eq!(
+            parse_join_query("token=a&token=b"),
+            Err(JoinQueryError::Duplicate("token"))
+        );
+        assert_eq!(
+            parse_join_query("room=a&token=b&token=c"),
+            Err(JoinQueryError::Duplicate("token"))
+        );
+        assert_eq!(
+            parse_join_query("room=a&room=a"),
+            Err(JoinQueryError::Duplicate("room")),
+            "even two equal values are a repetition"
+        );
+        let repeated_unknown =
+            parse_join_query("x=1&x=2&room=r").expect("a query");
+        assert_eq!(repeated_unknown.room.as_deref(), Some("r"));
+        assert_eq!(
+            JoinQueryError::Duplicate("room").to_string(),
+            "the join query names room twice"
+        );
+
+        // A URL that names a room twice is not a connection URL at all: a client that
+        // guessed would join a room the link did not name.
+        assert_eq!(
+            parse_session_url("ws://h/session?room=a&room=b&token=t"),
+            None
+        );
     }
 
     #[test]
@@ -791,15 +1046,19 @@ mod tests {
             url,
             "ws://127.0.0.1:8080/session?room=room%201&token=t%2Fk"
         );
-        let q = parse_join_query(url.split_once('?').unwrap().1);
+        let q =
+            parse_join_query(url.split_once('?').unwrap().1).expect("a query");
         assert_eq!(q.room.as_deref(), Some("room 1"));
         assert_eq!(q.token.as_deref(), Some("t/k"));
 
         let host = session_url("ws://127.0.0.1:8080/", None, None);
         assert_eq!(host, "ws://127.0.0.1:8080/session");
-        assert_eq!(parse_join_query(""), JoinQuery::default());
         assert_eq!(
-            parse_join_query("extra=1&room=r"),
+            parse_join_query("").expect("a query"),
+            JoinQuery::default()
+        );
+        assert_eq!(
+            parse_join_query("extra=1&room=r").expect("a query"),
             JoinQuery {
                 room: Some("r".into()),
                 token: None
