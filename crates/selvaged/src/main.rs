@@ -6,7 +6,7 @@ use std::process::exit;
 use std::time::Duration;
 
 use selvage_protocol::SERVER_NAME;
-use selvaged::{Server, ServerConfig};
+use selvaged::{Server, ServerConfig, page};
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:8080";
 const USAGE: &str =
@@ -47,6 +47,17 @@ async fn run(
         eprintln!(
             "--serve-page wants a directory: {} is not one",
             root.display()
+        );
+        exit(2);
+    }
+    // The page handler keeps a served file inside the page root by asking an open
+    // descriptor what it is, through `page::FD_DIR`. A platform without it would
+    // answer every page request with a 404, so it is refused once, here, instead.
+    if page.is_some() && !Path::new(page::FD_DIR).exists() {
+        eprintln!(
+            "--serve-page needs {} to keep a served page inside its root, and \
+             this platform has none",
+            page::FD_DIR
         );
         exit(2);
     }

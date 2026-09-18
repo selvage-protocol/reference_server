@@ -115,6 +115,13 @@ fn is_content_hashed(file: &Path) -> bool {
         })
 }
 
+/// Where a Linux descriptor names the file it holds: [`open_within`] reads it to
+/// ask what an open file really is, which is the way std offers and the way the
+/// served page is kept inside the page root. It exists on every platform this
+/// repository targets, and `selvaged` refuses `--serve-page` without it rather
+/// than answer every page request with a 404.
+pub const FD_DIR: &str = "/proc/self/fd";
+
 /// Opens `file` for a response, and only when the file that was opened still
 /// lives under `root`.
 ///
@@ -126,14 +133,15 @@ fn is_content_hashed(file: &Path) -> bool {
 /// and the file it names is the file that is read. The root is resolved once
 /// per request, which is what makes a page root that is itself a link work.
 ///
-/// The descriptor's own path is read through `/proc/self/fd`, the only way std
-/// offers to name what an open descriptor is; on a system without it every
-/// request is refused rather than served unverified, and every target here
-/// (Linux, the image, the Pi unit) has it.
+/// The descriptor's own path is read through [`FD_DIR`]. Validating the path and
+/// then reading it in a second step is what this replaces, and it is not offered
+/// as a fallback: a canonical path checked before the read is the check-then-use
+/// the deployment contract forbids, and it would be a guarantee that holds on one
+/// platform and not another.
 pub(crate) async fn open_within(root: &Path, file: &Path) -> Option<fs::File> {
     let real_root = fs::canonicalize(root).await.ok()?;
     let opened = fs::File::open(file).await.ok()?;
-    let real = fs::read_link(format!("/proc/self/fd/{}", opened.as_raw_fd()))
+    let real = fs::read_link(format!("{FD_DIR}/{}", opened.as_raw_fd()))
         .await
         .ok()?;
     real.starts_with(real_root).then_some(opened)
