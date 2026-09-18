@@ -20,6 +20,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use selvage_protocol as proto;
 use selvage_protocol::{code, event, method};
+use yrs::Observable;
+use yrs::Subscription;
 use yrs::block::ClientID;
 use yrs::encoding::read::Cursor;
 use yrs::sync::protocol::{
@@ -31,7 +33,7 @@ use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{
     Assoc, BranchID, Doc, GetString, IndexedSequence, OffsetKind, Options,
     ReadTxn, StateVector, StickyIndex, Text as YText, TextRef, Transact,
-    Update,
+    TransactionMut, Update,
 };
 
 use crate::editor::EngineEvent;
@@ -40,6 +42,11 @@ use crate::presence::{
 };
 use crate::session::ReconnectPolicy;
 use crate::{ConnectOptions, Error, KeepaliveConfig, SessionInfo};
+
+/// The origin this client tags its own document writes with. A remote frame is applied by
+/// `yrs`'s protocol implementation with no origin at all, so an observer tells an adapter's
+/// own edit from a peer's by this, and reports only the peer's.
+const LOCAL_ORIGIN: &str = "selvage:local";
 
 /// How long a handshake may take before the attempt is abandoned, first connect and
 /// reconnect alike.
@@ -358,6 +365,7 @@ fn spawn(
         request_id: 1,
         inflight: None,
         waiting: VecDeque::new(),
+        watched: HashMap::new(),
         local_state: Some(local_state),
         queued: VecDeque::new(),
         paused: false,
@@ -555,6 +563,11 @@ struct EngineTask {
     /// Requests made while another was in flight, in the order they were made. Each goes
     /// out when the one before it is answered; none of them is on the wire before then.
     waiting: VecDeque<Pending>,
+    /// The documents whose changes reach an adapter, by path: the handle whose observer
+    /// reports them. A document that has not arrived has no text to watch — creating one
+    /// would make an unreceived document look like an empty one, which §8.1 forbids a
+    /// sender to anchor against — so it is watched when it arrives.
+    watched: HashMap<String, Subscription>,
     /// The JSON published for the local client, replayed on every renewal.
     local_state: Option<String>,
     /// Frames produced while outbound is paused, flushed on resume. Text frames carry
@@ -616,6 +629,12 @@ impl EngineTask {
     /// handshake, and this client's own documents re-opened. Runs for the first seat and
     /// for every reconnect alike.
     fn seat(&mut self) {
+        // Every attempt seats a fresh replica, so the observers taken from the last one go
+        // with it. The documents it already carries are watched again — silently, because
+        // the adapter has their content and nothing about it changed — and one that only
+        // arrives later is reported as it arrives.
+        self.watched.clear();
+        let _ = self.attach_arrivals();
         // §9.1: the documents this client still holds open are re-opened, which is what
         // puts them back in the room's set when nobody else had them. Content is not
         // replayed: the sync handshake brings it back from the peers.
@@ -911,6 +930,9 @@ impl EngineTask {
             txn.state_vector()
         };
         self.mutate_text(path, op);
+        // A document this client is the first to touch is watched from now on; its arrival
+        // is its own edit, which the adapter already has.
+        let _ = self.attach_arrivals();
         let update = {
             let txn = self.doc().transact();
             txn.encode_state_as_update_v1(&before)
@@ -925,7 +947,9 @@ impl EngineTask {
     /// Applies `op` to a document's text, inside one write transaction.
     fn mutate_text(&mut self, path: &str, op: EditOp) {
         let text = self.doc().get_or_insert_text(path);
-        let mut txn = self.doc().transact_mut();
+        // Tagged as this client's own: an observer tells an adapter's edit from a peer's by
+        // the origin, and only the peer's is news to the adapter that made the other.
+        let mut txn = self.doc().transact_mut_with(LOCAL_ORIGIN);
         match op {
             EditOp::Insert { index, text: chunk } => {
                 text.insert(&mut txn, index, &chunk);
@@ -957,6 +981,45 @@ impl EngineTask {
 
     fn doc(&mut self) -> &mut Doc {
         self.awareness.doc_mut()
+    }
+
+    /// Attaches an observer to every held document that has arrived and is not watched
+    /// yet, returning the paths it attached: their arrival is a change an adapter has to
+    /// hear about, and no transaction reports it — `yrs` gives a root type an update
+    /// creates no kind of its own, so nothing fires for the very update that brings a
+    /// document this replica did not have.
+    fn attach_arrivals(&mut self) -> Vec<String> {
+        let arrived: Vec<String> = self
+            .open_documents
+            .clone()
+            .into_iter()
+            .filter(|path| !self.watched.contains_key(path))
+            .filter(|path| self.has_text(path))
+            .collect();
+        for path in &arrived {
+            self.watch(path);
+        }
+        arrived
+    }
+
+    /// Watches `path`: the document is here, so its text is there to be observed. The
+    /// observer reports the document a transaction changed, and only that one — a remote
+    /// keystroke costs one event for the document it typed into, not one per document this
+    /// client has open.
+    fn watch(&mut self, path: &str) {
+        let events = self.events.clone();
+        let watched: Arc<str> = Arc::from(path);
+        let text = self.doc().get_or_insert_text(path);
+        let subscription = text
+            .observe(move |txn, _event| report_change(&events, &watched, txn));
+        self.watched.insert(path.to_string(), subscription);
+    }
+
+    /// Whether this replica holds the text for `path` at all. Reading never creates one.
+    fn has_text(&self, path: &str) -> bool {
+        let doc = self.awareness.doc();
+        let txn = doc.transact();
+        txn.get_text(path).is_some()
     }
 
     /// The text of a document this replica holds, empty for one it does not hold or that
@@ -1220,11 +1283,17 @@ impl EngineTask {
         if self.open_documents.iter().all(|p| p != path) {
             self.open_documents.push(path.to_string());
         }
+        // A document this replica already holds is watched silently: the adapter is being
+        // told the open set right now and can read the text from it. One that has not
+        // arrived is watched when it does.
+        let _ = self.attach_arrivals();
     }
 
-    /// Removes a path from this client's own open set.
+    /// Removes a path from this client's own open set, and stops watching it: an adapter
+    /// that no longer presents a document is not told about it.
     fn release(&mut self, path: &str) {
         self.open_documents.retain(|p| p != path);
+        let _ = self.watched.remove(path);
     }
 
     /// Fails every request still waiting: the session ended before the server answered.
@@ -1273,7 +1342,7 @@ impl EngineTask {
             // session continues stale rather than ending.
             return;
         }
-        let kinds = kinds_in(frame);
+        let awareness = carries_awareness(frame);
         let Ok(replies) = DefaultProtocol.handle(&mut self.awareness, frame)
         else {
             // A payload no replica decodes is a peer bug or version skew, and the room
@@ -1290,21 +1359,13 @@ impl EngineTask {
         }
         // A cursor move is not a text change: an adapter must not re-reconcile every
         // buffer because somebody else's caret moved.
-        if kinds.has(FrameKinds::TEXT) {
-            self.notify_documents();
+        for path in self.attach_arrivals() {
+            let _ = self.events.send(EngineEvent::DocumentChanged { path });
         }
-        if kinds.has(FrameKinds::AWARENESS) {
+        if awareness {
             let _ = self.events.send(EngineEvent::PresenceChanged {
                 presence: self.presence(),
             });
-        }
-    }
-
-    /// Tells the adapter that the documents this client has open may have changed, because
-    /// a frame carried text.
-    fn notify_documents(&self) {
-        for path in self.open_documents.clone() {
-            let _ = self.events.send(EngineEvent::DocumentChanged { path });
         }
     }
 
@@ -1572,48 +1633,38 @@ fn resolve_anchor<T: ReadTxn>(
         .then_some(offset.index)
 }
 
-/// What a binary frame told this session about, one bit per kind: a frame may hold several
-/// concatenated y-protocols messages, so it can be more than one thing at once.
-#[derive(Debug, Default, Clone, Copy)]
-struct FrameKinds(u8);
-
-impl FrameKinds {
-    /// A message that can change the document text: a sync update, or a sync step 2.
-    const TEXT: u8 = 1;
-    /// A message that can change awareness: a state update, or a query.
-    const AWARENESS: u8 = 2;
-
-    const fn has(self, kind: u8) -> bool {
-        self.0 & kind != 0
+/// Reports a remote change to `path`. A transaction this client started itself is the
+/// adapter's own edit and is not news to it; `yrs` tells the two apart by the origin a write
+/// transaction carries.
+fn report_change(
+    events: &broadcast::Sender<EngineEvent>,
+    path: &str,
+    txn: &TransactionMut,
+) {
+    let mine = txn
+        .origin()
+        .is_some_and(|origin| origin.as_ref() == LOCAL_ORIGIN.as_bytes());
+    if mine {
+        return;
     }
-
-    const fn add(self, kind: u8) -> Self {
-        Self(self.0 | kind)
-    }
+    let _ = events.send(EngineEvent::DocumentChanged {
+        path: path.to_string(),
+    });
 }
 
-/// Reads the message types out of a frame. A frame that cannot be read reports neither
-/// kind; the protocol handler rejects it too, so nothing is lost.
-fn kinds_in(frame: &[u8]) -> FrameKinds {
-    let mut kinds = FrameKinds::default();
+/// Whether a frame carries an awareness message: a state update, or a query. A frame may
+/// hold several concatenated y-protocols messages, so this is asked of the whole frame.
+///
+/// A text message needs no flag of its own: the document it changes reports itself, through
+/// the observer a held document carries (`EngineTask::watch`).
+fn carries_awareness(frame: &[u8]) -> bool {
     let mut decoder = DecoderV1::new(Cursor::new(frame));
-    for message in MessageReader::new(&mut decoder) {
-        kinds = match message {
-            Ok(YMessage::Sync(
-                SyncMessage::SyncStep2(_) | SyncMessage::Update(_),
-            )) => kinds.add(FrameKinds::TEXT),
-            Ok(YMessage::Awareness(_) | YMessage::AwarenessQuery) => {
-                kinds.add(FrameKinds::AWARENESS)
-            }
-            Ok(
-                YMessage::Sync(SyncMessage::SyncStep1(_))
-                | YMessage::Auth(_)
-                | YMessage::Custom(..),
-            )
-            | Err(_) => kinds,
-        };
-    }
-    kinds
+    MessageReader::new(&mut decoder).any(|message| {
+        matches!(
+            message,
+            Ok(YMessage::Awareness(_) | YMessage::AwarenessQuery)
+        )
+    })
 }
 
 fn encode_y_message(message: &YMessage) -> Vec<u8> {
@@ -1638,6 +1689,7 @@ fn now_millis() -> u64 {
 mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::error::Error as StdError;
+    use std::iter;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1649,14 +1701,17 @@ mod tests {
     use yrs::ClientID;
     use yrs::sync::Awareness;
     use yrs::sync::AwarenessUpdate;
+    use yrs::sync::Message as YMessage;
     use yrs::sync::awareness::AwarenessUpdateEntry;
+    use yrs::sync::protocol::SyncMessage;
     use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact};
 
     use super::{
-        EngineTask, MAX_INBOUND_BINARY_BYTES, Sink, Stream, fresh_doc,
-        is_terminal_code, seed_update,
+        EngineTask, MAX_INBOUND_BINARY_BYTES, Sink, Stream, encode_y_message,
+        fresh_doc, is_terminal_code, seed_update,
     };
     use crate::editor::EngineEvent;
+    use crate::engine::EditOp;
     use crate::presence::PeerInfo;
     use crate::session::ReconnectPolicy;
     use crate::{ConnectOptions, Error, KeepaliveConfig, SessionInfo};
@@ -1665,6 +1720,7 @@ mod tests {
 
     const PATH: &str = "src/main.rs";
     const OTHER: &str = "src/other.rs";
+    const THIRD: &str = "src/third.rs";
 
     /// The ids of the request envelopes the engine has put on the wire since the last call:
     /// the queue is drained the way the run loop's flush drains it. One id at most is the
@@ -1867,6 +1923,147 @@ mod tests {
         Ok(())
     }
 
+    /// The paths the engine has reported as changed, as far as it has already said so.
+    fn changed_documents(
+        events: &mut broadcast::Receiver<EngineEvent>,
+    ) -> Vec<String> {
+        iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                EngineEvent::DocumentChanged { path } => Some(path),
+                EngineEvent::DocumentsChanged { .. }
+                | EngineEvent::GrantChanged { .. }
+                | EngineEvent::PeersChanged { .. }
+                | EngineEvent::PresenceChanged { .. }
+                | EngineEvent::HostDetached { .. }
+                | EngineEvent::HostAttached { .. }
+                | EngineEvent::RoomGone { .. }
+                | EngineEvent::SessionError { .. }
+                | EngineEvent::Reconnecting
+                | EngineEvent::Disconnected => None,
+            })
+            .collect()
+    }
+
+    /// A held document that arrives, and one that changed, reach the adapter; and a
+    /// document the replica already had does not arrive twice.
+    #[tokio::test]
+    async fn a_remote_change_reports_only_the_document_it_changed()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, mut events) = receiving_task().await?;
+        task.open_documents =
+            vec![PATH.to_string(), OTHER.to_string(), THIRD.to_string()];
+        // Two of the three are already here — as a re-seat finds the documents it carried —
+        // and the third arrives with the frame below.
+        let _ = task.doc().get_or_insert_text(PATH);
+        let _ = task.doc().get_or_insert_text(OTHER);
+        assert_eq!(
+            task.attach_arrivals(),
+            vec![PATH.to_string(), OTHER.to_string()],
+            "what is already here is watched when the seat looks"
+        );
+        assert!(changed_documents(&mut events).is_empty(), "and is not news");
+
+        // A peer's edit of PATH, as the wire carries it: one sync update.
+        let peer = fresh_doc(None)?;
+        let text = peer.get_or_insert_text(PATH);
+        let mut txn = peer.transact_mut();
+        text.insert(&mut txn, 0, "fn main() {}\n");
+        drop(txn);
+        task.handle_binary(&peer_frame(&peer));
+
+        assert_eq!(
+            changed_documents(&mut events),
+            vec![PATH.to_string()],
+            "one change, for the document that changed"
+        );
+        assert_eq!(
+            task.read_text(PATH),
+            "fn main() {}\n",
+            "and the frame was applied"
+        );
+        Ok(())
+    }
+
+    /// A document that arrives is announced, and it keeps being announced after: `yrs`
+    /// gives the root type an update creates no kind of its own, so nothing fires for the
+    /// very update that brings a document a replica did not have, and the observer it needs
+    /// is attached when it arrives.
+    #[tokio::test]
+    async fn a_document_that_arrives_is_announced_once_and_then_watched()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, mut events) = receiving_task().await?;
+        task.open_documents = vec![PATH.to_string()];
+        assert!(
+            task.attach_arrivals().is_empty(),
+            "a document that has not arrived cannot be watched"
+        );
+
+        let peer = fresh_doc(None)?;
+        let text = peer.get_or_insert_text(PATH);
+        let mut txn = peer.transact_mut();
+        text.insert(&mut txn, 0, "one\n");
+        drop(txn);
+        task.handle_binary(&peer_frame(&peer));
+        assert_eq!(
+            changed_documents(&mut events),
+            vec![PATH.to_string()],
+            "the arrival is announced"
+        );
+
+        // A later edit from the same peer is announced too — the case the replica cannot
+        // report for a root type it never materialized itself.
+        let mut later = peer.transact_mut();
+        text.insert(&mut later, 0, "two\n");
+        drop(later);
+        task.handle_binary(&peer_frame(&peer));
+        assert_eq!(
+            changed_documents(&mut events),
+            vec![PATH.to_string()],
+            "and so is the edit after it"
+        );
+        assert_eq!(task.read_text(PATH), "two\none\n");
+        Ok(())
+    }
+
+    /// A frame that changes nothing, and an edit this client made itself, reach nobody:
+    /// the observer reports a peer's transaction and not the adapter's own.
+    #[tokio::test]
+    async fn a_local_edit_is_not_reported_back_to_the_adapter()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, mut events) = receiving_task().await?;
+        task.open_documents = vec![PATH.to_string()];
+
+        // An empty update: a peer with nothing this replica is missing.
+        let peer = fresh_doc(None)?;
+        task.handle_binary(&peer_frame(&peer));
+        assert!(changed_documents(&mut events).is_empty());
+        assert!(
+            task.attach_arrivals().is_empty(),
+            "an empty update brings no document to watch"
+        );
+
+        // A local edit is applied, and reported to nobody: the adapter made it.
+        task.apply_edit(
+            PATH,
+            EditOp::Insert {
+                index: 0,
+                text: "local\n".to_string(),
+            },
+        );
+        assert!(changed_documents(&mut events).is_empty());
+        assert_eq!(task.read_text(PATH), "local\n");
+        Ok(())
+    }
+
+    /// `doc` as a peer would put it on the wire: one sync update carrying everything it has.
+    fn peer_frame(doc: &Doc) -> Vec<u8> {
+        let update = {
+            let txn = doc.transact();
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+        encode_y_message(&YMessage::Sync(SyncMessage::Update(update)))
+    }
+
     /// An over-bound binary frame is dropped, not applied and not reported
     /// (`PROTOCOL.md` §2.1): a payload that large never arrives from a conforming
     /// transport, and applying it would grow the replica without bound on a peer's word.
@@ -2024,6 +2221,7 @@ mod tests {
             request_id: 0,
             inflight: None,
             waiting: VecDeque::new(),
+            watched: HashMap::new(),
             local_state: None,
             queued: VecDeque::new(),
             paused: false,
