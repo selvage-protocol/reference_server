@@ -7,6 +7,7 @@
 use std::fmt::Write as _;
 use std::io;
 use std::mem::take;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -30,6 +31,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use selvage_protocol as proto;
 use selvage_protocol::{code, event};
 
+use crate::page;
 use crate::room::{Outbound, Queue, Registry};
 use crate::{ServerConfig, random_hex};
 
@@ -39,6 +41,7 @@ use session::{Applicant, Session, grace_ms, handshake};
 
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const NOT_FOUND: &str = r#"{"error":"not found","hint":"try /session (WebSocket) or /meta (HTTP)"}"#;
+const PAGE_NOT_FOUND: &str = r#"{"error":"not found","hint":"no such file in the served page directory"}"#;
 const METHOD_NOT_ALLOWED: &str = r#"{"error":"method not allowed","hint":"GET answers, HEAD answers headers-only"}"#;
 const SERVER_FULL_BODY: &str =
     r#"{"error":"server full","hint":"try again later"}"#;
@@ -715,8 +718,13 @@ async fn respond_plain(
         .await;
     }
     if head.path != proto::META_PATH {
-        return respond_status(tcp, Status::NotFound, NOT_FOUND, &head.method)
-            .await;
+        return match &config.page_root {
+            Some(root) => respond_page(tcp, head, root).await,
+            None => {
+                respond_status(tcp, Status::NotFound, NOT_FOUND, &head.method)
+                    .await
+            }
+        };
     }
     // Canonical (`CANONICAL.md`), so that the negotiation body has the same bytes for
     // every implementation. The grace is this server's configured value: it is the one
@@ -728,6 +736,80 @@ async fn respond_plain(
     ))
     .map_err(io::Error::other)?;
     respond_status(tcp, Status::Ok, &meta, &head.method).await
+}
+
+/// Serves one file from the page root. A path that leaves the root, a link that
+/// reaches out of it, a file that is missing, and a file past
+/// [`page::MAX_PAGE_BYTES`] are the same answer — there is nothing to serve — so
+/// a request cannot probe the host's disk by telling the refusals apart.
+///
+/// Every step after the first reads the descriptor the step before it opened:
+/// the size bound, the file check and the bytes all come from the file that
+/// [`page::open_within`] verified, never from a second look at the path.
+async fn respond_page(
+    tcp: &mut TcpStream,
+    head: &Head,
+    root: &Path,
+) -> io::Result<()> {
+    let Some(file) = page::resolve(root, &head.path) else {
+        return not_found_page(tcp, &head.method).await;
+    };
+    let Some(opened) = page::open_within(root, &file).await else {
+        return not_found_page(tcp, &head.method).await;
+    };
+    let Ok(metadata) = opened.metadata().await else {
+        return not_found_page(tcp, &head.method).await;
+    };
+    if !metadata.is_file() || metadata.len() > page::MAX_PAGE_BYTES {
+        return not_found_page(tcp, &head.method).await;
+    }
+    // One byte past the bound, so a file that grows under the read cannot make
+    // the response larger than a file of this size would be.
+    let mut body = Vec::new();
+    let mut bounded = opened.take(page::MAX_PAGE_BYTES.saturating_add(1));
+    if bounded.read_to_end(&mut body).await.is_err()
+        || body.len()
+            > usize::try_from(page::MAX_PAGE_BYTES).unwrap_or(usize::MAX)
+    {
+        return not_found_page(tcp, &head.method).await;
+    }
+    respond_file(tcp, &page::headers(&file), &body, &head.method).await
+}
+
+/// The one refusal a served page answers with: a path that leaves the root, a
+/// link that resolves out of it, a missing file and a file past the bound are
+/// deliberately the same bytes, so nothing about the host's disk can be probed
+/// by telling them apart.
+async fn not_found_page(tcp: &mut TcpStream, method: &str) -> io::Result<()> {
+    respond_status(tcp, Status::NotFound, PAGE_NOT_FOUND, method).await
+}
+
+/// Answers with a served file. The headers are [`page::headers`] — the pinned media type, the
+/// cache policy the name earns, and the hardening the page needs — and `nosniff` among them is
+/// what keeps a hashed chunk from being read as HTML. `connection: close` because the page's
+/// files are small and a keep-alive would hold a connection past the request that used it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a served file names its socket, its headers, its body and the method that decides the body"
+)]
+async fn respond_file(
+    tcp: &mut TcpStream,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    method: &str,
+) -> io::Result<()> {
+    let mut response =
+        format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n", body.len());
+    for (name, value) in headers {
+        let _ = write!(response, "{name}: {value}\r\n");
+    }
+    response.push_str("connection: close\r\n\r\n");
+    let mut bytes = response.into_bytes();
+    if method != "HEAD" {
+        bytes.extend_from_slice(body);
+    }
+    tcp.write_all(&bytes).await?;
+    tcp.shutdown().await
 }
 
 /// Answers a plain HTTP request. `HEAD` gets the status line and the headers a

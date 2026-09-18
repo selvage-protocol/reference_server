@@ -8,9 +8,10 @@ Two ways to run `selvaged` beyond `cargo run`, for two audiences:
 | `Dockerfile` + `compose.yaml` | Strangers self-hosting on their own machines | A multi-arch image and a one-service compose file — never the Pi |
 
 The server is memory-only under both: restarts end all rooms, and there is
-nothing to persist — hence no volumes anywhere here. `DESIGN.md` §9 names the
-missing deployment story; this directory is that story's first half (the
-second half, a live VPS, is still unordered spend).
+nothing to persist — hence no data volume anywhere here. The one mount is the
+page directory, read-only, which the server only ever reads. `DESIGN.md` §9
+names the missing deployment story; this directory is that story's first half
+(the second half, a live VPS, is still unordered spend).
 
 ## FSL-1.1-MIT redistribution review — required before any future publish
 
@@ -140,8 +141,11 @@ shell, no package manager. The `Dockerfile` cross-compiles both
 architectures natively on an x86_64 builder (one cross-toolchain stage per
 target, each pinned `--platform=$BUILDPLATFORM`), so building arm64 needs
 no QEMU — only *running* the arm64 image does. Build and run it on any
-machine with a working Docker; the CI runners are not such machines (see
-CI below), so the Dockerfile is human-verified, not CI-proven.
+machine with a working Docker; the container job below does exactly that on
+GitHub-hosted `ubuntu-24.04` (the amd64 path), so the `Dockerfile` is now
+CI-proven as well as human-verified. The Blacksmith runners are not such
+machines: they proved only github-scoped egress and could not execute buildx
+builds (see CI below).
 
 Fallback is the same static binary on `gcr.io/distroless/static:nonroot`
 (`--build-arg RUNTIME=distroless`). If a future dependency ever breaks the
@@ -169,14 +173,38 @@ against it. `scripts/ci-local.sh image` runs that smoke anywhere nix does.
 ### Compose
 
 `compose.yaml` is one service, one port mapping, `restart: unless-stopped`,
-an overridable `command`, and no volumes — the server keeps nothing on disk.
-`docker compose up`, then `curl /meta`, then host a room from an editor. Until
-the first image is published the file builds locally (`build:`); after that
-it pulls the published tag.
+an overridable `command`, and one read-only page mount — the server keeps
+nothing on disk of its own. `docker compose up`, then `curl /meta`, then host a
+room from an editor. Until the first image is published the file builds locally
+(`build:`); after that it pulls the published tag.
+
+### One origin: the page
+
+`selvaged --serve-page DIR` serves the browser page on the same origin as
+`/session` and `/meta` (see the root README). The container recipe mounts the
+page directory read-only at `/page` and passes the flag, so one container and
+one port answer the page, the meta document and the socket — the CORS proxy and
+the second page server the Pi runbook hand-writes are not needed.
+
+**The page is not in this repository.** It is the `web_client` repository's
+built `dist/`; this repository neither builds nor vendors it, so the image
+ships the server alone and the page is mounted (`-v …/dist:/page:ro`). A build
+that pulls it in — a Dockerfile stage that clones `web_client` at a pinned
+revision — is the obvious next step and is **not** done: this environment has
+no reachable copy of that repository to pin or to verify against. `./page`
+absent is not fatal: `/meta` and `/session` still answer and `/` is a `404`.
+
+### TLS
+
+`selvaged` speaks no TLS and claims none: an invite over `ws://` is plaintext,
+and an `https` page cannot dial a `ws://` socket (mixed active content). For a
+shareable link, put a terminator in front — `tailscale serve`, caddy, or your
+edge — and hand out the `https://`/`wss://` URL. Serving the page from the same
+origin as the socket is what makes that one terminator enough.
 
 ## CI
 
-`.github/workflows/image.yml` has two jobs. `smoke` runs on every PR and on
+`.github/workflows/image.yml` has three jobs. `smoke` runs on every PR and on
 `main`, one leg per architecture (`amd64` on the usual Blacksmith runners,
 `arm64` on GitHub-hosted ARM — each building natively, no cross-compilation): the
 same nix preamble as the checks job, then `scripts/image-smoke.sh`, which
@@ -189,6 +217,19 @@ skopeo. The `Dockerfile` above stays the portable static variant for
 machines with a working Docker; both agree on entrypoint, port, user,
 licence label and tag scheme, and the smoke asserts exactly those fields.
 
+`container` is the other half, and the only job that runs the image:
+GitHub-hosted `ubuntu-24.04` (chosen for its Docker daemon and unrestricted
+egress — the Blacksmith runners proved only github-scoped egress and could not
+execute buildx builds), a plain `docker build` of the `Dockerfile`, `docker
+run` with a page mounted, and `scripts/container-smoke.sh`: it asserts the
+container's `--version` and `/meta` against `Cargo.toml`, asserts the page's
+headers and bytes over the container's port, and then mints a room in the
+container and joins it as a guest with the harness's client engine
+(`crates/harness/examples/join_room.rs`), converging on an edit. A `--version`
+or `/meta` check is not that proof: no client had ever completed a handshake
+against the image. `scripts/ci-local.sh container` runs the same script where a
+Docker daemon exists.
+
 `publish` needs `smoke`, carries the only
 elevated permission in the repo (`packages: write`), logs in to GHCR with the
 built-in `GITHUB_TOKEN`, and is gated on release tags (`refs/tags/v*`) — tags
@@ -196,3 +237,15 @@ that are never cut from this work. It builds with Docker while the smoke
 builds with nix, so it must itself be re-proven green on a real run before
 any first publish. FSL review stays open until the owner
 closes it; the code merges, the artifacts do not.
+
+### The page in a container
+
+The page is not baked into the image (above), so a container that serves one
+mounts it; `scripts/container-smoke.sh` does exactly that with a three-file
+page and asserts the header policy a browser depends on: the pinned media type,
+`no-cache` for a stable name and `public, max-age=31536000, immutable` for a
+content-hashed one, `Referrer-Policy: no-referrer`, `X-Content-Type-Options:
+nosniff`, and the content security policy. Those headers are the static
+handler's own (`crates/selvaged/src/page.rs`) and pinned in
+`crates/harness/tests/page.rs` as well, so the container job proves them where
+they are actually served rather than only in-process.
