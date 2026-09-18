@@ -745,6 +745,57 @@ async fn joining_needs_the_room_and_the_token() {
     assert_eq!(host.peers().await.unwrap().len(), 0);
 }
 
+/// A first frame that is wrong in two ways is refused for the first one §11 orders: the
+/// envelope and its id, then `v`, then the method. The handshake used to judge the method
+/// first, so a frame that was both a non-hello method and an incompatible version was
+/// answered `hello_required` — a client that reads the code rather than the message would
+/// try again with a hello it still could not seat.
+#[tokio::test]
+async fn an_incompatible_first_frame_is_refused_for_its_version() {
+    let harness = Harness::start(Duration::from_secs(5)).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.send_json(&serde_json::json!({
+        "v": "selvage/2",
+        "id": 1,
+        "method": method::DOC_OPEN,
+        "params": {"path": PATH},
+    }))
+    .await
+    .expect("sends");
+    let refused = next_json_within(&mut raw, "the refusal").await;
+    assert_eq!(refused["event"], event::SESSION_ERROR);
+    assert_eq!(
+        refused["params"]["code"],
+        code::UNSUPPORTED_VERSION,
+        "the version is judged before the method: {refused}"
+    );
+    assert_eq!(
+        raw.read_to_close().await.expect("a close").close_code(),
+        Some(close::UNSUPPORTED_VERSION)
+    );
+
+    // A compatible version with a non-hello method is still `hello_required`, and a frame
+    // with no id is still `bad_message` before either of them.
+    let mut second = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    second
+        .send_json(&serde_json::json!({
+            "v": proto::WIRE_VERSION,
+            "id": 1,
+            "method": method::DOC_OPEN,
+            "params": {"path": PATH},
+        }))
+        .await
+        .expect("sends");
+    assert_eq!(
+        next_json_within(&mut second, "the refusal").await["params"]["code"],
+        code::HELLO_REQUIRED
+    );
+}
+
 /// `display_name` is bounded at 32 UTF-16 code units (`PROTOCOL.md` §5), so an astral
 /// character costs two. A name of exactly 32 code units — one of them astral — seats; one code
 /// unit over is refused `bad_params` before seating. Counting bytes or code points answers both

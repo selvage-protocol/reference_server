@@ -139,6 +139,16 @@ pub async fn handshake(
     if msg.id.is_none() {
         return Err((code::BAD_MESSAGE, "a request needs an id".to_string()));
     }
+    // The wire version before the method, as on a seated connection and as §11 orders the
+    // checks: a first frame that is both a non-hello method and an incompatible version
+    // was answered `hello_required`, which tells the client the wrong thing about why it
+    // was refused. The envelope and the id are judged first, the method after the version.
+    if !proto::is_compatible(&msg.v) {
+        return Err((
+            code::UNSUPPORTED_VERSION,
+            format!("unsupported wire version {}", msg.v),
+        ));
+    }
     if msg.method != method::SESSION_HELLO {
         return Err((
             code::HELLO_REQUIRED,
@@ -147,12 +157,6 @@ pub async fn handshake(
                 method::SESSION_HELLO,
                 msg.method
             ),
-        ));
-    }
-    if !proto::is_compatible(&msg.v) {
-        return Err((
-            code::UNSUPPORTED_VERSION,
-            format!("unsupported wire version {}", msg.v),
         ));
     }
     let mut params: proto::HelloParams = serde_json::from_value(msg.params)
