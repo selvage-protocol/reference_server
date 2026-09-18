@@ -1,6 +1,7 @@
 use std::env;
 use std::io;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::Duration;
 
@@ -8,7 +9,8 @@ use selvage_protocol::SERVER_NAME;
 use selvaged::{Server, ServerConfig};
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:8080";
-const USAGE: &str = "usage: selvaged [--listen ADDR] [--room-grace-ms MS]";
+const USAGE: &str =
+    "usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]";
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -28,13 +30,29 @@ async fn main() -> io::Result<()> {
             println!("{SERVER_NAME}");
             return Ok(());
         }
-        Action::Run(addr, room_grace) => run(addr, room_grace).await,
+        Action::Run(addr, room_grace, page) => {
+            run(addr, room_grace, page).await
+        }
     }
 }
 
-async fn run(addr: SocketAddr, room_grace: Duration) -> io::Result<()> {
+async fn run(
+    addr: SocketAddr,
+    room_grace: Duration,
+    page: Option<PathBuf>,
+) -> io::Result<()> {
+    if let Some(root) = &page
+        && !root.is_dir()
+    {
+        eprintln!(
+            "--serve-page wants a directory: {} is not one",
+            root.display()
+        );
+        exit(2);
+    }
     let config = ServerConfig {
         room_grace,
+        page_root: page.clone(),
         ..ServerConfig::default()
     };
     let server = match Server::bind(addr, config).await {
@@ -45,7 +63,8 @@ async fn run(addr: SocketAddr, room_grace: Duration) -> io::Result<()> {
         }
         Err(error) => return Err(error),
     };
-    for line in startup_lines(server.local_addr(), room_grace) {
+    for line in startup_lines(server.local_addr(), room_grace, page.as_deref())
+    {
         println!("{line}");
     }
     server.run().await;
@@ -54,7 +73,7 @@ async fn run(addr: SocketAddr, room_grace: Duration) -> io::Result<()> {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
-    Run(SocketAddr, Duration),
+    Run(SocketAddr, Duration, Option<PathBuf>),
     Help,
     Version,
 }
@@ -67,6 +86,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Action, String> {
         .parse()
         .map_err(|e| format!("bad default address: {e}"))?;
     let mut room_grace = ServerConfig::default().room_grace;
+    let mut page: Option<PathBuf> = None;
     let mut args = raw.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -84,10 +104,16 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Action, String> {
                 )?;
                 room_grace = grace(&value)?;
             }
+            "--serve-page" => {
+                let value = args
+                    .next()
+                    .ok_or("--serve-page wants a directory, e.g. /page")?;
+                page = Some(PathBuf::from(value));
+            }
             _ => return Err(format!("unknown argument: {arg}\n{USAGE}")),
         }
     }
-    Ok(Action::Run(addr, room_grace))
+    Ok(Action::Run(addr, room_grace, page))
 }
 
 fn help_text() -> String {
@@ -96,7 +122,10 @@ fn help_text() -> String {
         connect a client, and the client's output carries the invite link.\n\n  --listen ADDR       \
         address to bind (default {DEFAULT_ADDRESS})\n  --room-grace-ms MS  \
         how long a room survives its host disconnecting, in milliseconds \
-        (default {}s)\n  --help, -h          print this help\n  --version           \
+        (default {}s)\n  --serve-page DIR    \
+        serve the browser page from DIR on the same origin as /session and \
+        /meta, so its /meta read and socket need no CORS and no second origin\n  \
+        --help, -h          print this help\n  --version           \
         print the server version",
         ServerConfig::default().room_grace.as_secs()
     )
@@ -129,10 +158,21 @@ fn addr_in_use_hint(addr: SocketAddr) -> String {
 /// The startup lines: what is listening, how long rooms outlive their host, and what
 /// the host does next. The invite itself is minted host-side by the client library,
 /// so this points at it rather than printing one.
-fn startup_lines(local: SocketAddr, room_grace: Duration) -> Vec<String> {
+fn startup_lines(
+    local: SocketAddr,
+    room_grace: Duration,
+    page: Option<&Path>,
+) -> Vec<String> {
     let mut lines = vec![format!(
         "selvaged listening on ws://{local}/session (meta at http://{local}/meta)"
     )];
+    if let Some(root) = page {
+        lines.push(format!(
+            "serving the page from {} at http://{local}/ — the page, /meta and \
+            /session share one origin, so no CORS proxy is needed",
+            root.display()
+        ));
+    }
     if local.ip().is_loopback() {
         lines.push(format!(
             "note: {local} is loopback-only, so friends cannot reach it — bind \
@@ -182,7 +222,8 @@ mod tests {
             args(&[]),
             Ok(Action::Run(
                 DEFAULT_ADDRESS.parse().expect("the default binds"),
-                default_grace
+                default_grace,
+                None
             ))
         );
     }
@@ -196,8 +237,31 @@ mod tests {
             action,
             Action::Run(
                 "0.0.0.0:9000".parse().expect("the test address parses"),
-                Duration::from_secs(5)
+                Duration::from_secs(5),
+                None
             )
+        );
+    }
+
+    #[test]
+    fn serve_page_takes_a_directory() {
+        let expected = Action::Run(
+            DEFAULT_ADDRESS.parse().expect("the default binds"),
+            ServerConfig::default().room_grace,
+            Some(PathBuf::from("/page")),
+        );
+        assert_eq!(args(&["--serve-page", "/page"]), Ok(expected));
+    }
+
+    #[test]
+    fn the_last_serve_page_wins() {
+        assert_eq!(
+            args(&["--serve-page", "/a", "--serve-page", "/b"]),
+            Ok(Action::Run(
+                DEFAULT_ADDRESS.parse().expect("the default binds"),
+                ServerConfig::default().room_grace,
+                Some(PathBuf::from("/b")),
+            ))
         );
     }
 
@@ -217,6 +281,8 @@ mod tests {
         assert!(listen.contains("127.0.0.1:8080"), "{listen}");
         let grace = args(&["--room-grace-ms"]).expect_err("a bare grace fails");
         assert!(grace.contains("30000"), "{grace}");
+        let page = args(&["--serve-page"]).expect_err("a bare page fails");
+        assert!(page.contains("/page"), "{page}");
         let not_a_number = args(&["--room-grace-ms", "soon"])
             .expect_err("words are not millis");
         assert!(not_a_number.contains("30000"), "{not_a_number}");
@@ -228,6 +294,7 @@ mod tests {
         assert!(help.contains(USAGE), "{help}");
         assert!(help.contains(DEFAULT_ADDRESS), "{help}");
         assert!(help.contains("30s"), "{help}");
+        assert!(help.contains("--serve-page"), "{help}");
         assert!(help.contains("--version"), "{help}");
     }
 
@@ -253,7 +320,7 @@ mod tests {
     #[test]
     fn startup_points_loopback_hosts_at_the_next_step() {
         let local: SocketAddr = "127.0.0.1:8080".parse().expect("parses");
-        let lines = startup_lines(local, Duration::from_secs(30));
+        let lines = startup_lines(local, Duration::from_secs(30), None);
         let joined = lines.join("\n");
         assert!(joined.contains("ws://127.0.0.1:8080/session"), "{joined}");
         assert!(joined.contains("loopback-only"), "{joined}");
@@ -270,7 +337,8 @@ mod tests {
     #[test]
     fn startup_guides_a_wildcard_bind() {
         let local: SocketAddr = "0.0.0.0:8080".parse().expect("parses");
-        let joined = startup_lines(local, Duration::from_secs(30)).join("\n");
+        let joined =
+            startup_lines(local, Duration::from_secs(30), None).join("\n");
         assert!(!joined.contains("loopback-only"), "{joined}");
         assert!(
             joined.contains("replace the wildcard"),
@@ -281,9 +349,22 @@ mod tests {
     #[test]
     fn startup_stays_quiet_for_a_specific_address() {
         let local: SocketAddr = "192.0.2.7:8080".parse().expect("parses");
-        let joined = startup_lines(local, Duration::from_secs(30)).join("\n");
+        let joined =
+            startup_lines(local, Duration::from_secs(30), None).join("\n");
         assert!(!joined.contains("loopback-only"), "{joined}");
         assert!(!joined.contains("wildcard"), "{joined}");
         assert!(joined.contains("same invite link"), "{joined}");
+    }
+
+    #[test]
+    fn startup_names_the_served_page() {
+        let local: SocketAddr = "127.0.0.1:8080".parse().expect("parses");
+        let joined = startup_lines(
+            local,
+            Duration::from_secs(30),
+            Some(Path::new("/page")),
+        )
+        .join("\n");
+        assert!(joined.contains("serving the page from /page"), "{joined}");
     }
 }

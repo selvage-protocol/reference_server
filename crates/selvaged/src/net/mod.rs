@@ -7,6 +7,7 @@
 use std::fmt::Write as _;
 use std::io;
 use std::mem::take;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -16,6 +17,7 @@ use std::time::Duration;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -30,6 +32,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use selvage_protocol as proto;
 use selvage_protocol::{code, event};
 
+use crate::page;
 use crate::room::{Outbound, Queue, Registry};
 use crate::{ServerConfig, random_hex};
 
@@ -39,6 +42,7 @@ use session::{Applicant, Session, grace_ms, handshake};
 
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const NOT_FOUND: &str = r#"{"error":"not found","hint":"try /session (WebSocket) or /meta (HTTP)"}"#;
+const PAGE_NOT_FOUND: &str = r#"{"error":"not found","hint":"no such file in the served page directory"}"#;
 const METHOD_NOT_ALLOWED: &str = r#"{"error":"method not allowed","hint":"GET answers, HEAD answers headers-only"}"#;
 const SERVER_FULL_BODY: &str =
     r#"{"error":"server full","hint":"try again later"}"#;
@@ -715,8 +719,13 @@ async fn respond_plain(
         .await;
     }
     if head.path != proto::META_PATH {
-        return respond_status(tcp, Status::NotFound, NOT_FOUND, &head.method)
-            .await;
+        return match &config.page_root {
+            Some(root) => respond_page(tcp, head, root).await,
+            None => {
+                respond_status(tcp, Status::NotFound, NOT_FOUND, &head.method)
+                    .await
+            }
+        };
     }
     // Canonical (`CANONICAL.md`), so that the negotiation body has the same bytes for
     // every implementation. The grace is this server's configured value: it is the one
@@ -728,6 +737,61 @@ async fn respond_plain(
     ))
     .map_err(io::Error::other)?;
     respond_status(tcp, Status::Ok, &meta, &head.method).await
+}
+
+/// Serves one file from the page root. A path that leaves the root, a file that
+/// is missing, and a file past [`page::MAX_PAGE_BYTES`] are the same answer —
+/// there is nothing to serve — so a request cannot probe the host's disk by
+/// telling the refusals apart.
+async fn respond_page(
+    tcp: &mut TcpStream,
+    head: &Head,
+    root: &Path,
+) -> io::Result<()> {
+    let Some(file) = page::resolve(root, &head.path) else {
+        return not_found_page(tcp, &head.method).await;
+    };
+    let Ok(metadata) = fs::metadata(&file).await else {
+        return not_found_page(tcp, &head.method).await;
+    };
+    if !metadata.is_file() || metadata.len() > page::MAX_PAGE_BYTES {
+        return not_found_page(tcp, &head.method).await;
+    }
+    let Ok(body) = fs::read(&file).await else {
+        return not_found_page(tcp, &head.method).await;
+    };
+    respond_file(tcp, page::content_type(&file), &body, &head.method).await
+}
+
+async fn not_found_page(tcp: &mut TcpStream, method: &str) -> io::Result<()> {
+    respond_status(tcp, Status::NotFound, PAGE_NOT_FOUND, method).await
+}
+
+/// Answers with a served file. `no-store` because the page directory is read
+/// per request: a re-synced build is picked up without a restart, the way the
+/// demo's hand-written page server did it. `nosniff` holds the media type to
+/// the table above, which is what keeps a hashed chunk from being read as HTML.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a served file names its socket, its media type, its body and the method that decides the body"
+)]
+async fn respond_file(
+    tcp: &mut TcpStream,
+    content_type: &str,
+    body: &[u8],
+    method: &str,
+) -> io::Result<()> {
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n\
+         cache-control: no-store\r\nx-content-type-options: nosniff\r\nconnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    if method != "HEAD" {
+        response.extend_from_slice(body);
+    }
+    tcp.write_all(&response).await?;
+    tcp.shutdown().await
 }
 
 /// Answers a plain HTTP request. `HEAD` gets the status line and the headers a

@@ -5,11 +5,13 @@
 //! no file access: the token is the permission and the room dies with its host.
 
 mod net;
+pub mod page;
 pub mod room;
 
 use std::fmt::Write as _;
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,6 +56,10 @@ pub struct ServerConfig {
     /// How many paths one room's open-document set holds at once. Past it, opening a
     /// new path is refused.
     pub max_documents_per_room: usize,
+    /// Serve a static page from this directory on `GET /` and every other plain
+    /// path, from the same origin as `/session` and `/meta`. `None` keeps the
+    /// server a server alone: an unknown plain path answers `404`.
+    pub page_root: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -68,6 +74,7 @@ impl Default for ServerConfig {
             max_rooms: 1024,
             max_peers_per_room: 128,
             max_documents_per_room: 1024,
+            page_root: None,
         }
     }
 }
