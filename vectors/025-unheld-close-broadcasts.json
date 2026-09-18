@@ -1,0 +1,105 @@
+{
+  "id": "025",
+  "title": "A close for a path the closer never held still broadcasts doc.closed",
+  "spec": "PROTOCOL.md#docclose",
+  "notes": "Every validated close is announced, even when the set is unchanged: the guest closes a path it never held, the reply keeps the set, and both peers receive doc.closed with it. The host's effective close afterwards still removes the path.",
+  "selvage": "selvage/1",
+  "canonical": "SJ-C/1",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},\"token\":\"$token\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "open",
+      "conn": "guest",
+      "target": "/session?room=$room&token=$token"
+    },
+    {
+      "op": "send",
+      "conn": "guest",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Bob\",\"role\":\"guest\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"room.joined\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"}],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":2,\"method\":\"doc.open\",\"params\":{\"path\":\"a.txt\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":2,\"result\":{\"documents\":[\"a.txt\"]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"doc.opened\",\"params\":{\"documents\":[\"a.txt\"],\"path\":\"a.txt\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"doc.opened\",\"params\":{\"documents\":[\"a.txt\"],\"path\":\"a.txt\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "guest",
+      "text": "{\"id\":2,\"method\":\"doc.close\",\"params\":{\"path\":\"a.txt\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"id\":2,\"result\":{\"documents\":[\"a.txt\"]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"doc.closed\",\"params\":{\"documents\":[\"a.txt\"],\"path\":\"a.txt\",\"peer_id\":\"$guest_peer\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"doc.closed\",\"params\":{\"documents\":[\"a.txt\"],\"path\":\"a.txt\",\"peer_id\":\"$guest_peer\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":3,\"method\":\"doc.close\",\"params\":{\"path\":\"a.txt\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":3,\"result\":{\"documents\":[]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"doc.closed\",\"params\":{\"documents\":[],\"path\":\"a.txt\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"doc.closed\",\"params\":{\"documents\":[],\"path\":\"a.txt\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    }
+  ]
+}
