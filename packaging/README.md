@@ -220,3 +220,16 @@ that are never cut from this work. It builds with Docker while the smoke
 builds with nix, so it must itself be re-proven green on a real run before
 any first publish. FSL review stays open until the owner
 closes it; the code merges, the artifacts do not.
+
+### Not yet: the container smoke that joins a room
+
+The `--serve-page` work has no container-level proof yet. What exists: the
+local binary was run against a real `web_client/dist` copy and answered `/`,
+`/app.js`, `/meta`, `HEAD /` and two traversal shapes (`404`) on one origin,
+and `crates/harness/tests/page.rs` pins that behaviour. What is missing is a
+workflow job that builds the `Dockerfile` on a Docker-capable runner, starts
+the container with a page mounted, `GET /meta`, and joins a room with a real
+client engine. The engine is not yet reachable from the build: it needs either
+a small `selvage-harness` example driven against the container's base URL, or
+the dev shell in the job. That job is the next step, and it is the only thing
+that can prove `docker run` — this host has no Docker.
