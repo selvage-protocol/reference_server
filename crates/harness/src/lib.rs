@@ -8,7 +8,7 @@ use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::panic::{PanicHookInfo, set_hook, take_hook};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -334,6 +334,9 @@ pub struct DropProxy {
     addr: SocketAddr,
     task: JoinHandle<()>,
     connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// How many connections the relay has accepted, one per TCP connection a client made
+    /// through it: what makes a reconnect attempt countable rather than inferable.
+    accepted: Arc<AtomicUsize>,
 }
 
 impl DropProxy {
@@ -348,18 +351,28 @@ impl DropProxy {
         let target = upstream.to_string();
         let connections: Arc<Mutex<Vec<JoinHandle<()>>>> =
             Arc::new(Mutex::new(Vec::new()));
+        let accepted = Arc::new(AtomicUsize::new(0));
         let tracked = Arc::clone(&connections);
-        let task = tokio::spawn(accept_loop(listener, target, tracked));
+        let counted = Arc::clone(&accepted);
+        let task =
+            tokio::spawn(accept_loop(listener, target, tracked, counted));
         Ok(Self {
             addr,
             task,
             connections,
+            accepted,
         })
     }
 
     #[must_use]
     pub fn ws_base(&self) -> String {
         format!("ws://{}", self.addr)
+    }
+
+    /// How many connections have been relayed since this proxy started.
+    #[must_use]
+    pub fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
     }
 
     /// Cuts every relayed connection, dropping both of its sockets. The server sees its
@@ -399,12 +412,18 @@ fn track(connections: &Mutex<Vec<JoinHandle<()>>>, handle: JoinHandle<()>) {
 }
 
 /// Accepts relayed connections until the listener is dropped.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a relay loop names its listener, target and the two counters a test reads"
+)]
 async fn accept_loop(
     listener: TcpListener,
     target: String,
     connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    accepted: Arc<AtomicUsize>,
 ) {
     while let Ok((client, _)) = listener.accept().await {
+        accepted.fetch_add(1, Ordering::SeqCst);
         track(&connections, tokio::spawn(relay(client, target.clone())));
     }
 }

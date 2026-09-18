@@ -389,15 +389,22 @@ enum Attempt {
 }
 
 /// Refusals after which retrying the same URL cannot help (`PROTOCOL.md` §9.1, §11).
+///
+/// A code in the reserved `x.` namespace is one this document does not define, and §9.1
+/// makes every one of them a stop: a handshake refused with one **MUST NOT** be re-helloed
+/// automatically, whether or not this client knows the code. Recognising only the bare
+/// five would re-hello a `x.server_full` or `x.room_full` refusal until the retries ran
+/// out, which is the one behaviour §9.1 names as forbidden.
 fn is_terminal_code(name: &str) -> bool {
-    matches!(
-        name,
-        code::ROOM_UNKNOWN
-            | code::TOKEN_INVALID
-            | code::HOST_PRESENT
-            | code::UNSUPPORTED_VERSION
-            | code::ROOM_GONE
-    )
+    name.starts_with("x.")
+        || matches!(
+            name,
+            code::ROOM_UNKNOWN
+                | code::TOKEN_INVALID
+                | code::HOST_PRESENT
+                | code::UNSUPPORTED_VERSION
+                | code::ROOM_GONE
+        )
 }
 
 /// Runs the turn loop until the session ends.
@@ -1547,7 +1554,9 @@ mod tests {
     use yrs::sync::Awareness;
     use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact};
 
-    use super::{EngineTask, Sink, Stream, fresh_doc, seed_update};
+    use super::{
+        EngineTask, Sink, Stream, fresh_doc, is_terminal_code, seed_update,
+    };
     use crate::editor::EngineEvent;
     use crate::session::ReconnectPolicy;
     use crate::{ConnectOptions, KeepaliveConfig, SessionInfo};
@@ -1611,6 +1620,35 @@ mod tests {
         let restored = txn.get_text(PATH).map(|text| text.get_string(&txn));
         assert_eq!(restored.as_deref(), Some("fn main() {}"));
         Ok(())
+    }
+
+    /// A refusal a retry cannot change stops the retries (`PROTOCOL.md` §9.1). Every `x.`
+    /// code is one of them, known or not: the namespace is reserved for exactly this —
+    /// capacity, in this slice — and §9.1 forbids re-helloing a handshake refused with one.
+    #[test]
+    fn a_refusal_is_terminal_for_every_stopping_code() {
+        for name in [
+            code::ROOM_UNKNOWN,
+            code::TOKEN_INVALID,
+            code::HOST_PRESENT,
+            code::UNSUPPORTED_VERSION,
+            code::ROOM_GONE,
+            "x.server_full",
+            "x.room_full",
+            "x.something.invented.later",
+            "x.",
+        ] {
+            assert!(is_terminal_code(name), "{name} stops the retries");
+        }
+        for name in [
+            "",
+            "bad_message",
+            "bad_params",
+            "unknown_method",
+            "X.room_full",
+        ] {
+            assert!(!is_terminal_code(name), "{name} may be retried");
+        }
     }
 
     /// A loopback WebSocket pair: the engine end supplies a real sink and stream, and
