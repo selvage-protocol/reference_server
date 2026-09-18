@@ -163,62 +163,79 @@ pub async fn connect(
     options: ConnectOptions,
 ) -> Result<(Channel, SessionInfo), Error> {
     let local_state = serde_json::to_string(&options.initial_awareness)?;
-    let replica = handshake(&options, None, &local_state).await?;
+    let replica = handshake(&options, fresh_awareness(None)?, &local_state)
+        .await
+        .map_err(|(error, _replica)| error)?;
     let session = replica.session.clone();
     Ok((spawn(options, replica, local_state), session))
 }
 
-/// Opens the socket, seeds a fresh `Y.Doc` and sends `session.hello`.
+/// Opens the socket for `awareness` and sends `session.hello`.
 ///
-/// Every attempt gets a fresh replica: a reconnecting client is a new peer, and `yrs`
-/// keeps a tombstone for an awareness client id whose state was removed, so reusing one
-/// drops the first republish. `previous` carries the outgoing replica's state into the
-/// new one, so what the client already holds is not lost with the socket.
+/// The replica is built by the caller, so a reconnect that retries seats the same one
+/// rather than encoding this client's state into a new `Y.Doc` for every attempt. An error
+/// hands the replica back with it: nothing is applied before `room.joined`, so a replica a
+/// failed attempt built is the one it started with.
+#[expect(
+    clippy::result_large_err,
+    reason = "the error hands the replica back so the next attempt seats it instead of encoding the client's state again; boxing it would move that allocation, not remove it"
+)]
 async fn handshake(
     options: &ConnectOptions,
-    previous: Option<Vec<u8>>,
+    mut awareness: Awareness,
     local_state: &str,
-) -> Result<Replica, Error> {
-    // A text offset on this API is a UTF-16 code unit, the unit `yjs`, every editor's
-    // `offsetAt` and every peer on the wire use (PROTOCOL.md §8.1). `yrs` defaults to
-    // UTF-8 byte offsets, which would put a cursor after the first non-BMP character
-    // somewhere else than every other implementation does.
-    let doc = fresh_doc(previous)?;
-    let awareness_client_id = doc.client_id().get();
-    let mut awareness = Awareness::new(doc);
+) -> Result<Replica, (Error, Awareness)> {
     awareness.set_local_state_raw(local_state.to_string());
-
-    let url = proto::session_url(
-        &options.base_url,
-        options.room.as_deref(),
-        options.token.as_deref(),
-    );
-    let (ws, _) = tokio_tungstenite::connect_async(url)
-        .await
-        .map_err(Error::Wire)?;
-    let (mut sink, mut stream) = ws.split();
-
     let hello = proto::ClientMessage::new(
         1,
         method::SESSION_HELLO,
         serde_json::json!(proto::HelloParams {
             display_name: options.display_name.clone(),
             role: options.role,
-            awareness_client_id: Some(awareness_client_id),
+            awareness_client_id: Some(awareness.client_id().get()),
             capabilities: options.capabilities.clone(),
             client: options.client.clone(),
         }),
     );
-    sink.send(Message::text(hello.to_text()?))
-        .await
-        .map_err(Error::Wire)?;
-    let session = await_session(&mut stream, &options.base_url).await?;
-    Ok(Replica {
-        sink,
-        stream,
-        awareness,
-        session,
-    })
+
+    let url = proto::session_url(
+        &options.base_url,
+        options.room.as_deref(),
+        options.token.as_deref(),
+    );
+    let socket = match tokio_tungstenite::connect_async(url).await {
+        Ok((ws, _)) => ws,
+        Err(e) => return Err((Error::Wire(e), awareness)),
+    };
+    let (mut sink, mut stream) = socket.split();
+    let text = match hello.to_text() {
+        Ok(text) => text,
+        Err(e) => return Err((Error::Json(e), awareness)),
+    };
+    if let Err(e) = sink.send(Message::text(text)).await {
+        return Err((Error::Wire(e), awareness));
+    }
+    match await_session(&mut stream, &options.base_url).await {
+        Ok(session) => Ok(Replica {
+            sink,
+            stream,
+            awareness,
+            session,
+        }),
+        Err(error) => Err((error, awareness)),
+    }
+}
+
+/// A fresh replica to seat: a new `Y.Doc` — a reconnecting client is a new peer, and `yrs`
+/// keeps a tombstone for an awareness client id whose state was removed, so reusing one
+/// drops the first republish — carrying what this client already holds, so nothing is lost
+/// with the socket.
+fn fresh_awareness(previous: Option<Vec<u8>>) -> Result<Awareness, Error> {
+    // A text offset on this API is a UTF-16 code unit, the unit `yjs`, every editor's
+    // `offsetAt` and every peer on the wire use (PROTOCOL.md §8.1). `yrs` defaults to
+    // UTF-8 byte offsets, which would put a cursor after the first non-BMP character
+    // somewhere else than every other implementation does.
+    Ok(Awareness::new(fresh_doc(previous)?))
 }
 
 /// A new replica carrying `previous`'s state, if any. The fresh client id is what a
@@ -243,8 +260,10 @@ fn fresh_doc(previous: Option<Vec<u8>>) -> Result<Doc, Error> {
 /// The state a fresh replica is seated with, or `None` when there is nothing to carry.
 ///
 /// A replica that has integrated nothing encodes to the encoding of nothing, which
-/// [`fresh_doc`] would decode and apply for no effect at all — and the encode is O(document),
-/// once per attempt. The state vector is O(clients), which is why it is what decides.
+/// [`fresh_doc`] would decode and apply for no effect at all — and the encode is O(document).
+/// The state vector is O(clients), which is why it is what decides; the encode itself
+/// happens once per reconnect rather than once per attempt, because every attempt after the
+/// first seats the replica the one before it built.
 fn seed_update(doc: &Doc) -> Option<Vec<u8>> {
     let txn = doc.transact();
     if txn.state_vector().is_empty() {
@@ -365,6 +384,7 @@ fn spawn(
         request_id: 1,
         inflight: None,
         waiting: VecDeque::new(),
+        pending: None,
         watched: HashMap::new(),
         local_state: Some(local_state),
         queued: VecDeque::new(),
@@ -563,6 +583,9 @@ struct EngineTask {
     /// Requests made while another was in flight, in the order they were made. Each goes
     /// out when the one before it is answered; none of them is on the wire before then.
     waiting: VecDeque<Pending>,
+    /// The replica a failed reconnect attempt built, for the next one to seat: nothing is
+    /// applied before `room.joined`, so it is exactly the state the attempt started with.
+    pending: Option<Awareness>,
     /// The documents whose changes reach an adapter, by path: the handle whose observer
     /// reports them. A document that has not arrived has no text to watch — creating one
     /// would make an unreceived document look like an empty one, which §8.1 forbids a
@@ -777,22 +800,25 @@ impl EngineTask {
 
     /// One bounded reconnect attempt. The replica this client already holds is carried
     /// into the fresh one, so what it knows is not lost with the socket; a terminal
-    /// refusal stops the retries, every other failure is retried.
-    async fn attempt(&self) -> Attempt {
+    /// refusal stops the retries, every other failure is retried — on the replica it built,
+    /// so the state is encoded once for the reconnect rather than once per attempt.
+    async fn attempt(&mut self) -> Attempt {
         let mut options = self.options.clone();
         options.room.clone_from(&self.room);
         options.token.clone_from(&self.token);
         let local_state =
             self.local_state.clone().unwrap_or_else(|| "{}".to_string());
-        let previous = seed_update(self.awareness.doc());
+        let Ok(awareness) = self.replica_for_attempt() else {
+            return Attempt::Retry;
+        };
         let outcome = timeout(
             HANDSHAKE_TIMEOUT,
-            handshake(&options, previous, &local_state),
+            handshake(&options, awareness, &local_state),
         )
         .await;
         match outcome {
             Ok(Ok(replica)) => Attempt::Seated(Box::new(replica)),
-            Ok(Err(Error::Protocol { code, message }))
+            Ok(Err((Error::Protocol { code, message }, _replica)))
                 if is_terminal_code(&code) =>
             {
                 let _ = self
@@ -800,8 +826,21 @@ impl EngineTask {
                     .send(EngineEvent::SessionError { code, message });
                 Attempt::Refused
             }
-            _ => Attempt::Retry,
+            Ok(Err((_error, awareness))) => {
+                self.pending = Some(awareness);
+                Attempt::Retry
+            }
+            Err(_elapsed) => Attempt::Retry,
         }
+    }
+
+    /// The replica the next attempt seats: the one the last failed attempt built, or a
+    /// fresh one carrying this client's state. An attempt that timed out took its replica
+    /// with it, so the one it built is not always here.
+    fn replica_for_attempt(&mut self) -> Result<Awareness, Error> {
+        self.pending
+            .take()
+            .map_or_else(|| fresh_awareness(seed_update(self.doc())), Ok)
     }
 
     /// Handles one inbound frame.
@@ -2160,6 +2199,51 @@ mod tests {
         task.presence().iter().any(|p| p.client_id == client_id)
     }
 
+    /// The text a replica holds for `path`, if any.
+    fn carried(awareness: &Awareness) -> Option<String> {
+        let doc = awareness.doc();
+        let txn = doc.transact();
+        txn.get_text(PATH).map(|text| text.get_string(&txn))
+    }
+
+    /// A failed attempt's replica is the one the next attempt seats: a reconnect that
+    /// retries encodes this client's state once for the whole reconnect rather than once
+    /// per attempt, which is the entire cost of an attempt that cannot reach the server.
+    #[tokio::test]
+    async fn a_failed_attempt_hands_its_replica_to_the_next()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, _events) = receiving_task().await?;
+        task.mutate_text(
+            PATH,
+            EditOp::Insert {
+                index: 0,
+                text: "carried\n".to_string(),
+            },
+        );
+
+        // The first attempt builds a replica carrying what this client holds.
+        let first = task.replica_for_attempt()?;
+        let client_id = first.client_id();
+        assert!(task.pending.is_none(), "nothing was left over");
+
+        // The attempt fails, and hands its replica back; the next one seats that replica,
+        // not another built from the state all over again.
+        task.pending = Some(first);
+        let second = task.replica_for_attempt()?;
+        assert_eq!(
+            second.client_id(),
+            client_id,
+            "the same replica, and so the same awareness client id"
+        );
+        assert_eq!(
+            carried(&second).as_deref(),
+            Some("carried\n"),
+            "and it still holds what the client holds"
+        );
+        assert!(task.pending.is_none(), "and it is not kept twice");
+        Ok(())
+    }
+
     /// A loopback WebSocket pair: the engine end supplies a real sink and stream, and
     /// nothing connects anywhere.
     async fn loopback_pair() -> Result<(Sink, Stream), Box<dyn StdError>> {
@@ -2221,6 +2305,7 @@ mod tests {
             request_id: 0,
             inflight: None,
             waiting: VecDeque::new(),
+            pending: None,
             watched: HashMap::new(),
             local_state: None,
             queued: VecDeque::new(),
