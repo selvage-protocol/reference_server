@@ -7,12 +7,15 @@
 //! the page's `/meta` fetch and its WebSocket dial are both same-origin.
 //!
 //! A request path is a *file name under the page root*, never a path on the
-//! host: only the components below the root are used, and `.`, `..` and an
-//! empty component refuse the request outright. Nothing here resolves a
-//! symbolic link, so the operator's own page directory is exactly what is
-//! served.
+//! host: only the components below the root are used, `.`, `..` and an empty
+//! component refuse the request outright, and the file that gets opened has to
+//! resolve to somewhere under the same root — so a symbolic link the page
+//! directory holds cannot reach out of it.
 
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+
+use tokio::fs;
 
 /// The file a request for the root serves.
 const INDEX: &str = "index.html";
@@ -110,6 +113,30 @@ fn is_content_hashed(file: &Path) -> bool {
         && hash.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
         })
+}
+
+/// Opens `file` for a response, and only when the file that was opened still
+/// lives under `root`.
+///
+/// [`resolve`] keeps the *request* under the root, but the page directory is a
+/// build artifact and a symbolic link inside it can name a file outside —
+/// `dist/secret -> /etc/passwd` served to anyone who can reach the page. The
+/// check is on the descriptor the caller reads, not on the path that named it:
+/// a component swapped between an open and a check cannot move the descriptor,
+/// and the file it names is the file that is read. The root is resolved once
+/// per request, which is what makes a page root that is itself a link work.
+///
+/// The descriptor's own path is read through `/proc/self/fd`, the only way std
+/// offers to name what an open descriptor is; on a system without it every
+/// request is refused rather than served unverified, and every target here
+/// (Linux, the image, the Pi unit) has it.
+pub(crate) async fn open_within(root: &Path, file: &Path) -> Option<fs::File> {
+    let real_root = fs::canonicalize(root).await.ok()?;
+    let opened = fs::File::open(file).await.ok()?;
+    let real = fs::read_link(format!("/proc/self/fd/{}", opened.as_raw_fd()))
+        .await
+        .ok()?;
+    real.starts_with(real_root).then_some(opened)
 }
 
 /// The file `path` names under `root`, or `None` when it names none this

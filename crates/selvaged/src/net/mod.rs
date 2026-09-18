@@ -17,7 +17,6 @@ use std::time::Duration;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -739,10 +738,14 @@ async fn respond_plain(
     respond_status(tcp, Status::Ok, &meta, &head.method).await
 }
 
-/// Serves one file from the page root. A path that leaves the root, a file that
-/// is missing, and a file past [`page::MAX_PAGE_BYTES`] are the same answer —
-/// there is nothing to serve — so a request cannot probe the host's disk by
-/// telling the refusals apart.
+/// Serves one file from the page root. A path that leaves the root, a link that
+/// reaches out of it, a file that is missing, and a file past
+/// [`page::MAX_PAGE_BYTES`] are the same answer — there is nothing to serve — so
+/// a request cannot probe the host's disk by telling the refusals apart.
+///
+/// Every step after the first reads the descriptor the step before it opened:
+/// the size bound, the file check and the bytes all come from the file that
+/// [`page::open_within`] verified, never from a second look at the path.
 async fn respond_page(
     tcp: &mut TcpStream,
     head: &Head,
@@ -751,15 +754,25 @@ async fn respond_page(
     let Some(file) = page::resolve(root, &head.path) else {
         return not_found_page(tcp, &head.method).await;
     };
-    let Ok(metadata) = fs::metadata(&file).await else {
+    let Some(opened) = page::open_within(root, &file).await else {
+        return not_found_page(tcp, &head.method).await;
+    };
+    let Ok(metadata) = opened.metadata().await else {
         return not_found_page(tcp, &head.method).await;
     };
     if !metadata.is_file() || metadata.len() > page::MAX_PAGE_BYTES {
         return not_found_page(tcp, &head.method).await;
     }
-    let Ok(body) = fs::read(&file).await else {
+    // One byte past the bound, so a file that grows under the read cannot make
+    // the response larger than a file of this size would be.
+    let mut body = Vec::new();
+    let mut bounded = opened.take(page::MAX_PAGE_BYTES.saturating_add(1));
+    if bounded.read_to_end(&mut body).await.is_err()
+        || body.len()
+            > usize::try_from(page::MAX_PAGE_BYTES).unwrap_or(usize::MAX)
+    {
         return not_found_page(tcp, &head.method).await;
-    };
+    }
     respond_file(tcp, &page::headers(&file), &body, &head.method).await
 }
 

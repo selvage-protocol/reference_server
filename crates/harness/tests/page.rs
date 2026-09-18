@@ -8,6 +8,7 @@
 use std::env;
 use std::error::Error as StdError;
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::process;
 use std::time::SystemTime;
@@ -219,6 +220,37 @@ async fn a_traversal_is_the_same_answer_as_a_missing_file()
             "{line}: {body:?}"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_link_out_of_the_page_root_names_nothing() -> Result<(), Failure> {
+    // A page root is a build artifact, and a link inside one must not become a
+    // way to read the host's disk: what gets served is a file that resolves
+    // under the root, not a path that merely starts there.
+    let outside = PageDir::new()?;
+    outside.write("secret.txt", "the host's disk")?;
+    let dir = PageDir::new()?;
+    dir.write("app.js", "export const a = 1;")?;
+    symlink(outside.path.join("secret.txt"), dir.path.join("secret.js"))?;
+    // The linked *directory* is the shape a lexical check alone cannot see.
+    symlink(&outside.path, dir.path.join("assets"))?;
+    // …and a link that stays inside the root still serves, which is what a
+    // dist holding one relies on.
+    symlink("app.js", dir.path.join("alias.js"))?;
+    let harness = dir.start().await;
+
+    for line in ["GET /secret.js", "GET /assets/secret.txt"] {
+        let (status, headers, body) = request(&harness, line).await?;
+        assert_eq!(status, "HTTP/1.1 404 Not Found", "{line}: {headers}");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("not found"), "{line}: {text}");
+        assert!(!text.contains("the host's disk"), "{line}: {text}");
+    }
+
+    let (status, _, body) = request(&harness, "GET /alias.js").await?;
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert_eq!(body, b"export const a = 1;");
     Ok(())
 }
 
