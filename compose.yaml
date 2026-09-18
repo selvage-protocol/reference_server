@@ -23,5 +23,14 @@ services:
     # Inside the container the wildcard is correct: the port mapping supplies
     # the boundary. Override per host, e.g. `--listen 0.0.0.0:9000` with a
     # matching ports entry.
-    command: ["--listen", "0.0.0.0:8080"]
+    #
+    # One container, one port: the page is served from the same origin as
+    # /session and /meta, so the guest link is a page link (`/` with the room
+    # and token in the query) and nothing needs a CORS proxy. The page itself
+    # is the browser client's `dist/`, mounted read-only at `./page` — this
+    # repository does not build or vendor it (see packaging/README.md). With
+    # `./page` absent the server still answers /meta and /session; `/` is 404.
+    volumes:
+      - ./page:/page:ro
+    command: ["--listen", "0.0.0.0:8080", "--serve-page", "/page"]
     restart: unless-stopped

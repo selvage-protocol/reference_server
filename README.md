@@ -62,6 +62,32 @@ beyond a shell — a systemd user unit, or a multi-arch container image with a
 one-service compose file — see `packaging/` (install docs, upgrade flow, version
 truthfulness, and the licence review that must precede any image publish).
 
+### One container, one port, and the page
+
+`selvaged --serve-page DIR` serves the browser page from the same origin as `/session`
+and `/meta`. One process, one port, one origin: the page's `/meta` read is same-origin
+(no CORS proxy) and its socket is `ws://` or `wss://` on the page's own host (no
+cross-origin dial). The guest link is then a page link —
+`http://HOST:PORT/?room=<room>&token=<token>` — with no `server=` parameter.
+
+The page itself is the browser client's built `dist/`, which lives in the `web_client`
+repository and is **not** built or vendored here; point the flag at a copy of it:
+
+```sh
+docker run --rm -p 127.0.0.1:8080:8080 \
+  -v "$PWD/page:/page:ro" \
+  ghcr.io/selvage-protocol/selvaged --listen 0.0.0.0:8080 --serve-page /page
+```
+
+With no page directory the server still answers `/meta` and `/session`; `/` is `404`.
+`compose.yaml` mounts `./page` and passes the flag already.
+
+**Not secure by default.** `ws://`/`http://` is plaintext: the invite token travels in
+the clear, so it is for a tailnet, a VPN or loopback. The protocol's transport security
+is the deployer's to supply; put a TLS terminator in front — `tailscale serve`, caddy,
+or your edge — and hand out the `https://`/`wss://` URL. There is no TLS inside
+`selvaged`, and none is claimed. Rooms are memory-only: a restart ends every room.
+
 The vector replay reads `vectors/`, or `SELVAGE_VECTORS` when that is set — the Nix build
 cannot see outside the Cargo workspace, so `flake.nix` hands the directory in explicitly.
 

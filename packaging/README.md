@@ -174,6 +174,30 @@ an overridable `command`, and no volumes — the server keeps nothing on disk.
 the first image is published the file builds locally (`build:`); after that
 it pulls the published tag.
 
+### One origin: the page
+
+`selvaged --serve-page DIR` serves the browser page on the same origin as
+`/session` and `/meta` (see the root README). The container recipe mounts the
+page directory read-only at `/page` and passes the flag, so one container and
+one port answer the page, the meta document and the socket — the CORS proxy and
+the second page server the Pi runbook hand-writes are not needed.
+
+**The page is not in this repository.** It is the `web_client` repository's
+built `dist/`; this repository neither builds nor vendors it, so the image
+ships the server alone and the page is mounted (`-v …/dist:/page:ro`). A build
+that pulls it in — a Dockerfile stage that clones `web_client` at a pinned
+revision — is the obvious next step and is **not** done: this environment has
+no reachable copy of that repository to pin or to verify against. `./page`
+absent is not fatal: `/meta` and `/session` still answer and `/` is a `404`.
+
+### TLS
+
+`selvaged` speaks no TLS and claims none: an invite over `ws://` is plaintext,
+and an `https` page cannot dial a `ws://` socket (mixed active content). For a
+shareable link, put a terminator in front — `tailscale serve`, caddy, or your
+edge — and hand out the `https://`/`wss://` URL. Serving the page from the same
+origin as the socket is what makes that one terminator enough.
+
 ## CI
 
 `.github/workflows/image.yml` has two jobs. `smoke` runs on every PR and on
