@@ -22,6 +22,96 @@ const INDEX: &str = "index.html";
 /// into memory. Over the bound the request is answered like a missing file.
 pub(crate) const MAX_PAGE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// The policy for a name carrying a content hash: its bytes cannot change
+/// under that name, so a reload may reuse it without asking. A year is the
+/// conventional "for ever" of a hashed asset, not a promise about the file.
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+/// The policy for every other name. The shell and the bundler's stable names
+/// change whenever the page is rebuilt, so a cached copy is revalidated rather
+/// than pinned; the page root is read per request, so a re-synced build is
+/// served without a restart either way.
+const REVALIDATE: &str = "no-cache";
+
+/// The page's content security policy: no default source at all, so every
+/// fetch the page makes is one of the directives below.
+///
+/// `connect-src` admits any websocket or HTTP origin, because the page is a
+/// client for whatever server an invite names — a page served from one origin
+/// joining a room on another is the normal case, not a defect. `'unsafe-inline'`
+/// covers the shell's inline style block and its pre-paint script, neither of
+/// which can be hashed per build.
+pub(crate) const CSP: &str = concat!(
+    "default-src 'none'; ",
+    "script-src 'self' 'unsafe-inline'; ",
+    "style-src 'self' 'unsafe-inline'; ",
+    "img-src 'self' data:; ",
+    "font-src 'self'; ",
+    "worker-src 'self' blob:; ",
+    "connect-src 'self' ws: wss: http: https:; ",
+    "manifest-src 'self'; ",
+    "base-uri 'none'; ",
+    "form-action 'none'; ",
+    "frame-ancestors 'none'",
+);
+
+/// Every header one served file carries, in the order they are written.
+///
+/// The media type comes from the pinned table below, never the host's mime
+/// database. The cache policy is the name's: a content-hashed asset is pinned,
+/// everything else revalidates. The last three are the hardening the demo's
+/// hand-written page server carried and a static handler forgets: an invite
+/// URL carries the room token, so its referrer is withheld from every origin
+/// the page visits, and `nosniff` holds a response to the media type this table
+/// gave it.
+pub(crate) fn headers(file: &Path) -> [(&'static str, &'static str); 5] {
+    [
+        ("content-type", content_type(file)),
+        ("cache-control", cache_control(file)),
+        ("referrer-policy", "no-referrer"),
+        ("x-content-type-options", "nosniff"),
+        ("content-security-policy", CSP),
+    ]
+}
+
+/// How a client may cache this file.
+fn cache_control(file: &Path) -> &'static str {
+    if is_content_hashed(file) {
+        IMMUTABLE
+    } else {
+        REVALIDATE
+    }
+}
+
+/// Whether the name carries a content hash the bundler wrote — `-<hash>` before
+/// the extension, eight or more characters of the alphabet a hash is written in:
+/// the pattern the demo's page server pinned. The extensions are the ones the
+/// bundler hashes, so a name that merely looks hashed is not pinned.
+/// `name-1a2b3c4d.js` is; `app.js` and `app-1a2b3c.js` are not, the latter
+/// because seven characters is not a hash, and `lang-255Y2KCL.js.map` is not,
+/// because there the extension is `map` and the hash sits before the `.js`.
+fn is_content_hashed(file: &Path) -> bool {
+    let Some(name) = file.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some((stem, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    if !matches!(
+        extension,
+        "js" | "css" | "map" | "ttf" | "woff" | "woff2" | "png" | "svg"
+    ) {
+        return false;
+    }
+    let Some((_, hash)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    hash.len() >= 8
+        && hash.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+        })
+}
+
 /// The file `path` names under `root`, or `None` when it names none this
 /// serves. `path` is the origin-form request target with its query already
 /// split off, so it starts with `/`; percent-encoding is deliberately not
@@ -78,7 +168,10 @@ pub(crate) fn content_type(file: &Path) -> &'static str {
 mod tests {
     use std::path::Path;
 
-    use super::{INDEX, content_type, resolve};
+    use super::{
+        CSP, IMMUTABLE, INDEX, REVALIDATE, cache_control, content_type,
+        headers, resolve,
+    };
 
     fn resolved(path: &str) -> String {
         resolve(Path::new("/page"), path)
@@ -156,6 +249,65 @@ mod tests {
         );
         assert_eq!(content_type(Path::new("codicon.ttf")), "font/ttf");
         assert_eq!(content_type(Path::new("icon.png")), "image/png");
+    }
+
+    #[test]
+    fn a_content_hashed_name_is_pinned_and_a_stable_one_revalidates() {
+        for name in [
+            "app-1a2b3c4d.js",
+            "editor.worker-09f8e7d6.js",
+            "index-abcdefgh.css",
+            "app-1a2b3c4d.map",
+            "codicon-7c6e5d4f.ttf",
+            "codicon-7c6e5d4f.woff",
+            "codicon-7c6e5d4f.woff2",
+            "preview-deadbeef.png",
+            "svp-0f1e2d3c.svg",
+        ] {
+            assert_eq!(cache_control(Path::new(name)), IMMUTABLE, "{name}");
+        }
+        for name in [
+            // The shell and the bundler's unhashed names.
+            "index.html",
+            "app.js",
+            // A hash shorter than eight characters is not one.
+            "app-1a2b3c.js",
+            // The extensions the bundler does not hash.
+            "app-1a2b3c4d.html",
+            "app-1a2b3c4d.txt",
+            // A source map of a hashed chunk: the extension is `map` and the
+            // hash is not next to it, so the name is not the hash's.
+            "lang-255Y2KCL.js.map",
+            // A hash-looking name with no extension, and a bare extension.
+            "app-1a2b3c4d",
+            ".js",
+        ] {
+            assert_eq!(cache_control(Path::new(name)), REVALIDATE, "{name}");
+        }
+    }
+
+    #[test]
+    fn every_served_file_carries_its_type_its_cache_policy_and_the_hardening() {
+        let index = headers(Path::new("index.html"));
+        assert!(index.contains(&("content-type", "text/html; charset=utf-8")));
+        assert!(index.contains(&("cache-control", REVALIDATE)));
+        assert!(index.contains(&("referrer-policy", "no-referrer")));
+        assert!(index.contains(&("x-content-type-options", "nosniff")));
+        assert!(index.contains(&("content-security-policy", CSP)));
+
+        let hashed = headers(Path::new("app-1a2b3c4d.js"));
+        assert!(hashed.contains(&("cache-control", IMMUTABLE)));
+        assert!(hashed.contains(&("content-security-policy", CSP)));
+    }
+
+    #[test]
+    fn the_csp_admits_what_the_page_needs_and_nothing_else() {
+        // The page dials whatever server its invite names, so the socket
+        // directives stay open; everything else is the page's own origin.
+        assert!(CSP.contains("connect-src 'self' ws: wss: http: https:"));
+        assert!(CSP.contains("script-src 'self' 'unsafe-inline'"));
+        assert!(CSP.starts_with("default-src 'none'"));
+        assert!(CSP.contains("frame-ancestors 'none'"));
     }
 
     #[test]

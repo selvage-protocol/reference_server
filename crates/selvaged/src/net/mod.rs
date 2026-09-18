@@ -760,37 +760,38 @@ async fn respond_page(
     let Ok(body) = fs::read(&file).await else {
         return not_found_page(tcp, &head.method).await;
     };
-    respond_file(tcp, page::content_type(&file), &body, &head.method).await
+    respond_file(tcp, &page::headers(&file), &body, &head.method).await
 }
 
 async fn not_found_page(tcp: &mut TcpStream, method: &str) -> io::Result<()> {
     respond_status(tcp, Status::NotFound, PAGE_NOT_FOUND, method).await
 }
 
-/// Answers with a served file. `no-store` because the page directory is read
-/// per request: a re-synced build is picked up without a restart, the way the
-/// demo's hand-written page server did it. `nosniff` holds the media type to
-/// the table above, which is what keeps a hashed chunk from being read as HTML.
+/// Answers with a served file. The headers are [`page::headers`] — the pinned media type, the
+/// cache policy the name earns, and the hardening the page needs — and `nosniff` among them is
+/// what keeps a hashed chunk from being read as HTML. `connection: close` because the page's
+/// files are small and a keep-alive would hold a connection past the request that used it.
 #[expect(
     clippy::too_many_arguments,
-    reason = "a served file names its socket, its media type, its body and the method that decides the body"
+    reason = "a served file names its socket, its headers, its body and the method that decides the body"
 )]
 async fn respond_file(
     tcp: &mut TcpStream,
-    content_type: &str,
+    headers: &[(&str, &str)],
     body: &[u8],
     method: &str,
 ) -> io::Result<()> {
-    let mut response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n\
-         cache-control: no-store\r\nx-content-type-options: nosniff\r\nconnection: close\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    if method != "HEAD" {
-        response.extend_from_slice(body);
+    let mut response =
+        format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n", body.len());
+    for (name, value) in headers {
+        let _ = write!(response, "{name}: {value}\r\n");
     }
-    tcp.write_all(&response).await?;
+    response.push_str("connection: close\r\n\r\n");
+    let mut bytes = response.into_bytes();
+    if method != "HEAD" {
+        bytes.extend_from_slice(body);
+    }
+    tcp.write_all(&bytes).await?;
     tcp.shutdown().await
 }
 

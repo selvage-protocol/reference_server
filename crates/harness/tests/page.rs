@@ -87,6 +87,34 @@ async fn request(
     Ok((status.to_string(), headers.to_string(), body))
 }
 
+/// The content security policy the served page carries, ported from the demo's
+/// hand-written page server. Pinned here as bytes, because it is a contract with
+/// the browser rather than with this repository: `connect-src` has to admit a
+/// websocket on any origin, since the page joins whatever server its invite
+/// names, and every other directive is the page's own origin.
+const CSP: &str = "default-src 'none'; script-src 'self' 'unsafe-inline'; \
+    style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; \
+    worker-src 'self' blob:; connect-src 'self' ws: wss: http: https:; \
+    manifest-src 'self'; base-uri 'none'; form-action 'none'; \
+    frame-ancestors 'none'";
+
+/// Asserts the headers every served file carries, whatever its name.
+fn assert_hardened(headers: &str) {
+    for want in [
+        "referrer-policy: no-referrer",
+        "x-content-type-options: nosniff",
+    ] {
+        assert!(
+            headers.to_ascii_lowercase().contains(want),
+            "{want} is missing from {headers}"
+        );
+    }
+    assert!(
+        headers.contains(&format!("content-security-policy: {CSP}")),
+        "the CSP is missing from {headers}"
+    );
+}
+
 #[tokio::test]
 async fn the_root_serves_the_index_and_assets_with_types() -> Result<(), Failure>
 {
@@ -101,7 +129,9 @@ async fn the_root_serves_the_index_and_assets_with_types() -> Result<(), Failure
         headers.contains("content-type: text/html; charset=utf-8"),
         "{headers}"
     );
-    assert!(headers.contains("cache-control: no-store"), "{headers}");
+    // A stable name is never pinned: it changes whenever the page is rebuilt.
+    assert!(headers.contains("cache-control: no-cache"), "{headers}");
+    assert_hardened(&headers);
     assert_eq!(body, b"<!doctype html><title>selvage</title>");
 
     let (status, headers, body) = request(&harness, "GET /app.js").await?;
@@ -110,7 +140,33 @@ async fn the_root_serves_the_index_and_assets_with_types() -> Result<(), Failure
         headers.contains("content-type: text/javascript; charset=utf-8"),
         "a hashed chunk must not be HTML: {headers}"
     );
+    assert!(headers.contains("cache-control: no-cache"), "{headers}");
+    assert_hardened(&headers);
     assert_eq!(body, b"export const a = 1;");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_content_hashed_name_is_pinned() -> Result<(), Failure> {
+    let dir = PageDir::new()?;
+    dir.write("app-1a2b3c4d.js", "export const hashed = 1;")?;
+    dir.write("app-1a2b3c.js", "export const short = 1;")?;
+    let harness = dir.start().await;
+
+    let (status, headers, _) =
+        request(&harness, "GET /app-1a2b3c4d.js").await?;
+    assert_eq!(status, "HTTP/1.1 200 OK", "{headers}");
+    assert!(
+        headers.contains("cache-control: public, max-age=31536000, immutable"),
+        "a content-hashed name may be pinned: {headers}"
+    );
+    assert_hardened(&headers);
+
+    // Seven characters is not a hash, so this one still revalidates: pinning a
+    // name whose bytes change under it would serve a stale bundle.
+    let (status, headers, _) = request(&harness, "GET /app-1a2b3c.js").await?;
+    assert_eq!(status, "HTTP/1.1 200 OK", "{headers}");
+    assert!(headers.contains("cache-control: no-cache"), "{headers}");
     Ok(())
 }
 
@@ -138,6 +194,7 @@ async fn head_carries_the_length_without_the_body() -> Result<(), Failure> {
     let (status, headers, body) = request(&harness, "HEAD /").await?;
     assert_eq!(status, "HTTP/1.1 200 OK", "{headers}");
     assert!(headers.contains("content-length: 12"), "{headers}");
+    assert_hardened(&headers);
     assert!(body.is_empty(), "HEAD carries no body: {body:?}");
     Ok(())
 }
