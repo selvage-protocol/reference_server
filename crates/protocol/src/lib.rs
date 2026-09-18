@@ -530,6 +530,13 @@ fn take_escaped(rest: &[u8]) -> Option<(u8, &[u8])> {
     Some((byte, rest.get(2..)?))
 }
 
+/// Decodes the percent escapes in a URL component.
+///
+/// A query is RFC 3986, not `application/x-www-form-urlencoded`: `+` is a literal plus in
+/// it, and the reference's own [`percent_encode`] writes one as `%2B` for exactly that
+/// reason. Treating it as a space would read a second implementation's literal `+` as a
+/// different value — a different room, a different token — while both meant the same
+/// thing.
 #[must_use]
 pub fn percent_decode(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(s.len());
@@ -545,7 +552,7 @@ pub fn percent_decode(s: &str) -> String {
             rest = after;
             continue;
         }
-        out.push(if *first == b'+' { b' ' } else { *first });
+        out.push(*first);
         rest = tail;
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -757,6 +764,23 @@ mod tests {
         for text in ["Ada", " Ada ", "𝄞", "a\u{a0}b", "ｆ"] {
             assert!(!has_control_characters(text), "{text:?} is carried");
         }
+    }
+
+    #[test]
+    fn a_plus_in_a_query_is_a_literal_plus() {
+        // RFC 3986: `+` is a sub-delimiter, legal in a query and not a space. The two
+        // spellings of one value must read the same, or a second implementation writing
+        // the literal one is talking about a different room.
+        let q = parse_join_query("room=r+1&token=a+b");
+        assert_eq!(q.room.as_deref(), Some("r+1"));
+        assert_eq!(q.token.as_deref(), Some("a+b"));
+        assert_eq!(percent_decode("%2B"), "+");
+        assert_eq!(percent_encode("a+b"), "a%2Bb");
+        assert_eq!(percent_decode(&percent_encode("a+b")), "a+b");
+
+        // A space still arrives as one, percent-encoded, which is the only way it can.
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(parse_join_query("room=a%20b").room.as_deref(), Some("a b"));
     }
 
     #[test]
