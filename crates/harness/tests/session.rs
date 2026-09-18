@@ -499,6 +499,90 @@ async fn meta_negotiates_the_wire_version() {
     assert_eq!(meta.roles, vec!["host", "guest"]);
 }
 
+/// A host whose socket stops answering is ended, so the room can move on: a peer that
+/// answers no ping is not idle but gone — a roaming client whose TCP end died unobserved,
+/// a hung relay — and leaving it seated strands the room, since it stays the host, no grace
+/// is armed, and every guest waits for a `host.detached` that cannot come. Here the host is
+/// a raw socket that completes the handshake and then never reads, so it never answers the
+/// server's pings (`PROTOCOL.md` §2.1).
+#[tokio::test]
+async fn a_host_that_stops_answering_its_pings_is_detached()
+-> Result<(), Failure> {
+    let harness = Harness::start_with(ServerConfig {
+        ping_interval: Duration::from_millis(20),
+        room_grace: Duration::from_secs(30),
+        ..ServerConfig::default()
+    })
+    .await;
+    let mut host = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    host.hello(&serde_json::json!({"display_name": "Ada", "role": "host"}))
+        .await
+        .expect("says hello");
+    let created = next_json_within(&mut host, "room.created").await;
+    assert_eq!(created["event"], event::ROOM_CREATED);
+    let room = Room {
+        id: created["params"]["room_id"]
+            .as_str()
+            .expect("a room id")
+            .to_string(),
+        token: created["params"]["token"]
+            .as_str()
+            .expect("a token")
+            .to_string(),
+        invite_url: String::new(),
+    };
+
+    let guest = harness.join(&room, "Bob").await.expect("guest joins");
+    let detached = wait_for_event(&guest, "host.detached", |event| {
+        matches!(event, EngineEvent::HostDetached { .. })
+    });
+    let EngineEvent::HostDetached { grace_ms } = detached.await else {
+        panic!("host.detached");
+    };
+    assert_eq!(grace_ms, 30_000, "the grace starts as it does on any drop");
+
+    // The room is alive, not destroyed: a host that comes back inside the grace reclaims it.
+    let _reclaimed = harness
+        .reclaim(&room, "Ada")
+        .await
+        .expect("the room waits for its host");
+    Ok(())
+}
+
+/// A merely slow link is untouched. The server's ping interval here is 20 ms and the
+/// session runs for fifteen of them; a client that answers its pings (every conforming one
+/// does, as it reads) is never mistaken for a dead socket, and no reconnect happens at all.
+#[tokio::test]
+async fn a_slow_link_is_not_killed_by_the_liveness_bound() -> Result<(), Failure>
+{
+    let harness = Harness::start_with(ServerConfig {
+        ping_interval: Duration::from_millis(20),
+        room_grace: Duration::from_secs(30),
+        ..ServerConfig::default()
+    })
+    .await;
+    let (host, room) = harness.host("Ada").await?;
+    let guest = harness.join(&room, "Bob").await?;
+    let before = guest.session().peer.peer_id.clone();
+
+    sleep(Duration::from_millis(300)).await;
+
+    guest.open(PATH).await.expect("the session is still seated");
+    assert_eq!(
+        guest.session().peer.peer_id,
+        before,
+        "no reconnect stands in for a session that never dropped"
+    );
+    assert_eq!(
+        host.documents().await?,
+        vec![PATH.to_string()],
+        "the room still holds the guest's document"
+    );
+    Ok(())
+}
+
 /// The room's grace period is advertised before a session exists (`PROTOCOL.md` §2): a host
 /// learns it from `host.detached` only if it is still connected, and the connection that
 /// has to size its retry budget to the grace is the one that is gone. The value here is the
