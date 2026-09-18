@@ -141,8 +141,11 @@ shell, no package manager. The `Dockerfile` cross-compiles both
 architectures natively on an x86_64 builder (one cross-toolchain stage per
 target, each pinned `--platform=$BUILDPLATFORM`), so building arm64 needs
 no QEMU — only *running* the arm64 image does. Build and run it on any
-machine with a working Docker; the CI runners are not such machines (see
-CI below), so the Dockerfile is human-verified, not CI-proven.
+machine with a working Docker; the container job below does exactly that on
+GitHub-hosted `ubuntu-24.04` (the amd64 path), so the `Dockerfile` is now
+CI-proven as well as human-verified. The Blacksmith runners are not such
+machines: they proved only github-scoped egress and could not execute buildx
+builds (see CI below).
 
 Fallback is the same static binary on `gcr.io/distroless/static:nonroot`
 (`--build-arg RUNTIME=distroless`). If a future dependency ever breaks the

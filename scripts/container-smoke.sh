@@ -32,7 +32,9 @@ done
 
 port="${1:-18080}"
 image="selvaged-smoke"
-name="selvaged-smoke"
+# Named per invocation: a `SIGKILL`ed or crashed run leaves its container behind,
+# and a second invocation must not collide with it — or remove its container.
+name="selvaged-smoke-$PPID-$$"
 page_dir="$TMPDIR/container-smoke-page"
 report_dir="$TMPDIR/container-smoke"
 version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
