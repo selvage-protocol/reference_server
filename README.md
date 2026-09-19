@@ -149,7 +149,7 @@ for a client to connect instead, and a client's output carries the invite link.
 one flake check per step, and needs `nix`:
 
 ```sh
-scripts/ci-local.sh all        # format, clippy, tests, the default package, licences, every check evaluated, actionlint
+scripts/ci-local.sh all        # format, clippy, tests, the default package, licences, every check evaluated, the TLS front, actionlint
 scripts/ci-local.sh nightly    # coverage, the rest of cargo-deny and cargo-audit (slow)
 scripts/ci-local.sh lint       # actionlint over the workflow files, on its own
 scripts/ci-local.sh image      # the nix-built image smoke, no Docker needed
@@ -189,6 +189,8 @@ period if its host does not reclaim it. There are no accounts and no file access
 
 `crates/client` is the sync engine (one `Y.Doc` per session, one `Y.Text` per document,
 with y-protocols and awareness behind it) and the `EditorAdapter` seam an editor implements.
+It reads `GET /meta` best-effort before the first socket, so a reconnect's budget spans the
+room grace the server advertises (`PROTOCOL.md` §9.1).
 `crates/harness` puts one server beside N clients driven programmatically, and it is also
 where the runnable transcript and the vector replay live.
 
@@ -255,9 +257,8 @@ The server is licensed differently from everything beside it.
 told about `FSL-1.1-MIT` for that one crate. The Functional Source License 1.1 is free for
 any non-competing purpose: a company self-hosting it internally is free, as are
 non-commercial education and research. It forbids making the software available to others in
-a commercial product or service that substitutes for it. `packaging/README.md` records what
-the owner accepted for this project's published image, and that the acceptance does not
-extend to services built on the software. Each release converts to MIT on the second
+a commercial product or service that substitutes for it. `packaging/README.md` records what the owner accepted for this project's published
+image, and where that acceptance stops. Each release converts to MIT on the second
 anniversary of the date it was made available, irrevocably.
 
 The harness links `selvaged`, so its own `MIT OR Apache-2.0` covers the crate while a

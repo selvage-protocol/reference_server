@@ -238,6 +238,17 @@
           fmt = craneLib.cargoFmt {
             inherit src;
           };
+
+          # The TLS front's idle logic (`packaging/pi-demo/tls-proxy.py`): a quiet half
+          # of a tunnel is not a dead one, and nothing else in this repository can see
+          # that. Stdlib Python only, so it needs neither the Pi nor a certificate.
+          tls-proxy = pkgs.runCommand "tls-proxy-test" {
+            nativeBuildInputs = [pkgs.python3];
+          } ''
+            cd ${./packaging/pi-demo}
+            python3 -B test_tls_proxy.py
+            touch $out
+          '';
         };
 
         devShells.default = craneLib.devShell {
