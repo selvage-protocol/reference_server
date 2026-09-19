@@ -93,6 +93,16 @@
       "op": "expect",
       "conn": "cleo",
       "text": "{\"event\":\"room.joined\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[\"src/main.rs\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\",\"role\":\"guest\"}],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Cleo\",\"peer_id\":\"$cleo_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"display_name\":\"Cleo\",\"peer_id\":\"$cleo_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"display_name\":\"Cleo\",\"peer_id\":\"$cleo_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
     }
   ],
   "selvage": "selvage/1",

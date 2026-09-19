@@ -1,0 +1,70 @@
+{
+  "id": "034",
+  "title": "One peer opening the same path twice is one hold, and one close releases it",
+  "spec": "PROTOCOL.md#docopen",
+  "notes": "PROTOCOL.md §5 says a peer MUST tolerate the same path being opened by several peers, and by the same peer twice: holds belong to a connection, and opening a path twice from one connection is one hold. Vector 011 covers the several-peers half; this is the same-peer half, and it is where a refcount would show. The second open is still announced — every validated open is — but the room's set carries the path once, so the single close that follows releases the one hold and the path leaves the set. A server that counted two holds would keep the path after that close.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},\"token\":\"$token\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":2,\"method\":\"doc.open\",\"params\":{\"path\":\"src/main.rs\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":2,\"result\":{\"documents\":[\"src/main.rs\"]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"doc.opened\",\"params\":{\"documents\":[\"src/main.rs\"],\"path\":\"src/main.rs\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":3,\"method\":\"doc.open\",\"params\":{\"path\":\"src/main.rs\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":3,\"result\":{\"documents\":[\"src/main.rs\"]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"doc.opened\",\"params\":{\"documents\":[\"src/main.rs\"],\"path\":\"src/main.rs\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":4,\"method\":\"doc.close\",\"params\":{\"path\":\"src/main.rs\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":4,\"result\":{\"documents\":[]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"doc.closed\",\"params\":{\"documents\":[],\"path\":\"src/main.rs\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    }
+  ],
+  "selvage": "selvage/1",
+  "canonical": "SJ-C/1"
+}
