@@ -184,9 +184,11 @@ pub(crate) fn content_type(file: &Path) -> &'static str {
         Some("html") => "text/html; charset=utf-8",
         Some("js" | "mjs") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
-        Some("json" | "map" | "webmanifest") => {
-            "application/json; charset=utf-8"
-        }
+        Some("json" | "map") => "application/json; charset=utf-8",
+        // The manifest has a media type of its own, and the page that links it asks
+        // for that one: the retired `serve.py` table answered this and the one-origin
+        // move grouped it with JSON, which changed the type without changing the file.
+        Some("webmanifest") => "application/manifest+json; charset=utf-8",
         Some("wasm") => "application/wasm",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
@@ -280,8 +282,8 @@ mod tests {
             "text/javascript; charset=utf-8"
         );
         assert_eq!(
-            content_type(Path::new("manifest.webmanifest")),
-            "application/json; charset=utf-8"
+            content_type(Path::new("site.webmanifest")),
+            "application/manifest+json; charset=utf-8"
         );
         assert_eq!(content_type(Path::new("codicon.ttf")), "font/ttf");
         assert_eq!(content_type(Path::new("icon.png")), "image/png");
