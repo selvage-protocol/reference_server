@@ -33,7 +33,7 @@ nix develop . -c cargo build --release --locked -p selvaged
 One image serves the page and the server on one port, built from this checkout:
 
 ```sh
-docker buildx build -t selvaged:local .
+docker buildx build --load -t selvaged:local .
 docker run --rm -p 127.0.0.1:8080:8080 selvaged:local
 ```
 
@@ -53,6 +53,10 @@ docker run --rm -p 127.0.0.1:8080:8080 \
   -v "$PWD/page:/page:ro" \
   selvaged:local
 ```
+
+The container serves as UID `65532`. Mounted page files need read permission, and their
+directories need read and search permission for that UID, through ownership, group
+membership, or mode bits. Inaccessible files return `404`.
 
 With no page directory the server still answers `/meta` and `/session`, and `/` is `404`.
 `packaging/README.md` is the rest of it: tags and version truthfulness, the multi-arch
@@ -178,8 +182,8 @@ invite link inside that window reclaims the room.
 A room holds its membership, the open-document set, and the peers seated in it. It holds
 nothing about what those peers say: no part of the server reads a document payload or an
 awareness payload, and the relay between peers is opaque to both. A peer's role is `host`
-or `guest`, the invite token is the permission, and the room dies with its host. There are
-no accounts and no file access.
+or `guest`, the invite token is the permission, and the room is removed after the grace
+period if its host does not reclaim it. There are no accounts and no file access.
 
 ## The client library and the harness
 
@@ -251,12 +255,15 @@ The server is licensed differently from everything beside it.
 told about `FSL-1.1-MIT` for that one crate. The Functional Source License 1.1 is free for
 any non-competing purpose: a company self-hosting it internally is free, as are
 non-commercial education and research. It forbids making the software available to others in
-a commercial product or service that substitutes for it. A free competing relay is not a
-Competing Use under that text. Each release converts to MIT on the second anniversary of the
-date it was made available, irrevocably.
+a commercial product or service that substitutes for it. `packaging/README.md` records what
+the owner accepted for this project's published image, and that the acceptance does not
+extend to services built on the software. Each release converts to MIT on the second
+anniversary of the date it was made available, irrevocably.
 
 The harness links `selvaged`, so its own `MIT OR Apache-2.0` covers the crate while a
-redistributed `selvage-harness` binary carries FSL code with it.
+redistributed `selvage-harness` binary carries FSL code with it. That redistribution must
+include the FSL terms or a link to them and retain the copyright notices; the harness's
+licence does not replace its dependency's FSL terms.
 
 The vendored vectors are `CC-BY-4.0`
 ([`selvage-protocol/specification`](https://github.com/selvage-protocol/specification)), which
