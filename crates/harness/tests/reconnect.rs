@@ -586,7 +586,7 @@ async fn a_host_sizes_its_retry_budget_from_the_advertised_grace()
 /// A room that advertises no grace leaves the policy its own attempts: there is no window
 /// to span, so a client gives up exactly where it did before a grace was read at all.
 #[tokio::test]
-async fn a_room_without_a_grace_leaves_the_policys_own_attempts()
+async fn a_room_without_a_grace_leaves_the_policy_its_own_attempts()
 -> Result<(), Failure> {
     let harness = Harness::start_with(ServerConfig {
         room_grace: Duration::ZERO,
