@@ -91,3 +91,8 @@ jobs:
       # Unknown actions, bad expressions and shell mistakes, caught before the run.
       - name: lint the workflows
         run: nix develop . -c actionlint
+
+      # The same check the pre-commit hook runs: the hook cannot run outside the dev shell,
+      # which is how a misspelling reached `main`, while a job sees every pull request.
+      - name: typos
+        run: nix develop . -c typos
