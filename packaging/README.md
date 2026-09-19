@@ -213,11 +213,29 @@ published `ghcr.io/selvage-protocol/selvaged:0.1.0-7d64cbb`, `:0.1.0` and `:late
 from the `publish` job, whose own assertions pulled both architectures back out of
 the registry and checked `--version` and `/meta` against `0.1.0`.
 
-**That package is private**, GHCR's default for a new package: an anonymous pull is
-refused (`401` from `ghcr.io/token`) while a known-public package answers, and
-making it public is an account setting only the owner can change. Nothing here
-depends on it — `compose.yaml`'s `build: .` builds the same Dockerfile locally, and
-that is the path a stranger has until the package is public.
+**That package is public, and an anonymous pull of it works.** GHCR leaves a new
+package private by default, and making one public needs the organization's
+**Package Creation** setting set to Public first (Organization settings → Packages →
+Package Creation → Public); the owner has now changed it and made this package public,
+and a package's visibility is irreversible. Verified on 2026-09-19 with **no
+credentials presented** — no account, no `docker login`:
+
+- `GET https://ghcr.io/token?scope=repository:selvage-protocol/selvaged:pull&service=ghcr.io`
+  → `200`, a token minted to a caller who named no identity;
+- the tag list `…/tags/list` → `{"name":"selvage-protocol/selvaged","tags":["0.1.0-7d64cbb","0.1.0","latest"]}`;
+- the tag's manifest `…/manifests/0.1.0` → `application/vnd.oci.image.index.v1+json`, a
+  list holding `linux/amd64` and `linux/arm64` plus the two attestation manifests;
+- a real blob pull through that same token — the `linux/amd64` image config — reporting
+  `"architecture":"amd64"`, `Cmd ["--listen", "0.0.0.0:8080", "--serve-page", "/page"]`
+  and version `0.1.0`.
+
+A stranger pulls it with no account:
+
+```sh
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.1.0
+```
+
+and `compose.yaml`'s `build: .` remains the route for an image built from a checkout.
 
 ### Compose
 
@@ -260,6 +278,22 @@ Overriding the baked page is a mount over `/page` (`-v …/dist:/page:ro`), and 
 needs no command override: the image's own command already names that directory.
 A missing `./page` is not fatal either way — `/meta` and `/session` still
 answer and `/` is a `404`.
+
+### A page-only image, for a second origin
+
+`web_client` publishes the page by itself as
+`ghcr.io/selvage-protocol/selvage-web`; that repository's README owns its build, its tags,
+its runtime and its CI. Use it when the browser client should live on an origin of its own
+— one page in front of several `selvaged` instances, or a page host separate from the
+servers — instead of sharing the server's one listener.
+
+Two things follow from that, and they are the honest cost. The page becomes a **second
+origin**: the socket is not CORS-bound and the `/meta` read is advisory, so a cross-origin
+page works, but every link must name the server (the `?server=` parameter, or a page built
+with a different default), because the page's built-in default is one particular endpoint.
+And a one-origin deployment with the page, `/meta` and `/session` on one port needs neither,
+so **one origin stays the default** — the shape above, and the single service in
+`compose.yaml`.
 
 ### TLS
 
