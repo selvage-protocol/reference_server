@@ -60,12 +60,19 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then arch=aarch64; machine=183; else arch=x8
 # and the page cannot fall behind its source. `--platform=$BUILDPLATFORM`: the
 # bundle is the same on every architecture, so this stage runs natively on the
 # build host instead of once per target under emulation.
-FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS page
+# Two things in this base are the stage's own: trixie for ImageMagick 7's
+# `magick`, which the client's build shells out to for the sized icons
+# (bookworm's imagemagick is 6.x and installs `convert` only), and an explicit
+# `ca-certificates`, because the official node images install it and then purge
+# it as auto-removable in the same layer — no layer of `node:22-trixie-slim`
+# holds an `/etc/ssl` path. Node carries its own trusted roots and works
+# without it; git, which fetches the pinned revision over HTTPS here, does not.
+FROM --platform=$BUILDPLATFORM node:22-trixie-slim AS page
 ARG WEB_CLIENT_SHA
 WORKDIR /web_client
 # hadolint ignore=DL3008
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
+    && apt-get install -y --no-install-recommends ca-certificates git imagemagick \
     && rm -rf /var/lib/apt/lists/*
 RUN git init -q . \
     && git remote add origin https://github.com/selvage-protocol/web_client.git \

@@ -231,8 +231,9 @@ CORS proxy or a second page server.
 
 **The page is built into the image.** The `web_client` bundle is not vendored
 here: the `Dockerfile`'s `page` stage clones that repository at the revision in
-the `WEB_CLIENT_SHA` build argument, runs `npm ci && npm run build`, and copies
-the resulting `dist/` to `/page`. The pin is
+the `WEB_CLIENT_SHA` build argument, runs `npm ci && npm run build` on a Debian
+trixie node image (the client's icon renderer shells out to ImageMagick 7's
+`magick`), and copies the resulting `dist/` to `/page`. The pin is
 `a861d36cdc1ec7e603ad0eb5ffd25ac95199d43e`, `web_client`'s `main` head when this
 was written (2026-09-19), and updating it is editing that one argument; the
 image records the revision it carries in `com.selvage.page.revision`. The page
