@@ -874,13 +874,10 @@ impl EngineTask {
         Reconnect::Seated
     }
 
-    /// The delay before the next attempt: `initial_delay` doubling to `max_delay`.
+    /// The delay before the next attempt: the policy's own backoff, so the wait here is
+    /// the wait the retry budget was sized against, floor included.
     fn backoff_delay(&self) -> Duration {
-        let factor = 1u32.checked_shl(self.attempts).unwrap_or(u32::MAX);
-        self.policy
-            .initial_delay
-            .saturating_mul(factor)
-            .min(self.policy.max_delay)
+        self.policy.backoff_delay(self.attempts)
     }
 
     /// Waits out the backoff, serving commands as they arrive so a caller that shuts the

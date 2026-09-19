@@ -100,7 +100,10 @@ impl Invite {
 #[derive(Debug, Clone, Copy)]
 pub struct ReconnectPolicy {
     pub enabled: bool,
+    /// Initial backoff, floored at one millisecond wherever it is used: a caller that
+    /// named no delay retries rather than spins.
     pub initial_delay: Duration,
+    /// Backoff ceiling, floored at one millisecond wherever it is used.
     pub max_delay: Duration,
     /// The caller's own cap on attempts. `Some` is the caller's number and is never
     /// raised by anything a room advertises; `None` — the default — starts at
@@ -131,6 +134,18 @@ impl Default for ReconnectPolicy {
 }
 
 impl ReconnectPolicy {
+    /// The wait before attempt `attempts` (zero-based): the initial delay doubling to the
+    /// ceiling, both floored at a millisecond.
+    ///
+    /// The retry budget is sized against this same function, so the window a retry was
+    /// measured against is the window it spans.
+    pub(crate) fn backoff_delay(&self, attempts: u32) -> Duration {
+        let initial = self.initial_delay.max(Duration::from_millis(1));
+        let ceiling = self.max_delay.max(Duration::from_millis(1));
+        let factor = 1u32.checked_shl(attempts).unwrap_or(u32::MAX);
+        initial.saturating_mul(factor).min(ceiling)
+    }
+
     /// The attempts a reconnect makes for a room that reported `grace` — or reported none,
     /// when it is `None`.
     ///
@@ -152,16 +167,10 @@ impl ReconnectPolicy {
 /// How many delays of this policy's backoff fit in `grace`. The count is capped, so a
 /// policy with a tiny delay cannot turn a large advertised grace into a long loop.
 fn attempts_for_grace(grace: Duration, policy: &ReconnectPolicy) -> u32 {
-    // A zero delay would make the sum never advance; one millisecond is the floor the
-    // cap is sized against.
-    let initial = policy.initial_delay.max(Duration::from_millis(1));
-    let ceiling = policy.max_delay.max(Duration::from_millis(1));
     let mut waited = Duration::ZERO;
     let mut attempts: u32 = 0;
     while waited < grace && attempts < MAX_GRACE_ATTEMPTS {
-        let factor = 1u32.checked_shl(attempts).unwrap_or(u32::MAX);
-        waited =
-            waited.saturating_add(initial.saturating_mul(factor).min(ceiling));
+        waited = waited.saturating_add(policy.backoff_delay(attempts));
         attempts = attempts.saturating_add(1);
     }
     attempts
@@ -394,5 +403,29 @@ mod tests {
             ..ReconnectPolicy::default()
         };
         assert_eq!(instant.budget_for_grace(Some(far)), 360);
+    }
+
+    /// The pair the budget is sized against is the pair a retry waits: a policy with a
+    /// zero delay is a burst, and a budget of 360 attempts sized against it would be 360
+    /// connections with no wait at all between them.
+    #[test]
+    fn a_zero_delay_policy_waits_a_millisecond_per_attempt() {
+        let instant = ReconnectPolicy {
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            ..ReconnectPolicy::default()
+        };
+        assert_eq!(instant.backoff_delay(0), Duration::from_millis(1));
+        assert_eq!(
+            instant.backoff_delay(400),
+            Duration::from_millis(1),
+            "the floor is not doubled"
+        );
+        // A policy with a real backoff is untouched by the floor, and stops doubling at
+        // its ceiling.
+        let policy = ReconnectPolicy::default();
+        assert_eq!(policy.backoff_delay(0), Duration::from_millis(500));
+        assert_eq!(policy.backoff_delay(3), Duration::from_secs(4));
+        assert_eq!(policy.backoff_delay(9), Duration::from_secs(10));
     }
 }
