@@ -53,9 +53,9 @@ your own checkout.
 The page is baked in. The image builds the browser client's `dist/` from a pinned revision
 and serves it, so a container needs no mount. The `web_client` repository also publishes the
 page on its own, as `ghcr.io/selvage-protocol/selvage-web`, for the editor on its own origin
-or one page in front of several servers; *Serving the page* below has the trade-off. A page
-built elsewhere overrides the baked one by mounting over it, because the image's own command
-already passes `--serve-page /page`:
+or one page in front of several servers; that second origin changes what a link looks like,
+and *Serving the page* below has both. A page built elsewhere overrides the baked one by
+mounting over it, because the image's own command already passes `--serve-page /page`:
 
 ```sh
 docker run --rm -p 127.0.0.1:8080:8080 \
@@ -221,12 +221,14 @@ The page is the browser client's built `dist/`, which lives in the `web_client` 
 the image builds it from a pinned revision and serves it.
 
 `web_client` also publishes the bundle as a page-only image,
-`ghcr.io/selvage-protocol/selvage-web`, whose own README owns the build and the tags. It is
-for putting the editor on its own origin, or for one page in front of several servers. That
-is a second origin, and it works because the page's socket is not CORS-bound and its `/meta`
-read is only advisory — but it costs a second port and a second thing to upgrade. One origin
-stays the default: this image, whose page, `/meta` and `/session` share one listener, and
-`--serve-page` from any deployment.
+`ghcr.io/selvage-protocol/selvage-web`, whose own README owns the build, the tags and the
+runtime. It is for putting the editor on its own origin, or for one page in front of several
+servers. That is a second origin, and it works because the page's socket is not CORS-bound
+and its `/meta` read is only advisory — but it costs a second port and a second thing to
+upgrade, and every invite link must then name the server, as `?server=`, because the page's
+built-in default is one particular endpoint and the page's own origin says nothing about
+which server to dial. One origin stays the default: this image, whose page, `/meta` and
+`/session` share one listener, and `--serve-page` from any deployment.
 
 Served files carry the policy a browser needs: a media type from a pinned table (never the
 host's mime database), `Cache-Control: no-cache` for a stable name and `public,

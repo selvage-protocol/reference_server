@@ -213,12 +213,13 @@ published `ghcr.io/selvage-protocol/selvaged:0.1.0-7d64cbb`, `:0.1.0` and `:late
 from the `publish` job, whose own assertions pulled both architectures back out of
 the registry and checked `--version` and `/meta` against `0.1.0`.
 
-**That package is public, and an anonymous pull of it works.** GHCR leaves a new
-package private by default, and making one public needs the organization's
-**Package Creation** setting set to Public first (Organization settings → Packages →
-Package Creation → Public); the owner has now changed it and made this package public,
-and a package's visibility is irreversible. Verified on 2026-09-19 with **no
-credentials presented** — no account, no `docker login`:
+**That package is public, and an anonymous pull of it works.** Two different settings are
+in play, and it is worth keeping them apart: an organization decides whether its members
+may create public packages at all (**Package Creation**, under Organization settings →
+Packages), and a package then carries its own **visibility**, which is what makes an
+anonymous pull work. The owner opened the first and set this package to public; a package's
+visibility is irreversible. Verified on 2026-09-19 with **no credentials presented** — no
+account, no `docker login`:
 
 - `GET https://ghcr.io/token?scope=repository:selvage-protocol/selvaged:pull&service=ghcr.io`
   → `200`, a token minted to a caller who named no identity;
