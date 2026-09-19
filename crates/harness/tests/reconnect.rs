@@ -4,7 +4,7 @@
 //! the room with it, and no session method closes one peer's socket.
 
 use std::error::Error as StdError;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use selvage_client::{ConnectOptions, ReconnectPolicy, SyncEngine};
 use selvage_harness::{
@@ -13,6 +13,7 @@ use selvage_harness::{
     wait_for_peer,
 };
 use selvage_protocol::code;
+use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
@@ -454,7 +455,13 @@ async fn a_reconnect_into_a_full_room_makes_one_attempt() -> Result<(), Failure>
                 ..ReconnectPolicy::default()
             });
     let guest = SyncEngine::connect(options).await?;
-    assert_eq!(guest_proxy.accepted(), 1, "the first connection is relayed");
+    // The relay's first connection is the client's `/meta` read — §9.1 sizes the retry
+    // budget from the grace it carries — and the second is the session itself.
+    assert_eq!(
+        guest_proxy.accepted(),
+        2,
+        "the meta read and the session are relayed"
+    );
     // Wait for the seat to be taken before taking it away: a roster that has not yet heard
     // `peer.joined` is empty for the same reason one that has heard `peer.left` is, and the
     // wait below would return before the drop had happened at all.
@@ -476,8 +483,162 @@ async fn a_reconnect_into_a_full_room_makes_one_attempt() -> Result<(), Failure>
     .await;
     assert_eq!(
         guest_proxy.accepted(),
+        3,
+        "the meta read, the session, and one reconnect attempt refused `x.room_full`"
+    );
+    Ok(())
+}
+
+/// A fast backoff for a test that counts attempts: 50 ms each, so a budget is a small,
+/// known number of connections rather than a wall-clock wait.
+fn fast_policy() -> ReconnectPolicy {
+    ReconnectPolicy {
+        initial_delay: Duration::from_millis(50),
+        max_delay: Duration::from_millis(50),
+        ..ReconnectPolicy::default()
+    }
+}
+
+/// Takes the server away from a client behind `proxy`: the accept loop is aborted and
+/// every relayed connection cut, so a retry is refused rather than seated and what the
+/// relay counts is the retry budget itself.
+///
+/// Waiting for the port to refuse is part of it. A retry that landed in the window
+/// before the accept loop died would seat, reset the attempts, and leave the count
+/// below measuring the race rather than the budget.
+async fn server_goes_away(
+    harness: &Harness,
+    proxy: &DropProxy,
+) -> Result<(), Failure> {
+    harness.abort();
+    let upstream = harness.upstream();
+    wait_for("the server's port to refuse connections", || {
+        let target = upstream.clone();
+        async move { TcpStream::connect(&target).await.err().map(|_error| ()) }
+    })
+    .await;
+    proxy.drop_all();
+    Ok(())
+}
+
+/// Waits for a session to end, from a subscription taken before whatever ends it: a
+/// receiver made afterwards would miss the event it exists to see.
+async fn wait_for_giving_up(
+    events: &mut broadcast::Receiver<EngineEvent>,
+) -> Result<(), Failure> {
+    let start = Instant::now();
+    let deadline = WAIT.saturating_add(WAIT);
+    loop {
+        if start.elapsed() >= deadline {
+            return Err(
+                format!("the session did not end within {deadline:?}").into()
+            );
+        }
+        match timeout(Duration::from_millis(50), events.recv()).await {
+            Ok(Ok(EngineEvent::Disconnected)) => return Ok(()),
+            Ok(Err(_)) => {
+                return Err(
+                    "the engine's stream closed before it gave up".into()
+                );
+            }
+            Ok(Ok(_)) | Err(_) => {}
+        }
+    }
+}
+
+/// The grace a server advertises is what a reconnect has to span (`PROTOCOL.md` §9.1), and
+/// the five attempts a bare policy makes would give up inside a thirty-second window.
+/// `/meta` is where a host reads that number: its own connection is the one that drops,
+/// and a `host.detached` reaches only the peers it left behind.
+///
+/// Ten attempts at 50 ms span the 500 ms advertised here, and the relay counts them.
+#[tokio::test]
+async fn a_host_sizes_its_retry_budget_from_the_advertised_grace()
+-> Result<(), Failure> {
+    let harness = Harness::start_with(ServerConfig {
+        room_grace: Duration::from_millis(500),
+        ..ServerConfig::default()
+    })
+    .await;
+    let proxy = DropProxy::start(&harness.upstream()).await?;
+    let host = SyncEngine::connect(
+        ConnectOptions::host(proxy.ws_base(), "Ada")
+            .with_reconnect(fast_policy()),
+    )
+    .await?;
+    assert_eq!(
+        proxy.accepted(),
         2,
-        "one reconnect attempt, refused `x.room_full`"
+        "the meta read and the session itself are relayed"
+    );
+
+    let mut events = host.subscribe();
+    server_goes_away(&harness, &proxy).await?;
+    wait_for_giving_up(&mut events).await?;
+    assert_eq!(
+        proxy.accepted(),
+        12,
+        "the meta read, the session, and the ten retries that span the advertised grace"
+    );
+    Ok(())
+}
+
+/// A room that advertises no grace leaves the policy its own attempts: there is no window
+/// to span, so a client gives up exactly where it did before a grace was read at all.
+#[tokio::test]
+async fn a_room_without_a_grace_leaves_the_policys_own_attempts()
+-> Result<(), Failure> {
+    let harness = Harness::start_with(ServerConfig {
+        room_grace: Duration::ZERO,
+        ..ServerConfig::default()
+    })
+    .await;
+    let proxy = DropProxy::start(&harness.upstream()).await?;
+    let host = SyncEngine::connect(
+        ConnectOptions::host(proxy.ws_base(), "Ada")
+            .with_reconnect(fast_policy()),
+    )
+    .await?;
+
+    let mut events = host.subscribe();
+    server_goes_away(&harness, &proxy).await?;
+    wait_for_giving_up(&mut events).await?;
+    assert_eq!(
+        proxy.accepted(),
+        7,
+        "the meta read, the session, and the policy's own five attempts"
+    );
+    Ok(())
+}
+
+/// A caller that named its own number keeps it, whatever the room advertises: the grace
+/// sizes a budget the caller left open, and this one was not — the read that would have
+/// found it is not made either, so the relay sees the session and the two attempts alone.
+#[tokio::test]
+async fn a_callers_own_attempts_win_over_the_advertised_grace()
+-> Result<(), Failure> {
+    let harness = Harness::start_with(ServerConfig {
+        room_grace: Duration::from_millis(500),
+        ..ServerConfig::default()
+    })
+    .await;
+    let proxy = DropProxy::start(&harness.upstream()).await?;
+    let policy = ReconnectPolicy {
+        max_attempts: Some(2),
+        ..fast_policy()
+    };
+    let host = SyncEngine::connect(
+        ConnectOptions::host(proxy.ws_base(), "Ada").with_reconnect(policy),
+    )
+    .await?;
+
+    let mut events = host.subscribe();
+    server_goes_away(&harness, &proxy).await?;
+    wait_for_giving_up(&mut events).await?;
+    assert_eq!(
+        proxy.accepted(),
+        3,
+        "the session and the caller's own two attempts, with no meta read at all"
     );
     Ok(())
 }

@@ -189,6 +189,8 @@ period if its host does not reclaim it. There are no accounts and no file access
 
 `crates/client` is the sync engine (one `Y.Doc` per session, one `Y.Text` per document,
 with y-protocols and awareness behind it) and the `EditorAdapter` seam an editor implements.
+It reads `GET /meta` best-effort before the first socket, so a reconnect's budget spans the
+room grace the server advertises (`PROTOCOL.md` §9.1).
 `crates/harness` puts one server beside N clients driven programmatically, and it is also
 where the runnable transcript and the vector replay live.
 

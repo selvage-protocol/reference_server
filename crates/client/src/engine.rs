@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{Interval, MissedTickBehavior, interval, sleep, timeout};
@@ -151,9 +152,16 @@ struct Replica {
     session: SessionInfo,
 }
 
+/// How long the `GET /meta` before a connect may take. Advisory either way: `/meta` is a
+/// convenience, not the handshake, and an unreachable one decides nothing (§9.1).
+const META_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Runs one connection attempt: socket, handshake, and the reply. Never retried here:
 /// a first connect that fails is a failure the caller sees, and a reconnect decides for
 /// itself whether another attempt is worth making.
+///
+/// `grace` is the room grace the retry budget is sized against, read before the socket
+/// by [`advertised_grace`].
 ///
 /// # Errors
 ///
@@ -161,13 +169,78 @@ struct Replica {
 /// server refuses the session.
 pub async fn connect(
     options: ConnectOptions,
+    grace: Option<Duration>,
 ) -> Result<(Channel, SessionInfo), Error> {
     let local_state = serde_json::to_string(&options.initial_awareness)?;
     let replica = handshake(&options, fresh_awareness(None)?, &local_state)
         .await
         .map_err(|(error, _replica)| error)?;
     let session = replica.session.clone();
-    Ok((spawn(options, replica, local_state), session))
+    Ok((
+        spawn(
+            options,
+            FirstSeat {
+                replica,
+                local_state,
+                grace,
+            },
+        ),
+        session,
+    ))
+}
+
+/// The room grace the server advertises in `GET /meta` (`PROTOCOL.md` §2), read
+/// best-effort before the first connection.
+///
+/// §9.1 sizes the retry budget against the room's grace, and the handshake reply has no
+/// member to carry it: a *host* — whose own connection is the one that drops, and whose
+/// room dies when the grace ends — learns it nowhere else, because a `host.detached`
+/// reaches only the peers it left behind. What answers nothing is not a failure: `None`
+/// is "the room reported nothing to size against", which is the same as a `/meta` that
+/// never answered, carried a body this client cannot read, or was not a `200`.
+pub async fn advertised_grace(base_url: &str) -> Option<Duration> {
+    let (authority, path) = meta_target(base_url)?;
+    let body = timeout(META_TIMEOUT, http_get(&authority, &path))
+        .await
+        .ok()??;
+    let meta: proto::Meta = serde_json::from_str(&body).ok()?;
+    Some(Duration::from_millis(meta.keepalive.room_grace_ms))
+}
+
+/// The `host:port` and request path a `GET /meta` has to use, taken from the base URL
+/// the session is dialled on. `None` when there is no authority to read.
+///
+/// Only `ws://` reaches a read: this crate builds `tokio-tungstenite` with no TLS
+/// feature, so a `wss://` base is one no session here can be seated on either, and a
+/// plaintext request to a TLS port is not a read worth making. A base mounted under a
+/// path prefix is read where the server itself would serve the meta document, under it.
+fn meta_target(base_url: &str) -> Option<(String, String)> {
+    let rest = base_url.trim_end_matches('/').strip_prefix("ws://")?;
+    let (authority, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+    if authority.is_empty() {
+        return None;
+    }
+    let trimmed = prefix.trim_matches('/');
+    let path = if trimmed.is_empty() {
+        proto::META_PATH.to_string()
+    } else {
+        format!("/{trimmed}{}", proto::META_PATH)
+    };
+    Some((authority.to_string(), path))
+}
+
+/// Reads `path` from `authority` over one plain TCP connection, returning the body of a
+/// `200`. `None` for anything else, the way a read that decided nothing should read.
+async fn http_get(authority: &str, path: &str) -> Option<String> {
+    let mut stream = TcpStream::connect(authority).await.ok()?;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nhost: {authority}\r\nconnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.ok()?;
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    head.starts_with("HTTP/1.1 200").then(|| body.to_string())
 }
 
 /// Opens the socket for `awareness` and sends `session.hello`.
@@ -347,11 +420,22 @@ fn session_info(params: proto::SessionParams, base_url: &str) -> SessionInfo {
     }
 }
 
-fn spawn(
-    options: ConnectOptions,
+/// Everything the engine task starts with beyond the caller's options: the replica the
+/// first handshake seated, the awareness state it republishes, and the grace the retry
+/// budget is sized against — read before the socket, because the handshake reply has no
+/// member to carry it (`PROTOCOL.md` §9.1).
+struct FirstSeat {
     replica: Replica,
     local_state: String,
-) -> Channel {
+    grace: Option<Duration>,
+}
+
+fn spawn(options: ConnectOptions, first: FirstSeat) -> Channel {
+    let FirstSeat {
+        replica,
+        local_state,
+        grace,
+    } = first;
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     let (events_tx, _) = broadcast::channel(64);
     let session_slot = Arc::new(Mutex::new(replica.session.clone()));
@@ -360,6 +444,7 @@ fn spawn(
     let keepalive = options
         .keepalive
         .unwrap_or_else(|| KeepaliveConfig::from(replica.session.keepalive));
+    let retry_budget = options.reconnect.budget_for_grace(grace);
     let room = options.room.clone();
     let token = options.token.clone();
     let task = EngineTask {
@@ -369,6 +454,7 @@ fn spawn(
         stream: replica.stream,
         awareness: replica.awareness,
         session: replica.session,
+        retry_budget,
         session_slot: Arc::clone(&session_slot),
         room,
         token,
@@ -553,6 +639,9 @@ struct EngineTask {
     stream: Stream,
     awareness: Awareness,
     session: SessionInfo,
+    /// Attempts a reconnect makes before it gives up: the policy's own number, raised to
+    /// cover a grace the room reported and never lowered (`PROTOCOL.md` §9.1).
+    retry_budget: u32,
     /// The description `SyncEngine::session` reads, replaced on every reconnect.
     session_slot: Arc<Mutex<SessionInfo>>,
     /// The room to reconnect to, learned from `room.created` when this client minted it.
@@ -729,7 +818,7 @@ impl EngineTask {
         // `reconnecting` first would announce a retry that is not going to run.
         if self.terminal
             || !self.policy.enabled
-            || self.attempts >= self.policy.max_attempts
+            || self.attempts >= self.retry_budget
         {
             return Reconnect::GivenUp;
         }
@@ -744,10 +833,23 @@ impl EngineTask {
     /// shut down. Returns the last decision.
     async fn retry_until_seated(&mut self) -> Reconnect {
         let mut outcome: Option<Reconnect> = None;
-        while outcome.is_none() && self.attempts < self.policy.max_attempts {
+        while outcome.is_none() && self.attempts < self.retry_budget {
             outcome = self.retry_once().await;
         }
         outcome.unwrap_or(Reconnect::GivenUp)
+    }
+
+    /// Raises the retry budget to cover a grace the room reported (`PROTOCOL.md` §9.1).
+    ///
+    /// It only ever grows, and a caller's own `max_attempts` is not touched at all: a
+    /// number that arrives later, or a smaller one, is never a reason to give up sooner.
+    /// Overshooting costs one handshake — a room the server has reaped answers
+    /// `room_unknown`, which is terminal — while undershooting abandons a room that is
+    /// still open, so the two mistakes are not the same size.
+    fn apply_grace(&mut self, grace: Duration) {
+        self.retry_budget = self
+            .retry_budget
+            .max(self.policy.budget_for_grace(Some(grace)));
     }
 
     /// One wait-then-attempt step. `None` says another attempt is allowed.
@@ -1581,11 +1683,14 @@ impl EngineTask {
         });
     }
 
-    fn host_detached(&self, params: Option<&serde_json::Value>) {
+    fn host_detached(&mut self, params: Option<&serde_json::Value>) {
         let grace_ms = params
             .and_then(|p| p.get("grace_ms"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_default();
+        // §9.1: the guest left behind is the peer that has to keep re-helloing until the
+        // window has passed, and this is where it learns how long the window is.
+        self.apply_grace(Duration::from_millis(grace_ms));
         let _ = self.events.send(EngineEvent::HostDetached { grace_ms });
     }
 
@@ -1877,6 +1982,40 @@ mod tests {
         ] {
             assert!(!is_terminal_code(name), "{name} may be retried");
         }
+    }
+
+    /// The grace a `host.detached` carries sizes the retry budget of the peer it left
+    /// behind (`PROTOCOL.md` §9.1): the guest is the one whose own socket then drops, and
+    /// the window is how long the room survives its host. The budget only ever grows — a
+    /// smaller window arriving later is not a reason to abandon the room sooner — and the
+    /// event an adapter reads still carries the number the server sent.
+    #[tokio::test]
+    async fn a_detach_raises_the_retry_budget_and_never_lowers_it()
+    -> Result<(), Box<dyn StdError>> {
+        let (mut task, mut events) = receiving_task().await?;
+        assert_eq!(task.retry_budget, 5, "the policy's own attempts to start");
+
+        task.handle_text(
+            r#"{"v":"selvage/1","event":"host.detached","params":{"grace_ms":30000}}"#,
+        );
+        let event = timeout(Duration::from_secs(1), events.recv()).await??;
+        assert!(
+            matches!(event, EngineEvent::HostDetached { grace_ms: 30_000 }),
+            "the adapter still reads the number the server sent, got {event:?}"
+        );
+        assert_eq!(
+            task.retry_budget, 7,
+            "30 s of the default backoff is seven attempts"
+        );
+
+        task.handle_text(
+            r#"{"v":"selvage/1","event":"host.detached","params":{"grace_ms":1000}}"#,
+        );
+        assert_eq!(
+            task.retry_budget, 7,
+            "a smaller window than the one already applied changes nothing"
+        );
+        Ok(())
     }
 
     /// A refused request is the one in flight and nothing else: the answer is the caller's,
@@ -2290,6 +2429,7 @@ mod tests {
             stream,
             awareness: Awareness::new(Doc::new()),
             session: session.clone(),
+            retry_budget: ReconnectPolicy::default().budget_for_grace(None),
             session_slot: Arc::new(Mutex::new(session)),
             room: None,
             token: None,

@@ -49,15 +49,29 @@ impl SyncEngine {
     /// Connects, completes the session handshake and starts the engine task.
     ///
     /// A failure here is a failure: reconnection retries a session that dropped, never
-    /// the first connection behind the caller's back (`PROTOCOL.md` §9.1).
+    /// the first connection behind the caller's back (`PROTOCOL.md` §9.1). It reads
+    /// `GET /meta` first, best-effort and bounded, because the grace that read carries is
+    /// what sizes a later reconnect's budget and nothing else in the handshake has it.
     ///
     /// # Errors
     ///
     /// Returns [`Error`] when the socket cannot be opened, the server refuses the
     /// session, or the handshake does not finish within ten seconds.
     pub async fn connect(options: ConnectOptions) -> Result<Self, Error> {
+        // `PROTOCOL.md` §9.1: the room's grace is what a reconnect has to span, and the
+        // handshake reply has no member to carry it. Read best-effort, bounded on its own
+        // so the ten seconds below stay the handshake's, and only when a retry would use
+        // it: a caller that named its own attempts is not sized by the grace at all.
+        let grace = if options.reconnect.enabled
+            && options.reconnect.max_attempts.is_none()
+        {
+            engine::advertised_grace(&options.base_url).await
+        } else {
+            None
+        };
         let established =
-            timeout(engine::HANDSHAKE_TIMEOUT, engine::connect(options)).await;
+            timeout(engine::HANDSHAKE_TIMEOUT, engine::connect(options, grace))
+                .await;
         let (channel, _) = match established {
             Ok(result) => result?,
             Err(_) => return Err(Error::Closed),
