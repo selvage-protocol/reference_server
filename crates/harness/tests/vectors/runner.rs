@@ -317,20 +317,31 @@ impl Peer {
     ///
     /// A frame here is one no step of the run has read. A close ends the stream
     /// and is not a frame; a quiet connection costs one window and nothing more.
+    ///
+    /// # Errors
+    ///
+    /// Returns the receive error when the socket fails while draining: an empty
+    /// drain after a reset is not a quiet connection, it is a failure the replay
+    /// must report rather than pass.
     #[expect(
         clippy::excessive_nesting,
         reason = "a drain loop over frames; skipping keepalive is one level deeper than the gate allows"
     )]
-    async fn drain(&mut self) -> Vec<String> {
+    async fn drain(&mut self) -> Result<Vec<String>, Failure> {
         let mut unread = Vec::new();
         loop {
             let message = match timeout(DRAIN_WINDOW, self.ws.next()).await {
-                Err(_) | Ok(None | Some(Err(_))) => return unread,
+                Err(_) | Ok(None) => return Ok(unread),
+                Ok(Some(Err(error))) => {
+                    return Err(
+                        self.wrong(&format!("the drain failed: {error}"))
+                    );
+                }
                 Ok(Some(Ok(message))) => message,
             };
             match classify(message) {
                 None => {}
-                Some(Incoming::Closed { .. }) => return unread,
+                Some(Incoming::Closed { .. }) => return Ok(unread),
                 Some(Incoming::Text(text)) => unread.push(text),
                 Some(Incoming::Binary(bytes)) => {
                     unread.push(format!("binary {}", bytes_hex(&bytes)));
@@ -423,7 +434,8 @@ impl Session {
     /// # Errors
     ///
     /// Returns an error naming the connection when one keeps sending past the
-    /// drain budget instead of going quiet.
+    /// drain budget instead of going quiet, and propagates a drain receive
+    /// error naming the connection whose socket failed.
     #[expect(
         clippy::excessive_nesting,
         reason = "a drain over connections, each bounded by its own timeout"
@@ -431,11 +443,15 @@ impl Session {
     async fn drain(&mut self) -> Result<Vec<String>, Failure> {
         let mut report = Vec::new();
         for (name, peer) in &mut self.peers {
-            let Ok(held) = timeout(DRAIN_BUDGET, peer.drain()).await else {
-                return Err(format!(
-                    "draining `{name}` stalled: still sending after {DRAIN_BUDGET:?}"
-                )
-                .into());
+            let held = match timeout(DRAIN_BUDGET, peer.drain()).await {
+                Err(_) => {
+                    return Err(format!(
+                        "draining `{name}` stalled: still sending after {DRAIN_BUDGET:?}"
+                    )
+                    .into());
+                }
+                Ok(Err(error)) => return Err(error),
+                Ok(Ok(held)) => held,
             };
             if held.is_empty() {
                 continue;
@@ -1079,6 +1095,63 @@ mod tests {
     //! comparison is the part of this runner that decides whether a transcript held.
 
     use super::{Bindings, check_text};
+
+    #[tokio::test]
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "a fake server behind a spawned task; the handshake and the bad frame are one level deeper than the gate allows"
+    )]
+    async fn a_receive_error_while_draining_is_not_a_quiet_connection() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::TcpListener;
+        use tokio::time::sleep;
+
+        // A server that completes the handshake and then sends a frame with a
+        // reserved opcode, which no `Message` spells: the client's next read
+        // is a protocol error, the shape a reset takes mid-drain.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener binds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has an address");
+        let server = tokio::spawn(async move {
+            let (socket, _) =
+                listener.accept().await.expect("a client connects");
+            let mut server = tokio_tungstenite::accept_async(socket)
+                .await
+                .expect("the handshake holds");
+            server
+                .get_mut()
+                .write_all(&[0x83, 0x00])
+                .await
+                .expect("the bad frame sends");
+            sleep(Duration::from_secs(30)).await;
+        });
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .expect("the client connects");
+        let mut session = super::Session::new();
+        session.peers.insert(
+            "peer".to_string(),
+            super::Peer {
+                name: "peer".to_string(),
+                ws,
+                doc: yrs::Doc::new(),
+                frames: 0,
+            },
+        );
+        let error = session.drain().await.expect_err(
+            "a receive error while draining must fail, not read as quiet",
+        );
+        server.abort();
+        let report = error.to_string();
+        assert!(
+            report.contains("`peer`") && report.contains("drain failed"),
+            "the failure names the connection whose socket failed: {report}"
+        );
+    }
 
     /// A frame in the byte form of `CANONICAL.md` §2, which is what a vector carries.
     fn canonical(value: &serde_json::Value) -> String {
