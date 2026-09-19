@@ -71,12 +71,17 @@ cross-origin dial). The guest link is then a page link —
 `http://HOST:PORT/?room=<room>&token=<token>` — with no `server=` parameter.
 
 The page itself is the browser client's built `dist/`, which lives in the `web_client`
-repository. The container image builds it from a pinned revision and serves it, so a
-container needs no mount:
+repository. The image builds it from a pinned revision and serves it, so a container
+needs no mount. Build it locally — `docker buildx build -t selvaged:local .`, or
+`docker compose up`, which builds the same Dockerfile — and run it:
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged
+docker run --rm -p 127.0.0.1:8080:8080 selvaged:local
 ```
+
+The released image (`ghcr.io/selvage-protocol/selvaged:0.1.0`, `:latest`) is the same
+build; that GHCR package is private at the time of writing, so pulling it works only
+for the account that owns it.
 
 A page built elsewhere overrides the baked one by mounting over it — the image's own
 command already passes `--serve-page /page`:
@@ -84,7 +89,7 @@ command already passes `--serve-page /page`:
 ```sh
 docker run --rm -p 127.0.0.1:8080:8080 \
   -v "$PWD/page:/page:ro" \
-  ghcr.io/selvage-protocol/selvaged
+  selvaged:local
 ```
 
 With no page directory the server still answers `/meta` and `/session`; `/` is `404`.
