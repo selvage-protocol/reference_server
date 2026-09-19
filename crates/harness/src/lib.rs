@@ -454,6 +454,35 @@ where
 /// Panics when `label` never becomes true within [`WAIT`], printing what `describe` saw.
 pub async fn wait_for_described<F, Fut, T, D, DFut>(
     label: &str,
+    describe: D,
+    check: F,
+) -> T
+where
+    D: FnMut() -> DFut,
+    DFut: Future<Output = String>,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    wait_for_described_within(WAIT, label, describe, check).await
+}
+
+/// [`wait_for_described`], bounded by `deadline` instead of [`WAIT`].
+///
+/// A wait whose effect is known to be slower than [`WAIT`] needs a longer bound than a
+/// local engine operation: the room ejecting a peer after relaying tens of mebibytes to
+/// a socket that never drains is I/O under coverage, not a scheduling turn. The bound
+/// stays a bound — the assertion is on the state `check` reports, not on the time taken.
+///
+/// # Panics
+///
+/// Panics when `label` never becomes true within `deadline`, printing what `describe` saw.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the deadline and the (label, describe, check) triple are the whole shape of a bounded wait; a builder for one helper is worse"
+)]
+pub async fn wait_for_described_within<F, Fut, T, D, DFut>(
+    deadline: Duration,
+    label: &str,
     mut describe: D,
     mut check: F,
 ) -> T
@@ -469,8 +498,8 @@ where
             return value;
         }
         assert!(
-            start.elapsed() < WAIT,
-            "timed out after {WAIT:?} waiting for {label}{}",
+            start.elapsed() < deadline,
+            "timed out after {deadline:?} waiting for {label}{}",
             as_suffix(&describe().await)
         );
         sleep(Duration::from_millis(5)).await;
