@@ -1,0 +1,15 @@
+[Unit]
+Description=Selvage demo TLS front (page, /meta and /session on one origin)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/pi/selvage-demo/tls-proxy.py
+WorkingDirectory=/home/pi/selvage-demo
+StandardOutput=append:/home/pi/selvage-demo/tls-proxy.log
+StandardError=inherit
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

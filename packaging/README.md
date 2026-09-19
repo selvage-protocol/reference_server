@@ -1,17 +1,17 @@
 # Packaging and deployment
 
-Two ways to run `selvaged` beyond `cargo run`, for two audiences:
+Three shapes, for three audiences:
 
 | Path | Who it is for | What it is |
 |---|---|---|
-| `systemd/` | The Pi demo today, a VPS demo later | A user unit plus install docs — the proven path, generalized |
+| `pi-demo/` | The live Pi demo, exactly as it runs | The TLS front and the user units that are deployed — tracked here so a deployment artefact is reviewable |
+| `systemd/` | A self-hoster on their own machine | A user unit plus install docs — the proven path, generalized, with no front |
 | `Dockerfile` + `compose.yaml` | Strangers self-hosting on their own machines | A multi-arch image and a one-service compose file — never the Pi |
-
-The server is memory-only under both: restarts end all rooms, and there is
-nothing to persist — hence no data volume anywhere here. The one mount is the
-page directory, read-only, which the server only ever reads. `DESIGN.md` §9
-names the missing deployment story; this directory is that story's first half
-(the second half, a live VPS, is still unordered spend).
+The server is memory-only under all three: restarts end all rooms, and
+there is nothing to persist — hence no data volume anywhere here. The one
+mount is the page directory, read-only, which the server only ever reads.
+`DESIGN.md` §9 names the missing deployment story; this directory is that
+story's first half (the second half, a live VPS, is still unordered spend).
 
 ## FSL-1.1-MIT redistribution review — required before any future publish
 
@@ -38,10 +38,27 @@ What is already in place for that review:
   `.github/workflows/image.yml` runs on release tags only, no tag has been
   cut, and none will be cut from this work.
 
+## The Pi demo's shape (`pi-demo/`)
+
+`pi-demo/` is the demo that is live right now, tracked file for file: the
+`selvaged` user unit (`--serve-page`, so the page, `/meta` and `/session`
+share one origin), the stdlib TLS front in front of it, the front's unit, and
+the front's environment documented. It is a deployment record as much as a
+recipe — `reference_server/packaging/pi-demo/README.md` says what each file
+installs to, how the three hashes are compared, and how to roll back, and
+`ai_notes/docs/runbook-pi-demo.md` owns the live state.
+
+**This is not the container path.** The container's port mapping is its
+boundary, so it binds `0.0.0.0:8080` and needs no front; the Pi's boundary is
+the tailnet, and it binds the tailnet address with a TLS terminator in front
+of it because `selvaged` speaks no TLS. Nor is it the `systemd/` unit above,
+which is the same binary with no front — a self-hoster supplies TLS with
+`tailscale serve`, caddy or their own edge.
+
 ## systemd user unit
 
-`systemd/selvaged.service` is the Pi demo's hand-written unit, generalized:
-absolute binary path, explicit `--listen`, explicit `--room-grace-ms`,
+`systemd/selvaged.service` is the Pi's hand-written unit, generalized for any
+machine: absolute binary path, explicit `--listen`, explicit `--room-grace-ms`,
 `Restart=always`, linger, and file-append logging. `%h` expands to the
 installing user's home, so the file installs as-is.
 
@@ -183,8 +200,9 @@ room from an editor. Until the first image is published the file builds locally
 `selvaged --serve-page DIR` serves the browser page on the same origin as
 `/session` and `/meta` (see the root README). The container recipe mounts the
 page directory read-only at `/page` and passes the flag, so one container and
-one port answer the page, the meta document and the socket — the CORS proxy and
-the second page server the Pi runbook hand-writes are not needed.
+one port answer the page, the meta document and the socket. The Pi demo does
+the same thing behind a TLS front (`pi-demo/`), so neither shape needs a CORS
+proxy or a second page server.
 
 **The page is not in this repository.** It is the `web_client` repository's
 built `dist/`; this repository neither builds nor vendors it, so the image
