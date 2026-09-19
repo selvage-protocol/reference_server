@@ -1,21 +1,43 @@
 name: image
 
-# The smoke job runs on every PR and on main without pushing anything: it
-# builds the image with nix/dockerTools (no Docker daemon involved), verifies
-# the manifest and container config with skopeo, and asserts version
-# truthfulness against the exact binary extracted from the image layers.
-# One leg per architecture, each building natively — no cross-compilation.
-# The container job is the other half: a real `docker build` of the
-# Dockerfile, a real `docker run`, and a room joined in the running container
-# by the harness's client engine. The publish job below pushes to GHCR, and
-# only on release tags — no tag has been cut, so it has never run. See
-# packaging/README.md (including the FSL-1.1-MIT redistribution review that
+# The smoke job builds the image with nix/dockerTools (no Docker daemon
+# involved), verifies the manifest and container config with skopeo, and
+# asserts version truthfulness against the exact binary extracted from the
+# image layers. One leg per architecture, each building natively — no
+# cross-compilation. The container job is the other half: a real `docker build`
+# of the Dockerfile, a real `docker run`, and a room joined in the running
+# container by the harness's client engine. The publish job below pushes to
+# GHCR, and only on release tags — no tag has been cut, so it has never run.
+# See packaging/README.md (including the FSL-1.1-MIT redistribution review that
 # must happen before any future publish).
+#
+# A pull request runs all of it only when it changes something the image is
+# built from or a script the smoke reads: a prose edit does not build an image.
+# There is no `push: branches: [main]`, because the merge commit carries the
+# content the pull request already proved — but a release tag does run it, and
+# that is the one event a pull request cannot rehearse, since `publish` needs
+# the smoke. `workflow_dispatch` is the manual re-run.
 on:
   pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile'
+      - 'compose.yaml'
+      - 'packaging/**'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'scripts/image-*.sh'
+      - 'scripts/container-smoke.sh'
+      # Both smokes call these two, so a change to either is a change to the
+      # image's own gate.
+      - 'scripts/check-server-version.sh'
+      - 'scripts/skopeo-policy.json'
+      - '.github/workflows/image.yml'
   push:
-    branches: [main]
     tags: ['v*']
+  workflow_dispatch:
 
 concurrency:
   group: image-${{ github.ref }}
@@ -29,6 +51,9 @@ jobs:
     strategy:
       # One leg's failure must never cancel the other's proof.
       fail-fast: false
+      # Both legs run on every event. The arm64 leg is a GitHub-hosted runner
+      # and costs no Blacksmith minutes, so restricting it to tags would save
+      # nothing and give up the arm64 image on the event that reviews it.
       matrix:
         include:
           - runner: blacksmith-4vcpu-ubuntu-2404

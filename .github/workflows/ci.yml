@@ -1,9 +1,13 @@
 name: ci
 
+# No `push: branches: [main]`: a pull request already runs every step below, and
+# the merge commit carries the same content, so the merge would buy the same
+# minutes a second time. `workflow_dispatch` is the re-run for a commit that
+# reached `main` without one, and the scheduled `nightly.yml` is the run that
+# keeps the default branch's store cache warm for the branches that restore it.
 on:
-  push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -44,11 +48,16 @@ jobs:
       # No `purge`: it needs `actions: write`, and this workflow has `contents: read`.
       # No `gc-max-store-size`: the checks are built with --no-link, so a GC here would
       # collect the very store paths this cache exists to save.
+      # The key names no architecture because only x86_64 jobs write it; the
+      # prefix must, because it is what a changed `flake.lock` falls back to, and
+      # `image.yml`'s arm leg saves under the same `${{ runner.os }}` prefix — a
+      # loose prefix can otherwise restore gigabytes of arm64 store on an x86_64
+      # runner that has 14 GB of disk.
       - name: restore and save the Nix store
         uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
 
       - name: format
         run: nix build .#checks.x86_64-linux.fmt --no-link --print-build-logs
