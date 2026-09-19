@@ -57,7 +57,7 @@ jobs:
       # none of them has a home in `ci.yml`. The vectors are read from the checkout's
       # `vectors/`, so no `SELVAGE_VECTORS` is needed here (the sandbox check sets it).
       - name: coverage
-        run: nix develop . -c cargo tarpaulin --fail-under 80
+        run: nix develop . -c cargo tarpaulin --engine llvm --fail-under 80
 
       - name: cargo-deny
         run: nix develop . -c cargo deny check

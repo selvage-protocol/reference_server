@@ -11,7 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use selvage_harness::{
     EngineEvent, Error, Harness, Role, Room, SelectionOffsets, ServerConfig,
     SyncEngine, WAIT, wait_for, wait_for_convergence, wait_for_described,
-    wait_for_event, wait_for_peer,
+    wait_for_described_within, wait_for_event, wait_for_peer,
 };
 use selvage_protocol as proto;
 use selvage_protocol::{close, code, event, method};
@@ -19,7 +19,6 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
-use tokio::task::yield_now;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -28,6 +27,12 @@ const PATH: &str = "src/main.rs";
 
 /// A path only the guest in the document-set test holds open.
 const GUEST_ONLY: &str = "only/guest.rs";
+
+/// A peer is ejected only after the room relays tens of mebibytes into a socket that
+/// never drains, so the wait for the announcement is I/O under coverage, not a local
+/// engine turn. [`WAIT`] bounds the latter; this bounds the former, and still fails a
+/// run that never ejects at all.
+const EJECTION_WAIT: Duration = Duration::from_secs(30);
 
 /// Anything these tests can fail with.
 type Failure = Box<dyn StdError>;
@@ -2441,7 +2446,9 @@ async fn unknown_http_paths_name_the_two_real_ones() {
 /// bounded, so the first broadcast past a full queue removes it: the room is told
 /// `peer.left`, its task is stopped, and everyone else keeps being served. Filling the
 /// queue past the socket takes megabytes — 32 frames plus the kernel's — so the flood
-/// is 1 MiB binary frames, which stay well under the frame bound.
+/// is 1 MiB binary frames, which stay well under the frame bound and stop just past the
+/// cap. Past that the room is flooding the surviving peers, not the slow one, and under
+/// coverage a peer that only reads is overtaken and ejected in turn.
 #[tokio::test]
 async fn a_peer_that_stops_reading_is_disconnected_and_announced() {
     let harness = Harness::start(Duration::from_secs(5)).await;
@@ -2478,18 +2485,21 @@ async fn a_peer_that_stops_reading_is_disconnected_and_announced() {
         next_json_within(&mut flood, "room.joined").await["event"],
         event::ROOM_JOINED
     );
+    let mut progress = host.subscribe();
     let big = vec![0xA5u8; 1024 * 1024];
-    for _ in 0..150 {
+    for _ in 0..48 {
         flood.send(0x2, &big).await.expect("floods");
-        // Let the room drain between sends: the flood must fill the slow peer's
-        // queue, not win a scheduling race against the host's. Unpaced, a loaded
-        // machine ejects the host too and the final open fails — flakily, under
-        // coverage, on unmodified main as well as here.
-        yield_now().await;
+        // Wait for the host to read the frame before sending the next: the flood races
+        // the host, the host is the peer that must survive it, and unpaced the host is
+        // overtaken and ejected for falling behind like the slow peer.
+        pace(&mut progress)
+            .await
+            .expect("the observer reads the flood frame");
     }
 
     // The room announces the removal, and the slow socket ends.
-    wait_for_described(
+    wait_for_described_within(
+        EJECTION_WAIT,
         "the host to see the slow peer leave",
         || async { format!("{:?}", host.peers().await) },
         || async {
@@ -2498,7 +2508,7 @@ async fn a_peer_that_stops_reading_is_disconnected_and_announced() {
         },
     )
     .await;
-    match timeout(WAIT, slow.read_to_end())
+    match timeout(EJECTION_WAIT, slow.read_to_end())
         .await
         .expect("the server ends the slow connection")
     {
@@ -3229,13 +3239,20 @@ async fn queued_bytes_past_the_cap_eject_a_slow_peer() {
         next_json_within(&mut flood, "room.joined").await["event"],
         event::ROOM_JOINED
     );
+    let mut progress = host.subscribe();
     let big = vec![0xA5u8; 8 * 1024 * 1024];
     for _ in 0..6 {
         flood.send(0x2, &big).await.expect("floods");
+        // Paced on the host's own reading, so the flood cannot overtake the peer that
+        // has to survive it and eject the host with the slow one.
+        pace(&mut progress)
+            .await
+            .expect("the observer reads the flood frame");
     }
 
     // The room announces the removal, and the slow socket ends.
-    wait_for_described(
+    wait_for_described_within(
+        EJECTION_WAIT,
         "the host to see the slow peer leave",
         || async { format!("{:?}", host.peers().await) },
         || async {
@@ -3244,7 +3261,7 @@ async fn queued_bytes_past_the_cap_eject_a_slow_peer() {
         },
     )
     .await;
-    match timeout(WAIT, slow.read_to_end())
+    match timeout(EJECTION_WAIT, slow.read_to_end())
         .await
         .expect("the server ends the slow connection")
     {
@@ -3302,40 +3319,100 @@ async fn a_slow_host_is_ejected_departure_first() {
     );
     wait_for_peer(&watcher, "Flo").await;
     let mut events = watcher.subscribe();
+    let mut progress = watcher.subscribe();
 
     // Six 8 MiB frames are 48 MiB past the 32 MiB cap in 6 frames, where the
     // 32-frame cap would see nothing wrong: the never-reading host is ejected.
     let big = vec![0xA5u8; 8 * 1024 * 1024];
     for _ in 0..6 {
         flood.send(0x2, &big).await.expect("floods");
+        // Paced on the watcher's own reading, so the flood cannot overtake the peer that
+        // has to observe the order and eject it with the host it was watching.
+        pace(&mut progress)
+            .await
+            .expect("the observer reads the flood frame");
     }
 
     // Departure first, grace second — the clean-leave order. Relay noise is
     // ignored; the wait stops at the grace announcement, reporting whether the
-    // removal announcement came before it.
-    let removal_first = timeout(WAIT, removal_before_grace(&mut events))
-        .await
-        .expect("the watcher hears the ejection");
+    // removal announcement came before it, and prints what it read if it runs out.
+    let mut observed = Vec::new();
+    let removal_first = timeout(
+        EJECTION_WAIT,
+        removal_before_grace(&mut events, &mut observed),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the watcher hears the ejection within {EJECTION_WAIT:?}; saw {observed:?}"
+        )
+    });
     assert!(removal_first, "peer.left is announced before host.detached");
 }
 
 /// Reads engine events until the grace announcement, reporting whether the removal
-/// announcement came before it.
+/// announcement came before it. Every event read lands in `observed`, so a wait that
+/// runs out can print the order it actually saw.
 async fn removal_before_grace(
     events: &mut broadcast::Receiver<EngineEvent>,
+    observed: &mut Vec<EngineEvent>,
 ) -> bool {
     let mut saw_removal = false;
-    while let Ok(event) = events.recv().await {
+    while let Some(event) = next_event(events).await {
         if let EngineEvent::PeersChanged { peers } = &event
             && !peers.iter().any(|peer| peer.display_name == "Ada")
         {
             saw_removal = true;
         }
-        if matches!(event, EngineEvent::HostDetached { .. }) {
+        let detached = matches!(event, EngineEvent::HostDetached { .. });
+        observed.push(event);
+        if detached {
             return saw_removal;
         }
     }
     false
+}
+
+/// The next engine event, skipping a receive that fell behind: a lagging receiver has
+/// lost events it cannot ask for again, but the stream still holds the ones after.
+async fn next_event(
+    events: &mut broadcast::Receiver<EngineEvent>,
+) -> Option<EngineEvent> {
+    loop {
+        match events.recv().await {
+            Ok(event) => return Some(event),
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}
+
+/// Waits for the observer to process one undecodable flood frame.
+///
+/// Subscribe before sending the first frame. Each garbage binary frame produces one
+/// `SessionError` in the incoming-frame handler, so consuming it acknowledges a socket
+/// read rather than just a command turn. Keep this separate from ejection subscriptions
+/// so pacing cannot consume the departure announcements they need to inspect.
+async fn pace(
+    progress: &mut broadcast::Receiver<EngineEvent>,
+) -> Result<(), Failure> {
+    timeout(EJECTION_WAIT, read_flood_frame(progress)).await??;
+    Ok(())
+}
+
+/// Consumes events through the next flood acknowledgement without hiding receive errors.
+async fn read_flood_frame(
+    progress: &mut broadcast::Receiver<EngineEvent>,
+) -> Result<(), broadcast::error::RecvError> {
+    loop {
+        let event = progress.recv().await?;
+        if matches!(event, EngineEvent::SessionError { code, message }
+            if code == code::BAD_MESSAGE
+                && message == "a binary frame could not be decoded")
+        {
+            return Ok(());
+        }
+    }
 }
 
 /// Opening documents stays linear in the set and stops at the cap: 1024 short paths

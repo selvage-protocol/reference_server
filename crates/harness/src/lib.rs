@@ -454,6 +454,37 @@ where
 /// Panics when `label` never becomes true within [`WAIT`], printing what `describe` saw.
 pub async fn wait_for_described<F, Fut, T, D, DFut>(
     label: &str,
+    describe: D,
+    check: F,
+) -> T
+where
+    D: FnMut() -> DFut,
+    DFut: Future<Output = String>,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    wait_for_described_within(WAIT, label, describe, check).await
+}
+
+/// [`wait_for_described`], bounded by `deadline` instead of [`WAIT`].
+///
+/// A wait whose effect is known to be slower than [`WAIT`] needs a longer bound than a
+/// local engine operation: the room ejecting a peer after relaying tens of mebibytes to
+/// a socket that never drains is I/O under coverage, not a scheduling turn. The bound
+/// bounds both callbacks as well as polling. Diagnostics are sampled after failed checks
+/// while time remains, so a timeout reports the last completed observation without
+/// awaiting another callback past the deadline.
+///
+/// # Panics
+///
+/// Panics when `label` never becomes true within `deadline`, printing the last observation.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the deadline and the (label, describe, check) triple are the whole shape of a bounded wait; a builder for one helper is worse"
+)]
+pub async fn wait_for_described_within<F, Fut, T, D, DFut>(
+    deadline: Duration,
+    label: &str,
     mut describe: D,
     mut check: F,
 ) -> T
@@ -464,16 +495,30 @@ where
     Fut: Future<Output = Option<T>>,
 {
     let start = Instant::now();
+    let mut observed = String::new();
     loop {
-        if let Some(value) = check().await {
+        assert!(
+            start.elapsed() < deadline,
+            "timed out after {deadline:?} waiting for {label}{}",
+            as_suffix(&observed)
+        );
+        let mut remaining = deadline.saturating_sub(start.elapsed());
+        if !remaining.is_zero()
+            && let Ok(Some(value)) = timeout(remaining, check()).await
+            && start.elapsed() < deadline
+        {
             return value;
         }
-        assert!(
-            start.elapsed() < WAIT,
-            "timed out after {WAIT:?} waiting for {label}{}",
-            as_suffix(&describe().await)
-        );
-        sleep(Duration::from_millis(5)).await;
+        remaining = deadline.saturating_sub(start.elapsed());
+        if !remaining.is_zero()
+            && let Ok(description) = timeout(remaining, describe()).await
+        {
+            observed = description;
+        }
+        remaining = deadline.saturating_sub(start.elapsed());
+        if !remaining.is_zero() {
+            sleep(Duration::from_millis(5).min(remaining)).await;
+        }
     }
 }
 
@@ -592,5 +637,59 @@ pub async fn wait_for_event(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use std::future::{pending, ready};
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+
+    use super::{WAIT, wait_for_described_within};
+
+    #[tokio::test]
+    #[should_panic(expected = "waiting for pending check")]
+    async fn a_pending_check_cannot_outlive_the_deadline() {
+        let result = timeout(
+            WAIT,
+            wait_for_described_within(
+                Duration::from_millis(20),
+                "pending check",
+                pending::<String>,
+                pending::<Option<()>>,
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "the helper exceeded its deadline");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "waiting for pending diagnostic")]
+    async fn a_pending_diagnostic_cannot_outlive_the_deadline() {
+        let result = timeout(
+            WAIT,
+            wait_for_described_within(
+                Duration::from_millis(20),
+                "pending diagnostic",
+                pending::<String>,
+                || ready(None::<()>),
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "the helper exceeded its deadline");
+    }
+
+    #[tokio::test]
+    async fn a_successful_check_does_not_need_diagnostics() {
+        let result = wait_for_described_within(
+            WAIT,
+            "ready state",
+            pending::<String>,
+            || ready(Some(42)),
+        )
+        .await;
+        assert_eq!(result, 42);
     }
 }
