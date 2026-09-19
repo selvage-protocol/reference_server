@@ -226,7 +226,7 @@
               inherit src cargoArtifacts;
               SELVAGE_VECTORS = ./vectors;
               pname = "${binName}-tarpaulin";
-              buildPhaseCargoCommand = "cargo tarpaulin --fail-under 80";
+              buildPhaseCargoCommand = "cargo tarpaulin --engine llvm --fail-under 80";
               installPhase = "mkdir -p $out";
               nativeBuildInputs = [pkgs.cargo-tarpaulin];
             }
