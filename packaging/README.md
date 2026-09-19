@@ -205,6 +205,20 @@ below), verifies manifest and container config with skopeo, extracts the
 exact binary from the image layers, and checks `--version` and `/meta`
 against it. `scripts/ci-local.sh image` runs that smoke anywhere nix does.
 
+### Published releases
+
+`v0.1.0` (2026-09-19, at `7d64cbb`, the merge of \#25) is the first: its tag run —
+https://github.com/selvage-protocol/reference\_server/actions/runs/35428735910 —
+published `ghcr.io/selvage-protocol/selvaged:0.1.0-7d64cbb`, `:0.1.0` and `:latest`
+from the `publish` job, whose own assertions pulled both architectures back out of
+the registry and checked `--version` and `/meta` against `0.1.0`.
+
+**That package is private**, GHCR's default for a new package: an anonymous pull is
+refused (`401` from `ghcr.io/token`) while a known-public package answers, and
+making it public is an account setting only the owner can change. Nothing here
+depends on it — `compose.yaml`'s `build: .` builds the same Dockerfile locally, and
+that is the path a stranger has until the package is public.
+
 ### Compose
 
 `compose.yaml` is one service and one port mapping, and it runs the image the
