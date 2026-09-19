@@ -5,14 +5,21 @@ name: image
 # asserts version truthfulness against the exact binary extracted from the
 # image layers. One leg per architecture, each building natively — no
 # cross-compilation. The container job is the other half: a real `docker build`
-# of the Dockerfile, a real `docker run`, and a room joined in the running
-# container by the harness's client engine. The publish job below pushes to
-# GHCR, and only on release tags — no tag has been cut, so it has never run.
-# See packaging/README.md (including the FSL-1.1-MIT redistribution review that
-# must happen before any future publish).
+# of the Dockerfile, a real `docker run` under the hardening the hosting gate
+# requires, and a room joined in the running container by the harness's client
+# engine. The publish-rehearsal job runs the publish path's own buildx steps —
+# the multi-architecture build, the tag computation and the version assertions
+# — with nothing pushed to GHCR; the publish job pushes, on release tags only.
+# See packaging/README.md.
+#
+# Everything that needs buildx runs on GitHub-hosted `ubuntu-24.04`. The
+# Blacksmith runners this repository otherwise uses proved only github-scoped
+# egress and could not execute buildx builds over nine red rounds, so the
+# release path lives where buildx works; the pull-request feedback jobs that do
+# not need it (the checks, and the nix smoke) stay on Blacksmith.
 #
 # A pull request runs all of it only when it changes something the image is
-# built from or a script the smoke reads: a prose edit does not build an image.
+# built from or a script a job reads: a prose edit does not build an image.
 # There is no `push: branches: [main]`, because the merge commit carries the
 # content the pull request already proved — but a release tag does run it, and
 # that is the one event a pull request cannot rehearse, since `publish` needs
@@ -30,6 +37,8 @@ on:
       - 'flake.lock'
       - 'scripts/image-*.sh'
       - 'scripts/container-smoke.sh'
+      - 'scripts/release-tags.sh'
+      - 'scripts/assert-image-version.sh'
       # Both smokes call these two, so a change to either is a change to the
       # image's own gate.
       - 'scripts/check-server-version.sh'
@@ -101,9 +110,9 @@ jobs:
     # `ubuntu-24.04` ships Docker and reaches the whole network, while the
     # Blacksmith runners this repository otherwise uses proved only
     # github-scoped egress and could not execute buildx builds over nine red
-    # rounds (`publish` below is re-proven on a real run for the same reason).
-    # No buildx and nothing pushed: one architecture, a plain local build of
-    # the repository's own Dockerfile, and scripts/container-smoke.sh.
+    # rounds. No buildx and nothing pushed: one architecture, a plain local
+    # build of the repository's own Dockerfile, and scripts/container-smoke.sh,
+    # which runs the container hardened and asserts the page the image bakes.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -127,7 +136,8 @@ jobs:
           df -h /
 
       # The Dockerfile needs no nix: its builder stage is Docker's own
-      # cross-toolchain image. The dev shell is here for the client engine.
+      # cross-toolchain image and its page stage is node's. The dev shell is
+      # here for the client engine.
       - uses: cachix/install-nix-action@v31.11.1
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
@@ -141,18 +151,87 @@ jobs:
       - name: build the image, run it, and join a room in it
         run: scripts/container-smoke.sh
 
+  publish-rehearsal:
+    # The publish path with nothing published: the same multi-architecture
+    # buildx build, the tag computation from the same script, and the same
+    # `--version` and `/meta` assertions against the image that was built.
+    # `smoke` cannot prove any of that — it builds with nix and never runs the
+    # image — and `container` builds one architecture with no buildx, so
+    # without this job the first proof the release path works would be the
+    # release itself. `publish` waits on it for that reason.
+    #
+    # There is no GHCR credential here and no elevated permission: the image
+    # goes to a `registry:2` container on the runner's own loopback. A manifest
+    # list cannot be loaded into the Docker daemon, so a loopback registry is
+    # what lets the assertions run against the image that was built instead of
+    # against a second, differently built one. Nothing leaves the runner.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: free disk space
+        run: |
+          df -h /
+          sudo rm -rf \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/lib/android \
+            /usr/local/share/boost \
+            /usr/share/dotnet || true
+          df -h /
+
+      - uses: docker/setup-qemu-action@v3
+
+      # The builder pushes to `localhost:5000`, which is insecure-registry
+      # plaintext and, by default, the build container's own loopback: the host
+      # network namespace is what makes it the runner's.
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: start a loopback registry
+        run: docker run --detach --name rehearsal-registry --publish 5000:5000 registry:2
+
+      - name: compute the release tags
+        id: tags
+        run: scripts/release-tags.sh >> "$GITHUB_OUTPUT"
+
+      # The same build the publish job runs, including the moving `<version>`
+      # and `latest` aliases, so a malformed tag name cannot reach a release.
+      - name: build both architectures
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            localhost:5000/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}
+            localhost:5000/selvage-protocol/selvaged:${{ steps.tags.outputs.version }}
+            localhost:5000/selvage-protocol/selvaged:latest
+          build-args: |
+            VERSION=${{ steps.tags.outputs.version }}
+            REVISION=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: assert the built version on both architectures
+        run: |
+          scripts/assert-image-version.sh \
+            "localhost:5000/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}" \
+            "${{ steps.tags.outputs.version }}"
+
   publish:
-    needs: [smoke]
-    # Release tags only. No `v*` tag has ever been cut, and none is cut here:
-    # pushing the image to GHCR is redistribution of the FSL-1.1-MIT binary,
-    # which needs the redistribution review recorded in packaging/README.md
-    # before any future publish. Note the publish leg builds with Docker
-    # while the smoke builds with nix: the runners that proved the smoke
-    # cannot execute buildx builds, so this leg must itself be re-proven
-    # (green on a real run) before any first publish — a tag cut is not
-    # permission to assume it works.
+    needs: [smoke, publish-rehearsal]
+    # Release tags only. `publish-rehearsal` above has just run this job's
+    # buildx steps on this same commit without pushing anywhere, so a tag is
+    # not permission to assume the release path works — it is the one run where
+    # the image is redistributed, which the owner accepted for FSL-1.1-MIT on
+    # 2026-09-19 (see packaging/README.md).
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: read
@@ -183,23 +262,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: compute tags
+      # The release tag that triggered this job must name the Cargo version,
+      # because the registry tags derive from Cargo — the check lives in the
+      # script so the rehearsal computes them the same way.
+      - name: compute the release tags
         id: tags
-        run: |
-          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
-          sha="$(git rev-parse --short HEAD)"
-          # The registry tags derive from Cargo, so the release tag that
-          # triggered this job must name the same version — otherwise a tag
-          # cut from the wrong commit would publish a mismatched version.
-          if [ "${GITHUB_REF_NAME:?}" != "v$version" ]; then
-            echo "tag $GITHUB_REF_NAME does not match Cargo version $version" >&2
-            exit 1
-          fi
-          {
-            echo "version=$version"
-            echo "sha=$sha"
-            echo "tag=ghcr.io/selvage-protocol/selvaged:$version-$sha"
-          } >> "$GITHUB_OUTPUT"
+        run: scripts/release-tags.sh "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
 
       - name: build and push
         uses: docker/build-push-action@v6
@@ -208,7 +276,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ steps.tags.outputs.tag }}
+            ghcr.io/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}
             ghcr.io/selvage-protocol/selvaged:${{ steps.tags.outputs.version }}
             ghcr.io/selvage-protocol/selvaged:latest
           build-args: |
@@ -218,19 +286,9 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
 
       # The pushed image must report the version it is tagged with, on both
-      # architectures — the same truthfulness the smoke job asserts locally.
+      # architectures — the read-back the rehearsal asserted locally.
       - name: assert the published version
         run: |
-          tag='${{ steps.tags.outputs.tag }}'
-          version='${{ steps.tags.outputs.version }}'
-          for arch in amd64 arm64; do
-            out="$(docker run --rm --platform "linux/$arch" "$tag" --version)"
-            if [ "$out" != "selvaged/$version" ]; then
-              echo "$arch --version says '$out', want 'selvaged/$version'" >&2
-              exit 1
-            fi
-          done
-          port=18080
-          docker run -d --name published-smoke -p "127.0.0.1:$port:8080" "$tag"
-          trap 'docker rm -f published-smoke >/dev/null' EXIT
-          scripts/check-server-version.sh "http://127.0.0.1:$port" "$version" "selvaged/$version"
+          scripts/assert-image-version.sh \
+            "ghcr.io/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}" \
+            "${{ steps.tags.outputs.version }}"
