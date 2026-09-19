@@ -8,35 +8,47 @@ Three shapes, for three audiences:
 | `systemd/` | A self-hoster on their own machine | A user unit plus install docs — the proven path, generalized, with no front |
 | `Dockerfile` + `compose.yaml` | Strangers self-hosting on their own machines | A multi-arch image and a one-service compose file — never the Pi |
 The server is memory-only under all three: restarts end all rooms, and
-there is nothing to persist — hence no data volume anywhere here. The one
-mount is the page directory, read-only, which the server only ever reads.
+there is nothing to persist — hence no data volume anywhere here. The image
+carries its page; the only mount any shape has is the optional read-only page
+override, which the server only ever reads.
 `DESIGN.md` §9 names the missing deployment story; this directory is that
 story's first half (the second half, a live VPS, is still unordered spend).
 
-## FSL-1.1-MIT redistribution review — required before any future publish
+## FSL-1.1-MIT redistribution — accepted by the owner, 2026-09-19
 
 `crates/selvaged` is source-available under `FSL-1.1-MIT`, not open source.
 Handing the binary to someone else — pushing the image to GHCR, or any
-third-party re-host — is **redistribution of the binary**, permitted for
-Permitted Purposes and forbidden for **Competing Use** (a commercial
-product or service that substitutes for the software). That review has **not**
-happened: what GHCR distribution and third-party re-hosts count as Competing
-Use, the exact package visibility, and the wording below are open items for
-the owner, not decisions this directory takes.
+third-party re-host — is **redistribution of the binary**: the licence permits
+it for any Permitted Purpose and forbids it for a **Competing Use** (making the
+software available to others in a commercial product or service that
+substitutes for the software, for something else we offer, or one that offers
+the same or substantially similar functionality), and its Redistribution
+clause carries those terms onto every copy.
 
-What is already in place for that review:
+**The owner accepted that scope for this project's publication on 2026-09-19.**
+Publishing the built image to GHCR as `ghcr.io/selvage-protocol/selvaged`, where
+anyone may pull it, and re-hosting that published image, are within the
+licence's Permitted Purpose as the owner reads it, and are not a Competing Use.
+Read that as the owner's own acceptance of these terms for these artefacts —
+not as a legal opinion, and not as permission for anything this project does
+not publish. The licence also grants a future one: each release's terms become
+MIT on the second anniversary of the release.
+
+What the acceptance stands on, all of it in the artefacts themselves:
 
 - The licence text ships **inside the image** (`/LICENSE`, copied from
   `crates/selvaged/LICENSE`) and in its annotations
   (`org.opencontainers.image.licenses=FSL-1.1-MIT`, alongside title, source,
-  version and revision labels).
+  version, revision and the page's revision labels).
 - The binary stays in its own layer; no MIT/Apache crate's binary is copied
   into the same tag in a way that confuses the licence story. (The harness
   links `selvaged`, so a redistributed harness binary carries FSL code — the
   top-level README already says so, and the image never ships one.)
-- No image has been pushed anywhere. The publish leg of
-  `.github/workflows/image.yml` runs on release tags only, no tag has been
-  cut, and none will be cut from this work.
+- A published tag names the revision it was built from (`<version>-<sha>`); the
+  moving `<version>` and `latest` aliases follow only a release.
+- Nothing here says a *service* built on the software is permitted: a
+  commercial product or service that substitutes for it is the Competing Use
+  the licence still forbids.
 
 ## The Pi demo's shape (`pi-demo/`)
 
@@ -142,12 +154,14 @@ After every upgrade the log must show the startup lines and `--version` and
 
 Multi-arch (`linux/amd64` + `linux/arm64`): the arm64 variant is for other
 people's Pis and ARM VPSes, not for this Pi, which already runs a native
-binary. Build locally:
+binary. Build locally — the build fetches the page's pinned `web_client`
+revision, so it needs network, and running it needs no mount:
 
 ```sh
 docker buildx build -t selvaged:local .
-docker run --rm -p 8080:8080 selvaged:local
+docker run --rm -p 127.0.0.1:8080:8080 selvaged:local
 curl -sS http://127.0.0.1:8080/meta
+curl -sS http://127.0.0.1:8080/ | head -c 200   # the page, from the image
 ```
 
 Primary shape is a musl-static binary on `scratch`: the lockfile carries no
@@ -155,14 +169,15 @@ TLS C shims (no openssl/ring/aws-lc-sys — verified by grep over `Cargo.lock`;
 only `libc`/`mio` as OS shims), so the static build needs no C libraries, and
 the runtime holds one binary plus `/LICENSE` as non-root user 65532, no
 shell, no package manager. The `Dockerfile` cross-compiles both
-architectures natively on an x86_64 builder (one cross-toolchain stage per
+architectures natively on an x86\_64 builder (one cross-toolchain stage per
 target, each pinned `--platform=$BUILDPLATFORM`), so building arm64 needs
 no QEMU — only *running* the arm64 image does. Build and run it on any
-machine with a working Docker; the container job below does exactly that on
-GitHub-hosted `ubuntu-24.04` (the amd64 path), so the `Dockerfile` is now
-CI-proven as well as human-verified. The Blacksmith runners are not such
-machines: they proved only github-scoped egress and could not execute buildx
-builds (see CI below).
+machine with a working Docker; the `container` job below does exactly that on
+GitHub-hosted `ubuntu-24.04` (the amd64 path), and the `publish-rehearsal` job
+builds both architectures there with buildx, so the `Dockerfile` is CI-proven
+as well as human-verified. The Blacksmith runners are not such machines: they
+proved only github-scoped egress and could not execute buildx builds (see CI
+below).
 
 Fallback is the same static binary on `gcr.io/distroless/static:nonroot`
 (`--build-arg RUNTIME=distroless`). If a future dependency ever breaks the
@@ -177,7 +192,10 @@ reachable address explicitly.
 
 Image tags are `<cargo-version>-<short-sha>` (e.g. `0.1.0-e617d81`), computed
 by `scripts/image-tag.sh`, plus moving `<version>`/`latest` aliases only on
-published releases. `--version`, `/meta`, and `CARGO_PKG_VERSION` are already
+published releases; `scripts/release-tags.sh` computes the same identity for
+the two buildx jobs and refuses a release tag whose name is not the Cargo
+version, so a tag cut from the wrong commit cannot publish a mismatch.
+`--version`, `/meta`, and `CARGO_PKG_VERSION` are already
 wired together in code (`Meta::reference`, test-enforced by
 `version_matches_what_meta_serves`); `scripts/check-server-version.sh`
 asserts the same truthfulness against a running server, and
@@ -189,28 +207,44 @@ against it. `scripts/ci-local.sh image` runs that smoke anywhere nix does.
 
 ### Compose
 
-`compose.yaml` is one service, one port mapping, `restart: unless-stopped`,
-an overridable `command`, and one read-only page mount — the server keeps
-nothing on disk of its own. `docker compose up`, then `curl /meta`, then host a
-room from an editor. Until the first image is published the file builds locally
-(`build:`); after that it pulls the published tag.
+`compose.yaml` is one service and one port mapping, and it runs the image the
+way the hosting gate requires (owner-decided 2026-09-19): `read_only: true`,
+`cap_drop: [ALL]`, `security_opt: [no-new-privileges:true]`, and nothing
+mounted — no host socket, no volume, no writable path, which the server does
+not need because it keeps nothing on disk. `docker compose up`, then
+`curl /meta`, then host a room from an editor. The page is the image's own; a
+page built elsewhere is served by uncommenting the single `./page` mount the
+file documents (compose mounts unconditionally when a volume is set, and an
+empty directory would replace the baked page, so the override is commented
+rather than absent). `image:` names the released tag and `build: .` builds the
+same Dockerfile locally, so `compose up` works from a checkout whether or not
+the published package is pullable for that user.
 
 ### One origin: the page
 
 `selvaged --serve-page DIR` serves the browser page on the same origin as
-`/session` and `/meta` (see the root README). The container recipe mounts the
-page directory read-only at `/page` and passes the flag, so one container and
-one port answer the page, the meta document and the socket. The Pi demo does
-the same thing behind a TLS front (`pi-demo/`), so neither shape needs a CORS
-proxy or a second page server.
+`/session` and `/meta` (see the root README). The image bakes the page at
+`/page` and its default command passes `--serve-page /page`, so one container
+and one port answer the page, the meta document and the socket. The Pi demo
+does the same thing behind a TLS front (`pi-demo/`), so neither shape needs a
+CORS proxy or a second page server.
 
-**The page is not in this repository.** It is the `web_client` repository's
-built `dist/`; this repository neither builds nor vendors it, so the image
-ships the server alone and the page is mounted (`-v …/dist:/page:ro`). A build
-that pulls it in — a Dockerfile stage that clones `web_client` at a pinned
-revision — is the obvious next step and is **not** done: this environment has
-no reachable copy of that repository to pin or to verify against. `./page`
-absent is not fatal: `/meta` and `/session` still answer and `/` is a `404`.
+**The page is built into the image.** The `web_client` bundle is not vendored
+here: the `Dockerfile`'s `page` stage clones that repository at the revision in
+the `WEB_CLIENT_SHA` build argument, runs `npm ci && npm run build`, and copies
+the resulting `dist/` to `/page`. The pin is
+`a861d36cdc1ec7e603ad0eb5ffd25ac95199d43e`, `web_client`'s `main` head when this
+was written (2026-09-19), and updating it is editing that one argument; the
+image records the revision it carries in `com.selvage.page.revision`. The page
+is built from that revision's source rather than copied from the `dist/`
+committed there, and at this pin the two are byte-identical — a clone built with
+`npm ci && npm run build` leaves `git status` clean — so the image carries the
+reviewed bytes and the page cannot fall behind its source.
+
+Overriding the baked page is a mount over `/page` (`-v …/dist:/page:ro`), and it
+needs no command override: the image's own command already names that directory.
+A missing `./page` is not fatal either way — `/meta` and `/session` still
+answer and `/` is a `404`.
 
 ### TLS
 
@@ -222,51 +256,70 @@ origin as the socket is what makes that one terminator enough.
 
 ## CI
 
-`.github/workflows/image.yml` has three jobs. `smoke` runs on a pull request
+`.github/workflows/image.yml` has four jobs. `smoke` runs on a pull request
 that changes something the image is built from — `crates/`, the manifests, the
-`Dockerfile`, `packaging/`, the flake, and the scripts the smoke reads — and on
-a release tag, one leg per architecture (`amd64` on the usual Blacksmith
-runners, `arm64` on GitHub-hosted ARM — each building natively, no
+`Dockerfile`, `compose.yaml`, `packaging/`, the flake, and the scripts a job
+reads — and on a release tag, one leg per architecture (`amd64` on the usual
+Blacksmith runners, `arm64` on GitHub-hosted ARM — each building natively, no
 cross-compilation): the same nix preamble as the checks job, then
-`scripts/image-smoke.sh`, which
-needs no Docker daemon at all. That is deliberate, not incidental: nine CI
+`scripts/image-smoke.sh`, which needs no Docker daemon at all. That is
+deliberate, not incidental: nine CI
 rounds established that these runners cannot execute buildx builds (daemon,
 setup actions, pulls and builder bootstrap all green; every build dead in
 seconds, including `FROM scratch`), so the smoke builds the image the way
 the runners provably can — `nix build .#image` — and verifies it with
-skopeo. The `Dockerfile` above stays the portable static variant for
+skopeo. The `Dockerfile` stays the portable static variant for
 machines with a working Docker; both agree on entrypoint, port, user,
-licence label and tag scheme, and the smoke asserts exactly those fields.
+licence label and tag scheme, and the smoke asserts exactly those fields. The
+nix image is the daemon-free shape and carries the server alone: the page is the
+`Dockerfile`'s own, and `container` is where it is proved.
 
-`container` is the other half, and the only job that runs the image:
-GitHub-hosted `ubuntu-24.04` (chosen for its Docker daemon and unrestricted
-egress — the Blacksmith runners proved only github-scoped egress and could not
-execute buildx builds), a plain `docker build` of the `Dockerfile`, `docker
-run` with a page mounted, and `scripts/container-smoke.sh`: it asserts the
-container's `--version` and `/meta` against `Cargo.toml`, asserts the page's
-headers and bytes over the container's port, and then mints a room in the
-container and joins it as a guest with the harness's client engine
-(`crates/harness/examples/join_room.rs`), converging on an edit. A `--version`
-or `/meta` check is not that proof: no client had ever completed a handshake
-against the image. `scripts/ci-local.sh container` runs the same script where a
-Docker daemon exists.
+`container` is the other half, and the only job that runs the image, on one
+architecture: GitHub-hosted `ubuntu-24.04` (chosen for its Docker daemon and
+unrestricted egress — the Blacksmith runners proved only github-scoped egress
+and could not execute buildx builds), a plain `docker build` of the
+`Dockerfile`, and `scripts/container-smoke.sh`. That script asserts
+`compose.yaml` carries the hardened run, that the container actually runs that
+way (read-only root filesystem, `CapDrop: [ALL]`, `no-new-privileges`, no mount
+at all), that the container's `--version` and `/meta` agree with `Cargo.toml`,
+that the page baked into the image is served with the headers the static
+handler pins, and then mints a room in the container and joins it as a guest
+with the harness's client engine (`crates/harness/examples/join_room.rs`),
+converging on an edit. A `--version` or `/meta` check is not that proof: no
+client had ever completed a handshake against the image.
+`scripts/ci-local.sh container` runs the same script where a Docker daemon and
+the compose plugin exist.
 
-`publish` needs `smoke`, carries the only
-elevated permission in the repo (`packages: write`), logs in to GHCR with the
-built-in `GITHUB_TOKEN`, and is gated on release tags (`refs/tags/v*`) — tags
-that are never cut from this work. It builds with Docker while the smoke
-builds with nix, so it must itself be re-proven green on a real run before
-any first publish. FSL review stays open until the owner
-closes it; the code merges, the artifacts do not.
+`publish-rehearsal` is the publish path with nothing published: GitHub-hosted
+`ubuntu-24.04`, `docker/setup-qemu-action`, `docker/setup-buildx-action`, a
+`registry:2` container on the runner's own loopback, the same
+`scripts/release-tags.sh`, the same multi-architecture buildx build as
+`publish` — moving `<version>`/`latest` aliases included — and the same
+`scripts/assert-image-version.sh` assertions: `--version` on both architectures
+and `/meta` against the image that was built. It holds no GHCR credential and
+no elevated permission, and nothing leaves the runner.
+
+`publish` needs `[smoke, publish-rehearsal]`, carries the only elevated
+permission in the repository (`packages: write`), logs in to GHCR with the
+built-in `GITHUB_TOKEN`, and is gated on release tags (`refs/tags/v*`) whose
+name must equal the Cargo version. It builds with Docker while `smoke` builds
+with nix, which is why the rehearsal exists and why the publish path is
+re-proven on every pull request before a tag can reach it. Both buildx jobs run
+on GitHub-hosted `ubuntu-24.04`: the release path is where the Blacksmith
+runners cannot go, and the pull-request feedback that does not need buildx
+stays there.
 
 ### The page in a container
 
-The page is not baked into the image (above), so a container that serves one
-mounts it; `scripts/container-smoke.sh` does exactly that with a three-file
-page and asserts the header policy a browser depends on: the pinned media type,
-`no-cache` for a stable name and `public, max-age=31536000, immutable` for a
-content-hashed one, `Referrer-Policy: no-referrer`, `X-Content-Type-Options:
-nosniff`, and the content security policy. Those headers are the static
-handler's own (`crates/selvaged/src/page.rs`) and pinned in
-`crates/harness/tests/page.rs` as well, so the container job proves them where
-they are actually served rather than only in-process.
+The image carries the page and serves it, so the container smoke's first
+subject is the baked page: `/` is the shell (`text/html`, `no-cache`,
+`Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, the content
+security policy), `/app.js` is the bundle, and a content-hashed chunk the bundle
+itself names is served `public, max-age=31536000, immutable`. The extraction
+fails the smoke when it finds no such name, so a report of a clean page cannot
+come from having read none. Those headers are the static handler's own
+(`crates/selvaged/src/page.rs`) and pinned in `crates/harness/tests/page.rs` as
+well, so the container job proves them where they are actually served rather
+than only in-process. A second container then mounts a three-file page over
+`/page` with no command override and asserts the same policy plus the exact
+bytes, which is the override `compose.yaml` documents.

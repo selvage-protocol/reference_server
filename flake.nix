@@ -84,6 +84,9 @@
         # The Dockerfile stays the portable static variant for machines with
         # a working Docker; both agree on entrypoint, port, user, licence
         # label and the <version>-<sha> tag scheme (see packaging/README.md).
+        # It additionally bakes the browser page and passes `--serve-page` in
+        # its command, which this one does not: the page needs node to build,
+        # and this image is the daemon-free shape the smoke can build.
         image = pkgs.dockerTools.buildImage {
           name = "ghcr.io/selvage-protocol/selvaged";
           tag = workspaceVersion;
