@@ -1,0 +1,15 @@
+[Unit]
+Description=Selvage demo session server (selvaged)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/home/pi/selvage-demo/selvaged --listen 100.64.0.3:8080 --room-grace-ms 30000 --serve-page /home/pi/selvage-web/dist
+WorkingDirectory=/home/pi/selvage-demo
+StandardOutput=append:/home/pi/selvage-demo/selvaged.log
+StandardError=inherit
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
