@@ -2485,13 +2485,16 @@ async fn a_peer_that_stops_reading_is_disconnected_and_announced() {
         next_json_within(&mut flood, "room.joined").await["event"],
         event::ROOM_JOINED
     );
+    let mut progress = host.subscribe();
     let big = vec![0xA5u8; 1024 * 1024];
     for _ in 0..48 {
         flood.send(0x2, &big).await.expect("floods");
         // Wait for the host to read the frame before sending the next: the flood races
         // the host, the host is the peer that must survive it, and unpaced the host is
         // overtaken and ejected for falling behind like the slow peer.
-        pace(&host).await;
+        pace(&mut progress)
+            .await
+            .expect("the observer reads the flood frame");
     }
 
     // The room announces the removal, and the slow socket ends.
@@ -3236,12 +3239,15 @@ async fn queued_bytes_past_the_cap_eject_a_slow_peer() {
         next_json_within(&mut flood, "room.joined").await["event"],
         event::ROOM_JOINED
     );
+    let mut progress = host.subscribe();
     let big = vec![0xA5u8; 8 * 1024 * 1024];
     for _ in 0..6 {
         flood.send(0x2, &big).await.expect("floods");
         // Paced on the host's own reading, so the flood cannot overtake the peer that
         // has to survive it and eject the host with the slow one.
-        pace(&host).await;
+        pace(&mut progress)
+            .await
+            .expect("the observer reads the flood frame");
     }
 
     // The room announces the removal, and the slow socket ends.
@@ -3313,6 +3319,7 @@ async fn a_slow_host_is_ejected_departure_first() {
     );
     wait_for_peer(&watcher, "Flo").await;
     let mut events = watcher.subscribe();
+    let mut progress = watcher.subscribe();
 
     // Six 8 MiB frames are 48 MiB past the 32 MiB cap in 6 frames, where the
     // 32-frame cap would see nothing wrong: the never-reading host is ejected.
@@ -3321,7 +3328,9 @@ async fn a_slow_host_is_ejected_departure_first() {
         flood.send(0x2, &big).await.expect("floods");
         // Paced on the watcher's own reading, so the flood cannot overtake the peer that
         // has to observe the order and eject it with the host it was watching.
-        pace(&watcher).await;
+        pace(&mut progress)
+            .await
+            .expect("the observer reads the flood frame");
     }
 
     // Departure first, grace second — the clean-leave order. Relay noise is
@@ -3378,17 +3387,32 @@ async fn next_event(
     }
 }
 
-/// Whether `observer` still sees a peer with this display name.
+/// Waits for the observer to process one undecodable flood frame.
 ///
-/// A round trip through the engine, so a flood paced on it cannot outrun the peer that
-/// has to read the flood — the channel is served by the same task that reads the socket.
-/// One round trip through `observer`'s engine.
-///
-/// The reply is produced by the same task that drains the observer's socket, so a flood
-/// paced on this cannot outrun the peer that has to read it — the difference between an
-/// observer that keeps up and one ejected for falling behind the peer it was watching.
-async fn pace(observer: &SyncEngine) {
-    drop(observer.peers().await);
+/// Subscribe before sending the first frame. Each garbage binary frame produces one
+/// `SessionError` in the incoming-frame handler, so consuming it acknowledges a socket
+/// read rather than just a command turn. Keep this separate from ejection subscriptions
+/// so pacing cannot consume the departure announcements they need to inspect.
+async fn pace(
+    progress: &mut broadcast::Receiver<EngineEvent>,
+) -> Result<(), Failure> {
+    timeout(EJECTION_WAIT, read_flood_frame(progress)).await??;
+    Ok(())
+}
+
+/// Consumes events through the next flood acknowledgement without hiding receive errors.
+async fn read_flood_frame(
+    progress: &mut broadcast::Receiver<EngineEvent>,
+) -> Result<(), broadcast::error::RecvError> {
+    loop {
+        let event = progress.recv().await?;
+        if matches!(event, EngineEvent::SessionError { code, message }
+            if code == code::BAD_MESSAGE
+                && message == "a binary frame could not be decoded")
+        {
+            return Ok(());
+        }
+    }
 }
 
 /// Opening documents stays linear in the set and stops at the cap: 1024 short paths
