@@ -125,6 +125,11 @@
       "op": "expect",
       "conn": "guest",
       "text": "{\"event\":\"peer.left\",\"params\":{\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"host.detached\",\"params\":{\"grace_ms\":30000},\"v\":\"selvage/1\"}"
     }
   ],
   "selvage": "selvage/1",

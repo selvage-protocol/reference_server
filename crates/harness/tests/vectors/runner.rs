@@ -26,7 +26,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
 use yrs::encoding::read::Cursor;
@@ -40,8 +40,18 @@ pub type Failure = Box<dyn StdError>;
 /// The placeholder that matches anything and is never remembered.
 const ANY: &str = "$_";
 
+/// How long the unread check waits for one more frame before it believes a
+/// connection is quiet — the same window as `DRAIN_TIMEOUT` in the specification
+/// runner, which is what caught the transcripts that stopped reading early.
+const DRAIN_WINDOW: Duration = Duration::from_millis(100);
+
+/// How long the unread check waits on one connection in total before it calls
+/// the drain stalled and names the connection. A quiet connection costs one
+/// window; only a server that keeps sending can reach this.
+const DRAIN_BUDGET: Duration = Duration::from_secs(5);
+
 /// One vector file.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Vector {
     pub id: String,
@@ -62,7 +72,7 @@ pub struct Vector {
 }
 
 /// The server a vector needs. `room_grace_ms` is the host-reconnect grace period.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSpec {
     #[serde(default = "default_grace")]
@@ -85,7 +95,7 @@ impl Default for ServerSpec {
 /// One step of a transcript. A step may carry a member the runner does not read — `refused`
 /// marks a frame the vector sends on purpose knowing it is malformed — because the schema
 /// validator and this runner are not the same reader.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Step {
     pub op: String,
     #[serde(default)]
@@ -114,7 +124,7 @@ pub struct Step {
 
 /// What a binary frame must be, described rather than spelled out: a payload depends on the
 /// random client id of whoever wrote it, the framing does not.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrameSpec {
     pub message_type: u64,
@@ -125,7 +135,7 @@ pub struct FrameSpec {
 }
 
 /// An awareness update's content, as the reference decoder reads it back.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AwarenessSpec {
     pub clients: Vec<u64>,
@@ -303,6 +313,43 @@ impl Peer {
         }
     }
 
+    /// The frames still on the connection once the transcript stops reading.
+    ///
+    /// A frame here is one no step of the run has read. A close ends the stream
+    /// and is not a frame; a quiet connection costs one window and nothing more.
+    ///
+    /// # Errors
+    ///
+    /// Returns the receive error when the socket fails while draining: an empty
+    /// drain after a reset is not a quiet connection, it is a failure the replay
+    /// must report rather than pass.
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "a drain loop over frames; skipping keepalive is one level deeper than the gate allows"
+    )]
+    async fn drain(&mut self) -> Result<Vec<String>, Failure> {
+        let mut unread = Vec::new();
+        loop {
+            let message = match timeout(DRAIN_WINDOW, self.ws.next()).await {
+                Err(_) | Ok(None) => return Ok(unread),
+                Ok(Some(Err(error))) => {
+                    return Err(
+                        self.wrong(&format!("the drain failed: {error}"))
+                    );
+                }
+                Ok(Some(Ok(message))) => message,
+            };
+            match classify(message) {
+                None => {}
+                Some(Incoming::Closed { .. }) => return Ok(unread),
+                Some(Incoming::Text(text)) => unread.push(text),
+                Some(Incoming::Binary(bytes)) => {
+                    unread.push(format!("binary {}", bytes_hex(&bytes)));
+                }
+            }
+        }
+    }
+
     fn wrong(&self, what: &str) -> Failure {
         format!("on `{}`, after {} frames: {what}", self.name, self.frames)
             .into()
@@ -380,6 +427,43 @@ impl Session {
             out = out.replace(name.as_str(), value.as_str());
         }
         out
+    }
+
+    /// What each connection still holds that no step of the transcript reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the connection when one keeps sending past the
+    /// drain budget instead of going quiet, and propagates a drain receive
+    /// error naming the connection whose socket failed.
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "a drain over connections, each bounded by its own timeout"
+    )]
+    async fn drain(&mut self) -> Result<Vec<String>, Failure> {
+        let mut report = Vec::new();
+        for (name, peer) in &mut self.peers {
+            let held = match timeout(DRAIN_BUDGET, peer.drain()).await {
+                Err(_) => {
+                    return Err(format!(
+                        "draining `{name}` stalled: still sending after {DRAIN_BUDGET:?}"
+                    )
+                    .into());
+                }
+                Ok(Err(error)) => return Err(error),
+                Ok(Ok(held)) => held,
+            };
+            if held.is_empty() {
+                continue;
+            }
+            let noun = if held.len() == 1 { "frame" } else { "frames" };
+            report.push(format!(
+                "`{name}` holds {} {noun} the transcript does not read: {}",
+                held.len(),
+                held.join(", ")
+            ));
+        }
+        Ok(report)
     }
 }
 
@@ -910,11 +994,44 @@ async fn run_step(
     }
 }
 
+/// A failed step, placed in the transcript and in its connection's stream.
+///
+/// Every step reads the frame at the head of its connection's queue, so a queue
+/// that is one frame behind fails on a frame from an earlier moment. The step's
+/// place in the transcript and how many frames that connection had already read
+/// are what make that visible.
+fn describe_step(session: &Session, step: &Step, place: &StepPlace) -> String {
+    let at = format!("step {} of {} `{}`", place.index, place.total, step.op);
+    let Some(conn) = step.conn.as_ref() else {
+        return at;
+    };
+    let (Some(peer), Some(read)) = (session.peers.get(conn), place.before)
+    else {
+        return at;
+    };
+    let reading = if peer.frames == read {
+        format!("after {read} frames read")
+    } else {
+        format!("reading frame {} ({read} read before it)", peer.frames)
+    };
+    format!("{at} on `{conn}`, {reading}")
+}
+
+/// Where a step sits: its place in the transcript and what its connection had
+/// read before it ran.
+struct StepPlace {
+    total: usize,
+    index: usize,
+    before: Option<usize>,
+}
+
 /// Replays one vector against a fresh server.
 ///
 /// # Errors
 ///
-/// Returns the first step that did not hold, with the vector and the step it was.
+/// Returns the first step that did not hold, with the vector and the step it
+/// was — or what each connection still holds that no step reads, when the
+/// transcript stops reading early.
 pub async fn replay(vector: &Vector) -> Result<(), Failure> {
     if vector.selvage != "selvage/1" || vector.canonical != "SJ-C/1" {
         return Err(format!(
@@ -929,17 +1046,46 @@ pub async fn replay(vector: &Vector) -> Result<(), Failure> {
     };
     let harness = Harness::start_with(config).await;
     let mut session = Session::new();
+    let total = vector.steps.len();
     for (index, step) in vector.steps.iter().enumerate() {
+        let place = StepPlace {
+            total,
+            index,
+            before: step
+                .conn
+                .as_ref()
+                .and_then(|name| session.peers.get(name))
+                .map(|peer| peer.frames),
+        };
         run_step(&mut session, &harness, step)
             .await
             .map_err(|error| {
                 format!(
-                    "vector {} — {} ({}), step {index} `{}`: {error}",
-                    vector.id, vector.title, vector.spec, step.op
+                    "vector {} — {} ({}), {}: {error}",
+                    vector.id,
+                    vector.title,
+                    vector.spec,
+                    describe_step(&session, step, &place)
                 )
             })?;
     }
-    Ok(())
+    let unread = session.drain().await.map_err(|error| {
+        format!(
+            "vector {} — {} ({}): {error}",
+            vector.id, vector.title, vector.spec
+        )
+    })?;
+    if unread.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "vector {} — {} ({}): holds frames the transcript does not read:\n{}",
+        vector.id,
+        vector.title,
+        vector.spec,
+        unread.join("\n")
+    )
+    .into())
 }
 
 #[cfg(test)]
@@ -949,6 +1095,63 @@ mod tests {
     //! comparison is the part of this runner that decides whether a transcript held.
 
     use super::{Bindings, check_text};
+
+    #[tokio::test]
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "a fake server behind a spawned task; the handshake and the bad frame are one level deeper than the gate allows"
+    )]
+    async fn a_receive_error_while_draining_is_not_a_quiet_connection() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::TcpListener;
+        use tokio::time::sleep;
+
+        // A server that completes the handshake and then sends a frame with a
+        // reserved opcode, which no `Message` spells: the client's next read
+        // is a protocol error, the shape a reset takes mid-drain.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener binds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has an address");
+        let server = tokio::spawn(async move {
+            let (socket, _) =
+                listener.accept().await.expect("a client connects");
+            let mut server = tokio_tungstenite::accept_async(socket)
+                .await
+                .expect("the handshake holds");
+            server
+                .get_mut()
+                .write_all(&[0x83, 0x00])
+                .await
+                .expect("the bad frame sends");
+            sleep(Duration::from_secs(30)).await;
+        });
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .expect("the client connects");
+        let mut session = super::Session::new();
+        session.peers.insert(
+            "peer".to_string(),
+            super::Peer {
+                name: "peer".to_string(),
+                ws,
+                doc: yrs::Doc::new(),
+                frames: 0,
+            },
+        );
+        let error = session.drain().await.expect_err(
+            "a receive error while draining must fail, not read as quiet",
+        );
+        server.abort();
+        let report = error.to_string();
+        assert!(
+            report.contains("`peer`") && report.contains("drain failed"),
+            "the failure names the connection whose socket failed: {report}"
+        );
+    }
 
     /// A frame in the byte form of `CANONICAL.md` §2, which is what a vector carries.
     fn canonical(value: &serde_json::Value) -> String {
