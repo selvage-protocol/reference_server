@@ -22,8 +22,8 @@ name: image
 # built from or a script a job reads: a prose edit does not build an image.
 # There is no `push: branches: [main]`, because the merge commit carries the
 # content the pull request already proved — but a release tag does run it, and
-# that is the one event a pull request cannot rehearse, since `publish` needs
-# the smoke. `workflow_dispatch` is the manual re-run.
+# `publish` is gated on the tag: a pull request rehearses the same build and the
+# same assertions and pushes nothing. `workflow_dispatch` is the manual re-run.
 on:
   pull_request:
     paths:
