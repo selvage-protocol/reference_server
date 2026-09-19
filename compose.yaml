@@ -2,18 +2,24 @@
 # machine (and, later, optionally the VPS demo) — emphatically not the Pi,
 # which already runs the native binary under packaging/systemd/.
 #
-# No volumes: the server is memory-only and keeps nothing on disk, so there
-# is nothing to persist. No companion services: the server needs no database,
-# no TLS proxy, no idle-timeout policing in front of it beyond what the
-# operator's own edge already does.
+# No volumes: the image carries the browser page it serves (Dockerfile `page`
+# stage), and the server is memory-only and keeps nothing on disk, so there is
+# nothing to persist and nothing to mount. See the `./page` override at the
+# bottom for serving a page built elsewhere.
 #
-# Until the first image is published to GHCR (no tag has been cut — see
-# packaging/README.md), `compose up` builds locally via `build:`. After that,
-# the same file pulls the published image.
+# No companion services either: the server needs no database, no TLS proxy, no
+# idle-timeout policing in front of it beyond what the operator's own edge
+# already does.
+#
+# The run is the hardened one the hosting gate requires before any public
+# deployment (owner-decided 2026-09-19): the root filesystem is read-only,
+# every capability is dropped, and no process in the container may gain one.
+# Nothing beyond the container's own port is reachable, and no host socket is
+# mounted — a public deployment is gated on no host socket access at all.
 services:
   selvaged:
     build: .
-    image: ghcr.io/selvage-protocol/selvaged:0.1
+    image: ghcr.io/selvage-protocol/selvaged:0.1.0
     ports:
       # Loopback by default: a stranger evaluating locally reaches it, and
       # nothing else does. Operators serving beyond their own machine rebind
@@ -21,16 +27,28 @@ services:
       # reachable address explicitly.
       - "127.0.0.1:8080:8080"
     # Inside the container the wildcard is correct: the port mapping supplies
-    # the boundary. Override per host, e.g. `--listen 0.0.0.0:9000` with a
-    # matching ports entry.
+    # the boundary. The image's own command is
+    # `--listen 0.0.0.0:8080 --serve-page /page`; override per host, e.g.
+    # `--listen 0.0.0.0:9000` with a matching ports entry.
     #
     # One container, one port: the page is served from the same origin as
     # /session and /meta, so the guest link is a page link (`/` with the room
-    # and token in the query) and nothing needs a CORS proxy. The page itself
-    # is the browser client's `dist/`, mounted read-only at `./page` — this
-    # repository does not build or vendor it (see packaging/README.md). With
-    # `./page` absent the server still answers /meta and /session; `/` is 404.
-    volumes:
-      - ./page:/page:ro
-    command: ["--listen", "0.0.0.0:8080", "--serve-page", "/page"]
+    # and token in the query) and nothing needs a CORS proxy. The page is the
+    # browser client's built `dist/`, baked into the image at a pinned
+    # revision; with no page at all the server still answers /meta and
+    # /session, and `/` is 404.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
+    #
+    # Override: serve a page built from another `web_client` revision (or one
+    # you are working on) by mounting it over the baked copy — the image's own
+    # command already points `--serve-page` at /page, so the mount is the whole
+    # override. Compose has no conditional mount, so an uncommented `./page`
+    # that does not exist replaces the baked page with an empty directory:
+    # uncomment it only when the directory is there.
+    # volumes:
+    #   - ./page:/page:ro

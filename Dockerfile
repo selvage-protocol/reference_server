@@ -12,10 +12,20 @@
 # If a future dependency ever breaks the musl build, compile a glibc binary
 # instead and keep the distroless runtime — the stage below already accepts
 # any binary at /selvaged. See packaging/README.md.
+#
+# The image also serves the browser page: a `page` stage builds the
+# `web_client` bundle at the pinned revision below and copies it to /page,
+# which the runtime's default command hands to `--serve-page`. Serving a page
+# needs no mount; the override is a mount (see compose.yaml).
 ARG TARGETARCH=amd64
 ARG RUNTIME=scratch
 ARG VERSION=dev
 ARG REVISION=unknown
+# The browser client revision the baked page is built from: a commit on
+# `selvage-protocol/web_client` main, as a full SHA (a shallow fetch by
+# revision demands one). The page is updated by editing this line alone, and
+# the image names the revision it carries in `com.selvage.page.revision`.
+ARG WEB_CLIENT_SHA=a861d36cdc1ec7e603ad0eb5ffd25ac95199d43e
 
 # One cross-toolchain image per target, always run natively on the build host:
 # each stage cross-compiles its target triple, so building arm64 needs no
@@ -29,13 +39,48 @@ FROM builder-${TARGETARCH} AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN if [ "$TARGETARCH" = "arm64" ]; then echo aarch64; else echo x86_64; fi \
-        > /tmp/musl-arch \
+# The binary's ELF header is checked against the architecture this stage was
+# chosen for — `e_machine`, byte 18 of a little-endian ELF: 62 is x86-64, 183
+# is AArch64. Without it a graph that resolved `builder-${TARGETARCH}` to the
+# wrong cross-toolchain would still produce an image, and a runtime assertion
+# could still pass, because the runner's binfmt registrations execute either
+# architecture's binary. The toolchain image is Ubuntu with binutils.
+RUN if [ "$TARGETARCH" = "arm64" ]; then arch=aarch64; machine=183; else arch=x86_64; machine=62; fi \
     && cargo build --locked --release -p selvaged \
-        --target "$(cat /tmp/musl-arch)-unknown-linux-musl" \
-    && cp "target/$(cat /tmp/musl-arch)-unknown-linux-musl/release/selvaged" \
-        /selvaged \
+        --target "$arch-unknown-linux-musl" \
+    && cp "target/$arch-unknown-linux-musl/release/selvaged" /selvaged \
+    && [ "$(od -An -tu1 -j18 -N1 /selvaged | tr -d ' ')" = "$machine" ] \
     && /selvaged --version
+
+# The page: the browser client's built `dist/`, cloned at the pinned revision
+# and bundled here so a container serves one with no mount. It is built from
+# that revision's source rather than from the `dist/` committed there — at
+# this pin the two are byte-identical (a clone built with `npm ci && npm run
+# build` leaves `git status` clean), so the image carries the reviewed bytes
+# and the page cannot fall behind its source. `--platform=$BUILDPLATFORM`: the
+# bundle is the same on every architecture, so this stage runs natively on the
+# build host instead of once per target under emulation.
+# Two things in this base are the stage's own: trixie for ImageMagick 7's
+# `magick`, which the client's build shells out to for the sized icons
+# (bookworm's imagemagick is 6.x and installs `convert` only), and an explicit
+# `ca-certificates`, because the official node images install it and then purge
+# it as auto-removable in the same layer — no layer of `node:22-trixie-slim`
+# holds an `/etc/ssl` path. Node carries its own trusted roots and works
+# without it; git, which fetches the pinned revision over HTTPS here, does not.
+FROM --platform=$BUILDPLATFORM node:22-trixie-slim AS page
+ARG WEB_CLIENT_SHA
+WORKDIR /web_client
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git imagemagick \
+    && rm -rf /var/lib/apt/lists/*
+RUN git init -q . \
+    && git remote add origin https://github.com/selvage-protocol/web_client.git \
+    && git fetch --depth 1 origin "$WEB_CLIENT_SHA" \
+    && git checkout -q --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "$WEB_CLIENT_SHA" \
+    && npm ci --no-audit --no-fund \
+    && npm run build
 
 # `scratch` takes no tag and `runtime-*` is an internal stage, so DL3006
 # (always tag the image) is unactionable here by design. hadolint
@@ -44,27 +89,32 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then echo aarch64; else echo x86_64; fi \
 FROM scratch AS runtime-scratch
 COPY --from=builder /selvaged /selvaged
 COPY crates/selvaged/LICENSE /LICENSE
+COPY --from=page /web_client/dist /page
 USER 65532
 EXPOSE 8080
 ENTRYPOINT ["/selvaged"]
-CMD ["--listen", "0.0.0.0:8080"]
+CMD ["--listen", "0.0.0.0:8080", "--serve-page", "/page"]
 
 FROM gcr.io/distroless/static:nonroot AS runtime-distroless
 COPY --from=builder /selvaged /selvaged
 COPY crates/selvaged/LICENSE /LICENSE
+COPY --from=page /web_client/dist /page
 EXPOSE 8080
 ENTRYPOINT ["/selvaged"]
-CMD ["--listen", "0.0.0.0:8080"]
+CMD ["--listen", "0.0.0.0:8080", "--serve-page", "/page"]
 
 FROM runtime-${RUNTIME} AS final
 ARG VERSION
 ARG REVISION
+ARG WEB_CLIENT_SHA
 # The FSL-1.1-MIT licence travels inside the image (see /LICENSE) and in its
-# annotations. Pushing this image anywhere is redistribution of the binary:
-# review the Competing Use scope before publishing — see packaging/README.md.
+# annotations. Pushing this image anywhere is redistribution of the binary;
+# the owner accepted GHCR distribution, and re-hosts of the published image,
+# as permitted redistribution on 2026-09-19 — see packaging/README.md.
 LABEL org.opencontainers.image.title="selvaged" \
-      org.opencontainers.image.description="Memory-only reference server for the Selvage Session Protocol" \
+      org.opencontainers.image.description="Memory-only reference server for the Selvage Session Protocol, serving the browser client's built page" \
       org.opencontainers.image.source="https://github.com/selvage-protocol/reference_server" \
       org.opencontainers.image.licenses="FSL-1.1-MIT" \
       org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${REVISION}"
+      org.opencontainers.image.revision="${REVISION}" \
+      com.selvage.page.revision="${WEB_CLIENT_SHA}"

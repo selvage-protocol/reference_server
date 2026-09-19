@@ -10,8 +10,14 @@
 #                                 # skopeo manifest/config checks, version
 #                                 # assertions — no Docker, runs anywhere nix does
 #   scripts/ci-local.sh container # the `image` workflow's container job: docker
-#                                 # build/run plus a room join (needs Docker)
+#                                 # build/run hardened plus a room join (needs Docker
+#                                 # and the compose plugin)
 #   scripts/ci-local.sh all       # everything the `checks` job runs (nightly is opt-in: it is slow)
+#
+# The `image` workflow's `publish-rehearsal` and `publish` jobs (multi-arch buildx) have no
+# step here: this host has no Docker, let alone buildx, so they are read from the run and
+# from `scripts/release-tags.sh` and `scripts/assert-image-version.sh`, which those jobs and
+# this script's container job share.
 #
 # Keep this in step with the workflow — it runs the same commands, so that a red job is found
 # here rather than on a runner. `lint` catches unknown actions, bad expressions and shell

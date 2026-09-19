@@ -60,7 +60,7 @@ A free tunnel that forwards to your port works for a first test; beyond that you
 machine with a public address (a small VPS, the right firewall rules). To run the server
 beyond a shell — a systemd user unit, or a multi-arch container image with a
 one-service compose file — see `packaging/` (install docs, upgrade flow, version
-truthfulness, and the licence review that must precede any image publish).
+truthfulness, and the FSL-1.1-MIT redistribution the published image carries).
 
 ### One container, one port, and the page
 
@@ -71,25 +71,34 @@ cross-origin dial). The guest link is then a page link —
 `http://HOST:PORT/?room=<room>&token=<token>` — with no `server=` parameter.
 
 The page itself is the browser client's built `dist/`, which lives in the `web_client`
-repository and is **not** built or vendored here; point the flag at a copy of it:
+repository. The container image builds it from a pinned revision and serves it, so a
+container needs no mount:
+
+```sh
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged
+```
+
+A page built elsewhere overrides the baked one by mounting over it — the image's own
+command already passes `--serve-page /page`:
 
 ```sh
 docker run --rm -p 127.0.0.1:8080:8080 \
   -v "$PWD/page:/page:ro" \
-  ghcr.io/selvage-protocol/selvaged --listen 0.0.0.0:8080 --serve-page /page
+  ghcr.io/selvage-protocol/selvaged
 ```
 
 With no page directory the server still answers `/meta` and `/session`; `/` is `404`.
-`compose.yaml` mounts `./page` and passes the flag already.
+`compose.yaml` runs the image hardened and documents the same override.
 
 Served files carry the policy a browser needs: a media type from a pinned table
 (never the host's mime database), `Cache-Control: no-cache` for a stable name and
 `public, max-age=31536000, immutable` for a content-hashed one, `Referrer-Policy:
 no-referrer` — an invite URL carries the room token, which must not travel on in a
 `Referer` header — `X-Content-Type-Options: nosniff`, and a `Content-Security-Policy`.
-`scripts/container-smoke.sh` builds the image with Docker, runs it with a page mounted,
-and joins a room in it with the harness's client engine; `scripts/ci-local.sh container`
-runs the same where a Docker daemon exists.
+`scripts/container-smoke.sh` builds the image with Docker, runs it read-only with every
+capability dropped, asserts the page the image bakes, and joins a room in it with the
+harness's client engine; `scripts/ci-local.sh container` runs the same where a Docker
+daemon exists.
 
 **Not secure by default.** `ws://`/`http://` is plaintext: the invite token travels in
 the clear, so it is for a tailnet, a VPN or loopback. The protocol's transport security
