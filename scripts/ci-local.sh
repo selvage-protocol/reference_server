@@ -3,7 +3,7 @@
 # Runs the steps of .github/workflows/ci.yml on this machine, without containers (this host
 # has no Docker or Podman, so `act` cannot run here).
 #
-#   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval, lint
+#   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval, the TLS front, lint
 #   scripts/ci-local.sh nightly   # coverage, the rest of cargo-deny and cargo-audit (slow)
 #   scripts/ci-local.sh lint      # actionlint over the workflow files, on its own
 #   scripts/ci-local.sh image     # the `image` workflow's smoke: nix-built image,
@@ -52,6 +52,10 @@ job_checks() {
   nix develop . -c cargo deny check licenses
   say "checks: evaluate every check"
   nix flake check --no-build .
+  # The TLS front's idle logic, stdlib Python and no Pi: the one check that is not a
+  # Cargo target.
+  say "checks: the TLS front's idle logic"
+  nix build .#checks.x86_64-linux.tls-proxy --no-link --print-build-logs
   say "checks: lint the workflows"
   nix develop . -c actionlint
 }

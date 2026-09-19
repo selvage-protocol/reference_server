@@ -18,6 +18,7 @@ directory owns the files, and the two must agree.
 | `tls-proxy.py` | `~/selvage-demo/tls-proxy.py` | The TLS front: one certificate, every path relayed |
 | `tls-proxy.service` | `~/.config/systemd/user/selvage-tls-proxy.service` | The front's user unit |
 | `tls-proxy.env.example` | — | The front's environment, documented rather than installed |
+| `test_tls_proxy.py` | — | The front's idle logic against fake sockets, run by the `tls-proxy` flake check — no Pi, no certificate |
 
 ## The shape
 

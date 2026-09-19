@@ -83,6 +83,11 @@ jobs:
       - name: evaluate every check
         run: nix flake check --no-build .
 
+      # The TLS front's idle logic (`packaging/pi-demo/tls-proxy.py`): the one check here
+      # that is not a Cargo target. Stdlib Python, so the runner needs nothing but nix.
+      - name: the TLS front's idle logic
+        run: nix build .#checks.x86_64-linux.tls-proxy --no-link --print-build-logs
+
       # Unknown actions, bad expressions and shell mistakes, caught before the run.
       - name: lint the workflows
         run: nix develop . -c actionlint
