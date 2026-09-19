@@ -39,14 +39,23 @@ docker run --rm -p 127.0.0.1:8080:8080 selvaged:local
 
 `docker compose up` builds the same `Dockerfile` through `compose.yaml`, which runs the
 image read-only with every capability dropped. The published image is
-`ghcr.io/selvage-protocol/selvaged:0.1.0`, with `:latest` the same build. That GHCR package
-is private at the time of writing, so pulling it works only for the account that owns it,
-and the local build is the route that works for everyone.
+`ghcr.io/selvage-protocol/selvaged:0.1.0`, with `:latest` the same build, and the GHCR
+package is public: it pulls anonymously, with no account and no `docker login`. The
+shortest route to a running server is therefore
+
+```sh
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.1.0
+```
+
+and the local build above is the route for an image you are changing, or one built from
+your own checkout.
 
 The page is baked in. The image builds the browser client's `dist/` from a pinned revision
-and serves it, so a container needs no mount. A page built elsewhere overrides the baked
-one by mounting over it, because the image's own command already passes `--serve-page
-/page`:
+and serves it, so a container needs no mount. The `web_client` repository also publishes the
+page on its own, as `ghcr.io/selvage-protocol/selvage-web`, for the editor on its own origin
+or one page in front of several servers; that second origin changes what a link looks like,
+and *Serving the page* below has both. A page built elsewhere overrides the baked one by
+mounting over it, because the image's own command already passes `--serve-page /page`:
 
 ```sh
 docker run --rm -p 127.0.0.1:8080:8080 \
@@ -210,6 +219,16 @@ is no cross-origin dial. The guest link is then a page link,
 
 The page is the browser client's built `dist/`, which lives in the `web_client` repository;
 the image builds it from a pinned revision and serves it.
+
+`web_client` also publishes the bundle as a page-only image,
+`ghcr.io/selvage-protocol/selvage-web`, whose own README owns the build, the tags and the
+runtime. It is for putting the editor on its own origin, or for one page in front of several
+servers. That is a second origin, and it works because the page's socket is not CORS-bound
+and its `/meta` read is only advisory — but it costs a second port and a second thing to
+upgrade, and every invite link must then name the server, as `?server=`, because the page's
+built-in default is one particular endpoint and the page's own origin says nothing about
+which server to dial. One origin stays the default: this image, whose page, `/meta` and
+`/session` share one listener, and `--serve-page` from any deployment.
 
 Served files carry the policy a browser needs: a media type from a pinned table (never the
 host's mime database), `Cache-Control: no-cache` for a stable name and `public,
