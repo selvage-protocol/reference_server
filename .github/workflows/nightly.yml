@@ -15,7 +15,12 @@ permissions:
 
 jobs:
   nightly:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # GitHub-hosted, unlike the jobs in `ci.yml`: this is a scheduled audit and
+    # not a feedback path, so its minutes need not be bought, and the three
+    # commands below reach the whole network — the advisory database and the
+    # crates it compares against — where the Blacksmith runners have proved
+    # github-scoped egress only.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7.0.1
@@ -43,7 +48,10 @@ jobs:
         uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
+          # Architecture-qualified for the same reason as `ci.yml`'s: the
+          # `${{ runner.os }}`-only prefix also matches the arm64 store
+          # `image.yml`'s arm leg saves, which is useless on this runner.
+          restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
 
       # These three are the ones that were left behind when the monorepo was split, and
       # none of them has a home in `ci.yml`. The vectors are read from the checkout's

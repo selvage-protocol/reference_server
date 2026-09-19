@@ -204,10 +204,13 @@ origin as the socket is what makes that one terminator enough.
 
 ## CI
 
-`.github/workflows/image.yml` has three jobs. `smoke` runs on every PR and on
-`main`, one leg per architecture (`amd64` on the usual Blacksmith runners,
-`arm64` on GitHub-hosted ARM — each building natively, no cross-compilation): the
-same nix preamble as the checks job, then `scripts/image-smoke.sh`, which
+`.github/workflows/image.yml` has three jobs. `smoke` runs on a pull request
+that changes something the image is built from — `crates/`, the manifests, the
+`Dockerfile`, `packaging/`, the flake, and the scripts the smoke reads — and on
+a release tag, one leg per architecture (`amd64` on the usual Blacksmith
+runners, `arm64` on GitHub-hosted ARM — each building natively, no
+cross-compilation): the same nix preamble as the checks job, then
+`scripts/image-smoke.sh`, which
 needs no Docker daemon at all. That is deliberate, not incidental: nine CI
 rounds established that these runners cannot execute buildx builds (daemon,
 setup actions, pulls and builder bootstrap all green; every build dead in
