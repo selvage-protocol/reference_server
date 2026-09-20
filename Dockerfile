@@ -58,7 +58,6 @@ COPY crates ./crates
 # wrong cross-toolchain would still produce an image, and a runtime assertion
 # could still pass, because the runner's binfmt registrations execute either
 # architecture's binary. The toolchain image is Ubuntu with binutils.
-RUN echo "TARGETARCH seen in builder stage: '$TARGETARCH'" > /build-targetarch-debug.txt
 RUN if [ "$TARGETARCH" = "arm64" ]; then arch=aarch64; machine=183; else arch=x86_64; machine=62; fi \
     && cargo build --locked --release -p selvaged \
         --target "$arch-unknown-linux-musl" \
@@ -102,7 +101,6 @@ RUN git init -q . \
 # trailing text as extra arguments, so they would break the build.
 FROM scratch AS runtime-scratch
 COPY --from=builder /selvaged /selvaged
-COPY --from=builder /build-targetarch-debug.txt /build-targetarch-debug.txt
 COPY crates/selvaged/LICENSE /LICENSE
 COPY --from=page /web_client/dist /page
 USER 65532

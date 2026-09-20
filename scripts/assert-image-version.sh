@@ -24,15 +24,7 @@
 # it, so this needs no binfmt/qemu support on the runner. Actually running the
 # image — `--version`, and the live `/meta` round-trip — stays scoped to the
 # runner's own architecture, which needs no emulation either.
-set -Eeuo pipefail
-report_failure() {
-    local msg="assert-image-version.sh failed at line $1: $2"
-    echo "::error::$msg"
-    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-        printf '### assert-image-version.sh failed\n%s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
-    fi
-}
-trap 'report_failure "$LINENO" "$BASH_COMMAND"' ERR
+set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
@@ -44,7 +36,6 @@ want="selvaged/$version"
 
 declare -A elf_machine=([amd64]=62 [arm64]=183)
 host_arch="$(docker version --format '{{.Server.Arch}}')"
-echo "host arch: $host_arch"
 
 TMPDIR="${TMPDIR:-$repo_root/.tmp}"
 mkdir -p "$TMPDIR"
@@ -63,7 +54,6 @@ for arch in amd64 arm64; do
     docker create --platform "linux/$arch" --name "$extract_name" "$image" >/dev/null
     bin="$TMPDIR/assert-image-version-$arch"
     docker cp "$extract_name:/selvaged" "$bin" >/dev/null
-    docker cp "$extract_name:/build-targetarch-debug.txt" - 2>/dev/null | tar -xO 2>/dev/null | sed "s/^/[$arch] /" || true
     docker rm -f "$extract_name" >/dev/null
     magic="$(od -An -tx1 -N4 "$bin" | tr -d ' \n')"
     if [ "$magic" != "7f454c46" ]; then
