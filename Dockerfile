@@ -36,6 +36,11 @@ ARG WEB_CLIENT_SHA=a861d36cdc1ec7e603ad0eb5ffd25ac95199d43e
 FROM --platform=$BUILDPLATFORM messense/rust-musl-cross:x86_64-musl-amd64 AS builder-amd64
 FROM --platform=$BUILDPLATFORM messense/rust-musl-cross:aarch64-musl-amd64 AS builder-arm64
 FROM builder-${TARGETARCH} AS builder
+# FROM clears every ARG a stage did not ask for; without this, $TARGETARCH
+# below is empty (not "amd64") and the arch check two lines down always
+# takes its else branch, so every platform builds x86_64 regardless of
+# which cross-toolchain stage FROM just selected.
+ARG TARGETARCH
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
