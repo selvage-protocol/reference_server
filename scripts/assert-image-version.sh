@@ -24,7 +24,15 @@
 # it, so this needs no binfmt/qemu support on the runner. Actually running the
 # image — `--version`, and the live `/meta` round-trip — stays scoped to the
 # runner's own architecture, which needs no emulation either.
-set -euo pipefail
+set -Eeuo pipefail
+report_failure() {
+    local msg="assert-image-version.sh failed at line $1: $2"
+    echo "::error::$msg"
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        printf '### assert-image-version.sh failed\n%s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
+    fi
+}
+trap 'report_failure "$LINENO" "$BASH_COMMAND"' ERR
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
@@ -36,6 +44,7 @@ want="selvaged/$version"
 
 declare -A elf_machine=([amd64]=62 [arm64]=183)
 host_arch="$(docker version --format '{{.Server.Arch}}')"
+echo "host arch: $host_arch"
 
 TMPDIR="${TMPDIR:-$repo_root/.tmp}"
 mkdir -p "$TMPDIR"
