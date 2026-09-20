@@ -22,18 +22,24 @@ name: image
 # built from or a script a job reads: a prose edit does not build an image.
 # There is no `push: branches: [main]`, because the merge commit carries the
 # content the pull request already proved — but a release tag does run it, and
-# `publish` is gated on a tag push: a pull request rehearses the same build and the
-# same assertions and pushes nothing. This workflow's own `workflow_dispatch` is
-# the manual re-run of the build and the smokes only — it deliberately cannot
-# publish, so a tag push stays the single path that redistributes the image. The
-# button that creates that tag lives in `release.yml`: a `workflow_dispatch`
-# there validates a version input against Cargo, refuses one that already has a
-# tag, and pushes the tag it creates — which lands here as an ordinary tag push
-# and runs `publish` and `release` exactly as a hand-pushed tag would. Adding an
-# input to this file that could publish directly was the alternative, and it was
-# rejected: on an arbitrary commit there is no tag for `scripts/release-tags.sh`
-# to agree with Cargo, so such an input would either duplicate the tag gate or
-# bypass it.
+# `publish` is gated on the ref being a release tag, checked against Cargo with
+# `scripts/release-tags.sh` — not on the triggering event — so a pull request
+# rehearses the same build and the same assertions and pushes nothing, and this
+# workflow's own `workflow_dispatch` (no inputs below) still cannot publish
+# unless the ref it is run against already is a matching tag. The button that
+# creates that tag lives in `release.yml`: a `workflow_dispatch` there validates
+# a version input against Cargo, refuses one that already has a tag, pushes the
+# tag it creates, and asks the API to dispatch this workflow against it, because
+# GitHub does not start a new run for an event produced with a workflow's own
+# `GITHUB_TOKEN` — which is what that tag push is — except `workflow_dispatch`
+# itself. That is why `publish` and `release` below check the ref and not
+# `github.event_name == 'push'`: the two paths that can reach a `v*` tag ref are
+# a hand push from a terminal and `release.yml`'s dispatch, and both name a
+# commit whose own Cargo.toml the script re-checks against the tag. Adding an
+# input to this file that could publish an arbitrary commit directly was the
+# alternative, and it was rejected: there is no tag on such a commit for
+# `scripts/release-tags.sh` to agree with Cargo, so such an input would either
+# duplicate the tag gate or bypass it.
 on:
   pull_request:
     paths:
@@ -241,9 +247,11 @@ jobs:
     # buildx steps on this same commit without pushing anywhere, so a tag is
     # not permission to assume the release path works — it is the one run where
     # the image is redistributed, which the owner accepted for FSL-1.1-MIT on
-    # 2026-09-19 (see packaging/README.md). A manual dispatch never reaches
-    # here: the gate below requires a tag push, not merely a tag ref.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # 2026-09-19 (see packaging/README.md). The gate is the ref, not the event:
+    # a pull request's ref is never a tag, and this workflow's own
+    # `workflow_dispatch` reaches here only when it is run against a ref that
+    # already is one — which `release.yml` is the one path that creates.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -307,13 +315,13 @@ jobs:
             "${{ steps.tags.outputs.version }}"
 
   release:
-    # The GitHub Release for the tag. A tag push is what publishes the image,
-    # but a tag alone leaves no release behind — the org holds bare tags and zero
-    # releases — so this job creates the release once `publish` has pushed and
-    # re-asserted the image. Same gate as `publish`: a tag push only, never a
-    # pull request or a dispatch run.
+    # The GitHub Release for the tag. Publishing the image is what makes a
+    # release worth creating, but a tag alone leaves no release behind — the org
+    # holds bare tags and zero releases — so this job creates it once `publish`
+    # has pushed and re-asserted the image. Same gate as `publish`: the ref
+    # names an existing, Cargo-agreeing tag, never a pull request's branch.
     needs: [publish]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

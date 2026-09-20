@@ -2,12 +2,24 @@ name: release
 
 # The button that creates a release. A manual dispatch takes the version to
 # release, refuses to proceed unless it matches the Cargo workspace version and
-# no tag already names it, then creates and pushes that tag. The tag push is
-# the only thing this workflow does: `image.yml`'s `publish` and `release` jobs
-# are gated on `push: tags: v*` there, unchanged, so a tag this workflow pushes
-# runs exactly the path a hand-pushed tag would, and this workflow itself has no
-# route to GHCR or to a GitHub Release. A pull request cannot reach
-# `workflow_dispatch` at all, so it still cannot publish or release.
+# no tag already names it, then creates and pushes that tag, and asks
+# `image.yml` to run against it. It does not, itself, touch GHCR or create a
+# GitHub Release — those stay in `image.yml`'s `publish` and `release` jobs,
+# gated on the ref being a `v*` tag (see that file), which this workflow can
+# only satisfy by creating a tag that names the exact commit it is pointed at.
+# A pull request cannot reach `workflow_dispatch` at all, so it still cannot
+# publish or release.
+#
+# The last step asks the API to dispatch `image.yml` rather than relying on the
+# tag push above to trigger it: GitHub does not start a new workflow run for an
+# event a workflow produced with its own `GITHUB_TOKEN` (the loop-prevention
+# rule), and a tag pushed with that token by `git push` two steps up is exactly
+# such an event, so it would land unpublished without this. `workflow_dispatch`
+# is the one event that rule exempts, which is why `image.yml`'s own gate below
+# no longer requires the ref to have arrived by `push`: any run against an
+# existing `v*` tag re-checks that tag's name against Cargo.toml with the same
+# script this workflow already ran it through, so a dispatch against a ref
+# that is not a matching tag still cannot publish.
 on:
   workflow_dispatch:
     inputs:
@@ -21,6 +33,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   tag:
@@ -57,3 +70,9 @@ jobs:
           tag="v$VERSION"
           git tag "$tag"
           git push origin "$tag"
+
+      - name: run image.yml for the new tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: gh workflow run image.yml --ref "v$VERSION"
