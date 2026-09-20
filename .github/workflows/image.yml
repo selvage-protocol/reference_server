@@ -185,6 +185,9 @@ jobs:
     # what lets the assertions run against the image that was built instead of
     # against a second, differently built one. Nothing leaves the runner.
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7.0.1
@@ -247,10 +250,35 @@ jobs:
           sbom: false
 
       - name: assert the built version on both architectures
+        id: assert-version
+        continue-on-error: true
         run: |
+          mkdir -p .tmp
           scripts/assert-image-version.sh \
             "localhost:5000/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}" \
-            "${{ steps.tags.outputs.version }}"
+            "${{ steps.tags.outputs.version }}" 2>&1 | tee .tmp/assert-version.log
+          exit "${PIPESTATUS[0]}"
+
+      # TEMPORARY: this host's anonymous view of a public repository's run page
+      # shows only the two built-in annotations, not a custom one or a job
+      # summary, so this is the only channel left to read the actual failure
+      # while diagnosing it. Remove once the rehearsal is green.
+      - name: post the assertion's own output to the pull request on failure
+        if: steps.assert-version.outcome == 'failure' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo '### assert-image-version.sh failed'
+            echo '```'
+            tail -c 60000 .tmp/assert-version.log
+            echo '```'
+          } > .tmp/assert-version-comment.md
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file .tmp/assert-version-comment.md
+
+      - name: fail the job if the assertion failed
+        if: steps.assert-version.outcome == 'failure'
+        run: exit 1
 
       # A version string baked at compile time reads the same regardless of
       # which architecture compiled it, so the assertion above cannot tell a
