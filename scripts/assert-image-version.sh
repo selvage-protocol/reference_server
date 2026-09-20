@@ -63,6 +63,7 @@ for arch in amd64 arm64; do
     docker create --platform "linux/$arch" --name "$extract_name" "$image" >/dev/null
     bin="$TMPDIR/assert-image-version-$arch"
     docker cp "$extract_name:/selvaged" "$bin" >/dev/null
+    docker cp "$extract_name:/build-targetarch-debug.txt" - 2>/dev/null | tar -xO 2>/dev/null | sed "s/^/[$arch] /" || true
     docker rm -f "$extract_name" >/dev/null
     magic="$(od -An -tx1 -N4 "$bin" | tr -d ' \n')"
     if [ "$magic" != "7f454c46" ]; then
