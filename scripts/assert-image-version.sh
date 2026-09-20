@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Assert a built image reports the version it is tagged with, on every
-# architecture it carries, and that the server inside it answers `/meta` with
-# that version and the `selvage/1` wire version.
+# architecture it carries, that its `/selvaged` binary is genuinely that
+# architecture's ELF (not just the host's binary running because the host
+# happens to execute it natively), and that the server inside it answers
+# `/meta` with that version and the `selvage/1` wire version — on every
+# architecture, not only the host's.
 #
 #   scripts/assert-image-version.sh <image-ref> <version> [port]
 #
@@ -11,6 +14,13 @@
 # binfmt registrations (`docker/setup-qemu-action`): `--platform` is explicit
 # because a manifest list otherwise resolves to the host's architecture and the
 # second half of the proof would quietly be the first half twice.
+#
+# `--version` prints a string baked into the binary at compile time, so it
+# reads the same regardless of which architecture actually compiled it — a
+# binary built for the wrong platform still passes that check, which is
+# exactly how a mislabelled arm64 leg shipped undetected before. The ELF
+# check below reads the executed binary's own header (byte 18: 62 is x86-64,
+# 183 is AArch64) instead of trusting anything the image claims about itself.
 set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -21,6 +31,19 @@ version="${2:?usage: assert-image-version.sh <image-ref> <version> [port]}"
 port="${3:-18080}"
 want="selvaged/$version"
 
+declare -A elf_machine=([amd64]=62 [arm64]=183)
+
+TMPDIR="${TMPDIR:-$repo_root/.tmp}"
+mkdir -p "$TMPDIR"
+
+container_names=()
+cleanup() {
+    for n in "${container_names[@]}"; do
+        docker rm -f "$n" >/dev/null 2>&1 || true
+    done
+}
+trap cleanup EXIT
+
 for arch in amd64 arm64; do
     out="$(docker run --rm --platform "linux/$arch" "$image" --version)"
     if [ "$out" != "$want" ]; then
@@ -28,14 +51,26 @@ for arch in amd64 arm64; do
         exit 1
     fi
     echo "version OK on linux/$arch: $out"
+
+    extract_name="version-elf-$arch-$PPID-$$"
+    container_names+=("$extract_name")
+    docker create --platform "linux/$arch" --name "$extract_name" "$image" >/dev/null
+    bin="$TMPDIR/assert-image-version-$arch"
+    docker cp "$extract_name:/selvaged" "$bin" >/dev/null
+    docker rm -f "$extract_name" >/dev/null
+    machine="$(od -An -tu1 -j18 -N1 "$bin" | tr -d ' ')"
+    want_machine="${elf_machine[$arch]}"
+    if [ "$machine" != "$want_machine" ]; then
+        echo "linux/$arch image's /selvaged has ELF e_machine $machine, want $want_machine ($arch)" >&2
+        exit 1
+    fi
+    echo "ELF OK on linux/$arch: e_machine $machine"
+    rm -f "$bin"
+
+    name="version-smoke-$arch-$PPID-$$"
+    container_names+=("$name")
+    docker run --detach --name "$name" --platform "linux/$arch" \
+        --publish "127.0.0.1:$port:8080" "$image"
+    scripts/check-server-version.sh "http://127.0.0.1:$port" "$version" "$want"
+    docker rm -f "$name" >/dev/null
 done
-
-name="version-smoke-$PPID-$$"
-cleanup() {
-    docker rm -f "$name" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-
-docker run --detach --name "$name" --platform linux/amd64 \
-    --publish "127.0.0.1:$port:8080" "$image"
-scripts/check-server-version.sh "http://127.0.0.1:$port" "$version" "$want"

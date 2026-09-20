@@ -55,6 +55,7 @@ on:
       - 'scripts/container-smoke.sh'
       - 'scripts/release-tags.sh'
       - 'scripts/assert-image-version.sh'
+      - 'scripts/assert-multiarch-layers.py'
       # Both smokes call these two, so a change to either is a change to the
       # image's own gate.
       - 'scripts/check-server-version.sh'
@@ -241,6 +242,17 @@ jobs:
             "localhost:5000/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}" \
             "${{ steps.tags.outputs.version }}"
 
+      # A version string baked at compile time reads the same regardless of
+      # which architecture compiled it, so the assertion above cannot tell a
+      # genuinely cross-compiled arm64 leg from a republished amd64 one. This
+      # reads the two platform manifests straight from the registry and
+      # checks their layer digests differ, then checks the extracted binary's
+      # own ELF header against the platform it is published under.
+      - name: assert the two platforms are genuinely different builds
+        run: |
+          scripts/assert-multiarch-layers.py \
+            "localhost:5000/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}"
+
   publish:
     needs: [smoke, publish-rehearsal]
     # Release tags only. `publish-rehearsal` above has just run this job's
@@ -313,6 +325,13 @@ jobs:
           scripts/assert-image-version.sh \
             "ghcr.io/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}" \
             "${{ steps.tags.outputs.version }}"
+
+      # Same proof as the rehearsal's, against what is now actually on GHCR:
+      # the manifests differ and each platform's binary is its own ELF.
+      - name: assert the two published platforms are genuinely different builds
+        run: |
+          scripts/assert-multiarch-layers.py \
+            "ghcr.io/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}"
 
   release:
     # The GitHub Release for the tag. Publishing the image is what makes a
