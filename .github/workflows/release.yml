@@ -1,0 +1,59 @@
+name: release
+
+# The button that creates a release. A manual dispatch takes the version to
+# release, refuses to proceed unless it matches the Cargo workspace version and
+# no tag already names it, then creates and pushes that tag. The tag push is
+# the only thing this workflow does: `image.yml`'s `publish` and `release` jobs
+# are gated on `push: tags: v*` there, unchanged, so a tag this workflow pushes
+# runs exactly the path a hand-pushed tag would, and this workflow itself has no
+# route to GHCR or to a GitHub Release. A pull request cannot reach
+# `workflow_dispatch` at all, so it still cannot publish or release.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, matching Cargo.toml (e.g. 0.1.1)'
+        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: true
+
+      # Same rule the publish path enforces on a tag it receives:
+      # `scripts/release-tags.sh` refuses a `v*` ref that disagrees with
+      # Cargo.toml, so the input is checked with the exact code a pushed tag
+      # is checked with again in `image.yml`.
+      - name: validate the version against Cargo.toml
+        env:
+          VERSION: ${{ inputs.version }}
+        run: scripts/release-tags.sh "v$VERSION" >/dev/null
+
+      - name: refuse an existing tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          tag="v$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "tag $tag already exists" >&2
+            exit 1
+          fi
+
+      - name: create and push the tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          tag="v$VERSION"
+          git tag "$tag"
+          git push origin "$tag"

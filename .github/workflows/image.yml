@@ -22,8 +22,18 @@ name: image
 # built from or a script a job reads: a prose edit does not build an image.
 # There is no `push: branches: [main]`, because the merge commit carries the
 # content the pull request already proved — but a release tag does run it, and
-# `publish` is gated on the tag: a pull request rehearses the same build and the
-# same assertions and pushes nothing. `workflow_dispatch` is the manual re-run.
+# `publish` is gated on a tag push: a pull request rehearses the same build and the
+# same assertions and pushes nothing. This workflow's own `workflow_dispatch` is
+# the manual re-run of the build and the smokes only — it deliberately cannot
+# publish, so a tag push stays the single path that redistributes the image. The
+# button that creates that tag lives in `release.yml`: a `workflow_dispatch`
+# there validates a version input against Cargo, refuses one that already has a
+# tag, and pushes the tag it creates — which lands here as an ordinary tag push
+# and runs `publish` and `release` exactly as a hand-pushed tag would. Adding an
+# input to this file that could publish directly was the alternative, and it was
+# rejected: on an arbitrary commit there is no tag for `scripts/release-tags.sh`
+# to agree with Cargo, so such an input would either duplicate the tag gate or
+# bypass it.
 on:
   pull_request:
     paths:
@@ -47,6 +57,8 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    # No inputs: a dispatch run builds and smokes only. Publish stays gated on
+    # a tag push, so this event has deliberately nothing that could push.
 
 concurrency:
   group: image-${{ github.ref }}
@@ -229,8 +241,9 @@ jobs:
     # buildx steps on this same commit without pushing anywhere, so a tag is
     # not permission to assume the release path works — it is the one run where
     # the image is redistributed, which the owner accepted for FSL-1.1-MIT on
-    # 2026-09-19 (see packaging/README.md).
-    if: startsWith(github.ref, 'refs/tags/v')
+    # 2026-09-19 (see packaging/README.md). A manual dispatch never reaches
+    # here: the gate below requires a tag push, not merely a tag ref.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -292,3 +305,34 @@ jobs:
           scripts/assert-image-version.sh \
             "ghcr.io/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}" \
             "${{ steps.tags.outputs.version }}"
+
+  release:
+    # The GitHub Release for the tag. A tag push is what publishes the image,
+    # but a tag alone leaves no release behind — the org holds bare tags and zero
+    # releases — so this job creates the release once `publish` has pushed and
+    # re-asserted the image. Same gate as `publish`: a tag push only, never a
+    # pull request or a dispatch run.
+    needs: [publish]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      # Does nothing when the release already exists (a re-run), and refuses a
+      # tag whose name is not the Cargo version — the same rule `release-tags.sh`
+      # enforces for the image.
+      - name: create the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists"
+            exit 0
+          fi
+          scripts/release-notes.sh "$GITHUB_REF_NAME" > notes.md
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md
