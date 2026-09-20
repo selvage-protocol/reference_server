@@ -1,0 +1,78 @@
+name: release
+
+# The button that creates a release. A manual dispatch takes the version to
+# release, refuses to proceed unless it matches the Cargo workspace version and
+# no tag already names it, then creates and pushes that tag, and asks
+# `image.yml` to run against it. It does not, itself, touch GHCR or create a
+# GitHub Release — those stay in `image.yml`'s `publish` and `release` jobs,
+# gated on the ref being a `v*` tag (see that file), which this workflow can
+# only satisfy by creating a tag that names the exact commit it is pointed at.
+# A pull request cannot reach `workflow_dispatch` at all, so it still cannot
+# publish or release.
+#
+# The last step asks the API to dispatch `image.yml` rather than relying on the
+# tag push above to trigger it: GitHub does not start a new workflow run for an
+# event a workflow produced with its own `GITHUB_TOKEN` (the loop-prevention
+# rule), and a tag pushed with that token by `git push` two steps up is exactly
+# such an event, so it would land unpublished without this. `workflow_dispatch`
+# is the one event that rule exempts, which is why `image.yml`'s own gate below
+# no longer requires the ref to have arrived by `push`: any run against an
+# existing `v*` tag re-checks that tag's name against Cargo.toml with the same
+# script this workflow already ran it through, so a dispatch against a ref
+# that is not a matching tag still cannot publish.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, matching Cargo.toml (e.g. 0.1.1)'
+        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: true
+
+      # Same rule the publish path enforces on a tag it receives:
+      # `scripts/release-tags.sh` refuses a `v*` ref that disagrees with
+      # Cargo.toml, so the input is checked with the exact code a pushed tag
+      # is checked with again in `image.yml`.
+      - name: validate the version against Cargo.toml
+        env:
+          VERSION: ${{ inputs.version }}
+        run: scripts/release-tags.sh "v$VERSION" >/dev/null
+
+      - name: refuse an existing tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          tag="v$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "tag $tag already exists" >&2
+            exit 1
+          fi
+
+      - name: create and push the tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          tag="v$VERSION"
+          git tag "$tag"
+          git push origin "$tag"
+
+      - name: run image.yml for the new tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: gh workflow run image.yml --ref "v$VERSION"

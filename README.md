@@ -39,12 +39,12 @@ docker run --rm -p 127.0.0.1:8080:8080 selvaged:local
 
 `docker compose up` builds the same `Dockerfile` through `compose.yaml`, which runs the
 image read-only with every capability dropped. The published image is
-`ghcr.io/selvage-protocol/selvaged:0.1.0`, with `:latest` the same build, and the GHCR
+`ghcr.io/selvage-protocol/selvaged:0.1.1`, with `:latest` the same build, and the GHCR
 package is public: it pulls anonymously, with no account and no `docker login`. The
 shortest route to a running server is therefore
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.1.0
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.1.1
 ```
 
 and the local build above is the route for an image you are changing, or one built from

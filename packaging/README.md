@@ -306,7 +306,7 @@ origin as the socket is what makes that one terminator enough.
 
 ## CI
 
-`.github/workflows/image.yml` has four jobs. `smoke` runs on a pull request
+`.github/workflows/image.yml` has five jobs. `smoke` runs on a pull request
 that changes something the image is built from — `crates/`, the manifests, the
 `Dockerfile`, `compose.yaml`, `packaging/`, the flake, and the scripts a job
 reads — and on a release tag, one leg per architecture (`amd64` on the usual
@@ -349,15 +349,35 @@ the compose plugin exist.
 and `/meta` against the image that was built. It holds no GHCR credential and
 no elevated permission, and nothing leaves the runner.
 
-`publish` needs `[smoke, publish-rehearsal]`, carries the only elevated
-permission in the repository (`packages: write`), logs in to GHCR with the
-built-in `GITHUB_TOKEN`, and is gated on release tags (`refs/tags/v*`) whose
+`publish` needs `[smoke, publish-rehearsal]`, carries an elevated
+permission (`packages: write`), logs in to GHCR with the
+built-in `GITHUB_TOKEN`, and is gated on a tag push (`refs/tags/v*`) whose
 name must equal the Cargo version. It builds with Docker while `smoke` builds
 with nix, which is why the rehearsal exists and why the publish path is
 re-proven on every pull request before a tag can reach it. Both buildx jobs run
 on GitHub-hosted `ubuntu-24.04`: the release path is where the Blacksmith
 runners cannot go, and the pull-request feedback that does not need buildx
-stays there.
+stays there. `release` needs `[publish]`, carries `contents: write`, and is
+gated the same way: the ref is a `v*` tag, not a particular triggering event
+(below). It creates the GitHub Release for the tag from
+`scripts/release-notes.sh` once the image is pushed and re-asserted, and does
+nothing on a re-run when the release already exists.
+
+`.github/workflows/release.yml` is the button: a `workflow_dispatch` that takes
+a version input, checks it against Cargo.toml with the same `scripts/release-tags.sh`
+the tag is checked with again above, refuses an input whose tag already exists
+on the remote, creates and pushes that tag, then asks the API to dispatch
+`image.yml` against it. That last step is why `publish` and `release` above
+gate on the ref rather than on `github.event_name == 'push'`: GitHub does not
+start a new workflow run for an event a workflow produced with its own
+`GITHUB_TOKEN`, and a tag this workflow pushes is exactly such an event, so it
+would reach `image.yml` unpublished without an explicit dispatch —
+`workflow_dispatch` is the one event that rule exempts. A dispatch run still
+cannot publish an image or create a release for a commit that is not a
+matching tag: `release.yml` has no route to GHCR or to a GitHub Release itself,
+and `image.yml`'s own `workflow_dispatch` (no inputs) reaches the gate only
+when it is pointed at a ref that already is one. A pull request cannot reach
+either workflow's `workflow_dispatch` at all.
 
 ### The page in a container
 
