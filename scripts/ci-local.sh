@@ -19,7 +19,7 @@
 # from `scripts/release-tags.sh`, `scripts/assert-image-version.sh` and
 # `scripts/assert-multiarch-layers.py`, which those jobs and this script's container job share.
 # The last of those needs only network access to a registry, not Docker: run it by hand against
-# any published tag, e.g. `scripts/assert-multiarch-layers.py ghcr.io/selvage-protocol/selvaged:0.1.1`.
+# any published tag, e.g. `scripts/assert-multiarch-layers.py ghcr.io/selvage-protocol/selvaged:0.1.2`.
 #
 # Keep this in step with the workflow — it runs the same commands, so that a red job is found
 # here rather than on a runner. `lint` catches unknown actions, bad expressions and shell

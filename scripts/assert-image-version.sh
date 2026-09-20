@@ -55,6 +55,11 @@ for arch in amd64 arm64; do
     bin="$TMPDIR/assert-image-version-$arch"
     docker cp "$extract_name:/selvaged" "$bin" >/dev/null
     docker rm -f "$extract_name" >/dev/null
+    magic="$(od -An -tx1 -N4 "$bin" | tr -d ' \n')"
+    if [ "$magic" != "7f454c46" ]; then
+        echo "linux/$arch image's /selvaged is not an ELF binary" >&2
+        exit 1
+    fi
     machine="$(od -An -tu1 -j18 -N1 "$bin" | tr -d ' ')"
     want_machine="${elf_machine[$arch]}"
     if [ "$machine" != "$want_machine" ]; then

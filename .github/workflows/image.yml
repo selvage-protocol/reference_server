@@ -235,6 +235,16 @@ jobs:
             REVISION=${{ github.sha }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
+          # A provenance/SBOM attestation turns the pushed reference into an
+          # index that also carries a platform-less attestation manifest;
+          # `docker create --platform` below has to resolve a single concrete
+          # platform out of that index against a plain `registry:2`, and this
+          # is a known source of platform-resolution failures for classic
+          # (non-buildx) pulls. The assertions here read the built binary and
+          # the raw manifests directly, so the attestations add a real failure
+          # mode for no verification value in return.
+          provenance: false
+          sbom: false
 
       - name: assert the built version on both architectures
         run: |
@@ -317,6 +327,12 @@ jobs:
             REVISION=${{ github.sha }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
+          # Same reason as the rehearsal's: the published-version assertion
+          # below resolves a concrete platform out of the pushed index with
+          # classic (non-buildx) `docker create --platform`, and attestation
+          # manifests are a known source of failures for that.
+          provenance: false
+          sbom: false
 
       # The pushed image must report the version it is tagged with, on both
       # architectures — the read-back the rehearsal asserted locally.
