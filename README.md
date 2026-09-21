@@ -305,10 +305,11 @@ the image builds it from a pinned revision and serves it.
 runtime. It is for putting the editor on its own origin, or for one page in front of several
 servers. That second origin works because the page's socket is not CORS-bound and its
 `/meta` read is only advisory, but it costs a second port and a second thing to upgrade, and
-every invite link must then name the server as `?server=`, because the page's built-in
-default is one particular endpoint and its own origin says nothing about which server to
-dial. One origin stays the default: this image, whose page, `/meta` and `/session` share one
-listener, and `--serve-page` from any deployment.
+a link at that origin cannot reach a room's own page: the page reads the server from the
+link's own address and from nowhere else, so an invite handed to a guest there is the wire
+shape (`ws://HOST:PORT/session?room=…&token=…`), which fronting servers that serve no page
+of their own hand out anyway. One origin stays the default: this image, whose page, `/meta`
+and `/session` share one listener, and `--serve-page` from any deployment.
 
 Served files carry the policy a browser needs: a media type from a pinned table,
 `Cache-Control: no-cache` for a stable name and `public, max-age=31536000, immutable` for a

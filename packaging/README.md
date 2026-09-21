@@ -309,8 +309,9 @@ servers — instead of sharing the server's one listener.
 
 Two things follow from that, and they are the honest cost. The page becomes a **second
 origin**: the socket is not CORS-bound and the `/meta` read is advisory, so a cross-origin
-page works, but every link must name the server (the `?server=` parameter, or a page built
-with a different default), because the page's built-in default is one particular endpoint.
+page works, but a link at that origin carries no room: the page reads the server from the
+link's own address and from nowhere else, so a guest there is handed the wire shape
+(`ws://HOST:PORT/session?room=…&token=…`) rather than a page link.
 And a one-origin deployment with the page, `/meta` and `/session` on one port needs neither,
 so **one origin stays the default** — the shape above, and the single service in
 `compose.yaml`.
