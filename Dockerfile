@@ -17,7 +17,15 @@
 # `web_client` bundle at the pinned revision below and copies it to /page,
 # which the runtime's default command hands to `--serve-page`. Serving a page
 # needs no mount; the override is a mount (see compose.yaml).
-ARG TARGETARCH=amd64
+# No default: buildx supplies this per platform automatically, and giving it
+# one here — even just for a plain, non-buildx `docker build .` fallback —
+# shadows that per-platform value for every later `${TARGETARCH}`, including
+# the `FROM builder-${TARGETARCH}` line below, which is exactly how both
+# legs of 0.1.0 and 0.1.1 built from the amd64 stage regardless of platform.
+# A plain `docker build .` still gets a correct value: Docker populates it
+# from the build machine's own architecture when there is no buildx platform
+# to draw it from.
+ARG TARGETARCH
 ARG RUNTIME=scratch
 ARG VERSION=dev
 ARG REVISION=unknown
@@ -36,6 +44,11 @@ ARG WEB_CLIENT_SHA=a861d36cdc1ec7e603ad0eb5ffd25ac95199d43e
 FROM --platform=$BUILDPLATFORM messense/rust-musl-cross:x86_64-musl-amd64 AS builder-amd64
 FROM --platform=$BUILDPLATFORM messense/rust-musl-cross:aarch64-musl-amd64 AS builder-arm64
 FROM builder-${TARGETARCH} AS builder
+# FROM clears every ARG a stage did not ask for, so this stage needs its own
+# ARG TARGETARCH to read the value at all; without it $TARGETARCH below is
+# empty and the arch check two lines down always takes its else branch,
+# regardless of which cross-toolchain stage FROM just selected.
+ARG TARGETARCH
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates

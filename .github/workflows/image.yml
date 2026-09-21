@@ -55,6 +55,7 @@ on:
       - 'scripts/container-smoke.sh'
       - 'scripts/release-tags.sh'
       - 'scripts/assert-image-version.sh'
+      - 'scripts/assert-multiarch-layers.py'
       # Both smokes call these two, so a change to either is a change to the
       # image's own gate.
       - 'scripts/check-server-version.sh'
@@ -234,12 +235,33 @@ jobs:
             REVISION=${{ github.sha }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
+          # A provenance/SBOM attestation turns the pushed reference into an
+          # index that also carries a platform-less attestation manifest;
+          # `docker create --platform` below has to resolve a single concrete
+          # platform out of that index against a plain `registry:2`, and this
+          # is a known source of platform-resolution failures for classic
+          # (non-buildx) pulls. The assertions here read the built binary and
+          # the raw manifests directly, so the attestations add a real failure
+          # mode for no verification value in return.
+          provenance: false
+          sbom: false
 
       - name: assert the built version on both architectures
         run: |
           scripts/assert-image-version.sh \
             "localhost:5000/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}" \
             "${{ steps.tags.outputs.version }}"
+
+      # A version string baked at compile time reads the same regardless of
+      # which architecture compiled it, so the assertion above cannot tell a
+      # genuinely cross-compiled arm64 leg from a republished amd64 one. This
+      # reads the two platform manifests straight from the registry and
+      # checks their layer digests differ, then checks the extracted binary's
+      # own ELF header against the platform it is published under.
+      - name: assert the two platforms are genuinely different builds
+        run: |
+          scripts/assert-multiarch-layers.py \
+            "localhost:5000/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}"
 
   publish:
     needs: [smoke, publish-rehearsal]
@@ -305,6 +327,12 @@ jobs:
             REVISION=${{ github.sha }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
+          # Same reason as the rehearsal's: the published-version assertion
+          # below resolves a concrete platform out of the pushed index with
+          # classic (non-buildx) `docker create --platform`, and attestation
+          # manifests are a known source of failures for that.
+          provenance: false
+          sbom: false
 
       # The pushed image must report the version it is tagged with, on both
       # architectures — the read-back the rehearsal asserted locally.
@@ -313,6 +341,13 @@ jobs:
           scripts/assert-image-version.sh \
             "ghcr.io/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}" \
             "${{ steps.tags.outputs.version }}"
+
+      # Same proof as the rehearsal's, against what is now actually on GHCR:
+      # the manifests differ and each platform's binary is its own ELF.
+      - name: assert the two published platforms are genuinely different builds
+        run: |
+          scripts/assert-multiarch-layers.py \
+            "ghcr.io/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}"
 
   release:
     # The GitHub Release for the tag. Publishing the image is what makes a
