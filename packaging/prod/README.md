@@ -188,6 +188,26 @@ asserted: the isolated proof runs a second container from the same image with on
 appears **28 times** in that container's log. The `crit` front saw the same
 requests and logged nothing.
 
+**The front is not the only container that can see an invite link.** A guest's
+link is a *page* link — `/?room=…&token=…` — so it lands on `selvage-web`, and
+that image keeps an nginx access log on its stdout. The cutover found it doing
+exactly that on the public URL:
+
+    172.18.0.4 - - [21/Sep/2026:13:28:45 +0000] "GET /?room=r-LEAKTEST&token=SUPERSECRETTOKEN HTTP/1.1" 200 32281 "-" "curl/8.22.0"
+
+`selvage-web` therefore runs with Docker's `none` logging driver: its output is
+discarded outright. Discarding rather than filtering is the point — it holds
+whatever the image's own configuration does, so bumping `SELVAGE_WEB_IMAGE`
+cannot quietly bring the leak back, and the alternative (a derived page image
+with the access log patched out) is a second copy of another repository's nginx
+configuration to keep in step. The price is named in `compose.yaml` beside the
+directive: this container's errors are discarded too. It is a static file server,
+and the front and the server beside it show the failures that matter.
+
+If `web_client` turns its own access log off — or shortens the format to `$uri`,
+which carries no query string — the driver can come back and this becomes the
+image's guarantee instead of the deployment's.
+
 ## The non-commercial notice
 
 The instance is gated non-commercial use only, which is a statement about this
