@@ -37,19 +37,18 @@ wss://lumi-raspberrypi.muskellunge-yo.ts.net:8444/session    the room socket
 ```
 
 `selvaged --serve-page DIR` serves the page on its own listener, so the page,
-the meta read and the socket are the same origin. That removes the two defects
-the previous shape worked around: the page's `/meta` fetch is no longer
-cross-origin (no CORS headers anywhere), and its WebSocket dial is no longer a
-plaintext request from an `https` page (no mixed-content refusal). The front
-therefore has nothing to route, rewrite or answer — it terminates TLS with the
-tailnet certificate and relays every path, byte for byte, to the address the
-server binds.
+the meta read and the socket are the same origin: the `/meta` read is
+same-origin and needs no CORS headers, and the socket is not a plaintext request
+from an `https` page, so no mixed-content refusal applies. The front therefore
+has nothing to route, rewrite or answer — it terminates TLS with the tailnet
+certificate and relays every path, byte for byte, to the address the server
+binds.
 
 Two consequences worth keeping:
 
 - **The front reads no request.** No routing table, no header rewriting, no
   preflight. Anything added there is a second HTTP implementation to keep
-  correct, which is what this replaced.
+  correct.
 - **The backend address must name the tailnet bind explicitly.** Never
   loopback: on a shared host another user's server can already hold the
   loopback port, and every guest then lands on the wrong server while `/meta`

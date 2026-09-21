@@ -1,9 +1,8 @@
 # The public demo's shape
 
 The exact files that run `selvage.dontblameme.dev`, tracked here so the
-deployment's shape is a reviewable artefact in a repository rather than a
-compose file that exists only on a machine. `pi-demo/` beside this directory is
-the same idea for the Pi.
+deployment's shape is a reviewable artefact in a repository. `pi-demo/` beside
+this directory is the same idea for the Pi.
 
 The two shapes differ in where the front is. The Pi is tailnet-only, so its
 front is a TLS terminator and nothing else: `selvaged` serves the page itself
@@ -74,13 +73,11 @@ The state it is in, set 2026-09-21:
 | 311 | `HTTPS-Cloudflare-v6` | Allow inbound TCP 443 from Cloudflare's 7 published IPv6 ranges |
 | 320 | `HTTPS` | **Deny** inbound TCP 443 from anywhere else |
 
-Rules 300 and 320 are the two rules the subscription created, kept and turned
-into a denial rather than deleted, so the change is legible against what was
-there. The one fact to keep in step with `proxy/conf.d/cloudflare-ips.conf` is
-the range list itself: refresh both together from
+The one fact to keep in step with `proxy/conf.d/cloudflare-ips.conf` is the
+range list itself: refresh both together from
 `https://api.cloudflare.com/client/v4/ips`, which is where both lists came from.
 Port 22 is not in the NSG at all and is refused by the default rule; hands-on
-access is Tailscale SSH over the tailnet, which this change does not touch.
+access is Tailscale SSH over the tailnet, which the NSG does not touch.
 
 ## What each container is allowed
 
@@ -132,8 +129,8 @@ container is killed inside its own cgroup and `restart: unless-stopped` brings
 it back in seconds, having dropped every room, rather than the kernel picking a
 victim on the host.
 
-The residual, named. Two independent terms can reach the cap, and only the first of
-them was counted when these numbers were chosen.
+Two independent terms can reach the cap, and only the first of them was counted
+when these numbers were chosen.
 
 - **The outbound queue**: 32 connections × 8 MiB is 256 MiB if all of them hold a full
   queue, which a peer that stops reading can arrange.
@@ -147,11 +144,6 @@ them was counted when these numbers were chosen.
   pressure at all. The front's per-source limits (8 sockets, 5 handshakes a second) put
   that behind four source addresses and about a minute of uploads; they do not bound it.
   The reproduction and its raw output are in `ai_notes/.tmp/harden-refserver-2026-09-21.md`.
-
-Past the cap the container is killed inside its own cgroup and `restart: unless-stopped`
-brings it back in seconds, having dropped every room. That is still the backstop working as
-designed rather than a surprise. What is wrong is the lever: this paragraph used to name
-`--max-connections` alone, and that bounds only the queue term.
 
 There is a third term, which is why moving one number is not the fix. A publish
 materialises the listing about three times — the text frame, the parsed value, and the
@@ -167,11 +159,11 @@ does so, and up to `--max-connections` hosts may be doing that at once.
 Each of the three can cross 320 MiB on its own, so they have to move together and the
 answer is a set: `--max-connections 8` with `--max-rooms 8` puts the queues at 64 MiB, the
 transients at \~96 MiB and the room state at 32 MiB of listings plus 8 MiB of document
-sets, which fits the cap with headroom. That is a change to what this demo *is* — 8 sockets is one source's whole
-allowance at the front, so a single visitor could fill it — and it belongs to the owner
-rather than to a hardening pass. The tracked shape above therefore still carries the
-numbers that were chosen deliberately; what has changed is that the arithmetic behind them
-now names all three terms, and the fix is one hand install of `compose.yaml`.
+sets, which fits the cap with headroom. That is a change to what this demo *is* — 8
+sockets is one source's whole allowance at the front, so a single visitor could fill
+it — and it belongs to the owner rather than to a hardening pass. The tracked shape
+above therefore still carries the numbers that were chosen deliberately, and the fix is
+one hand install of `compose.yaml`.
 
 ## What the front does that the server cannot
 
@@ -199,8 +191,8 @@ capacity flags landed:
   seated session. The front's `proxy_read_timeout` is 300 s, an order of
   magnitude above the server's 30-second ping, so it only ever fires on a socket
   that is genuinely gone; Cloudflare's own 100-second idle close is above the
-  ping too. **Nothing here lengthens the ping interval**, and nothing should:
-  30 s is what keeps a live session inside Cloudflare's 100 s.
+  ping too. **Nothing here lengthens the ping interval**: 30 s is what keeps a
+  live session inside Cloudflare's 100 s.
 
 - **No request URLs in a log.** The access log is `off`, and the error log is at
   `crit`, above every level at which nginx attaches the request line. That second
@@ -220,15 +212,14 @@ capacity flags landed:
   nginx's 60-second default would hold the visitor's socket open saying nothing;
   the observed result is a `504` after 5.0 s.
 
-The consequence is worth stating plainly: **in normal operation the front logs
-nothing at all.** Its whole `docker logs` is empty until something at `crit`
-happens. That is the posture, not an oversight, and the things an operator normally
-reads the front's log for are answered elsewhere — `docker compose ps` for whether
-it is up, the server's own startup line for the limits in force, and the isolated
-proof below for whether a change broke routing.
+**In normal operation the front logs nothing at all.** Its whole `docker logs`
+is empty until something at `crit` happens. That is deliberate, and the things an
+operator normally reads the front's log for are answered elsewhere — `docker
+compose ps` for whether it is up, the server's own startup line for the limits in
+force, and the isolated proof below for whether a change broke routing.
 
-The level is load-bearing rather than decorative, and that is tested rather than
-asserted: the isolated proof runs a second container from the same image with only
+The level is load-bearing and is tested: the isolated proof runs a second container
+from the same image with only
 `error_log` changed to `error` and the same traffic through it, and the token
 appears **28 times** in that container's log. The `crit` front saw the same
 requests and logged nothing.
@@ -274,24 +265,20 @@ The notice is served by the front, in two places:
 The banner lives in `proxy/conf.d/default.conf`, because it is a response the
 front changes and nothing else can. The page is `proxy/www/terms.html`, a file in
 the front's image, because a page of prose is a file and an nginx directive is
-not a place to keep one: the text used to be a single escaped line inside the
-server block, which is neither readable nor reviewable. Its styling is inline and
-self-contained, and the palette is the demo page's own, so `/terms` reads as part
-of the same thing. A second file to keep in step would buy nothing for one page
-of prose, and a stylesheet that failed to arrive would leave the terms with none.
+not a place to keep one. Its styling is inline and self-contained, and the palette
+is the demo page's own, so `/terms` reads as part of the same thing.
 
-The path is unchanged. `/terms` and `/terms/` answer with the page, the same
-bytes either way; before, only `/terms` did and the trailing slash was a 404. The
-page keeps the instance's restriction and the software's licences apart on
-purpose, because that distinction is the whole of the notice: the instance is
+`/terms` and `/terms/` answer with the page, the same bytes either way. The page
+keeps the instance's restriction and the software's licences apart on purpose,
+because that distinction is the whole of the notice: the instance is
 non-commercial, the software is not.
 
-The banner's cost is real and is named rather than hidden: it is markup injected
-into another repository's rendered page, and a page whose HTML stops ending in
-`</body>` loses it silently. What is asserted is therefore the bytes a visitor
-receives and not the files that produce them — `check-terms.sh` here, without
-Docker, and the isolated proof below on the box. If `web_client` ever carries the
-notice itself, the substitution goes and `/terms` stays.
+The banner is markup injected into another repository's rendered page, and a page
+whose HTML stops ending in `</body>` loses it silently. What is asserted is
+therefore the bytes a visitor receives and not the files that produce them —
+`check-terms.sh` here, without Docker, and the isolated proof below on the box. If
+`web_client` ever carries the notice itself, the substitution goes and `/terms`
+stays.
 
 ## Deploy
 
@@ -304,7 +291,7 @@ sudo docker compose -f /etc/selvage/compose.yaml up -d
 One command: it builds the front from `/etc/selvage/proxy/`, pulls whatever
 `.env` names, creates the network and starts the three services.
 
-Two settings make that one command honest about a change:
+Two settings make that one command reflect a change:
 
 - the front has `pull_policy: build`, so `up` rebuilds it even when the image
   already exists. Without it a configuration change would sit in this repository
@@ -315,7 +302,7 @@ Two settings make that one command honest about a change:
   once, at startup, and a recreated container can come back on a different
   address — a proxy left running would go on dialling the old one.
 
-**That rebuild has a cost worth knowing before you run the command by hand.**
+**That rebuild has a cost.**
 With BuildKit's default attestations the built image's manifest — and so its
 image ID — is stamped per build even when `proxy/` has not changed at all, and
 Compose recreates any container whose image ID moved. So this command replaces
