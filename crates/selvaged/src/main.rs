@@ -710,7 +710,8 @@ mod tests {
     }
 
     /// The startup line reports the limits this process actually enforces, which is what
-    /// makes a mis-sized deployment visible in its own log.
+    /// makes a deployment whose limits are not what its operator thought visible in its
+    /// own log.
     #[test]
     fn startup_names_the_limits_in_force() {
         let local: SocketAddr = "127.0.0.1:8080".parse().expect("parses");

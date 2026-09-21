@@ -74,10 +74,11 @@ nix run . -- --listen 0.0.0.0:8080
 
 ### What it prints, and its flags
 
-The startup line names the endpoint and the meta address:
+The startup line names the endpoint and the limits this process is enforcing:
 
 ```text
 selvaged listening on ws://127.0.0.1:8080/session (meta at http://127.0.0.1:8080/meta)
+limits: 1024 connections, 1024 rooms, 128 peers per room, 1024 documents per room, 32 MiB outbound per connection, 5 MiB inbound text envelope, 2 MiB/s inbound with a 64 MiB burst
 ```
 
 With the default bind it goes on to note that the address is loopback-only and how to
@@ -87,6 +88,10 @@ with its default.
 
 ```text
 usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]
+                [--max-connections N] [--max-rooms N] [--max-peers-per-room N]
+                [--max-documents-per-room N] [--outbound-queue-bytes N]
+                [--max-envelope-bytes N] [--inbound-bytes-per-sec N]
+                [--inbound-burst-bytes N]
 ```
 
 | Flag | What it does |
@@ -94,8 +99,74 @@ usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]
 | `--listen ADDR` | bind `ADDR` (default `127.0.0.1:8080`) |
 | `--room-grace-ms MS` | how long a room survives its host disconnecting, in milliseconds (default `30000`, printed as 30s) |
 | `--serve-page DIR` | serve the browser page from `DIR` on the same origin as `/session` and `/meta` |
+| `--max-connections N` | connections held at once, counted past the request head (default `1024`) |
+| `--max-rooms N` | rooms held at once; past it a room is not minted (default `1024`) |
+| `--max-peers-per-room N` | peers one room seats at once (default `128`) |
+| `--max-documents-per-room N` | paths one room's open-document set holds (default `1024`) |
+| `--outbound-queue-bytes N` | payload bytes queued but unwritten for one connection before it is dropped as a peer that stopped reading (default `33554432`, 32 MiB) |
+| `--max-envelope-bytes N` | the largest inbound text envelope the server will parse, judged on the frame's length before `serde_json` sees it (default `5242880`, 5 MiB) |
+| `--inbound-bytes-per-sec N` | bytes one connection may send a second, refilled continuously (default `2097152`, 2 MiB) |
+| `--inbound-burst-bytes N` | how much of that rate one connection may spend at once (default `67108864`, 64 MiB) |
 | `--help`, `-h` | print the usage and the flags |
 | `--version` | print `selvaged/<version>` |
+
+Every default is the reference value, so an existing deployment changes by nothing but the
+flags it now passes. The four capacity flags are bounds on what one process holds in memory
+and only that process can enforce them; the envelope bound and the inbound budget are what
+one connection may send, and they are judged in-process because a front cannot see either
+one. *Sizing a box*, below, says which of a deployment's bounds belong where.
+
+### What happens at a limit
+
+Every limit refuses deterministically, and what a peer sees depends on the limit:
+
+| Limit reached | What the peer sees |
+|---|---|
+| `--max-connections` | a plain HTTP request is answered `503` with `retry-after`; a WebSocket upgrade is answered and then closed `1013` |
+| `--max-rooms` | a refusal, `session.error` with code `x.server_full`, then close `4000` |
+| `--max-peers-per-room` | `x.room_full` on the join, then close `4000`. A host reclaiming a host-less room is always seated |
+| `--max-documents-per-room` | an error response `x.room_full` to the `doc.open`; the connection stays open and the set is unchanged |
+| `--max-envelope-bytes` | a seated connection gets `session.error` `bad_message` naming the bound and the frame's size; the connection stays open. Before the handshake the same refusal closes `4000` |
+| `--inbound-bytes-per-sec` / `--inbound-burst-bytes` | `session.error` `x.rate_limited` naming the budget, then close `1013`; the room is told `peer.left` and a reconnect starts with a fresh budget |
+| `--outbound-queue-bytes` | the peer is disconnected as one that stopped reading, and the room is told `peer.left` |
+
+The rate limit is charged per inbound frame, at its payload size or one kilobyte,
+whichever is larger: a flood of one-byte frames costs a kilobyte of budget each, because
+that is closer to what a frame costs the server than its payload is. Frames the session
+never parses — relayed document and awareness payloads — are charged too, since a relay is
+copied once per peer. A refusal is written before the socket closes; a peer that is still
+writing when the server closes it can lose that refusal to a reset its own writes bring,
+which is the same drop `PROTOCOL.md` §2.1 describes for an over-bound frame.
+
+### Sizing a box
+
+A small host should size the process rather than trust the defaults, which are the
+reference values and assume headroom. Two of them decide its memory: `max_peers_per_room`
+and `max_connections` multiply the per-connection outbound queue, so
+`connections × outbound-queue-bytes` is the outbound ceiling the process can reach (at the
+defaults, 32 GiB). The document set and the grant are per-room state, and the inbound
+budget bounds what one connection can spend of the CPU.
+
+For a 1 GiB box with something else running on it, these are a defensible set:
+
+```sh
+selvaged --listen 0.0.0.0:8080 --serve-page /page \
+  --max-connections 64 --max-rooms 64 --max-peers-per-room 8 \
+  --max-documents-per-room 256 --outbound-queue-bytes 4194304
+```
+
+The two inbound bounds keep their defaults here: 5 MiB is what the widest legal `doc.grant`
+needs, and 2 MiB/s is already far above what an editor sends. Lowering
+`--inbound-bytes-per-sec` below a few tens of kilobytes a second will exile a peer for
+traffic it did not choose to send: a client publishes presence on a timer, and each of
+those frames costs a kilobyte of budget.
+
+`selvaged` does not implement an idle deadline, and `PROTOCOL.md` §2.1 forbids closing a
+seated session for silence: a connection that answers its pings is never closed for being
+quiet. A deployment that needs one puts it in front, and the half of it that is in-process
+already is `head_timeout` (5 s): a connection that does not finish sending its request head
+inside that is closed, which is what reclaims a half-open socket before it is ever counted
+against `--max-connections`.
 
 ### The first room
 
