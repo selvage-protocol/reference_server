@@ -1,0 +1,75 @@
+{
+  "id": "036",
+  "title": "A string that decodes to a lone surrogate is `bad_message` on a seated connection",
+  "spec": "CANONICAL.md#23-strings",
+  "notes": "CANONICAL.md §2.3 refuses a `\\u` escape that resolves to an unpaired surrogate: the value is not representable in UTF-8, which is what a frame's bytes are, so a producer must not write one and a receiver rejects it with `bad_message` rather than let the two readings of the escape become two frames. PROTOCOL.md §5's value rule for a `path` and a `display_name` — non-blank, and free of the Unicode `Cc` category — admits the same value, and §1.1's \"a frame conforms when it satisfies both\" is what makes the refusal the answer: the frame is one JSON object, so `bad_message` and not `bad_params`. The astral path that follows is the same character written as the pair a producer is allowed to write, and it is accepted and announced, which is what says the refusal is about the unpaired escape and not about a non-ASCII path. Nothing else in the corpus reaches this: an `expect` frame cannot carry one at all, because a vector's own bytes are held to CANONICAL.md §2 and those bytes do not exist, so the rule is only pinnable from the sending side.",
+  "selvage": "selvage/1",
+  "canonical": "SJ-C/1",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},\"token\":\"$token\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":2,\"method\":\"doc.open\",\"params\":{\"path\":\"src/\\ud800.rs\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":3,\"method\":\"doc.open\",\"params\":{\"path\":\"src/\\ud83d\\ude00.rs\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":3,\"result\":{\"documents\":[\"src/😀.rs\"]},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"doc.opened\",\"params\":{\"documents\":[\"src/😀.rs\"],\"path\":\"src/😀.rs\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":4,\"method\":\"session.rename\",\"params\":{\"display_name\":\"\\ud800\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":5,\"method\":\"session.rename\",\"params\":{\"display_name\":\"Ada L\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":5,\"result\":{},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.renamed\",\"params\":{\"display_name\":\"Ada L\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+    }
+  ]
+}
