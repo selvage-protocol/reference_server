@@ -33,12 +33,26 @@ services:
     # published image for this front and there should not be one, because its
     # configuration is the deployment's own.
     image: selvage-prod-proxy:local
+    # Rebuild on every `up`, not only when the image is missing. The front is the
+    # one service here whose content is this directory, so "the repository is the
+    # source of truth" is only true if a change to `proxy/` reaches the running
+    # container — and `docker compose up -d` will not rebuild an image that
+    # already exists without being told to. With this, the one deployment command
+    # is also the one that deploys a configuration change.
+    pull_policy: build
     # Started after the two upstreams so that their names resolve. The front
-    # resolves `selvaged` and `selvage-web` once, at startup, and exits if it
-    # cannot; `restart: unless-stopped` covers the race that remains.
+    # resolves `selvaged` and `selvage-web` once, at startup, and caches the
+    # addresses, so `restart: true` matters as much as the ordering: recreating
+    # an upstream can give it a new address, and a proxy left running would go on
+    # dialling the old one. Compose restarts this service when it recreates
+    # either of those.
     depends_on:
-      - selvaged
-      - selvage-web
+      selvaged:
+        condition: service_started
+        restart: true
+      selvage-web:
+        condition: service_started
+        restart: true
     ports:
       # The only port any of the three publishes. It is 443 on the host because
       # Cloudflare connects to it; inside the container it is 8080, because

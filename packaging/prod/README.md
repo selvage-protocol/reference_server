@@ -141,9 +141,10 @@ capacity flags landed:
 
 - **Per-source caps at the front.** `selvaged` has no per-source view at all.
   `limit_conn` allows one source 32 connections to the page, 8 concurrent
-  `/session` sockets and 4 concurrent `/meta` reads; `limit_req` allows 5
-  `/session` handshakes a second with a burst of 10. Past either the source gets
-  a **429**. The keys are the end client's address: `real_ip` is told to trust
+  `/session` sockets and 4 concurrent `/meta` reads, each in its own zone so one
+  endpoint's count cannot spend another's; `limit_req` allows 5 `/session`
+  handshakes a second with a burst of 10. Past either the source gets a **429**.
+  The keys are the end client's address: `real_ip` is told to trust
   `CF-Connecting-IP` from Cloudflare's ranges and from nowhere else, so a
   connection that did not come through Cloudflare cannot name its own source.
 
@@ -221,6 +222,17 @@ sudo docker compose -f /etc/selvage/compose.yaml up -d
 One command: it builds the front from `/etc/selvage/proxy/`, pulls whatever
 `.env` names, creates the network and starts the three services. `up -d` on an
 unchanged deployment recreates nothing.
+
+Two settings make that one command honest about a change:
+
+- the front has `pull_policy: build`, so `up` rebuilds it even when the image
+  already exists. Without it a configuration change would sit in this repository
+  and not in the running container, because Compose does not rebuild for changed
+  build-context content on its own;
+- the front's `depends_on` entries carry `restart: true`, so recreating
+  `selvaged` or `selvage-web` restarts the front too. It resolves those two names
+  once, at startup, and a recreated container can come back on a different
+  address — a proxy left running would go on dialling the old one.
 
 Bootstrap, once, from a checkout of `reference_server`:
 
