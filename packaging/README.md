@@ -210,8 +210,8 @@ against it. `scripts/ci-local.sh image` runs that smoke anywhere nix does.
 ### Published releases
 
 The package holds `0.1.0-7d64cbb`, `0.1.0`, `0.1.1-a3f4b12`, `0.1.1`, `0.1.2-adc0ae2`,
-`0.1.2`, `0.2.0`, that release's own `<version>-<short-sha>` tag, and the moving `latest`,
-which is `0.2.0` as this is written (2026-09-21).
+`0.1.2`, `0.2.0`, `0.2.1`, that release's own `<version>-<short-sha>` tag, and the moving
+`latest`, which is `0.2.1` as this is written (2026-09-21).
 `v0.1.0` (2026-09-19, at `7d64cbb`, the merge of \#25) was the first: its tag run —
 https://github.com/selvage-protocol/reference\_server/actions/runs/35428735910 —
 published `ghcr.io/selvage-protocol/selvaged:0.1.0-7d64cbb`, `:0.1.0` and `:latest`
@@ -252,7 +252,7 @@ are the same build is already on GHCR when the job goes red, which is how `0.1.0
 A stranger pulls it with no account:
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.2.0
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.2.1
 ```
 
 and `compose.yaml`'s `build: .` remains the route for an image built from a checkout.
