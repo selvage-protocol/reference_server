@@ -27,65 +27,19 @@ import io
 import json
 import sys
 import tarfile
-import urllib.error
-import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from registry import (  # noqa: E402  (the path above is what makes this importable)
+    INDEX_ACCEPT,
+    MANIFEST_ACCEPT,
+    parse_ref,
+    registry_get,
+)
 
 ELF_MACHINE = {"amd64": 62, "arm64": 183}
 WANTED_PLATFORMS = ("amd64", "arm64")
-
-
-def parse_ref(ref):
-    if "@" in ref:
-        raise SystemExit(f"pin by tag, not digest: {ref!r}")
-    host_and_repo, _, tag = ref.rpartition(":")
-    if not host_and_repo or not tag:
-        raise SystemExit(f"expected <host>/<repo>:<tag>, got {ref!r}")
-    host, _, repo = host_and_repo.partition("/")
-    if not repo:
-        raise SystemExit(f"expected <host>/<repo>:<tag>, got {ref!r}")
-    return host, repo, tag
-
-
-def registry_get(host, path, accept, token=None):
-    scheme = "http" if host.startswith(("localhost", "127.0.0.1")) else "https"
-    url = f"{scheme}://{host}{path}"
-    headers = {"Accept": accept}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read(), resp.headers.get("Content-Type", "")
-    except urllib.error.HTTPError as e:
-        if e.code == 401 and token is None:
-            challenge = e.headers.get("WWW-Authenticate", "")
-            new_token = fetch_token(challenge)
-            return registry_get(host, path, accept, token=new_token)
-        raise SystemExit(f"GET {url} failed: {e.code} {e.reason}") from e
-
-
-def fetch_token(challenge):
-    # Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:x:pull"
-    if not challenge.startswith("Bearer "):
-        raise SystemExit(f"unsupported auth challenge: {challenge!r}")
-    params = {}
-    for part in challenge[len("Bearer ") :].split(","):
-        k, _, v = part.partition("=")
-        params[k.strip()] = v.strip().strip('"')
-    realm = params.pop("realm")
-    query = "&".join(f"{k}={v}" for k, v in params.items())
-    with urllib.request.urlopen(f"{realm}?{query}", timeout=30) as resp:
-        return json.loads(resp.read())["token"]
-
-
-INDEX_ACCEPT = (
-    "application/vnd.oci.image.index.v1+json,"
-    "application/vnd.docker.distribution.manifest.list.v2+json"
-)
-MANIFEST_ACCEPT = (
-    "application/vnd.oci.image.manifest.v1+json,"
-    "application/vnd.docker.distribution.manifest.v2+json"
-)
 
 
 def fetch_index(host, repo, tag):
