@@ -26,7 +26,9 @@ Run it directly:
 or as the flake check the workflows run: `nix build .#checks.<system>.prod-deploy`.
 """
 
+import hashlib
 import io
+import subprocess
 import sys
 import tempfile
 import types
@@ -295,6 +297,143 @@ class MainTest(unittest.TestCase):
     def test_a_refused_request_never_reaches_docker(self):
         with mock.patch("os.geteuid", return_value=0):
             self.assertEqual(self.run_main(b"SELVAGED_IMAGE=latest\n"), 1)
+
+
+class StagedDeployTest(unittest.TestCase):
+    """A failed deploy must not move the box's record of what it intends to run.
+
+    `.env` is the intent for the *next* `up -d`, so writing the new references into
+    it before the containers are up turns one bad release into a box that a hand
+    `up -d` and every later dispatch reproduce. The references therefore go into
+    `.env.deploy`, which is what `pull`, `up` and the convergence check read, and
+    `.env` is written only once they are up and converged.
+    """
+
+    OTHER = "ghcr.io/selvage-protocol/selvaged@sha256:" + "d" * 64
+
+    def prepare(self, directory):
+        etc = Path(directory)
+        (etc / "compose.yaml").write_text("name: selvage-prod\n")
+        before = f"SELVAGED_IMAGE={SELVAGED}\nSELVAGE_WEB_IMAGE={WEB}\n"
+        (etc / ".env").write_text(before)
+        return etc, before, hashlib.sha256((etc / "compose.yaml").read_bytes()).hexdigest()
+
+    def deploy(self, etc, shape, request_bytes, compose_stub, run_stub):
+        stdin = types.SimpleNamespace(buffer=io.BytesIO(request_bytes))
+        with mock.patch.multiple(
+            deploy,
+            ETC=etc,
+            COMPOSE=etc / "compose.yaml",
+            ENV_FILE=etc / ".env",
+            ENV_PREV=etc / ".env.prev",
+            ENV_STAGED=etc / ".env.deploy",
+        ), mock.patch.object(sys, "stdin", stdin), mock.patch.object(
+            deploy, "compose", compose_stub
+        ), mock.patch.object(deploy, "run", run_stub), mock.patch(
+            "os.geteuid", return_value=0
+        ):
+            return deploy.main(["selvage-deploy"])
+
+    def test_a_failed_up_leaves_the_persistent_pins_alone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            etc, before, shape = self.prepare(directory)
+            asked = []
+
+            def compose_stub(env_file, *arguments):
+                asked.append((env_file, arguments))
+                return subprocess.CompletedProcess(
+                    [], 1 if arguments[:1] == ("up",) else 0, "", ""
+                )
+
+            def run_stub(argv):
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            status = self.deploy(
+                etc,
+                shape,
+                request(f"COMPOSE_SHA256={shape}", f"SELVAGED_IMAGE={self.OTHER}"),
+                compose_stub,
+                run_stub,
+            )
+
+            self.assertEqual(status, 1)
+            self.assertEqual((etc / ".env").read_text(), before)
+            self.assertFalse((etc / ".env.prev").exists())
+            self.assertIn(self.OTHER, (etc / ".env.deploy").read_text())
+            self.assertEqual({env for env, _ in asked}, {etc / ".env.deploy"})
+
+    def test_a_converged_deploy_moves_the_record_and_clears_the_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            etc, before, shape = self.prepare(directory)
+            asked = []
+            running = "sha256:" + "e" * 64
+
+            def compose_stub(env_file, *arguments):
+                asked.append((env_file, arguments))
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            def run_stub(argv):
+                if argv[:2] == ["docker", "image"]:
+                    return subprocess.CompletedProcess(argv, 0, running + "\n", "")
+                if argv[:2] == ["docker", "inspect"]:
+                    return subprocess.CompletedProcess(
+                        argv, 0, f"one|t0|{running}|running\n", ""
+                    )
+                return subprocess.CompletedProcess(argv, 0, "one\n", "")
+
+            status = self.deploy(
+                etc,
+                shape,
+                request(f"COMPOSE_SHA256={shape}", f"SELVAGED_IMAGE={self.OTHER}"),
+                compose_stub,
+                run_stub,
+            )
+
+            self.assertEqual(status, 0)
+            self.assertIn(self.OTHER, (etc / ".env").read_text())
+            self.assertEqual((etc / ".env.prev").read_text(), before)
+            self.assertFalse((etc / ".env.deploy").exists())
+            self.assertEqual({env for env, _ in asked}, {etc / ".env.deploy"})
+
+    def test_a_failed_run_leaves_the_next_request_its_values_to_resolve(self):
+        """A request that omits the service still finds the pins that work.
+
+        This is the failure CodeRabbit named: a failed update followed by a request
+        naming only the other service. Because `.env` never moved, the omitted key
+        still resolves to the reference that was good, and the run deploys that.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            etc, _, shape = self.prepare(directory)
+            asked = []
+
+            def compose_stub(env_file, *arguments):
+                asked.append((env_file, arguments))
+                return subprocess.CompletedProcess(
+                    [], 1 if arguments[:1] == ("up",) else 0, "", ""
+                )
+
+            def run_stub(argv):
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            self.deploy(
+                etc,
+                shape,
+                request(f"COMPOSE_SHA256={shape}", f"SELVAGED_IMAGE={self.OTHER}"),
+                compose_stub,
+                run_stub,
+            )
+            self.deploy(
+                etc,
+                shape,
+                request(f"COMPOSE_SHA256={shape}", f"SELVAGE_WEB_IMAGE={WEB}"),
+                compose_stub,
+                run_stub,
+            )
+
+            staged = (etc / ".env.deploy").read_text()
+            self.assertIn(f"SELVAGED_IMAGE={SELVAGED}", staged)
+            self.assertNotIn(self.OTHER, staged)
+            self.assertIn("up", [call for _, call in asked][-1])
 
 
 if __name__ == "__main__":

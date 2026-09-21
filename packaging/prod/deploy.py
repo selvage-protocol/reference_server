@@ -22,6 +22,12 @@ What a request can and cannot do, because that is the whole security argument:
   a caller cannot add a port, drop a capability, mount a certificate it should
   not have or raise a memory limit.
 
+A run that fails leaves the box as it found it. The references it is deploying go
+into `/etc/selvage/.env.deploy`, which is what `pull` and `up` read; `/etc/selvage/.env`,
+the intent for the next `up -d`, is written only once the containers are up and
+converged on the digests that were asked for. One bad release therefore cannot
+leave a box that reproduces it on the next `up -d`, hand or automated.
+
 The residual, plainly: a deploy request is a deployment. Whoever can send one
 chooses which of the published releases runs, ends every live room by replacing
 the server, and can downgrade the deployment to an older published release. That
@@ -41,6 +47,10 @@ ETC = Path("/etc/selvage")
 COMPOSE = ETC / "compose.yaml"
 ENV_FILE = ETC / ".env"
 ENV_PREV = ETC / ".env.prev"
+# Where a run stages the references it is about to deploy. `pull`, `up` and the
+# convergence check read this rather than `.env`, so a run that fails leaves the
+# persistent file naming the images that are known to work.
+ENV_STAGED = ETC / ".env.deploy"
 
 # The two variables the compose file interpolates: which image repository each
 # may name, and which compose service it lands on.
@@ -174,12 +184,13 @@ def compose_environment() -> dict:
     return environment
 
 
-def compose_argv(*arguments: str) -> list[str]:
+def compose_argv(env_file: Path, *arguments: str) -> list[str]:
     """The project's own command line, spelled once.
 
     `--project-directory /etc/selvage` is what makes the front's relative build
     context resolve, and the compose file's `name:` is what names the project, so
-    nothing here needs `-p`.
+    nothing here needs `-p`. `--env-file` is explicit and is the caller's: a
+    deploy reads the staged file, and everything else reads the persistent one.
     """
     return [
         "docker",
@@ -189,14 +200,14 @@ def compose_argv(*arguments: str) -> list[str]:
         "-f",
         str(COMPOSE),
         "--env-file",
-        str(ENV_FILE),
+        str(env_file),
         *arguments,
     ]
 
 
-def compose(*arguments: str) -> subprocess.CompletedProcess:
+def compose(env_file: Path, *arguments: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        compose_argv(*arguments), env=compose_environment(), text=True, check=False
+        compose_argv(env_file, *arguments), env=compose_environment(), text=True, check=False
     )
 
 
@@ -208,9 +219,14 @@ def image_id(reference: str) -> str:
     return run(["docker", "image", "inspect", "--format", "{{.Id}}", reference]).stdout.strip()
 
 
-def service_state(service: str) -> dict:
-    """The container this service is running, or `{}` when there is none."""
-    listed = run(compose_argv("ps", "-q", "--all", service))
+def service_state(service: str, env_file: Path = ENV_FILE) -> dict:
+    """The container this service is running, or `{}` when there is none.
+
+    The env file only decides which *image references* compose would use; `ps`
+    finds the project's containers either way, because the project's name comes
+    from the compose file.
+    """
+    listed = run(compose_argv(env_file, "ps", "-q", "--all", service))
     container = listed.stdout.strip().split("\n")[0].strip()
     if not container:
         return {}
@@ -256,6 +272,11 @@ def record(pins: dict, written: str) -> bool:
     that a rollback is a hand edit against a file that exists rather than a
     reconstruction from a log. It is written only when the content actually
     changes, so a no-op deploy does not overwrite the last real previous state.
+
+    This is called **after** the new containers are up and converged, never
+    before: the file is the deployment's intent for the *next* `up -d`, and a run
+    that failed must leave it naming the images that are known to work rather
+    than the ones that just failed to come up.
     """
     rendered = render_env(pins)
     if rendered == written:
@@ -266,15 +287,20 @@ def record(pins: dict, written: str) -> bool:
     return True
 
 
+def stage(pins: dict) -> None:
+    """Put the references where this run's `pull`, `up` and checks will read them."""
+    atomic_write(ENV_STAGED, render_env(pins))
+
+
 def short(identifier: str) -> str:
     """Enough of a container or image id to read; the comparison is on the whole thing."""
     return identifier.replace("sha256:", "")[:12] or "-"
 
 
-def assert_converged(pins: dict) -> None:
+def assert_converged(pins: dict, env_file: Path = ENV_FILE) -> None:
     for key, (repository, service) in PINS.items():
         wanted = image_id(pins[key])
-        state = service_state(service)
+        state = service_state(service, env_file)
         if not wanted:
             raise Refused(f"{pins[key]} is not in the local image store after `pull`")
         if not state:
@@ -318,21 +344,35 @@ def main(argv: list[str]) -> int:
 
         before = {service: service_state(service) for service in SERVICES}
 
+        # The references this run is about to deploy go into their own file, and
+        # `pull`, `up` and every check below read that one. `.env` is written only
+        # once they are up and converged, so a run that fails leaves the box's own
+        # record of its intent naming the images that are known to work — and the
+        # next `up -d`, hand or automated, goes back to them.
+        stage(pins)
+
         print(f"=== pull {' '.join(named)} ===")
-        pulled = compose("pull", *named)
+        pulled = compose(ENV_STAGED, "pull", *named)
         if pulled.returncode != 0:
-            raise Refused(f"`docker compose pull {' '.join(named)}` failed")
+            raise Refused(
+                f"`docker compose pull {' '.join(named)}` failed; {ENV_STAGED} holds the "
+                f"references that were being deployed and {ENV_FILE} was not written"
+            )
+
+        print("=== up -d ===")
+        if compose(ENV_STAGED, "up", "-d").returncode != 0:
+            raise Refused(
+                f"`docker compose up -d` failed; {ENV_STAGED} holds the references that "
+                f"were being deployed and {ENV_FILE} was not written"
+            )
+
+        assert_converged(pins, ENV_STAGED)
 
         if record(pins, written):
             print(f"wrote {ENV_FILE}; the file it replaced is {ENV_PREV}")
         else:
             print(f"{ENV_FILE} already records both references")
-
-        print("=== up -d ===")
-        if compose("up", "-d").returncode != 0:
-            raise Refused("`docker compose up -d` failed")
-
-        assert_converged(pins)
+        ENV_STAGED.unlink(missing_ok=True)
 
         print("=== containers ===")
         for service in SERVICES:

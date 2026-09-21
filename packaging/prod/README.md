@@ -318,7 +318,9 @@ a guest sees the room gone. There is no reclaim after a restart.
 
 `.env` holds one generation and `deploy.py` keeps the file it replaced as
 `/etc/selvage/.env.prev`, so rolling back by hand is restoring that file and
-running the `up -d` above. The automated path is a dispatch of the same workflow
+running the `up -d` above. A run that *failed* changed neither: the references it
+was deploying are in `/etc/selvage/.env.deploy`, and the `up -d` above goes back
+to what `.env` still names. The automated path is a dispatch of the same workflow
 with the older `server_version` — the same mechanism as a deploy, which is why it
 is exercised by every deploy rather than rotting until the day it is needed.
 
@@ -346,12 +348,18 @@ required reviewer is the owner: the approval *is* the moment the credential
 exists, and it is the moment the live-session cost above is chosen.
 
 What a run may change is bounded by construction rather than by convention. It
-handed the box two digest-pinned references and the sha256 of `compose.yaml`,
-and nothing else: `deploy.py` matches every value against one fixed pattern and
+hands the box two digest-pinned references and the sha256 of `compose.yaml`, and
+nothing else: `deploy.py` matches every value against one fixed pattern and
 **verifies** the compose file against that hash instead of writing it. A run
 cannot add a port, drop a capability, mount a certificate or raise a memory
 limit, and it cannot rewrite the shape to do so later. Anything else it might
 want is a pull request and a hand install.
+
+A run that fails also leaves `/etc/selvage/.env` alone: the references it was
+deploying live in `/etc/selvage/.env.deploy` while it works, and the persistent
+file — the intent for the next `up -d`, and so for the next hand command — is
+written only once the containers are up and converged. One bad release therefore
+cannot leave a box that a later `up -d` reproduces.
 
 Getting in is Tailscale SSH as `deployci`, a local user on the box with no
 password, no key, no group but its own, and exactly one permitted root command —
