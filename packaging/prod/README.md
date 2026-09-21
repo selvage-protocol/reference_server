@@ -148,14 +148,29 @@ them was counted when these numbers were chosen.
   The reproduction and its raw output are in `ai_notes/.tmp/harden-refserver-2026-09-21.md`.
 
 Past the cap the container is killed inside its own cgroup and `restart: unless-stopped`
-brings it back in seconds, having dropped every room. That is still the backstop working
-as designed rather than a surprise. What is wrong is the lever: this paragraph used to
-name `--max-connections` alone, and that bounds only the queue term. The room-state term
-is bounded by **`--max-rooms`**, and the listing inside it by `--max-envelope-bytes`. With
-the box at 892 MiB and no swap, the honest fix is to cut `--max-rooms` — 64 to 16 puts the
-room state at about 64 MiB — and to bring the queue term down beside it, since 32 × 8 MiB
-is four fifths of the cap on its own. Both are a hand install of `compose.yaml`, which is
-why the tracked shape still carries the numbers above.
+brings it back in seconds, having dropped every room. That is still the backstop working as
+designed rather than a surprise. What is wrong is the lever: this paragraph used to name
+`--max-connections` alone, and that bounds only the queue term.
+
+There is a third term, which is why moving one number is not the fix. A publish
+materialises the listing about three times — the text frame, the parsed value, and the
+`Vec<String>` the room keeps — so a host publishing 4 MiB of paths costs \~12 MiB while it
+does so, and up to `--max-connections` hosts may be doing that at once.
+
+| term | worst case as configured | bounded by |
+|---|---|---|
+| outbound queues | 32 × 8 MiB = 256 MiB | `--max-connections`, `--outbound-queue-bytes` |
+| room state | 64 × (4 MiB of paths + 1 MiB of documents) | `--max-rooms`, and the listing by `--max-envelope-bytes` |
+| publish transients | \~12 MiB × the hosts publishing at once | `--max-connections` |
+
+Each of the three can cross 320 MiB on its own, so they have to move together and the
+answer is a set: `--max-connections 8` with `--max-rooms 8` puts the queues at 64 MiB, the
+transients at \~96 MiB and the room state at 32 MiB of listings plus 8 MiB of document
+sets, which fits the cap with headroom. That is a change to what this demo *is* — 8 sockets is one source's whole
+allowance at the front, so a single visitor could fill it — and it belongs to the owner
+rather than to a hardening pass. The tracked shape above therefore still carries the
+numbers that were chosen deliberately; what has changed is that the arithmetic behind them
+now names all three terms, and the fix is one hand install of `compose.yaml`.
 
 ## What the front does that the server cannot
 
