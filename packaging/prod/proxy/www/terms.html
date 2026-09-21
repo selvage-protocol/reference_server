@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Selvage demo: terms of use</title>
+    <meta
+      name="description"
+      content="How the public Selvage demo instance may be used, and where the software's licences are."
+    />
+    <!--
+      One file, styling included. The palette is the demo page's own (Catppuccin
+      Mocha: base, mantle, surface, subtext, mauve), so `/terms` reads as part
+      of the same thing rather than a fallback, and there is nothing here that
+      has to arrive for the page to render. The demo page is built in
+      `web_client` and is a 14 px application shell; this is prose, so it is the
+      same family and the same colours one step larger.
+    -->
+    <style>
+      :root {
+        color-scheme: dark;
+        --background: #1e1e2e;
+        --foreground: #cdd6f4;
+        --card: #181825;
+        --crust: #11111b;
+        --muted: #313244;
+        --muted-foreground: #a6adc8;
+        --border: #313244;
+        --primary: #cba6f7;
+        --radius: 0.5rem;
+        --shadow: 0 18px 44px -20px rgba(0, 0, 0, 0.8);
+      }
+      html {
+        background: var(--background);
+      }
+      body {
+        margin: 0;
+        color: var(--foreground);
+        font: 16px/1.65 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      main {
+        box-sizing: border-box;
+        max-width: 42rem;
+        margin: 3rem auto;
+        padding: 2.2rem 2rem 1.9rem;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        box-shadow: var(--shadow);
+      }
+      .eyebrow {
+        margin: 0 0 0.45rem;
+        font-size: 0.78rem;
+        font-weight: 650;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        color: var(--primary);
+      }
+      h1 {
+        margin: 0 0 1.3rem;
+        font-size: 1.6rem;
+        font-weight: 650;
+        line-height: 1.25;
+        letter-spacing: -0.01em;
+      }
+      h2 {
+        margin: 2.1rem 0 0.75rem;
+        font-size: 1.02rem;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+      }
+      p,
+      ul {
+        margin: 0 0 1rem;
+      }
+      ul {
+        padding-left: 1.15rem;
+      }
+      li {
+        margin: 0 0 0.55rem;
+      }
+      a {
+        color: var(--primary);
+        text-decoration: none;
+        border-bottom: 1px solid rgba(203, 166, 247, 0.35);
+      }
+      a:hover {
+        border-bottom-color: var(--primary);
+      }
+      a:focus-visible {
+        outline: 2px solid var(--primary);
+        outline-offset: 2px;
+        border-radius: 2px;
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.9em;
+        background: var(--crust);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 0.05em 0.35em;
+      }
+      .notice {
+        padding: 0.85em 1em;
+        background: rgba(203, 166, 247, 0.1);
+        border: 1px solid rgba(203, 166, 247, 0.35);
+        border-radius: var(--radius);
+      }
+      .footer {
+        margin: 2rem 0 0;
+        padding-top: 1.3rem;
+        border-top: 1px solid var(--border);
+      }
+      @media (max-width: 640px) {
+        main {
+          margin: 0;
+          padding: 1.7rem 1.2rem 1.5rem;
+          border: 0;
+          border-radius: 0;
+          box-shadow: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">Selvage demo</p>
+      <h1>Terms of use</h1>
+
+      <p>
+        This is a small public demo of Selvage, enough for you and a friend to try it
+        together. It is not a service, and it is free for personal and evaluation use.
+      </p>
+
+      <p class="notice">This instance is for non-commercial use only.</p>
+
+      <p>
+        Rooms are not persisted. They are held in memory, and they may be reset at any
+        time.
+      </p>
+
+      <p>
+        For commercial work,
+        <a href="https://github.com/selvage-protocol/reference_server">self-host it</a>.
+        The server is the same one this demo runs.
+      </p>
+
+      <h2>This instance and the software</h2>
+
+      <p>
+        This page is the notice of this one running instance. It changes nothing about
+        what anyone may build with Selvage, and the licences are unchanged:
+      </p>
+
+      <ul>
+        <li>
+          The Rust workspace and the clients are
+          <a href="https://github.com/selvage-protocol/reference_server/blob/main/LICENSE-MIT">MIT</a>
+          OR
+          <a href="https://github.com/selvage-protocol/reference_server/blob/main/LICENSE-APACHE">Apache-2.0</a>.
+        </li>
+        <li>
+          The server binary, <code>crates/selvaged</code>, is source-available under
+          <a href="https://github.com/selvage-protocol/reference_server/blob/main/crates/selvaged/LICENSE">FSL-1.1-MIT</a>.
+        </li>
+        <li>
+          The specification is
+          <a href="https://github.com/selvage-protocol/specification/blob/main/LICENSE">CC-BY-4.0</a>.
+        </li>
+      </ul>
+
+      <h2>Where the code is</h2>
+
+      <p>
+        The project lives at
+        <a href="https://github.com/selvage-protocol">github.com/selvage-protocol</a>:
+        the <a href="https://github.com/selvage-protocol/reference_server">server</a>,
+        the <a href="https://github.com/selvage-protocol/vscode_client">VS Code client</a>,
+        the <a href="https://github.com/selvage-protocol/nvim_client">Neovim client</a>,
+        the <a href="https://github.com/selvage-protocol/web_client">browser client</a>,
+        and the <a href="https://github.com/selvage-protocol/specification">specification</a>.
+        The site is
+        <a href="https://selvage-protocol.vercel.app">selvage-protocol.vercel.app</a>.
+      </p>
+
+      <p class="footer"><a href="/">Back to the demo</a></p>
+    </main>
+  </body>
+</html>

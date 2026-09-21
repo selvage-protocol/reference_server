@@ -26,8 +26,10 @@ those facts; this directory owns the files, and the two must agree.
 | `test_deploy.py` | nowhere; run where it is | What the request grammar refuses, and that a shape mismatch touches nothing |
 | `proxy/Dockerfile` | build context `/etc/selvage/proxy/` | The front's image, from the two files below it |
 | `proxy/nginx.conf` | baked into that image | Process and http scope: the log policy, the temp paths, the per-source zones |
-| `proxy/conf.d/default.conf` | baked into that image | The server block: TLS, the routes, the limits, the terms page |
+| `proxy/conf.d/default.conf` | baked into that image | The server block: TLS, the routes, the limits, the terms banner, and the location that serves the page below |
 | `proxy/conf.d/cloudflare-ips.conf` | baked into that image | Cloudflare's published ranges, for `real_ip` |
+| `proxy/www/terms.html` | baked into that image at `/usr/share/selvage/www/` | The terms of this instance, which is the page `/terms` answers with |
+| `check-terms.sh` | nowhere; run where it is | The notice read back out of the bytes the front serves, without Docker |
 
 ## The shape
 
@@ -44,7 +46,7 @@ One origin serves everything, one port is published, and the split is by path:
     |  proxy            (nginx, uid 101, port 443 -> 8080, TLS)
     |    /session  ------------------>  selvaged   :8080   WebSocket
     |    /meta     ------------------>  selvaged   :8080   JSON
-    |    /terms    ------------------>  answered by the front itself
+    |    /terms    ------------------>  read from the front's own image
     |    everything else  ----------->  selvage-web :8080   the page
     +------------------------------------------------------------
 ```
@@ -229,14 +231,27 @@ The notice is served by the front, in two places:
 - `GET /terms`, answered by the front, which is the full text and the stable URL
   the banner links to.
 
-Both live in `proxy/conf.d/default.conf`, because the notice is about the
-instance and this front is where the instance's configuration lives — the page
-itself is `web_client`'s built bundle. The cost of injecting markup into another
-repository's rendered page is real and is named rather than hidden: a page whose
-HTML stops ending in `</body>` loses the banner silently, so the substitution is
-asserted against the **served bytes** in the isolated proof below and not
-against this file. If `web_client` ever carries the notice itself, the
-substitution goes and `/terms` stays.
+The banner lives in `proxy/conf.d/default.conf`, because it is a response the
+front changes and nothing else can. The page is `proxy/www/terms.html`, a file in
+the front's image, because a page of prose is a file and an nginx directive is
+not a place to keep one: the text used to be a single escaped line inside the
+server block, which is neither readable nor reviewable. Its styling is inline and
+self-contained, and the palette is the demo page's own, so `/terms` reads as part
+of the same thing. A second file to keep in step would buy nothing for one page
+of prose, and a stylesheet that failed to arrive would leave the terms with none.
+
+The path is unchanged. `/terms` and `/terms/` answer with the page, the same
+bytes either way; before, only `/terms` did and the trailing slash was a 404. The
+page keeps the instance's restriction and the software's licences apart on
+purpose, because that distinction is the whole of the notice: the instance is
+non-commercial, the software is not.
+
+The banner's cost is real and is named rather than hidden: it is markup injected
+into another repository's rendered page, and a page whose HTML stops ending in
+`</body>` loses it silently. What is asserted is therefore the bytes a visitor
+receives and not the files that produce them — `check-terms.sh` here, without
+Docker, and the isolated proof below on the box. If `web_client` ever carries the
+notice itself, the substitution goes and `/terms` stays.
 
 ## Deploy
 
@@ -417,16 +432,29 @@ are never printed, copied into this directory, or checked in.
 
 ## The isolated proof
 
+`check-terms.sh` is the half of it that runs anywhere, Docker or not: it starts
+the front's own `nginx.conf` and `conf.d/default.conf` under nginx from `PATH`
+(or from nixpkgs when there is none) with the two upstream names answered on
+loopback and TLS off, and reads the notice back out of the bytes it serves.
+`/terms` and `/terms/` must answer with the file in this repository and each with
+the same bytes; the served page's text must still carry every claim the notice
+makes and every licence it names; every link target must be there; and the banner
+must still arrive in the page's own bytes. What the harness rewrites to run at
+all is asserted too, so a change to the front's shape stops the script instead of
+being quietly substituted into a passing run. It proves the notice reaches a
+visitor and nothing about TLS, the certificate or the upstreams, which is what
+the box proof below is for.
+
 The front's TLS path, its routing and its log policy are proved without starting
 this deployment, against throwaway backends on a high port, rather than assumed
 from the configuration — the exact commands and their real output are in
 `ai_notes/.tmp/prod-deploy-prep-2026-09-21.md`. What the proof covers: a TLS
 handshake that presents the origin certificate for the right name and refuses
 1.0 and 1.1; `/` answered by a `selvage-web` container with the terms banner in
-the bytes; `/meta` answered by a `selvaged` container; `/terms` answered by the
-front; a WebSocket upgrade answered `101`; `429` from both per-source caps under
-load; a forged `CF-Connecting-IP` from a peer outside Cloudflare's ranges
-ignored; a dead upstream answered in five seconds; and the front's whole log,
-which is empty. The level that keeps it empty is proved load-bearing by the same
-traffic against a second container with `error_log` at `error`, where the token
-appears 28 times.
+the bytes; `/meta` answered by a `selvaged` container; `/terms` answered from the
+front's own image; a WebSocket upgrade answered `101`; `429` from both per-source
+caps under load; a forged `CF-Connecting-IP` from a peer outside Cloudflare's
+ranges ignored; a dead upstream answered in five seconds; and the front's whole
+log, which is empty. The level that keeps it empty is proved load-bearing by the
+same traffic against a second container with `error_log` at `error`, where the
+token appears 28 times.

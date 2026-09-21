@@ -2,6 +2,14 @@
 # containers by their Compose service names (`packaging/prod/`): those names
 # resolve only inside that deployment's own network, so they are not addresses
 # anything can fetch and not links to check.
+#
+# `root_dir` is what lets a root-relative link be checked at all: without one,
+# lychee refuses to resolve `/...` out of a file on disk rather than trying. The
+# terms page's way back to the demo is exactly that link — same-origin by
+# design, so it must not name the origin — and against this checkout it resolves
+# to a path that is here. That the link works when the front serves the page is
+# `packaging/prod/check-terms.sh`'s assertion, which fetches it.
+root_dir = "."
 exclude = [
   "https://fsf.org/",
   "http://selvaged:8080",
