@@ -3,12 +3,14 @@
 
 Installed by hand as `/usr/local/sbin/selvage-deploy`, root-owned and mode 0755,
 and the only command the `deployci` user may run through sudo
-(`packaging/prod/deployci.sudoers`). That confinement is why this takes **no
-arguments**: a sudoers rule that permits an argument is a wildcard, and a
-wildcard around a script that reaches `docker compose` is a root shell with extra
-steps. The request arrives on stdin instead — `COMPOSE_SHA256` plus one or both
-image references — and every value it may carry is matched against a fixed
-pattern before anything else happens.
+(`packaging/prod/deployci.sudoers`, whose line ends in `""` so that sudo permits
+no argument at all rather than any). That confinement is why this takes **no
+arguments**: an argument to a script that reaches `docker compose` is a root shell
+with extra steps, and leaving the argument list to this program alone would put the
+entire bound inside one `sys.argv` check. The request arrives on stdin instead —
+`COMPOSE_SHA256` plus one or both image references — and every value it may carry
+is matched against a fixed pattern before anything else happens. The argument
+refusal below is the second lock on that door, not the first.
 
 What a request can and cannot do, because that is the whole security argument:
 

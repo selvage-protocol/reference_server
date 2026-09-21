@@ -355,10 +355,10 @@ want is a pull request and a hand install.
 
 Getting in is Tailscale SSH as `deployci`, a local user on the box with no
 password, no key, no group but its own, and exactly one permitted root command —
-`/usr/local/sbin/selvage-deploy`, with **no argument wildcard** in the sudoers
-rule, which is why the request arrives on stdin. `sudo -l -U deployci` on the box
-is the whole of the privilege model, and `deployci.sudoers` is the tracked copy
-of that line. The account `selvage` is deliberately not used: it has blanket
+`/usr/local/sbin/selvage-deploy ""`, where the `""` is what tells sudo that no
+argument is allowed rather than any. `sudo -l -U deployci` on the box is the
+whole of the privilege model, and `deployci.sudoers` is the tracked copy of that
+line. The account `selvage` is deliberately not used: it has blanket
 passwordless sudo, so a shell as `selvage` is a shell as root, and lending that
 to CI would make the deploy credential a root credential.
 

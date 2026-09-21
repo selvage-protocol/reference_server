@@ -7,15 +7,20 @@
 # would mean "GitHub can be root on production". Hence a user of its own, whose
 # only privilege is this line.
 #
-# There is deliberately **no argument wildcard**. `/usr/local/sbin/selvage-deploy`
-# is the whole command line: `deployci` may run that one program and may not run
-# it with an argument, which is why the deploy request arrives on stdin instead.
-# A wildcard here would put the entire bound inside the script's own argument
-# parsing, where one bad pattern is a root shell.
+# There is deliberately **no argument wildcard**, and the trailing `""` is what
+# says so: `/usr/local/sbin/selvage-deploy ""` permits that one program and no
+# argument at all, whereas the same line without the `""` would permit *any*
+# argument, because an empty argument list in sudoers means "any" rather than
+# "none". That distinction is the whole bound: without the `""` the argument
+# list is the script's own problem, and a wildcard there is a root shell.
+#
+# It is also why the deploy request arrives on stdin, and why the script refuses
+# its own arguments as well: the marker is what sudo enforces, and the script
+# check is the second lock on the same door.
 #
 # The script is root-owned mode 0755 under `/usr/local/sbin` (root:root 0755), so
 # the user it is granted to cannot change what it does.
 #
 # Installs to `/etc/sudoers.d/selvage-deploy`, root:root, mode 0440, and is read
 # with `visudo -c -f` before it is put there.
-deployci ALL=(root) NOPASSWD: /usr/local/sbin/selvage-deploy
+deployci ALL=(root) NOPASSWD: /usr/local/sbin/selvage-deploy ""
