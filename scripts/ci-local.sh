@@ -63,6 +63,11 @@ job_checks() {
   # rather than writes.
   say "checks: the public demo's deploy guard"
   nix build .#checks.x86_64-linux.prod-deploy --no-link --print-build-logs
+  # The public demo's front under a real nginx: that a source is refused, and that
+  # one metered endpoint cannot spend another's budget. Both are about a running
+  # proxy, so neither can be read out of the configuration.
+  say "checks: the public demo's front limits"
+  nix build .#checks.x86_64-linux.prod-front --no-link --print-build-logs
   say "checks: lint the workflows"
   nix develop . -c actionlint
   # The same check the pre-commit hook runs: a commit made outside the dev shell cannot
