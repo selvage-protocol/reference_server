@@ -10,10 +10,10 @@ two-client harness that gates it in CI.
 its surface. The shortest route to a running server is the published image:
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.2.0
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.2.1
 ```
 
-The GHCR package is public, so a pull needs no account and no `docker login`. `0.2.0` is
+The GHCR package is public, so a pull needs no account and no `docker login`. `0.2.1` is
 the current release; `0.1.2` was the first built separately for each architecture, and
 `0.1.0` and `0.1.1` carry the amd64 binary in their `linux/arm64` leg.
 `packaging/README.md` owns the full tag list and what each tag contains.
@@ -305,10 +305,11 @@ the image builds it from a pinned revision and serves it.
 runtime. It is for putting the editor on its own origin, or for one page in front of several
 servers. That second origin works because the page's socket is not CORS-bound and its
 `/meta` read is only advisory, but it costs a second port and a second thing to upgrade, and
-every invite link must then name the server as `?server=`, because the page's built-in
-default is one particular endpoint and its own origin says nothing about which server to
-dial. One origin stays the default: this image, whose page, `/meta` and `/session` share one
-listener, and `--serve-page` from any deployment.
+a link at that origin cannot reach a room's own page: the page reads the server from the
+link's own address and from nowhere else, so an invite handed to a guest there is the wire
+shape (`ws://HOST:PORT/session?room=…&token=…`), which fronting servers that serve no page
+of their own hand out anyway. One origin stays the default: this image, whose page, `/meta`
+and `/session` share one listener, and `--serve-page` from any deployment.
 
 Served files carry the policy a browser needs: a media type from a pinned table,
 `Cache-Control: no-cache` for a stable name and `public, max-age=31536000, immutable` for a

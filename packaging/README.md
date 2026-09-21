@@ -210,8 +210,8 @@ against it. `scripts/ci-local.sh image` runs that smoke anywhere nix does.
 ### Published releases
 
 The package holds `0.1.0-7d64cbb`, `0.1.0`, `0.1.1-a3f4b12`, `0.1.1`, `0.1.2-adc0ae2`,
-`0.1.2`, `0.2.0`, that release's own `<version>-<short-sha>` tag, and the moving `latest`,
-which is `0.2.0` as this is written (2026-09-21).
+`0.1.2`, `0.2.0`, `0.2.1`, that release's own `<version>-<short-sha>` tag, and the moving
+`latest`, which is `0.2.1` as this is written (2026-09-21).
 `v0.1.0` (2026-09-19, at `7d64cbb`, the merge of \#25) was the first: its tag run —
 https://github.com/selvage-protocol/reference\_server/actions/runs/35428735910 —
 published `ghcr.io/selvage-protocol/selvaged:0.1.0-7d64cbb`, `:0.1.0` and `:latest`
@@ -252,7 +252,7 @@ are the same build is already on GHCR when the job goes red, which is how `0.1.0
 A stranger pulls it with no account:
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.2.0
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.2.1
 ```
 
 and `compose.yaml`'s `build: .` remains the route for an image built from a checkout.
@@ -309,8 +309,9 @@ servers — instead of sharing the server's one listener.
 
 Two things follow from that, and they are the honest cost. The page becomes a **second
 origin**: the socket is not CORS-bound and the `/meta` read is advisory, so a cross-origin
-page works, but every link must name the server (the `?server=` parameter, or a page built
-with a different default), because the page's built-in default is one particular endpoint.
+page works, but a link at that origin carries no room: the page reads the server from the
+link's own address and from nowhere else, so a guest there is handed the wire shape
+(`ws://HOST:PORT/session?room=…&token=…`) rather than a page link.
 And a one-origin deployment with the page, `/meta` and `/session` on one port needs neither,
 so **one origin stays the default** — the shape above, and the single service in
 `compose.yaml`.
