@@ -2,7 +2,6 @@
 //! a seated connection answers.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -20,7 +19,11 @@ use crate::room::{
 };
 use crate::{mint_room_id, mint_token};
 
-use super::{SessionStream, Shared, event_frame};
+use super::{
+    RATE_LIMITED, SessionStream, Shared, budget_message, event_frame,
+    payload_len,
+};
+use crate::budget::InboundBudget;
 
 /// Why a connection was not seated: the error code and the message to send back.
 type Refusal = (&'static str, String);
@@ -117,21 +120,32 @@ struct Seating<'a> {
 ///
 /// Returns the refusal to send back when the first frame is not a compatible
 /// `session.hello`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a handshake names its transport, what the URL claimed, the server's limits and the budget the frames are charged to"
+)]
 pub async fn handshake(
     stream: &mut SessionStream,
     claims_host: bool,
-    hello_timeout: Duration,
+    config: &ServerConfig,
+    budget: &mut InboundBudget,
 ) -> Result<Hello, Refusal> {
-    let text = match timeout(hello_timeout, next_text(stream)).await {
-        Ok(Ok(text)) => text,
-        Ok(Err(reason)) => return Err((code::BAD_MESSAGE, reason)),
-        Err(_) => {
-            return Err((
-                code::HELLO_REQUIRED,
-                "session.hello was not sent in time".to_string(),
-            ));
-        }
-    };
+    let text =
+        match timeout(config.hello_timeout, next_text(stream, config, budget))
+            .await
+        {
+            Ok(Ok(text)) => text,
+            Ok(Err(refusal)) => return Err(refusal),
+            Err(_) => {
+                return Err((
+                    code::HELLO_REQUIRED,
+                    "session.hello was not sent in time".to_string(),
+                ));
+            }
+        };
+    if text.len() > config.max_envelope_bytes {
+        return Err(envelope_too_large(text.len(), config.max_envelope_bytes));
+    }
     let msg: proto::ClientMessage = proto::ClientMessage::from_text(&text)
         .map_err(|e| {
             envelope_refusal("first message is not a session envelope", &e)
@@ -193,27 +207,73 @@ pub async fn handshake(
     })
 }
 
-/// The next text frame on a connection that is still in the handshake.
-async fn next_text(stream: &mut SessionStream) -> Result<String, String> {
+/// The next text frame on a connection that is still in the handshake. Every frame read
+/// is charged to the connection's budget first: before seating is when a peer can send
+/// frames nobody answers, which is the cheapest flood to mount, and §11's shape for a
+/// fault there is a refusal and a close.
+async fn next_text(
+    stream: &mut SessionStream,
+    config: &ServerConfig,
+    budget: &mut InboundBudget,
+) -> Result<String, Refusal> {
     loop {
-        match stream.next().await {
-            Some(Ok(Message::Text(text))) => return Ok(text.to_string()),
-            Some(Ok(Message::Binary(_))) => {
-                return Err(
-                    "a binary frame arrived before session.hello".to_string()
-                );
+        let frame = match stream.next().await {
+            Some(Ok(frame)) => frame,
+            Some(Err(e)) => return Err((code::BAD_MESSAGE, e.to_string())),
+            None => {
+                return Err((
+                    code::BAD_MESSAGE,
+                    "connection closed during handshake".to_string(),
+                ));
             }
-            Some(Ok(Message::Close(_))) | None => {
-                return Err("connection closed during handshake".to_string());
+        };
+        if !budget.try_take(payload_len(&frame)) {
+            return Err((RATE_LIMITED, budget_message(config)));
+        }
+        match frame {
+            Message::Text(text) => return Ok(text.to_string()),
+            Message::Binary(_) => {
+                return Err((
+                    code::BAD_MESSAGE,
+                    "a binary frame arrived before session.hello".to_string(),
+                ));
             }
-            Some(Ok(_)) => {}
-            Some(Err(e)) => return Err(e.to_string()),
+            Message::Close(_) => {
+                return Err((
+                    code::BAD_MESSAGE,
+                    "connection closed during handshake".to_string(),
+                ));
+            }
+            // A control frame is charged and otherwise ignored, as on a seated
+            // connection: an unseated peer that floods them is held to the same budget.
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
         }
     }
 }
 
 fn envelope_refusal(what: &str, error: &serde_json::Error) -> Refusal {
     (code::BAD_MESSAGE, format!("{what}: {error}"))
+}
+
+/// The refusal for a text frame longer than this server parses, naming both the bound
+/// and the frame so an operator can see which of the two is wrong.
+///
+/// The bound is judged on the frame's length *before* `serde_json` is handed it. What
+/// that buys is the whole point of the bound: megabytes of attacker-chosen JSON are
+/// never materialized as a `Value` and a `Vec<String>` to be refused afterwards, and a
+/// frame that could not be a legal request is refused for the reason it actually has
+/// rather than for whichever parse error it happens to produce first. It stays a
+/// session fault rather than a transport one — the frame was received whole, so there is
+/// a session to refuse on — and the connection stays open, since a peer that sends one
+/// oversized envelope can send a smaller one next (`PROTOCOL.md` §2.1, §11).
+fn envelope_too_large(found: usize, limit: usize) -> Refusal {
+    (
+        code::BAD_MESSAGE,
+        format!(
+            "a text envelope is at most {limit} bytes; this frame is {found} bytes and \
+             was not parsed"
+        ),
+    )
 }
 
 /// Maps an admission failure to its refusal. `Unknown` and `TokenMismatch` stay
@@ -371,6 +431,30 @@ fn detach_locked(
         generation: detach.generation,
         poison,
     })
+}
+
+/// Takes a placement back when its handshake frame could not be queued.
+///
+/// A mint's room is removed outright: nothing had been told about it and no grace period
+/// is armed, so leaving it would hold a room slot for a session that does not exist. A
+/// join is detached like any departing peer, which leaves the room's other peers where
+/// they were. Either way the seat, its task registration and the sender that would have
+/// ended the connection are dropped, and the caller refuses the connection.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an unseat names the registry, whether the room was minted, and the two ids"
+)]
+fn unseat(
+    registry: &mut Registry,
+    minted: bool,
+    room_id: &str,
+    peer_id: &str,
+) -> Option<oneshot::Sender<()>> {
+    if minted {
+        drop(registry.remove_room(room_id));
+        return registry.take_task(peer_id);
+    }
+    detach_locked(registry, room_id, peer_id).and_then(|peer| peer.poison)
 }
 
 /// The `peer.left` a departure is announced with.
@@ -541,6 +625,7 @@ impl Applicant {
     pub async fn seat(self, shared: &Shared) -> Result<Session, Refusal> {
         let role = self.role();
         let info = self.info(role);
+        let minted = self.join.room.is_none();
         let seating = Seating {
             applicant: &self,
             config: &shared.config,
@@ -562,14 +647,37 @@ impl Applicant {
         let queue = self.queue.clone();
 
         let body = serde_json::to_value(&params).map_err(|e| bad_body(&e))?;
-        if let Some(frame) = event_frame(event_name, body) {
-            let _ = self.queue.try_queue(frame);
-        }
         // A joining connection learns the room's grant straight after its `room.joined`, so
         // it needs no round trip and `room.joined` needs no fifth member. Both go out under
         // the lock: see this method's comment.
-        if let Some(frame) = join_grant(granted.as_deref()) {
-            let _ = self.queue.try_queue(frame);
+        //
+        // These are the frames that seat this connection, and they are the ones it cannot
+        // be told about later: a queue that will not take one of them has seated nothing.
+        // Handing back a live session anyway is a client waiting for a handshake that is
+        // already lost, holding a seat and — for a mint — a room, so the placement is
+        // taken back and the connection refused instead. `--outbound-queue-bytes` cannot be
+        // set below the largest frame this server generates
+        // (`ServerConfig::smallest_queue_bytes`), so a deployment does not reach this by
+        // flag; it is the backstop for a configuration built past that.
+        let seated = event_frame(event_name, body)
+            .is_some_and(|frame| self.queue.try_queue(frame));
+        let announced_grant = granted.as_deref().is_none_or(|paths| {
+            join_grant(Some(paths))
+                .is_none_or(|frame| self.queue.try_queue(frame))
+        });
+        if !seated || !announced_grant {
+            let poison = unseat(&mut guard, minted, &room_id, &peer_id);
+            drop(guard);
+            drop(poison);
+            return Err((
+                SERVER_FULL,
+                format!(
+                    "a handshake frame does not fit this server's outbound queue of \
+                     {} bytes: the connection is refused rather than seated without its \
+                     handshake",
+                    shared.config.max_queue_bytes
+                ),
+            ));
         }
         drop(guard);
 
@@ -761,6 +869,16 @@ impl Session {
     /// a `params` object with two of one member is last-wins to a JSON reader, and one
     /// frame must not mean two things (`PROTOCOL.md` §4).
     async fn dispatch_text(&self, text: &str, shared: &Shared) {
+        // Judged on the frame, before the parser sees it (`PROTOCOL.md` §2.1): the
+        // envelope bound is the one check that has to happen on the way in rather than
+        // on what came out.
+        if text.len() > shared.config.max_envelope_bytes {
+            let (code, message) = envelope_too_large(
+                text.len(),
+                shared.config.max_envelope_bytes,
+            );
+            return self.alert(code, message);
+        }
         let msg = match proto::ClientMessage::from_text(text) {
             Ok(msg) => msg,
             Err(e) => return self.alert(code::BAD_MESSAGE, e.to_string()),
@@ -1079,7 +1197,149 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::room::{MAX_QUEUE_FRAMES, peer_channel};
+    use crate::room::{MAX_QUEUE_BYTES, MAX_QUEUE_FRAMES, peer_channel};
+
+    /// A `session.hello` as the handshake would have produced it.
+    fn hello(name: &str, claims_host: bool) -> Hello {
+        Hello {
+            params: proto::HelloParams {
+                awareness_client_id: None,
+                capabilities: Vec::new(),
+                client: None,
+                display_name: name.to_string(),
+                role: None,
+            },
+            claims_host,
+        }
+    }
+
+    /// Seats `applicant`, returning the refusal: the tests below are all about the one
+    /// case where seating must not happen.
+    async fn refused(applicant: Applicant, shared: &Shared) -> Refusal {
+        match applicant.seat(shared).await {
+            Ok(_) => panic!("the handshake frame does not fit the queue"),
+            Err(refusal) => refusal,
+        }
+    }
+
+    /// A server holding one registry, for a test that drives seating directly.
+    fn serving(config: ServerConfig) -> Shared {
+        Shared::new(config, Arc::new(Mutex::new(Registry::default())))
+    }
+
+    /// A mint whose `room.created` the queue will not take is taken back: the room is
+    /// removed rather than kept for a session that never heard about it, so its slot is
+    /// free for the next mint.
+    #[tokio::test]
+    async fn a_mint_that_cannot_be_told_is_taken_back() {
+        let shared = serving(ServerConfig {
+            max_rooms: 1,
+            max_queue_bytes: 64,
+            ..ServerConfig::default()
+        });
+        let (queue, _leftovers) = Queue::channel(64);
+        let (poison, _poisoned) = oneshot::channel();
+        let applicant = Applicant {
+            peer_id: "p-ada".to_string(),
+            join: proto::parse_join_query("").expect("a mint's query parses"),
+            hello: hello("Ada", true),
+            queue,
+            poison,
+        };
+        let refused = refused(applicant, &shared).await;
+        assert_eq!(refused.0, SERVER_FULL);
+
+        // The one room slot this server has is free: the refused mint did not keep it.
+        let (host, _host_rx) = peer_channel(
+            PeerInfo {
+                peer_id: "p-ada".to_string(),
+                display_name: "Ada".to_string(),
+                role: Role::Host,
+                awareness_client_id: None,
+            },
+            MAX_QUEUE_BYTES,
+        );
+        let mut guard = shared.registry.lock().await;
+        assert!(
+            guard
+                .create(
+                    NewRoom {
+                        id: "r-1".to_string(),
+                        token: "t".to_string(),
+                        keepalive: Keepalive::default(),
+                    },
+                    host,
+                    1,
+                )
+                .is_some(),
+            "the room the refused mint made was given back"
+        );
+    }
+
+    /// A room whose open-document set is wide enough that a joining connection's
+    /// `room.joined` does not fit its queue. The set is opened under the lock, so nothing
+    /// is delivered while it grows.
+    async fn wide_room(shared: &Shared) {
+        let (host, _host_rx) = peer_channel(
+            PeerInfo {
+                peer_id: "p-ada".to_string(),
+                display_name: "Ada".to_string(),
+                role: Role::Host,
+                awareness_client_id: None,
+            },
+            MAX_QUEUE_BYTES,
+        );
+        let mut guard = shared.registry.lock().await;
+        guard
+            .create(
+                NewRoom {
+                    id: "r-1".to_string(),
+                    token: "t".to_string(),
+                    keepalive: Keepalive::default(),
+                },
+                host,
+                1,
+            )
+            .expect("the room is minted");
+        let room = guard.room_mut("r-1").expect("the room is minted");
+        for n in 0..40 {
+            let path = format!("d{n:02}{}", "p".repeat(300));
+            room.open_document("p-ada", &path, 1024)
+                .expect("the set takes the path");
+        }
+    }
+
+    /// A join whose `room.joined` the queue will not take takes no seat either: the room
+    /// keeps the peers it had, and nothing of the newcomer's is left registered.
+    #[tokio::test]
+    async fn a_join_that_cannot_be_told_takes_no_seat() {
+        let shared = serving(ServerConfig {
+            max_queue_bytes: 4096,
+            ..ServerConfig::default()
+        });
+        wide_room(&shared).await;
+
+        let (queue, _leftovers) = Queue::channel(64);
+        let (poison, _poisoned) = oneshot::channel();
+        let applicant = Applicant {
+            peer_id: "p-bob".to_string(),
+            join: proto::parse_join_query("room=r-1&token=t")
+                .expect("the join query parses"),
+            hello: hello("Bob", false),
+            queue,
+            poison,
+        };
+        let refused = refused(applicant, &shared).await;
+        assert_eq!(refused.0, SERVER_FULL);
+
+        let mut guard = shared.registry.lock().await;
+        let room = guard.room("r-1").expect("the room is still there");
+        assert_eq!(room.peers.len(), 1, "the newcomer took no seat");
+        assert!(
+            guard.take_task("p-bob").is_none(),
+            "no task is left registered for it"
+        );
+    }
 
     /// Fills a fresh queue exactly: a full queue's worth of frames fits, so the
     /// session holding it is alive — and the next frame past it is refused.
@@ -1095,12 +1355,15 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_alert_ends_the_session_on_the_same_frame() {
         let mut registry = Registry::default();
-        let (host, _rx) = peer_channel(PeerInfo {
-            peer_id: "p-host".to_string(),
-            display_name: "Ada".to_string(),
-            role: Role::Host,
-            awareness_client_id: None,
-        });
+        let (host, _rx) = peer_channel(
+            PeerInfo {
+                peer_id: "p-host".to_string(),
+                display_name: "Ada".to_string(),
+                role: Role::Host,
+                awareness_client_id: None,
+            },
+            MAX_QUEUE_BYTES,
+        );
         assert_eq!(
             registry
                 .create(
@@ -1115,12 +1378,15 @@ mod tests {
                 .as_deref(),
             Some("r-1")
         );
-        let (guest, _rx) = peer_channel(PeerInfo {
-            peer_id: "p-slow".to_string(),
-            display_name: "Bob".to_string(),
-            role: Role::Guest,
-            awareness_client_id: None,
-        });
+        let (guest, _rx) = peer_channel(
+            PeerInfo {
+                peer_id: "p-slow".to_string(),
+                display_name: "Bob".to_string(),
+                role: Role::Guest,
+                awareness_client_id: None,
+            },
+            MAX_QUEUE_BYTES,
+        );
         let queue = guest.queue.clone();
         registry
             .admit(
@@ -1166,12 +1432,15 @@ mod tests {
         listing: Vec<String>,
     ) -> (Shared, Peer, mpsc::Receiver<Outbound>) {
         let mut registry = Registry::default();
-        let (host, _host_rx) = peer_channel(PeerInfo {
-            peer_id: "p-host".to_string(),
-            display_name: "Ada".to_string(),
-            role: Role::Host,
-            awareness_client_id: None,
-        });
+        let (host, _host_rx) = peer_channel(
+            PeerInfo {
+                peer_id: "p-host".to_string(),
+                display_name: "Ada".to_string(),
+                role: Role::Host,
+                awareness_client_id: None,
+            },
+            MAX_QUEUE_BYTES,
+        );
         assert!(
             registry
                 .create(
@@ -1189,12 +1458,15 @@ mod tests {
             .room_mut("r-1")
             .expect("the room is minted")
             .set_grant(listing);
-        let (newcomer, frames) = peer_channel(PeerInfo {
-            peer_id: "p-new".to_string(),
-            display_name: "Zoe".to_string(),
-            role: Role::Guest,
-            awareness_client_id: None,
-        });
+        let (newcomer, frames) = peer_channel(
+            PeerInfo {
+                peer_id: "p-new".to_string(),
+                display_name: "Zoe".to_string(),
+                role: Role::Guest,
+                awareness_client_id: None,
+            },
+            MAX_QUEUE_BYTES,
+        );
         let shared = Shared::new(
             ServerConfig::default(),
             Arc::new(Mutex::new(registry)),

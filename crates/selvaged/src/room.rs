@@ -19,13 +19,14 @@ use tokio::sync::oneshot;
 /// the bytes beside it and this stays as the backstop for a flood of small frames.
 pub const MAX_QUEUE_FRAMES: usize = 32;
 
-/// How many payload bytes one connection may have queued but unwritten: 32 MiB, four
-/// times the largest frame a legitimate session sends (an 8 MiB update, measured in
+/// How many payload bytes one connection may have queued but unwritten: the default for
+/// [`ServerConfig::max_queue_bytes`](crate::ServerConfig::max_queue_bytes), and 32 MiB —
+/// four times the largest frame a legitimate session sends (an 8 MiB update, measured in
 /// `crates/harness/tests/session.rs`), so a full-state sync plus concurrent traffic
 /// still fits. Past it the peer is slow, like past the frame cap. One slow peer holds
-/// at most this many counted bytes — the count includes the frame being written,
-/// released only after its send completes — plus the kernel's own buffers; the 33rd
-/// frame, or the byte past the cap, disconnects it instead.
+/// at most the configured cap in counted bytes — the count includes the frame being
+/// written, released only after its send completes — plus the kernel's own buffers; the
+/// 33rd frame, or the byte past the cap, disconnects it instead.
 pub const MAX_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 
 /// A frame the connection task should write out.
@@ -60,18 +61,22 @@ impl Outbound {
 pub struct Queue {
     tx: Sender<Outbound>,
     queued: Arc<AtomicUsize>,
+    /// The byte cap this queue was built with, from the server's configuration.
+    max_bytes: usize,
 }
 
 impl Queue {
-    /// A fresh queue and its receiving end. The writer drains the receiver and
-    /// releases each frame's bytes after its send completes.
+    /// A fresh queue and its receiving end, holding at most `max_bytes` payload bytes.
+    /// The writer drains the receiver and releases each frame's bytes after its send
+    /// completes.
     #[must_use]
-    pub fn channel() -> (Self, Receiver<Outbound>) {
+    pub fn channel(max_bytes: usize) -> (Self, Receiver<Outbound>) {
         let (tx, rx) = channel(MAX_QUEUE_FRAMES);
         (
             Self {
                 tx,
                 queued: Arc::new(AtomicUsize::new(0)),
+                max_bytes,
             },
             rx,
         )
@@ -103,7 +108,7 @@ impl Queue {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current
                     .checked_add(len)
-                    .filter(|reserved| *reserved <= MAX_QUEUE_BYTES)
+                    .filter(|reserved| *reserved <= self.max_bytes)
             })
             .is_err()
         {
@@ -476,6 +481,16 @@ impl Registry {
         })
     }
 
+    /// Takes a room out of the registry outright, returning it.
+    ///
+    /// A mint whose handshake never reached its host has no peers to announce and no
+    /// grace period to arm, and leaving it would hold a room slot for a session that does
+    /// not exist. Removing it twice is [`None`].
+    #[must_use]
+    pub fn remove_room(&mut self, room_id: &str) -> Option<Room> {
+        self.rooms.remove(room_id)
+    }
+
     #[must_use]
     pub fn room(&self, room_id: &str) -> Option<&Room> {
         self.rooms.get(room_id)
@@ -512,8 +527,11 @@ pub struct Detach {
 }
 
 #[must_use]
-pub fn peer_channel(info: PeerInfo) -> (Peer, Receiver<Outbound>) {
-    let (queue, rx) = Queue::channel();
+pub fn peer_channel(
+    info: PeerInfo,
+    max_bytes: usize,
+) -> (Peer, Receiver<Outbound>) {
+    let (queue, rx) = Queue::channel(max_bytes);
     (Peer::new(info, queue), rx)
 }
 
@@ -532,7 +550,7 @@ mod tests {
             role: Role::Guest,
             awareness_client_id: None,
         };
-        let (peer, _leftovers) = peer_channel(info);
+        let (peer, _leftovers) = peer_channel(info, MAX_QUEUE_BYTES);
         assert_eq!(
             registry
                 .create(
@@ -569,7 +587,7 @@ mod tests {
             role: Role::Guest,
             awareness_client_id: None,
         };
-        let (peer, _leftovers) = peer_channel(info);
+        let (peer, _leftovers) = peer_channel(info, MAX_QUEUE_BYTES);
         assert_eq!(
             registry
                 .create(
@@ -615,7 +633,7 @@ mod tests {
             role: Role::Host,
             awareness_client_id: None,
         };
-        let (peer, mut leftovers) = peer_channel(info);
+        let (peer, mut leftovers) = peer_channel(info, MAX_QUEUE_BYTES);
         assert_eq!(
             registry
                 .create(
@@ -650,12 +668,15 @@ mod tests {
     #[test]
     fn a_colliding_room_id_is_regenerated() {
         let mut registry = Registry::default();
-        let (host, _leftovers) = peer_channel(PeerInfo {
-            peer_id: "p-ada".to_string(),
-            display_name: "Ada".to_string(),
-            role: Role::Host,
-            awareness_client_id: None,
-        });
+        let (host, _leftovers) = peer_channel(
+            PeerInfo {
+                peer_id: "p-ada".to_string(),
+                display_name: "Ada".to_string(),
+                role: Role::Host,
+                awareness_client_id: None,
+            },
+            MAX_QUEUE_BYTES,
+        );
         assert_eq!(
             registry
                 .create(
@@ -670,12 +691,15 @@ mod tests {
                 .as_deref(),
             Some("r-1")
         );
-        let (guest, _leftovers) = peer_channel(PeerInfo {
-            peer_id: "p-bob".to_string(),
-            display_name: "Bob".to_string(),
-            role: Role::Guest,
-            awareness_client_id: None,
-        });
+        let (guest, _leftovers) = peer_channel(
+            PeerInfo {
+                peer_id: "p-bob".to_string(),
+                display_name: "Bob".to_string(),
+                role: Role::Guest,
+                awareness_client_id: None,
+            },
+            MAX_QUEUE_BYTES,
+        );
         let minted = registry
             .create(
                 NewRoom {
@@ -703,7 +727,7 @@ mod tests {
             role: Role::Host,
             awareness_client_id: None,
         };
-        let (peer, _leftovers) = peer_channel(info);
+        let (peer, _leftovers) = peer_channel(info, MAX_QUEUE_BYTES);
         assert_eq!(
             registry
                 .create(
