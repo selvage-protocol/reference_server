@@ -1,0 +1,26 @@
+# The one root command the CI user on the public demo may run, and nothing else.
+#
+# Tailscale SSH cannot restrict a command — the tailnet policy's `ssh` rules
+# carry `action`, `src`, `dst`, `users`, `checkPeriod`, `acceptEnv` and
+# `srcPosture`, and there is no `cmd` field — so an SSH grant is a shell grant.
+# `selvage` on that box has blanket passwordless sudo, so granting CI `selvage`
+# would mean "GitHub can be root on production". Hence a user of its own, whose
+# only privilege is this line.
+#
+# There is deliberately **no argument wildcard**, and the trailing `""` is what
+# says so: `/usr/local/sbin/selvage-deploy ""` permits that one program and no
+# argument at all, whereas the same line without the `""` would permit *any*
+# argument, because an empty argument list in sudoers means "any" rather than
+# "none". That distinction is the whole bound: without the `""` the argument
+# list is the script's own problem, and a wildcard there is a root shell.
+#
+# It is also why the deploy request arrives on stdin, and why the script refuses
+# its own arguments as well: the marker is what sudo enforces, and the script
+# check is the second lock on the same door.
+#
+# The script is root-owned mode 0755 under `/usr/local/sbin` (root:root 0755), so
+# the user it is granted to cannot change what it does.
+#
+# Installs to `/etc/sudoers.d/selvage-deploy`, root:root, mode 0440, and is read
+# with `visudo -c -f` before it is put there.
+deployci ALL=(root) NOPASSWD: /usr/local/sbin/selvage-deploy ""

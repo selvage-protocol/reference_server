@@ -58,6 +58,11 @@ job_checks() {
   # Cargo target.
   say "checks: the TLS front's idle logic"
   nix build .#checks.x86_64-linux.tls-proxy --no-link --print-build-logs
+  # The guard around the public demo's deploy script, which is the whole of that
+  # box's privilege model: one request grammar, and a shape the deploy verifies
+  # rather than writes.
+  say "checks: the public demo's deploy guard"
+  nix build .#checks.x86_64-linux.prod-deploy --no-link --print-build-logs
   say "checks: lint the workflows"
   nix develop . -c actionlint
   # The same check the pre-commit hook runs: a commit made outside the dev shell cannot

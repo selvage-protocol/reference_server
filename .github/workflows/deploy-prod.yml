@@ -1,0 +1,203 @@
+name: deploy-prod
+
+# The button that redeploys the public demo, `selvage.dontblameme.dev`.
+#
+# One job, behind the `prod` environment, which is what makes this safe to have
+# at all: the environment's required reviewer is the approval, and the
+# environment's secrets are unreadable until that approval passes. So between
+# deploys there is nothing anywhere for a compromised release workflow, a
+# compromised third-party action or a stolen repository secret to use.
+#
+# How it reaches the box: `tailscale/github-action` joins the tailnet as an
+# **ephemeral** node tagged `tag:ci`, using Tailscale workload identity
+# federation — a client id and an audience, which Tailscale's own documentation
+# says are not secrets, exchanged for a short-lived node together with a
+# GitHub-signed OIDC token whose `sub` claim carries this job's environment. The
+# tailnet's federated identity is constrained to exactly
+# `repo:selvage-protocol/reference_server:environment:prod`, which is why the
+# `environment:` line below is not decoration: without it there is no token, and
+# with it the approval gate and the credential's scope are the same condition
+# and cannot drift apart.
+#
+# Then Tailscale SSH as `deployci`, a local user on the box with no password, no
+# key and exactly one permitted root command — `/usr/local/sbin/selvage-deploy`,
+# with no argument wildcard. Tailscale SSH cannot restrict the command (the
+# policy's `ssh` rules have no `cmd` field), so the bound lives on the box and
+# is proved there rather than claimed here.
+#
+# What a run may change, which is the whole of what CI can do to production:
+# **which of two already-published images runs**. The request carries two
+# digest-pinned references — resolved from the versions this dispatch names —
+# and the sha256 of `packaging/prod/compose.yaml`. The box's copy of the compose
+# file is *verified* against that hash and never written, so a run cannot add a
+# port, drop a capability, mount a certificate or raise a memory limit. An input
+# this dispatch leaves empty means "leave that service exactly as it is".
+#
+# What a run cannot do to a live session: the page container is separate and the
+# server's state is memory-only, so this is where the honest cost is written
+# down — **replacing `selvaged` ends every room on the instance.** There is no
+# drain and no room count; `/meta` is the only read besides `/session`. That is
+# why there is a human on the approval and why the dispatch is deliberate rather
+# than a tag push.
+#
+# `workflow_dispatch` only: no `pull_request` and no `push` event can reach this
+# file, so no branch can deploy itself. The deploy workflow that runs is the
+# reviewed one on `main` (dispatch it with `--ref main`), and the *images* are
+# chosen by the inputs.
+#
+# Every action is pinned by commit SHA with the version it is in a comment. A
+# SHA behind a comment that claims a different version is worse than no pin, so
+# each one below was read back from the action's repository when it was written.
+#
+# `ubuntu-24.04` and not a Blacksmith runner: this job downloads a Tailscale
+# tarball from `pkgs.tailscale.com`, reads `ghcr.io` and speaks to the tailnet,
+# and Blacksmith runners have proved only GitHub-scoped egress. It also has to
+# support Node.js 24, which `tailscale/github-action@v4.1.3` declares
+# (`runs.using: node24`); the GitHub-hosted image does, and this repository
+# already runs `actions/checkout@v7.0.1` — also `node24` — on `ubuntu-24.04`
+# today.
+on:
+  workflow_dispatch:
+    inputs:
+      server_version:
+        description: 'selvaged version to deploy (e.g. 0.2.0). Empty leaves the running one alone.'
+        required: false
+        default: ''
+      web_version:
+        description: 'selvage-web version to deploy (e.g. 0.1.0). Empty leaves the running one alone.'
+        required: false
+        default: ''
+
+# Two deploys never interleave, and a queued one is not silently dropped: an
+# approval gate in front of a run that another run cancels is a gate that lies.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: prod
+    # `id-token: write` is what mints the OIDC token the Tailscale federated
+    # identity exchange needs, and it is only obtainable because this job names
+    # the environment above. Nothing here needs a write to the repository.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The request is built here, before the tailnet is joined and before
+      # anything reaches the box: every version is resolved to the digest the
+      # registry reports for it, so what runs is a digest and not a tag a
+      # publisher can repoint later. An input that is empty means "leave that
+      # service as it is" and its line is simply absent.
+      - name: resolve the versions to digests
+        env:
+          SERVER_VERSION: ${{ inputs.server_version }}
+          WEB_VERSION: ${{ inputs.web_version }}
+        run: |
+          set -euo pipefail
+          request="$RUNNER_TEMP/deploy-request"
+          echo "COMPOSE_SHA256=$(sha256sum packaging/prod/compose.yaml | cut -d' ' -f1)" >"$request"
+          if [ -n "$SERVER_VERSION" ]; then
+            digest=$(scripts/image-digest.py "ghcr.io/selvage-protocol/selvaged:$SERVER_VERSION")
+            echo "SELVAGED_IMAGE=ghcr.io/selvage-protocol/selvaged@$digest" >>"$request"
+          fi
+          if [ -n "$WEB_VERSION" ]; then
+            digest=$(scripts/image-digest.py "ghcr.io/selvage-protocol/selvage-web:$WEB_VERSION")
+            echo "SELVAGE_WEB_IMAGE=ghcr.io/selvage-protocol/selvage-web@$digest" >>"$request"
+          fi
+          if [ "$(wc -l <"$request")" -lt 2 ]; then
+            echo "nothing to deploy: name server_version, web_version or both" >&2
+            exit 1
+          fi
+          cat "$request"
+
+      # `ping` and the loop below are the plan's answer to the tailnet being
+      # eventually consistent about a peer that came up seconds ago: verify
+      # reachability, then poll the predicate with a deadline rather than sleep
+      # and hope. The ephemeral node is logged out again in the action's post
+      # step, so nothing is left joined between runs.
+      - uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888 # v4.1.3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+          ping: selvage-protocol-prod
+
+      - name: wait for the box to answer as deployci
+        run: |
+          set -euo pipefail
+          last=''
+          deadline=$((SECONDS + 150))
+          while :; do
+            if last=$(ssh -o BatchMode=yes -o ConnectTimeout=10 \
+                -o StrictHostKeyChecking=accept-new \
+                deployci@selvage-protocol-prod true 2>&1); then
+              echo "deployci@selvage-protocol-prod answers"
+              break
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "deployci@selvage-protocol-prod did not answer within 150s; last: $last" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+      # The only privileged thing this job does, and it is one argument-free
+      # command line: `deployci` may run nothing else as root. The request goes
+      # in on stdin because the sudoers rule deliberately has no argument
+      # wildcard, and the script refuses every value that is not one of the two
+      # digest-pinned images or the compose file's own sha256.
+      - name: deploy
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o ConnectTimeout=10 \
+            deployci@selvage-protocol-prod \
+            '/usr/bin/sudo /usr/local/sbin/selvage-deploy' \
+            <"$RUNNER_TEMP/deploy-request"
+
+      # A deploy that goes green because `docker compose` exited zero is a
+      # deploy nobody checked. This reads the *public* origin — over Cloudflare,
+      # through the front — and fails on the last observed value if it never
+      # reports the version that was asked for.
+      - name: verify the public origin reports what was deployed
+        env:
+          SERVER_VERSION: ${{ inputs.server_version }}
+        run: |
+          set -euo pipefail
+          url=https://selvage.dontblameme.dev
+          if [ -n "$SERVER_VERSION" ]; then
+            got=''
+            deadline=$((SECONDS + 180))
+            while :; do
+              body=$(curl -fsS --max-time 10 "$url/meta" || true)
+              got=$(printf '%s' "$body" | jq -r '.server // ""' 2>/dev/null || true)
+              if [ "$got" = "selvaged/$SERVER_VERSION" ]; then
+                echo "$url/meta reports $got"
+                break
+              fi
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "$url/meta did not report selvaged/$SERVER_VERSION within 180s; it says '${got}'" >&2
+                exit 1
+              fi
+              sleep 5
+            done
+          else
+            echo "no server version was dispatched, so /meta is read but not asserted"
+            curl -fsS --max-time 10 "$url/meta"
+            echo
+          fi
+          code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 10 "$url/")
+          if [ "$code" != "200" ]; then
+            echo "the page answered $code, not 200" >&2
+            exit 1
+          fi
+          echo "the page answers 200"
