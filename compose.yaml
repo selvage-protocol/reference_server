@@ -1,42 +1,31 @@
-# One-command self-host for strangers evaluating selvage on their own
-# machine (and, later, optionally the VPS demo) — emphatically not the Pi,
-# which already runs the native binary under packaging/systemd/.
+# Self-host for someone evaluating selvage on their own machine. The other
+# deployment shapes are in packaging/README.md; the Pi demo has its own units
+# under packaging/pi-demo/.
 #
-# No volumes: the image carries the browser page it serves (Dockerfile `page`
-# stage), and the server is memory-only and keeps nothing on disk, so there is
-# nothing to persist and nothing to mount. See the `./page` override at the
-# bottom for serving a page built elsewhere.
+# No volumes: the image carries the browser page it serves, and the server is
+# memory-only, so there is nothing to persist and nothing to mount. The `./page`
+# override at the bottom is the one mount here, and it is commented out.
 #
-# No companion services either: the server needs no database, no TLS proxy, no
-# idle-timeout policing in front of it beyond what the operator's own edge
-# already does.
-#
-# The run is the hardened one the hosting gate requires before any public
-# deployment (owner-decided 2026-09-19): the root filesystem is read-only,
-# every capability is dropped, and no process in the container may gain one.
-# Nothing beyond the container's own port is reachable, and no host socket is
-# mounted — a public deployment is gated on no host socket access at all.
+# The run is hardened: read-only root filesystem, every capability dropped, no
+# process able to gain one, and no host socket mounted.
 services:
   selvaged:
     build: .
     image: ghcr.io/selvage-protocol/selvaged:0.1.2
     ports:
       # Loopback by default: a stranger evaluating locally reaches it, and
-      # nothing else does. Operators serving beyond their own machine rebind
-      # deliberately (e.g. "8080:8080"), the way the systemd unit names its
-      # reachable address explicitly.
+      # nothing else does. To serve other machines, rebind deliberately, e.g.
+      # "8080:8080".
       - "127.0.0.1:8080:8080"
     # Inside the container the wildcard is correct: the port mapping supplies
     # the boundary. The image's own command is
     # `--listen 0.0.0.0:8080 --serve-page /page`; override per host, e.g.
     # `--listen 0.0.0.0:9000` with a matching ports entry.
     #
-    # One container, one port: the page is served from the same origin as
-    # /session and /meta, so the guest link is a page link (`/` with the room
-    # and token in the query) and nothing needs a CORS proxy. The page is the
-    # browser client's built `dist/`, baked into the image at a pinned
-    # revision; with no page at all the server still answers /meta and
-    # /session, and `/` is 404.
+    # One container, one port: the page, /session and /meta share an origin, so
+    # the guest link is a page link (`/` with the room and token in the query)
+    # and nothing needs a CORS proxy. The server needs no database and no TLS
+    # proxy beyond the operator's own edge.
     read_only: true
     cap_drop:
       - ALL
