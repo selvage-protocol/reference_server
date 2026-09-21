@@ -1,0 +1,138 @@
+# The public demo at `selvage.dontblameme.dev`, and nothing else.
+#
+# Three containers on one origin, on an Azure `Standard_B2ats_v2`: 2 vCPU,
+# 892 MiB of RAM and no swap. The front terminates TLS for the Cloudflare
+# Origin CA certificate and routes; the server answers `/session` and `/meta`;
+# the page answers everything else. `README.md` beside this file owns the shape
+# and the live state, and `web_client`'s README owns the page.
+#
+# This file is the source of truth for the deployment's shape and lives in this
+# repository. The box's copy is `/etc/selvage/compose.yaml`, installed by hand
+# once; the deployment changes which *images* run, never this shape.
+#
+# Every service below is hardened the same way, and the readback of that is what
+# the deployment is gated on: read-only root filesystem, every capability
+# dropped, no process able to gain one, and a non-root user with no mount it
+# does not need.
+#
+# The memory limits are the backstop, not a budget. The box has no swap, so
+# without them an over-committed server is the kernel choosing a victim on the
+# host; with them the container dies inside its own cgroup and `restart:
+# unless-stopped` brings it back in seconds, having dropped every room — visible
+# and bounded. The arithmetic: 892 MiB total, about 120 MiB for the Docker
+# daemon and containerd and about 350 MiB of stock Ubuntu and Tailscale, leaving
+# roughly 420 for the three. 48 + 48 + 320 is 416.
+
+name: selvage-prod
+
+services:
+  proxy:
+    build:
+      context: ./proxy
+    # Built on the box from the files beside this one, never pulled: there is no
+    # published image for this front and there should not be one, because its
+    # configuration is the deployment's own.
+    image: selvage-prod-proxy:local
+    # Rebuild on every `up`, not only when the image is missing. The front is the
+    # one service here whose content is this directory, so "the repository is the
+    # source of truth" is only true if a change to `proxy/` reaches the running
+    # container — and `docker compose up -d` will not rebuild an image that
+    # already exists without being told to. With this, the one deployment command
+    # is also the one that deploys a configuration change.
+    pull_policy: build
+    # Started after the two upstreams so that their names resolve. The front
+    # resolves `selvaged` and `selvage-web` once, at startup, and caches the
+    # addresses, so `restart: true` matters as much as the ordering: recreating
+    # an upstream can give it a new address, and a proxy left running would go on
+    # dialling the old one. Compose restarts this service when it recreates
+    # either of those.
+    depends_on:
+      selvaged:
+        condition: service_started
+        restart: true
+      selvage-web:
+        condition: service_started
+        restart: true
+    ports:
+      # The only port any of the three publishes. It is 443 on the host because
+      # Cloudflare connects to it; inside the container it is 8080, because
+      # nginx runs as uid 101 with every capability dropped and a non-root
+      # process cannot bind below 1024.
+      #
+      # Reachability is the network security group's job, not this file's: 443
+      # is admitted from Cloudflare's published ranges and from nowhere else.
+      # Nothing here listens on 80 — Cloudflare serves the redirect at its edge.
+      - "443:8080"
+    # The one mount in this deployment, and the only file the front reads from
+    # outside its own image. Read-only, twice over: the front never writes a
+    # certificate and cannot, and every directory it does need to write — the
+    # pid file and the five temp paths — is already on the runtime's own tmpfs.
+    #
+    # The key is mode 640 owned by `root` and group 101 on the host, which is
+    # the group uid 101 is in inside this image. `README.md` owns that readback.
+    volumes:
+      - /etc/selvage/tls/origin.pem:/etc/selvage/tls/origin.pem:ro
+      - /etc/selvage/tls/origin.key:/etc/selvage/tls/origin.key:ro
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 48m
+    restart: unless-stopped
+
+  selvaged:
+    image: ${SELVAGED_IMAGE:?set SELVAGED_IMAGE in .env to the published image, by digest}
+    # The image's own command serves a page from `/page` on one listener. This
+    # deployment splits the page into its own container, so the page flag is
+    # gone and the limits are the ones sized for this box. `README.md` owns why
+    # each number is what it is; the short form is that
+    # `--max-connections × --outbound-queue-bytes` is the server's own outbound
+    # ceiling and 32 × 8 MiB is the largest one this host can be surprised by.
+    #
+    # The grace period is the reference value on purpose: `/meta` advertises it
+    # and both clients size their reconnect budget from it.
+    command:
+      - --listen
+      - 0.0.0.0:8080
+      - --room-grace-ms
+      - "30000"
+      - --max-connections
+      - "32"
+      - --max-rooms
+      - "64"
+      - --max-peers-per-room
+      - "8"
+      - --max-documents-per-room
+      - "256"
+      - --outbound-queue-bytes
+      - "8388608"
+      - --max-envelope-bytes
+      - "5242880"
+      - --inbound-bytes-per-sec
+      - "1048576"
+      - --inbound-burst-bytes
+      - "33554432"
+    # No `ports:`. The server is reachable from the two containers beside it and
+    # from nothing else; every packet that reaches it came through the front.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 320m
+    restart: unless-stopped
+
+  selvage-web:
+    image: ${SELVAGE_WEB_IMAGE:?set SELVAGE_WEB_IMAGE in .env to the published image, by digest}
+    # No `ports:` here either. The page image already runs as uid 101 on 8080
+    # with the base's own hardening (`web_client/compose.yaml`), so this service
+    # is the same shape with the two things added that the one-origin deployment
+    # needs: it is only reachable through the front, and it has a memory limit.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 48m
+    restart: unless-stopped
