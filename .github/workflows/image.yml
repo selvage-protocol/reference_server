@@ -56,6 +56,8 @@ on:
       - 'scripts/release-tags.sh'
       - 'scripts/assert-image-version.sh'
       - 'scripts/assert-multiarch-layers.py'
+      - 'scripts/registry.py'
+      - 'scripts/image-digest.py'
       # Both smokes call these two, so a change to either is a change to the
       # image's own gate.
       - 'scripts/check-server-version.sh'
