@@ -30,6 +30,7 @@ those facts; this directory owns the files, and the two must agree.
 | `proxy/conf.d/cloudflare-ips.conf` | baked into that image | Cloudflare's published ranges, for `real_ip` |
 | `proxy/www/terms.html` | baked into that image at `/usr/share/selvage/www/` | The terms of this instance, which is the page `/terms` answers with |
 | `check-terms.sh` | nowhere; run where it is | The notice read back out of the bytes the front serves, without Docker |
+| `test_front_limits.py` | nowhere; run where it is | That the front refuses a source, and that one metered endpoint cannot spend another's budget |
 
 ## The shape
 
@@ -181,12 +182,16 @@ capacity flags landed:
 
 - **Per-source caps at the front.** `selvaged` has no per-source view at all.
   `limit_conn` allows one source 32 connections to the page, 8 concurrent
-  `/session` sockets and 4 concurrent `/meta` reads, each in its own zone so one
-  endpoint's count cannot spend another's; `limit_req` allows 5 `/session`
-  handshakes a second with a burst of 10. Past either the source gets a **429**.
-  The keys are the end client's address: `real_ip` is told to trust
-  `CF-Connecting-IP` from Cloudflare's ranges and from nowhere else, so a
-  connection that did not come through Cloudflare cannot name its own source.
+  `/session` sockets and 4 concurrent `/meta` reads; `limit_req` allows 5 `/session`
+  handshakes a second with a burst of 10 and 5 `/meta` reads a second with the
+  same burst. Each metered location names a zone of its own, for both
+  directives, so one endpoint's count cannot spend another's — the page reads
+  `/meta` on every load and opens `/session` on the click that follows, so a
+  shared request zone is a visitor refused at the join. Past either limit the
+  source gets a **429**. The keys are the end client's address: `real_ip` is
+  told to trust `CF-Connecting-IP` from Cloudflare's ranges and from nowhere
+  else, so a connection that did not come through Cloudflare cannot name its own
+  source.
 
 - **Total caps at the server.** `--max-connections` and the rest, above.
 
@@ -479,6 +484,17 @@ all is asserted too, so a change to the front's shape stops the script instead o
 being quietly substituted into a passing run. It proves the notice reaches a
 visitor and nothing about TLS, the certificate or the upstreams, which is what
 the box proof below is for.
+
+`test_front_limits.py` is the same harness pointed at the limits, and runs in CI
+as the `prod-front` check. It asserts what a configuration file cannot: that
+`/session` is refused with a real `429` past its burst, that six concurrent
+`/meta` reads are refused past `permeta`'s four, and that a source which has just
+spent `/meta` is still served on `/session`. Each client is a loopback address of
+its own, because the zones are keyed on `$binary_remote_addr`, so none of the
+claims waits for a rate to refill. The last claim carries its own control inside
+the test: the same run against a copy whose `/meta` names the session request
+zone has to fail it, and a control that passed would mean the test could not see
+the defect it exists for.
 
 The front's TLS path, its routing and its log policy are proved without starting
 this deployment, against throwaway backends on a high port, rather than assumed

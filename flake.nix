@@ -263,6 +263,20 @@
               python3 -B test_deploy.py
               touch $out
             '';
+
+          # The public demo's front, under its real configuration and a real nginx:
+          # whether a source is refused at all, and whether one metered endpoint can
+          # spend another's budget. Both are questions about a running proxy, and the
+          # second is the reason the front's zones are one per location; nothing else
+          # in this repository can see either.
+          prod-front =
+            pkgs.runCommand "prod-front-test" {
+              nativeBuildInputs = [pkgs.python3 pkgs.nginx];
+            } ''
+              cd ${./packaging/prod}
+              FRONT_LIMITS_WORKDIR="''${TMPDIR:-/build}/front-limits" python3 -B test_front_limits.py
+              touch $out
+            '';
         };
 
         devShells.default = craneLib.devShell {

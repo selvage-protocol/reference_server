@@ -83,14 +83,22 @@ jobs:
       - name: evaluate every check
         run: nix flake check --no-build .
 
-      # The TLS front's idle logic (`packaging/pi-demo/tls-proxy.py`), and the guard around
-      # the public demo's deploy script (`packaging/prod/deploy.py`): the two checks here
-      # that are not Cargo targets. Stdlib Python, so the runner needs nothing but nix.
+      # The TLS front's idle logic (`packaging/pi-demo/tls-proxy.py`), the guard around
+      # the public demo's deploy script (`packaging/prod/deploy.py`) and the public demo's
+      # front under a real nginx (`packaging/prod/test_front_limits.py`): the checks here
+      # that are not Cargo targets. Stdlib Python and nginx, so the runner needs nothing
+      # but nix.
       - name: the TLS front's idle logic
         run: nix build .#checks.x86_64-linux.tls-proxy --no-link --print-build-logs
 
       - name: the public demo's deploy guard
         run: nix build .#checks.x86_64-linux.prod-deploy --no-link --print-build-logs
+
+      # The public demo's front, under its real configuration and a real nginx: that a
+      # source is refused, and that one metered endpoint cannot spend another's budget.
+      # Both are about a running proxy, so neither is readable from the configuration.
+      - name: the public demo's front limits
+        run: nix build .#checks.x86_64-linux.prod-front --no-link --print-build-logs
 
       # Unknown actions, bad expressions and shell mistakes, caught before the run.
       - name: lint the workflows
