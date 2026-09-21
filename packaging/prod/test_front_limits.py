@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""The front's per-source limits, driven against the configuration that ships.
+"""The front's own contribution to a response: its per-source limits, and the
+`Strict-Transport-Security` field it deliberately does not add.
 
     python3 -B test_front_limits.py
 
@@ -11,19 +12,22 @@ traffic cannot spend another's budget — the page reads `/meta` on every load a
 opens `/session` on the click that follows, so a shared counter is a visitor
 refused at the join.
 
-Both are driven here against the front's real `nginx.conf` and
+All of it is driven against the front's real `nginx.conf` and
 `conf.d/default.conf`, under nginx with the two upstream names answered on
-loopback and TLS off, exactly as `check-terms.sh` does it. Three claims cannot
+loopback and TLS off, exactly as `check-terms.sh` does it. Four claims cannot
 be made by reading the files and are made by measuring:
 
   - `/session` refuses past its own burst (`limit_req`), with a real 429;
   - `/meta` refuses past its own concurrency (`limit_conn`), with a real 429;
   - a source that has just spent one metered endpoint is *not* refused on the
-    other.
+    other;
+  - the front serves no `Strict-Transport-Security` field of its own, on any of
+    its three locations.
 
-The last one comes with its own control, in this file: the same run against a
-copy of the configuration whose `/meta` names the `/session` request zone, which
-must *fail* the claim. A control that passes would mean the test cannot see the
+The last two come with their own control, in this file: the same run against a
+copy of the configuration whose `/meta` names the `/session` request zone, and
+one that adds an HSTS field to the server block. Each copy must *fail* the claim
+it is the control for. A control that passes would mean the test cannot see the
 defect it exists for.
 
 Every client is a loopback address of its own (`127.0.0.2` and up), because the
@@ -199,11 +203,16 @@ def source_conn(port, source, timeout=15):
     return conn
 
 
-def get(conn, path):
+def get_response(conn, path):
     conn.request("GET", path, headers={"Host": "selvage.dontblameme.dev", "User-Agent": "front-limits"})
     response = conn.getresponse()
+    headers = {name.lower(): value for name, value in response.getheaders()}
     response.read()
-    return response.status
+    return response.status, headers
+
+
+def get(conn, path):
+    return get_response(conn, path)[0]
 
 
 def refuse_after(conn, path, budget):
@@ -279,6 +288,51 @@ def phase_independence(port, label, expect_refusal):
         bad(f"[{label}] /meta spent at request {spent_at} and /session was refused: one endpoint's budget spent another's")
 
 
+def phase_header_posture(port, label, expect_sts):
+    """The `Strict-Transport-Security` field the front adds: none.
+
+    The demo's HSTS is the edge's. Cloudflare emits one field for every response
+    on the zone, the ones the origin never writes included, and a policy is a
+    property of the host rather than of the response that carried it -- so a
+    second field here would buy the deployment nothing and would make which of
+    the two a browser honours depend on their order, since a user agent
+    processes only the first (`RFC 6797` §8.1). `README.md` owns why the edge
+    owns it and what the zone's own field currently says.
+
+    The claim is a negative, so it carries the check that it is reading the
+    thing it claims to: a response with no header block at all would satisfy it
+    for the wrong reason, and every path asked for has to answer with a media
+    type before its silence about HSTS means anything.
+    """
+    asked = (("/", "page"), ("/terms", "the front's own file"), ("/meta", "the server's JSON"))
+    silent = []
+    sent = []
+    for path, what in asked:
+        conn = source_conn(port, "127.0.0.6")
+        try:
+            status, headers = get_response(conn, path)
+        finally:
+            conn.close()
+        if not headers.get("content-type"):
+            bad(f"[{label}] {path} ({what}) answered with no media type: this claim is not reading headers")
+        if "strict-transport-security" in headers:
+            sent.append(f"{path} -> {headers['strict-transport-security']!r}")
+        else:
+            silent.append(f"{path} -> {status} ({what})")
+    if expect_sts:
+        if sent:
+            ok(f"[{label}] the copy that adds an HSTS field was seen carrying one: {'; '.join(sent)}")
+        else:
+            bad(f"[{label}] the control adds an HSTS field and this claim did not see it: it cannot see the defect it exists for")
+    elif not sent:
+        ok(f"[{label}] the front added no Strict-Transport-Security: {'; '.join(silent)}")
+    else:
+        bad(
+            f"[{label}] the front added Strict-Transport-Security: {'; '.join(sent)} — the edge already "
+            f"emits one for the zone and RFC 6797 §8.1 makes a browser honour only the first"
+        )
+
+
 def phase_page_independence(port):
     conn = source_conn(port, "127.0.0.5")
     for _ in range(15):
@@ -322,7 +376,7 @@ def port_free(port):
     return True
 
 
-def run(ngx, work, stub_port, label, default_text=None, expect_refusal=False):
+def run(ngx, work, stub_port, label, default_text=None, expect_refusal=False, expect_sts=False):
     """Start the front on a port of its own and make the claims against it.
 
     A run whose nginx failed to bind (a leftover from a killed run holding the
@@ -350,6 +404,7 @@ def run(ngx, work, stub_port, label, default_text=None, expect_refusal=False):
         phase_own_limits(port)
         phase_independence(port, label, expect_refusal=expect_refusal)
         phase_page_independence(port)
+        phase_header_posture(port, label, expect_sts=expect_sts)
     finally:
         stop_front(ngx, work)
     return default
@@ -378,13 +433,29 @@ def main():
         control = shipped.replace(needle, "limit_req  zone=handshake burst=10 nodelay;")
         run(ngx, os.path.join(root, "control"), stub_port, "the control",
             default_text=control, expect_refusal=True)
+
+    # The second control: the shipped configuration with an HSTS field added to
+    # the server block. That is what a reader who took HSTS for the front's to
+    # set would write, and the posture claim above has to fail against it or it
+    # is not testing anything.
+    say("the control: the front adding a Strict-Transport-Security field")
+    marker = "    server_tokens off;"
+    if marker not in shipped:
+        bad(f"'{marker}' is not in the server block; the control has nothing to mutate")
+    else:
+        sts_control = shipped.replace(
+            marker,
+            marker + '\n    add_header Strict-Transport-Security "max-age=0; includeSubDomains; preload" always;',
+        )
+        run(ngx, os.path.join(root, "sts-control"), stub_port, "the STS control",
+            default_text=sts_control, expect_sts=True)
     stub.shutdown()
 
     say("result")
     if failures:
         print(f"  {len(failures)} assertion(s) failed")
         return 1
-    print("  the front refused on its own account, and one endpoint's traffic spent no other's")
+    print("  the front refused on its own account, one endpoint's traffic spent no other's, and it added no HSTS of its own")
     return 0
 
 

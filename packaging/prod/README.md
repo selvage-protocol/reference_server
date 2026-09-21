@@ -214,8 +214,7 @@ capacity flags landed:
 
 **In normal operation the front logs nothing at all.** Its whole `docker logs`
 is empty until something at `crit` happens. That is deliberate, and the things an
-operator normally reads the front's log for are answered elsewhere — `docker
-compose ps` for whether it is up, the server's own startup line for the limits in
+operator normally reads the front's log for are answered elsewhere — `docker compose ps` for whether it is up, the server's own startup line for the limits in
 force, and the isolated proof below for whether a change broke routing.
 
 The level is load-bearing and is tested: the isolated proof runs a second container
@@ -247,6 +246,70 @@ and the front and the server beside it show the failures that matter.
 If `web_client` turns its own access log off — or shortens the format to `$uri`,
 which carries no query string — the driver can come back and this becomes the
 image's guarantee instead of the deployment's.
+
+## Transport security is the edge's, and the front is silent about it
+
+**Nothing in this directory sets `Strict-Transport-Security`**, and nothing here
+has ever set it: no file under `packaging/prod/` carries an `add_header` at all.
+What a visitor receives for this host is Cloudflare's, added at the zone:
+
+```console
+$ curl -sS -o /dev/null -D - https://selvage.dontblameme.dev/ | grep -i strict-transport
+strict-transport-security: max-age=0; includeSubDomains; preload
+```
+
+That field is the edge's and not the origin's, and the response that shows it
+does not settle the question — both layers answer on this hostname. Two others
+do. `https://selvage.dontblameme.dev/cdn-cgi/trace` is answered by Cloudflare
+and never reaches an origin, and it carries the same field; so does the zone's
+apex, where `dontblameme.dev` answers a `301` to another site from the edge.
+The value is Cloudflare's HSTS setting with a max-age of `0`, which is that
+dashboard's own "Disable HSTS", with the include-subdomains and preload toggles
+left on beside it.
+
+What a browser does with it, read from `RFC 6797` §8.1 rather than assumed: a
+max-age of `0` means the user agent *removes* a policy it has stored for the
+host, or does not note the host at all, so the field enforces nothing; over
+plain HTTP any HSTS field is ignored outright; and where two arrive in one
+response the user agent processes only the first. The domain's reach does not
+depend on it either way, because `.dev` is on the preload list —
+`{"name": "dev", "policy": "public-suffix", "mode": "force-https", "include_subdomains": true}`,
+verbatim from Chromium's `transport_security_state_static.json` — so a browser upgrades this host to HTTPS before it sends anything and a
+`max-age=0` header cannot take that away. The field is a claim and not a
+control — which is why an inert one is worth correcting rather than leaving to
+look deliberate.
+
+**Why the front must not set one.** A field added here would reach a visitor
+only through Cloudflare, which already emits one for every response on the
+zone — including the ones no origin writes, such as the apex redirect and the
+edge's own endpoints, which is the half an origin can never cover. A policy is
+a property of the host and not of the response that carried it, so a second
+field would buy nothing and would put which policy a browser applies at the
+mercy of header order. HSTS belongs to the zone, and this directory's
+contribution to transport security is the one Cloudflare does not make: TLS
+1.2 and 1.3 only on the origin listener, and an origin no one but Cloudflare
+can reach (`proxy/conf.d/default.conf`, and the network security group whose
+rules are above).
+
+**What the owner can change, and what it costs.** The setting is one control
+in the Cloudflare dashboard (SSL/TLS → Edge Certificates → HSTS) and no
+credential for it exists in any repository, so this is not a deploy and not a
+file. Turning HSTS off at the zone is the option that leaves no claim behind.
+Setting a real max-age is not a one-line fix: `includeSubDomains` and
+`preload` are already on beside it, and both apply to **the whole of
+`dontblameme.dev`** — `includeSubDomains` would break any plain-HTTP service on
+any subdomain of it for every browser that has seen the field, and a preload
+entry is slow to remove and is served from a list the browsers ship. A demo
+instance with no long-term commitment wants a short max-age if it wants one at
+all, and neither of those two tokens; enabling them is a decision about the
+domain rather than about this instance.
+
+The live state of that control is `ai_notes/docs/runbook-prod-demo.md`, which
+owns the host and the dashboard; this section owns the reason the front is
+silent, and `test_front_limits.py` is where it is measured: it asserts that the
+front's `/`, `/terms` and `/meta` carry no `Strict-Transport-Security`, and a
+control in the same test adds one to a copy of the configuration and requires
+the assertion to fail against it.
 
 ## The non-commercial notice
 
