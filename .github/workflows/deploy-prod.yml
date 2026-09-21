@@ -15,9 +15,10 @@ name: deploy-prod
 # GitHub-signed OIDC token whose `sub` claim carries this job's environment. The
 # tailnet's federated identity is constrained to exactly
 # `repo:selvage-protocol/reference_server:environment:prod`, which is why the
-# `environment:` line below matters: without it there is no token, and with it the
-# approval gate and the credential's scope are the same condition and cannot
-# drift apart.
+# `environment:` line below matters: a job without it is still issued a token, but
+# the claim names the ref rather than the environment, so that rule rejects the
+# exchange. With the line, the approval gate and the credential's scope are the
+# same condition and cannot drift apart.
 #
 # Then Tailscale SSH as `deployci`, a local user on the box with no password, no
 # key and exactly one permitted root command — `/usr/local/sbin/selvage-deploy`,
