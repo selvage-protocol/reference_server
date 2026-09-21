@@ -70,7 +70,7 @@ def say(what):
 
 def nginx_binary():
     if os.environ.get("NGINX_BIN"):
-        return os.environ["NGINX"]
+        return os.environ["NGINX_BIN"]
     found = shutil.which("nginx")
     if found:
         return found
