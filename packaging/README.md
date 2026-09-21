@@ -1,16 +1,18 @@
 # Packaging and deployment
 
-Three shapes, for three audiences:
+Four shapes, for four audiences:
 
 | Path | Who it is for | What it is |
 |---|---|---|
 | `pi-demo/` | The live Pi demo, exactly as it runs | The TLS front and the user units that are deployed — tracked here so a deployment artefact is reviewable |
+| `prod/` | The live public demo, exactly as it runs | The TLS front, the router and the three-service compose file for one public origin — the Pi's pattern with a page container of its own |
 | `systemd/` | A self-hoster on their own machine | A user unit plus install docs — the proven path, generalized, with no front |
 | `Dockerfile` + `compose.yaml` | Strangers self-hosting on their own machines | A multi-arch image and a one-service compose file — never the Pi |
-The server is memory-only under all three: restarts end all rooms, and
+The server is memory-only under all four: restarts end all rooms, and
 there is nothing to persist — hence no data volume anywhere here. The image
-carries its page; the only mount any shape has is the optional read-only page
-override, which the server only ever reads.
+carries its page; the mounts are the optional read-only page override, which the
+server only ever reads, and the public demo's origin certificate, which is what
+its front terminates TLS with (`prod/README.md`).
 `DESIGN.md` §9 names the missing deployment story; this directory is that
 story's first half.
 

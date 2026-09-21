@@ -1,1 +1,9 @@
-exclude = ["https://fsf.org/"]
+# The two added entries are the public demo's front proxying to its sibling
+# containers by their Compose service names (`packaging/prod/`): those names
+# resolve only inside that deployment's own network, so they are not addresses
+# anything can fetch and not links to check.
+exclude = [
+  "https://fsf.org/",
+  "http://selvaged:8080",
+  "http://selvage-web:8080",
+]
