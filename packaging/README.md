@@ -12,7 +12,7 @@ there is nothing to persist — hence no data volume anywhere here. The image
 carries its page; the only mount any shape has is the optional read-only page
 override, which the server only ever reads.
 `DESIGN.md` §9 names the missing deployment story; this directory is that
-story's first half (the second half, a live VPS, is still unordered spend).
+story's first half.
 
 ## FSL-1.1-MIT redistribution — accepted by the owner, 2026-09-19
 
@@ -207,33 +207,40 @@ against it. `scripts/ci-local.sh image` runs that smoke anywhere nix does.
 
 ### Published releases
 
-`v0.1.0` (2026-09-19, at `7d64cbb`, the merge of \#25) is the first: its tag run —
+The package holds `0.1.0-7d64cbb`, `0.1.0`, `0.1.1-a3f4b12`, `0.1.1` and the moving
+`latest`, which is `0.1.1` as this is written (2026-09-21). `v0.1.0` (2026-09-19, at
+`7d64cbb`, the merge of \#25) was the first: its tag run —
 https://github.com/selvage-protocol/reference\_server/actions/runs/35428735910 —
 published `ghcr.io/selvage-protocol/selvaged:0.1.0-7d64cbb`, `:0.1.0` and `:latest`
-from the `publish` job, whose own assertions pulled both architectures back out of
-the registry and checked `--version` and `/meta` against `0.1.0`.
+from the `publish` job.
 
-**That package is public, and an anonymous pull of it works.** Two different settings are
-in play, and it is worth keeping them apart: an organization decides whether its members
-may create public packages at all (**Package Creation**, under Organization settings →
-Packages), and a package then carries its own **visibility**, which is what makes an
-anonymous pull work. The owner opened the first and set this package to public; a package's
-visibility is irreversible. Verified on 2026-09-19 with **no credentials presented** — no
-account, no `docker login`:
+**The package is public, and an anonymous pull of it works.** The registry mints a pull
+token to a caller who names no identity; verified on 2026-09-21 with **no credentials
+presented**, the tag list and a blob pull both answering. The owner set that, and it is the
+package's own visibility setting, which is irreversible; it is separate from the
+organization's **Package Creation** setting, which decides whether members may create
+public packages at all.
 
-- `GET https://ghcr.io/token?scope=repository:selvage-protocol/selvaged:pull&service=ghcr.io`
-  → `200`, a token minted to a caller who named no identity;
-- the tag list `…/tags/list` → `{"name":"selvage-protocol/selvaged","tags":["0.1.0-7d64cbb","0.1.0","latest"]}`;
-- the tag's manifest `…/manifests/0.1.0` → `application/vnd.oci.image.index.v1+json`, a
-  list holding `linux/amd64` and `linux/arm64` plus the two attestation manifests;
-- a real blob pull through that same token — the `linux/amd64` image config — reporting
-  `"architecture":"amd64"`, `Cmd ["--listen", "0.0.0.0:8080", "--serve-page", "/page"]`
-  and version `0.1.0`.
+**`0.1.0` and `0.1.1` carry the amd64 binary in their `linux/arm64` leg**, so the tag says
+nothing about the architecture inside it: the published image runs on `linux/amd64`, and an
+ARM machine builds from a checkout. `scripts/assert-multiarch-layers.py <tag>` reads a
+tag's two platform manifests out of the registry and checks each one's `/selvaged` for the
+ELF machine its platform claims. Against `0.1.0` and `0.1.1` it reports this and exits
+non-zero:
+
+```text
+linux/amd64 and linux/arm64 carry the exact same layer digests: the arm64 leg was not built separately from the amd64 one
+linux/arm64: /selvaged has ELF e_machine 62, want 183
+```
+
+`publish` and `publish-rehearsal` both run that assertion, after the push: a tag whose legs
+are the same build is already on GHCR when the job goes red, which is the state `0.1.1` is
+in.
 
 A stranger pulls it with no account:
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.1.0
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged
 ```
 
 and `compose.yaml`'s `build: .` remains the route for an image built from a checkout.
@@ -249,9 +256,9 @@ not need because it keeps nothing on disk. `docker compose up`, then
 page built elsewhere is served by uncommenting the single `./page` mount the
 file documents (compose mounts unconditionally when a volume is set, and an
 empty directory would replace the baked page, so the override is commented
-rather than absent). `image:` names the released tag and `build: .` builds the
-same Dockerfile locally, so `compose up` works from a checkout whether or not
-the published package is pullable for that user.
+rather than absent). `image:` names the tag the release publishes and `build: .`
+builds the same Dockerfile locally, so `compose up` works from a checkout whether
+or not that tag is pullable yet.
 
 ### One origin: the page
 
@@ -312,8 +319,7 @@ that changes something the image is built from — `crates/`, the manifests, the
 reads — and on a release tag, one leg per architecture (`amd64` on the usual
 Blacksmith runners, `arm64` on GitHub-hosted ARM — each building natively, no
 cross-compilation): the same nix preamble as the checks job, then
-`scripts/image-smoke.sh`, which needs no Docker daemon at all. That is
-deliberate, not incidental: nine CI
+`scripts/image-smoke.sh`, which needs no Docker daemon at all. Nine CI
 rounds established that these runners cannot execute buildx builds (daemon,
 setup actions, pulls and builder bootstrap all green; every build dead in
 seconds, including `FROM scratch`), so the smoke builds the image the way
@@ -325,10 +331,10 @@ nix image is the daemon-free shape and carries the server alone: the page is the
 `Dockerfile`'s own, and `container` is where it is proved.
 
 `container` is the other half, and the only job that runs the image, on one
-architecture: GitHub-hosted `ubuntu-24.04` (chosen for its Docker daemon and
-unrestricted egress — the Blacksmith runners proved only github-scoped egress
-and could not execute buildx builds), a plain `docker build` of the
-`Dockerfile`, and `scripts/container-smoke.sh`. That script asserts
+architecture: GitHub-hosted `ubuntu-24.04`, chosen for its Docker daemon and its
+egress (the Blacksmith runners proved only github-scoped egress), a plain
+`docker build` of the `Dockerfile`, and `scripts/container-smoke.sh`. That script
+asserts
 `compose.yaml` carries the hardened run, that the container actually runs that
 way (read-only root filesystem, `CapDrop: [ALL]`, `no-new-privileges`, no mount
 at all), that the container's `--version` and `/meta` agree with `Cargo.toml`,
@@ -345,19 +351,19 @@ the compose plugin exist.
 `registry:2` container on the runner's own loopback, the same
 `scripts/release-tags.sh`, the same multi-architecture buildx build as
 `publish` — moving `<version>`/`latest` aliases included — and the same
-`scripts/assert-image-version.sh` assertions: `--version` on both architectures
-and `/meta` against the image that was built. It holds no GHCR credential and
-no elevated permission, and nothing leaves the runner.
+`scripts/assert-image-version.sh` and `scripts/assert-multiarch-layers.py`
+assertions: `--version` on both architectures, `/meta` against the image that
+was built, and each platform's binary checked for the ELF machine it claims. It
+holds no GHCR credential and no elevated permission, and nothing leaves the
+runner.
 
 `publish` needs `[smoke, publish-rehearsal]`, carries an elevated
 permission (`packages: write`), logs in to GHCR with the
 built-in `GITHUB_TOKEN`, and is gated on a tag push (`refs/tags/v*`) whose
 name must equal the Cargo version. It builds with Docker while `smoke` builds
 with nix, which is why the rehearsal exists and why the publish path is
-re-proven on every pull request before a tag can reach it. Both buildx jobs run
-on GitHub-hosted `ubuntu-24.04`: the release path is where the Blacksmith
-runners cannot go, and the pull-request feedback that does not need buildx
-stays there. `release` needs `[publish]`, carries `contents: write`, and is
+re-proven on every pull request before a tag can reach it. `release` needs
+`[publish]`, carries `contents: write`, and is
 gated the same way: the ref is a `v*` tag, not a particular triggering event
 (below). It creates the GitHub Release for the tag from
 `scripts/release-notes.sh` once the image is pushed and re-asserted, and does

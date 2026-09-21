@@ -45,7 +45,8 @@ async fn run(
         && !root.is_dir()
     {
         eprintln!(
-            "--serve-page wants a directory: {} is not one",
+            "--serve-page wants a directory: {} is not one (create it, or drop \
+             the flag to serve /session and /meta alone)",
             root.display()
         );
         exit(2);
@@ -55,8 +56,9 @@ async fn run(
     // answer every page request with a 404, so it is refused once, here, instead.
     if page.is_some() && !Path::new(page::FD_DIR).exists() {
         eprintln!(
-            "--serve-page needs {} to keep a served page inside its root, and \
-             this platform has none",
+            "--serve-page cannot run here: it keeps a served file inside its \
+             root through {}, which this platform does not have. Drop the flag \
+             to serve /session and /meta alone",
             page::FD_DIR
         );
         exit(2);
@@ -134,8 +136,7 @@ fn help_text() -> String {
         address to bind (default {DEFAULT_ADDRESS})\n  --room-grace-ms MS  \
         how long a room survives its host disconnecting, in milliseconds \
         (default {}s)\n  --serve-page DIR    \
-        serve the browser page from DIR on the same origin as /session and \
-        /meta, so its /meta read and socket need no CORS and no second origin\n  \
+        serve the browser page from DIR, on the same origin as /session and /meta\n  \
         --help, -h          print this help\n  --version           \
         print the server version",
         ServerConfig::default().room_grace.as_secs()
@@ -143,16 +144,16 @@ fn help_text() -> String {
 }
 
 fn address(value: &str) -> Result<SocketAddr, String> {
-    value.parse().map_err(|e| {
-        format!("--listen wants an address, e.g. 127.0.0.1:8080\n{e}")
+    value.parse().map_err(|_| {
+        "--listen wants an IP address and port, e.g. 127.0.0.1:8080 (a hostname \
+         is not an address)"
+            .to_string()
     })
 }
 
 fn grace(value: &str) -> Result<Duration, String> {
-    let ms: u64 = value.parse().map_err(|e| {
-        format!(
-            "--room-grace-ms wants a number of milliseconds, e.g. 30000\n{e}"
-        )
+    let ms: u64 = value.parse().map_err(|_| {
+        "--room-grace-ms wants a number of milliseconds, e.g. 30000".to_string()
     })?;
     Ok(Duration::from_millis(ms))
 }
@@ -179,8 +180,7 @@ fn startup_lines(
     )];
     if let Some(root) = page {
         lines.push(format!(
-            "serving the page from {} at http://{local}/ — the page, /meta and \
-            /session share one origin, so no CORS proxy is needed",
+            "serving the page from {} at http://{local}/",
             root.display()
         ));
     }

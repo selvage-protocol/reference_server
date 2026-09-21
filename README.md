@@ -6,14 +6,21 @@ two-client harness that gates it in CI.
 
 ## Get it working
 
-Three routes to a running `selvaged`: from this checkout, from the container image, or
-through `nix run`. It is one binary with no configuration file, and the flags below are
-the whole of its surface.
+`selvaged` is one binary with no configuration file, and the flags below are the whole of
+its surface. The shortest route to a running server is the published image:
+
+```sh
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged
+```
+
+The GHCR package is public, so a pull needs no account and no `docker login`; that
+untagged name is `:latest`, which follows the newest release. The `0.1.0` and `0.1.1`
+arm64 legs carry an amd64 binary, so on an ARM machine build from a checkout instead.
+`packaging/README.md` owns the full tag list and what each tag really contains.
 
 ### From a checkout
 
-`cargo` and `rustc` are not on this host's ambient PATH; they come from the flake, so run
-cargo through the dev shell:
+With Nix, `cargo` and `rustc` come from the flake, so run cargo through the dev shell:
 
 ```sh
 nix develop . -c cargo run -p selvaged -- --listen 127.0.0.1:8080
@@ -28,9 +35,9 @@ nix develop . -c cargo build --release --locked -p selvaged
 ./target/release/selvaged --listen 127.0.0.1:8080
 ```
 
-### The container
+### Build the image from this checkout
 
-One image serves the page and the server on one port, built from this checkout:
+One image serves the page and the server on one port:
 
 ```sh
 docker buildx build --load -t selvaged:local .
@@ -38,36 +45,21 @@ docker run --rm -p 127.0.0.1:8080:8080 selvaged:local
 ```
 
 `docker compose up` builds the same `Dockerfile` through `compose.yaml`, which runs the
-image read-only with every capability dropped. The published image is
-`ghcr.io/selvage-protocol/selvaged:0.1.2`, with `:latest` the same build, and the GHCR
-package is public: it pulls anonymously, with no account and no `docker login`. The
-shortest route to a running server is therefore
+image read-only with every capability dropped. This is the route for an image you are
+changing, or one built from your own checkout.
+
+The page is baked in, so a container needs no mount, and a page built elsewhere overrides
+it by mounting over `/page` — the image's own command already passes `--serve-page /page`:
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.1.2
-```
-
-and the local build above is the route for an image you are changing, or one built from
-your own checkout.
-
-The page is baked in. The image builds the browser client's `dist/` from a pinned revision
-and serves it, so a container needs no mount. The `web_client` repository also publishes the
-page on its own, as `ghcr.io/selvage-protocol/selvage-web`, for the editor on its own origin
-or one page in front of several servers; that second origin changes what a link looks like,
-and *Serving the page* below has both. A page built elsewhere overrides the baked one by
-mounting over it, because the image's own command already passes `--serve-page /page`:
-
-```sh
-docker run --rm -p 127.0.0.1:8080:8080 \
-  -v "$PWD/page:/page:ro" \
-  selvaged:local
+docker run --rm -p 127.0.0.1:8080:8080 -v "$PWD/page:/page:ro" selvaged:local
 ```
 
 The container serves as UID `65532`. Mounted page files need read permission, and their
 directories need read and search permission for that UID, through ownership, group
-membership, or mode bits. Inaccessible files return `404`.
+membership, or mode bits. Inaccessible files return `404`. With no page directory the
+server still answers `/meta` and `/session`, and `/` is `404`.
 
-With no page directory the server still answers `/meta` and `/session`, and `/` is `404`.
 `packaging/README.md` is the rest of it: tags and version truthfulness, the multi-arch
 build, the FSL-1.1-MIT redistribution question, the systemd user unit, and the Pi demo.
 
@@ -100,7 +92,7 @@ usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]
 | Flag | What it does |
 |---|---|
 | `--listen ADDR` | bind `ADDR` (default `127.0.0.1:8080`) |
-| `--room-grace-ms MS` | how long a room survives its host disconnecting, in milliseconds (default `30000`, which the help prints as 30s) |
+| `--room-grace-ms MS` | how long a room survives its host disconnecting, in milliseconds (default `30000`, printed as 30s) |
 | `--serve-page DIR` | serve the browser page from `DIR` on the same origin as `/session` and `/meta` |
 | `--help`, `-h` | print the usage and the flags |
 | `--version` | print `selvaged/<version>` |
@@ -142,12 +134,12 @@ claimed.
 
 ### The checks worth running
 
-Three commands, and they do different things:
+The harness is the quickest way to watch the protocol work:
 
 ```sh
-nix develop . -c cargo test                                   # protocol unit tests, convergence and lifecycle
-nix develop . -c cargo test -p selvage-harness --test vectors  # the vector replay over vectors/
 nix develop . -c cargo run -p selvage-harness                  # the whole slice, printed step by step
+nix develop . -c cargo test                                    # protocol unit tests, convergence and lifecycle
+nix develop . -c cargo test -p selvage-harness --test vectors  # the vector replay over vectors/
 ```
 
 `cargo run -p selvage-harness` runs a scripted demo transcript: it starts a server, mints
@@ -158,17 +150,16 @@ for a client to connect instead, and a client's output carries the invite link.
 one flake check per step, and needs `nix`:
 
 ```sh
-scripts/ci-local.sh all        # format, clippy, tests, the default package, licences, every check evaluated, the TLS front, actionlint
+scripts/ci-local.sh all        # the whole gate, and what the `checks` job runs
 scripts/ci-local.sh nightly    # coverage, the rest of cargo-deny and cargo-audit (slow)
 scripts/ci-local.sh lint       # actionlint over the workflow files, on its own
 scripts/ci-local.sh image      # the nix-built image smoke, no Docker needed
 scripts/ci-local.sh container  # docker build, docker run and a room join (needs Docker)
 ```
 
-`all` is what the `checks` job runs; `nightly` is opt-in because it is slow. Two jobs of
-the `image` workflow have no step here, the multi-arch buildx rehearsal and publish, since
-this host has no Docker, let alone buildx; they are read from the run and from the scripts
-those jobs share with `container`.
+`all` is what the `checks` job runs; `nightly` is opt-in because it is slow. The `image`
+workflow's two buildx jobs have no step here, since this host has no Docker, let alone
+buildx; a pull request's checks are where they run.
 
 ## What lives here
 
@@ -223,18 +214,18 @@ the image builds it from a pinned revision and serves it.
 `web_client` also publishes the bundle as a page-only image,
 `ghcr.io/selvage-protocol/selvage-web`, whose own README owns the build, the tags and the
 runtime. It is for putting the editor on its own origin, or for one page in front of several
-servers. That is a second origin, and it works because the page's socket is not CORS-bound
-and its `/meta` read is only advisory — but it costs a second port and a second thing to
-upgrade, and every invite link must then name the server, as `?server=`, because the page's
-built-in default is one particular endpoint and the page's own origin says nothing about
-which server to dial. One origin stays the default: this image, whose page, `/meta` and
-`/session` share one listener, and `--serve-page` from any deployment.
+servers. That second origin works because the page's socket is not CORS-bound and its
+`/meta` read is only advisory, but it costs a second port and a second thing to upgrade, and
+every invite link must then name the server as `?server=`, because the page's built-in
+default is one particular endpoint and its own origin says nothing about which server to
+dial. One origin stays the default: this image, whose page, `/meta` and `/session` share one
+listener, and `--serve-page` from any deployment.
 
-Served files carry the policy a browser needs: a media type from a pinned table (never the
-host's mime database), `Cache-Control: no-cache` for a stable name and `public,
-max-age=31536000, immutable` for a content-hashed one, `Referrer-Policy: no-referrer`
-because an invite URL carries the room token and must not travel on in a `Referer` header,
-`X-Content-Type-Options: nosniff`, and a `Content-Security-Policy`.
+Served files carry the policy a browser needs: a media type from a pinned table,
+`Cache-Control: no-cache` for a stable name and `public, max-age=31536000, immutable` for a
+content-hashed one, `X-Content-Type-Options: nosniff`, a `Content-Security-Policy`, and
+`Referrer-Policy: no-referrer`, because an invite URL carries the room token and must not
+travel on in a `Referer` header.
 
 `scripts/container-smoke.sh` builds the image with Docker, runs it read-only with every
 capability dropped, asserts the page the image bakes, and joins a room in it with the
@@ -246,13 +237,12 @@ exists.
 The wire protocol is described by the specification repository,
 [`selvage-protocol/specification`](https://github.com/selvage-protocol/specification):
 `PROTOCOL.md` is the prose, `CANONICAL.md` fixes the bytes of a frame, and `schema/` is the
-machine-readable model. That repository is the canonical source for all three, and this one
-authors none of them.
+machine-readable model. This repository authors none of it.
 
 Its wire vectors are vendored here as `vectors/`, next to the harness that replays them, so
 that a plain `cargo test` and the Nix sandbox need no sibling checkout.
-`scripts/sync-vectors.sh` copies them in from a specification checkout when they change; the
-specification remains the canonical source.
+`scripts/sync-vectors.sh` copies them in from a specification checkout when they change, and
+the specification remains the canonical source.
 
 The replay reads `vectors/`, or `SELVAGE_VECTORS` when that is set. The Nix build cannot see
 outside the Cargo workspace, so `flake.nix` hands the directory in explicitly.
