@@ -170,15 +170,18 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Action, String> {
     // The outbound queue has to hold one whole frame, and the largest frame this
     // configuration can be asked to carry is the room's open-document set echoed to every
     // peer, the whole grant, or a relayed payload. A queue below that does not bound
-    // memory, it breaks sessions: a handshake frame nobody can queue seats nobody, and a
-    // host is dropped for publishing a grant larger than what the server holds for it.
+    // memory, it breaks sessions: a handshake frame nobody can queue seats nobody, and
+    // every peer — the one that asked included — is dropped for opening a path the server
+    // echoed. What a frame costs is its wire bytes, so a set of paths JSON has to escape
+    // costs twice their length, which is the usual reason this fires.
     let smallest = config.smallest_queue_bytes();
     if config.max_queue_bytes < smallest {
         return Err(format!(
             "--outbound-queue-bytes {} is below the {smallest} bytes this configuration \
              needs: the queue has to hold one whole frame, which is the room's \
              open-document set echoed to every peer, the whole grant, or a relayed \
-             payload. Raise --outbound-queue-bytes, or lower --max-documents-per-room",
+             payload, counted in the bytes the frame wires to. Raise \
+             --outbound-queue-bytes, or lower --max-documents-per-room",
             config.max_queue_bytes
         ));
     }
@@ -681,10 +684,21 @@ mod tests {
 
     /// An outbound queue below what one frame needs is refused at the command line, with
     /// the flag named: the failure it would otherwise cause is a handshake that seats
-    /// nobody, or a host dropped for publishing a grant its own queue cannot hold.
+    /// nobody, or every peer dropped, the publisher included, for a `doc.open` the
+    /// server itself echoed.
     #[test]
     fn a_queue_that_cannot_hold_a_frame_is_refused() {
+        // The 8 MiB frame bound `PROTOCOL.md` §2.1 states, which a deployment reaches for
+        // first and which is not the floor at the reference document cap.
+        const FRAME_BOUND: usize = 8 * 1024 * 1024;
         let smallest = ServerConfig::default().smallest_queue_bytes();
+        // The floor counts the frame and not the path: the reference document cap holds
+        // 4 MiB of path bytes, which JSON may write as 8 MiB, so the largest frame the
+        // server can echo is wider than the frame bound.
+        assert!(
+            smallest > FRAME_BOUND,
+            "an escaped set is wider than the frame bound: {smallest}"
+        );
         let refused = args(&[
             "--outbound-queue-bytes",
             &smallest.saturating_sub(1).to_string(),

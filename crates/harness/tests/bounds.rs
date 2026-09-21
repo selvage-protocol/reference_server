@@ -6,6 +6,7 @@
 //! refused — is pinned in `session.rs`.
 
 use selvage_protocol as proto;
+use selvaged::ServerConfig;
 use yrs::sync::{Message as YMessage, SyncMessage};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact};
@@ -192,5 +193,74 @@ fn full_set_echoes_wire_to_about_4_mib() {
     assert!(
         granted < 5 * 1024 * 1024,
         "the widest grant echo stays near the budget: {granted}"
+    );
+}
+
+/// The same echoes written the way a legal path can double, which is the shape the paths
+/// of a working tree never take but a peer may: JSON writes a `"` or a `\` as two
+/// bytes, so 1024 paths of 4096 backslashes hold 4 MiB of path bytes and wire to 8 MiB.
+///
+/// This is the frame the outbound queue has to hold, and the floor `--outbound-queue-bytes`
+/// is refused below, so it is measured against `ServerConfig::smallest_queue_bytes` rather
+/// than against a number written down here. The unescaped shape above is what a set of
+/// this size usually costs; this one is why a floor counted in path bytes is not a floor.
+#[test]
+fn an_escaped_full_set_fits_the_queue_floor() {
+    let config = ServerConfig::default();
+    let floor = config.smallest_queue_bytes();
+    eprintln!(
+        "the queue floor for the reference configuration is {floor} bytes"
+    );
+
+    // Every path at both caps, and every byte of it escaping to two.
+    let path = "\\".repeat(4096);
+    let opened = proto::ServerMessage::event(
+        "doc.opened",
+        serde_json::json!({
+            "peer_id": "p-0123456789abcdef",
+            "path": path,
+            "documents": vec![path; 1024],
+        }),
+    )
+    .to_text()
+    .expect("serializes")
+    .len();
+    eprintln!("an escaped doc.opened with a full set wires to {opened} bytes");
+    assert!(
+        opened <= floor,
+        "the widest set echo does not fit the queue floor: {opened} > {floor}"
+    );
+
+    // The widest listing the byte budget admits is twice that on the wire, and no
+    // envelope can carry it, so what the floor has to hold is what can arrive: the server
+    // echoes a `doc.grant` only after it has parsed one, and one frame is all it arrives
+    // in. Pinned as the invariant rather than as the echo, because the echo of a listing
+    // that cannot arrive is not a frame this server can be handed.
+    let paths: Vec<String> = (0..1024).map(|_| "\\".repeat(4096)).collect();
+    let listed: usize = paths.iter().map(String::len).sum();
+    assert_eq!(listed, 4 * 1024 * 1024, "the listing is at the byte budget");
+    let granted = proto::ServerMessage::event(
+        "doc.granted",
+        serde_json::json!({ "paths": paths }),
+    )
+    .to_text()
+    .expect("serializes")
+    .len();
+    eprintln!(
+        "an escaped doc.granted with that listing wires to {granted} bytes, against a \
+         {}-byte envelope bound",
+        config.max_envelope_bytes
+    );
+    assert!(
+        granted > config.max_envelope_bytes,
+        "this listing is one the envelope bound refuses: {granted} ≤ {}",
+        config.max_envelope_bytes
+    );
+    // A listing that does arrive whole is echoed whole, so the floor has to clear the
+    // envelope the server will parse: the event carries the same bytes back.
+    assert!(
+        floor >= config.max_envelope_bytes,
+        "a listing that arrives whole has to be echoable whole: {floor} < {}",
+        config.max_envelope_bytes
     );
 }

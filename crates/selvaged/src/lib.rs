@@ -62,11 +62,16 @@ pub struct ServerConfig {
     /// server can hold, so a small host sizes it rather than its peer count.
     pub max_queue_bytes: usize,
     /// The largest inbound text envelope this server will parse, in bytes. Checked on
-    /// the frame's length *before* `serde_json` sees it: the widest legal request is a
-    /// `doc.grant` carrying [`net::MAX_GRANT_BYTES`](crate::net) of paths, and parsing
-    /// megabytes of attacker-chosen JSON to find out it was too big is the cost this
-    /// bound removes. A frame past it is refused `bad_message` on the frame's own
-    /// vocabulary, with the connection left open.
+    /// the frame's length *before* `serde_json` sees it: parsing megabytes of
+    /// attacker-chosen JSON to find out it was too big is the cost this bound removes.
+    /// It sits below the transport's frame bound, so an envelope past it is refused
+    /// `bad_message` on the frame's own vocabulary with the connection left open, rather
+    /// than ending the connection the way an over-bound frame does.
+    ///
+    /// Its unit is wire bytes, which is not the unit a listing is measured in:
+    /// `doc.grant`'s listing is capped in path bytes by
+    /// [`net::MAX_GRANT_BYTES`](crate::net), and JSON writes a `"` or a `\` as two
+    /// bytes, so a listing written in either carries half the path bytes it could.
     pub max_envelope_bytes: usize,
     /// The bytes per second one connection may send, refilled continuously. Past it the
     /// connection is told so and ended: the peer's session is over, and its reconnect
@@ -95,9 +100,12 @@ impl Default for ServerConfig {
             max_peers_per_room: 128,
             max_documents_per_room: 1024,
             max_queue_bytes: room::MAX_QUEUE_BYTES,
-            // 5 MiB: the 4 MiB a full grant's paths may occupy, plus the JSON around
-            // them and the escaping a path may need. A grant that escapes past it is
-            // refused with the bound named rather than parsed.
+            // 5 MiB, inside the 8 MiB frame bound so that an over-bound envelope is
+            // refused on the frame's own vocabulary and not by ending the connection.
+            // The 4 MiB a full grant's paths may occupy does not always fit here: a path
+            // whose bytes all escape wires to twice its length, and a listing heavy in
+            // them is refused with the bound named rather than parsed, the same way a
+            // listing past the byte budget is.
             max_envelope_bytes: 5 * 1024 * 1024,
             // 2 MiB/s sustained, 64 MiB bursting. Above anything an editor does — a
             // keystroke is tens of bytes, a presence update one a quiescent 100 ms —
@@ -118,18 +126,35 @@ impl ServerConfig {
     /// handshake that cannot be delivered seats nothing and a host whose own grant is
     /// larger than its queue is dropped by publishing it.
     ///
-    /// [`ServerConfig::default`] clears this at 8 MiB (the frame bound); the arithmetic is
-    /// what a deployment lowers `--max-documents-per-room` for, since the document set is
-    /// echoed whole to every peer on every change.
+    /// What is counted is the frame, and a frame is not measured in paths. JSON writes a
+    /// `"` or a `\` as two bytes, and a path carries no control character
+    /// (`PROTOCOL.md` §5), so a legal path wires to at most twice its length and a set of
+    /// them to twice its path bytes. A grant cannot reach that: a host publishes one as a
+    /// single `doc.grant`, so the largest listing a room can hold is one whose own frame
+    /// fit the envelope bound, and the event echoing it is the same listing written
+    /// again.
+    ///
+    /// [`ServerConfig::default`] clears this; the arithmetic is what a deployment lowers
+    /// `--max-documents-per-room` for, since the document set is echoed whole to every
+    /// peer on every change.
     #[must_use]
     pub fn smallest_queue_bytes(&self) -> usize {
-        // The peers list and the envelope around the set, on top of the paths themselves.
+        // The peers list, the path a `doc.*` event names and the envelope around them.
         const ENVELOPE_HEADROOM: usize = 64 * 1024;
+        // The most JSON adds to one byte: `"` and `\` are written as two, and every
+        // other byte a path may carry is written as one.
+        const MAX_ESCAPE: usize = 2;
         let documents = self
             .max_documents_per_room
             .saturating_mul(net::MAX_DOC_PATH_BYTES)
+            .saturating_mul(MAX_ESCAPE)
             .saturating_add(ENVELOPE_HEADROOM);
-        let grant = net::MAX_GRANT_BYTES.saturating_add(ENVELOPE_HEADROOM);
+        // A listing is bounded in path bytes and, being one frame, in wire bytes; the
+        // smaller of the two is all the room can hold and therefore all it can echo.
+        let grant = net::MAX_GRANT_BYTES
+            .saturating_mul(MAX_ESCAPE)
+            .min(net::MAX_FRAME_BYTES.min(self.max_envelope_bytes))
+            .saturating_add(ENVELOPE_HEADROOM);
         net::MAX_FRAME_BYTES.max(documents).max(grant)
     }
 }

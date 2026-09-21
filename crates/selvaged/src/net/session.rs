@@ -46,6 +46,12 @@ pub const MAX_GRANT_PATH_BYTES: usize = 4096;
 /// ~400 MiB of room state, re-serialized on every publish and delivered whole to every
 /// late joiner. What a late joiner can be sent is bounded by what could be published.
 ///
+/// Its unit is the path, not the frame. JSON writes a `"` or a `\` as two bytes, so a
+/// listing written in either is up to twice this on the wire, and the `doc.grant` that
+/// carries it has to fit the envelope bound besides — the room state this caps and the
+/// frames that carry it are different sizes, and the smaller bound is the one a given
+/// listing meets.
+///
 /// 4 MiB clears measured real use with headroom: a 25,000-path working-tree listing is
 /// 893,750 path bytes, and 100,000 typical paths are 3,575,000 bytes, both publishing
 /// whole; a contaminated tree (123,883 files, ~11.9 MiB of path bytes with build
