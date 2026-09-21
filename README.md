@@ -110,11 +110,11 @@ usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]
 | `--help`, `-h` | print the usage and the flags |
 | `--version` | print `selvaged/<version>` |
 
-Every default is the reference value, so an existing deployment changes by nothing but the
-flags it now passes. The four capacity flags are bounds on what one process holds in memory
-and only that process can enforce them; the envelope bound and the inbound budget are what
-one connection may send, and they are judged in-process because a front cannot see either
-one. *Sizing a box*, below, says which of a deployment's bounds belong where.
+Every default is the reference value. The four capacity flags are bounds on what one
+process holds in memory and only that process can enforce them; the envelope bound and
+the inbound budget are what one connection may send, and they are judged in-process
+because a front cannot see either one. *Sizing a box*, below, says which of a
+deployment's bounds belong where.
 
 ### What happens at a limit
 
@@ -158,7 +158,7 @@ counted in path bytes is not a floor. A queue below the largest of those does no
 memory, it breaks sessions — a handshake frame nobody can queue seats nobody, and every
 peer is ejected, the publisher included, for a `doc.open` the server itself echoed — so the
 command line refuses the combination and says which flag to move. That also makes the queue
-the honest place the echo is paid for: the set is why lowering `--max-documents-per-room`
+the place the echo is paid for: the set is why lowering `--max-documents-per-room`
 is what buys a smaller queue.
 
 For a 1 GiB box with something else running on it, these are a defensible set:

@@ -132,8 +132,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Action, String> {
                     .ok_or("--serve-page wants a directory, e.g. /page")?;
                 page = Some(PathBuf::from(value));
             }
-            // The capacity flags, each defaulting to the reference value so an
-            // existing deployment changes by nothing but the flags it now passes.
+            // The capacity flags, each defaulting to the reference value.
             "--max-connections" => {
                 config.max_connections = limit(&mut args, "--max-connections")?;
             }
@@ -298,7 +297,7 @@ fn endpoint_help(default: &ServerConfig) -> Vec<(&'static str, String)> {
 
 /// The flags that size what one server holds. Each is a bound on this process's own
 /// memory, which only this process can enforce, and each defaults to the reference
-/// value so an existing deployment changes by nothing but the flags it passes.
+/// value.
 fn capacity_help(default: &ServerConfig) -> Vec<(&'static str, String)> {
     vec![
         (
@@ -558,8 +557,8 @@ mod tests {
         assert_eq!(plan.config, untouched);
     }
 
-    /// The two bounds that close the text-envelope and rate-limit findings are flags
-    /// too, and they land in the fields the server reads them from.
+    /// The two bounds on what one connection may send are flags too, and they land in
+    /// the fields the server reads them from.
     #[test]
     fn the_abuse_flags_set_their_own_limits() {
         let plan = plan(&[
