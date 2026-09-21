@@ -38,6 +38,8 @@ use crate::{ServerConfig, random_hex};
 
 mod session;
 
+pub use session::{MAX_DOC_PATH_BYTES, MAX_GRANT_BYTES};
+
 use session::{Applicant, Session, grace_ms, handshake};
 
 const MAX_HEAD_BYTES: usize = 16 * 1024;
@@ -62,7 +64,7 @@ const HEAD_TOO_LARGE_BODY: &str = r#"{"error":"request head too large","hint":"s
 /// pastes to ~8 MiB and history-amplified documents to a few megabytes live. Shapes
 /// measured in `crates/harness/tests/bounds.rs`, clearance pinned in
 /// `crates/harness/tests/session.rs`.
-const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// RFC 6455 allows 125 bytes in a control-frame payload, and a close frame spends two of
 /// them on its status code.
@@ -297,6 +299,14 @@ impl Shared {
     /// answers with — so the close is 4002 (§11).
     async fn serve_session(&self, ws: SessionSocket, query: &str) {
         let mut wire = Wire::new(ws, self.config.max_queue_bytes);
+        // One budget per connection, built before the handshake and carried through it:
+        // the frames a peer sends while it is not yet seated are the ones it never reads
+        // an answer to, so they are the cheapest ones to flood with, and a connection
+        // that spends its budget there is refused exactly as a seated one is.
+        let mut budget = InboundBudget::new(
+            self.config.inbound_bytes_per_sec,
+            self.config.inbound_burst_bytes,
+        );
         let join = match proto::parse_join_query(query) {
             Ok(join) => join,
             Err(error) => {
@@ -306,7 +316,8 @@ impl Shared {
         };
         let claims_host = join.room.is_none();
         let greeted =
-            handshake(&mut wire.stream, claims_host, &self.config).await;
+            handshake(&mut wire.stream, claims_host, &self.config, &mut budget)
+                .await;
         let seated = match greeted {
             Ok(hello) => {
                 let (poison_tx, poison_rx) = oneshot::channel();
@@ -325,7 +336,9 @@ impl Shared {
             Err(refusal) => Err(refusal),
         };
         match seated {
-            Ok((session, poison)) => self.drive(session, wire, poison).await,
+            Ok((session, poison)) => {
+                self.drive(session, wire, poison, budget).await;
+            }
             Err((code, message)) => refuse(wire, code, message).await,
         }
     }
@@ -333,13 +346,14 @@ impl Shared {
     /// Runs a seated session until the connection ends, then lets the peers know.
     #[expect(
         clippy::too_many_arguments,
-        reason = "a drive names its session, transport and poison channel; all three move into the turn loop"
+        reason = "a drive names its session, transport, poison channel and the budget the handshake already drew on; all four move into the turn loop"
     )]
     async fn drive(
         &self,
         session: Session,
         wire: Wire,
         poison: oneshot::Receiver<()>,
+        budget: InboundBudget,
     ) {
         let mut ping = interval(self.config.ping_interval);
         ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -351,10 +365,7 @@ impl Shared {
             ping,
             poison,
             missed_pings: AtomicU32::new(0),
-            budget: InboundBudget::new(
-                self.config.inbound_bytes_per_sec,
-                self.config.inbound_burst_bytes,
-            ),
+            budget,
         };
         pump(&mut live, self).await;
         live.session.leave(self).await;
@@ -483,15 +494,18 @@ impl Live {
         incoming: Option<Result<Message, WireError>>,
         shared: &Shared,
     ) -> bool {
-        if matches!(incoming, Some(Ok(Message::Pong(_)))) {
-            self.missed_pings.store(0, Ordering::Relaxed);
-            return true;
-        }
+        // Every frame but a close is charged, the answers to this server's own pings
+        // included: an unsolicited Pong is a frame like any other, and the ping interval
+        // makes a legitimate one cost a kilobyte a turn.
         if let Some(Ok(frame)) = &incoming
             && !self.budget.try_take(payload_len(frame))
         {
             self.over_budget(shared);
             return false;
+        }
+        if matches!(incoming, Some(Ok(Message::Pong(_)))) {
+            self.missed_pings.store(0, Ordering::Relaxed);
+            return true;
         }
         self.session.handle_frame(incoming, shared).await
     }
@@ -501,12 +515,7 @@ impl Live {
     /// writer, and a queue that will not take them means the peer had stopped reading
     /// long before its budget ran out.
     fn over_budget(&self, shared: &Shared) {
-        let message = format!(
-            "this connection sent past its inbound budget of {} bytes a second (burst {}); \
-             the session is over and a reconnect starts with a fresh budget",
-            shared.config.inbound_bytes_per_sec,
-            shared.config.inbound_burst_bytes
-        );
+        let message = budget_message(&shared.config);
         let event = proto::ServerMessage::event(
             event::SESSION_ERROR,
             serde_json::json!({ "code": RATE_LIMITED, "message": message }),
@@ -521,13 +530,25 @@ impl Live {
     }
 }
 
-/// What one inbound frame carries, in bytes. A Pong is `0`: it is the answer to a ping
-/// this server sent, so charging it would bill a peer for the keepalive.
-fn payload_len(frame: &Message) -> usize {
+/// What a peer is told when it has spent its inbound budget: the numbers it passed and
+/// what happens next. The handshake builds the same refusal, from the same words.
+pub fn budget_message(config: &ServerConfig) -> String {
+    format!(
+        "this connection sent past its inbound budget of {} bytes a second (burst {}); \
+         the session is over and a reconnect starts with a fresh budget",
+        config.inbound_bytes_per_sec, config.inbound_burst_bytes
+    )
+}
+
+/// What one inbound frame carries, in bytes. A close carries nothing: it is not a shape
+/// anything can be flooded with, because the first one ends the connection.
+pub fn payload_len(frame: &Message) -> usize {
     match frame {
         Message::Text(text) => text.len(),
-        Message::Binary(bytes) | Message::Ping(bytes) => bytes.len(),
-        Message::Close(_) | Message::Pong(_) | Message::Frame(_) => 0,
+        Message::Binary(bytes)
+        | Message::Ping(bytes)
+        | Message::Pong(bytes) => bytes.len(),
+        Message::Close(_) | Message::Frame(_) => 0,
     }
 }
 

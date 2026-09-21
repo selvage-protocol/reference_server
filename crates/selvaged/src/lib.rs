@@ -110,6 +110,30 @@ impl Default for ServerConfig {
     }
 }
 
+impl ServerConfig {
+    /// The smallest outbound queue that can hold every frame this configuration can put
+    /// in one: the largest frame a peer may relay, the room's whole open-document set as
+    /// the events echo it, and the whole grant. A queue below this does not bound memory,
+    /// it breaks sessions — a frame the queue refuses is a frame nobody receives, so the
+    /// handshake that cannot be delivered seats nothing and a host whose own grant is
+    /// larger than its queue is dropped by publishing it.
+    ///
+    /// [`ServerConfig::default`] clears this at 8 MiB (the frame bound); the arithmetic is
+    /// what a deployment lowers `--max-documents-per-room` for, since the document set is
+    /// echoed whole to every peer on every change.
+    #[must_use]
+    pub fn smallest_queue_bytes(&self) -> usize {
+        // The peers list and the envelope around the set, on top of the paths themselves.
+        const ENVELOPE_HEADROOM: usize = 64 * 1024;
+        let documents = self
+            .max_documents_per_room
+            .saturating_mul(net::MAX_DOC_PATH_BYTES)
+            .saturating_add(ENVELOPE_HEADROOM);
+        let grant = net::MAX_GRANT_BYTES.saturating_add(ENVELOPE_HEADROOM);
+        net::MAX_FRAME_BYTES.max(documents).max(grant)
+    }
+}
+
 pub struct Server {
     listener: TcpListener,
     /// The address the listener is actually bound to, resolved once at bind time.

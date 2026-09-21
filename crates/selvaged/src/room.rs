@@ -481,6 +481,16 @@ impl Registry {
         })
     }
 
+    /// Takes a room out of the registry outright, returning it.
+    ///
+    /// A mint whose handshake never reached its host has no peers to announce and no
+    /// grace period to arm, and leaving it would hold a room slot for a session that does
+    /// not exist. Removing it twice is [`None`].
+    #[must_use]
+    pub fn remove_room(&mut self, room_id: &str) -> Option<Room> {
+        self.rooms.remove(room_id)
+    }
+
     #[must_use]
     pub fn room(&self, room_id: &str) -> Option<&Room> {
         self.rooms.get(room_id)

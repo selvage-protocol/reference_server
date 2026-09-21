@@ -3639,12 +3639,111 @@ async fn flood_answered_requests(
     }
 }
 
+/// Asserts that a connection ends promptly rather than lingering, and reports how it
+/// ended when it does not: a peer left holding a seat while its client waits is the
+/// failure this shape looks for.
+#[expect(
+    clippy::panic,
+    reason = "a socket that lingers is a test failure, not a value to recover"
+)]
+async fn ends_promptly(raw: &mut RawSocket) {
+    match timeout(WAIT, raw.read_to_end()).await {
+        Ok(None | Some(ErrorKind::ConnectionReset)) => {}
+        Ok(Some(kind)) => {
+            panic!("the socket ends; it does not linger: {kind:?}");
+        }
+        Err(elapsed) => panic!("the server ends the connection: {elapsed}"),
+    }
+}
+
+/// Sends `count` one-byte Ping frames, stopping when the server ends the socket: a write
+/// that fails means the budget was already spent and the refusal is on its way.
+async fn ping_flood(raw: &mut RawSocket, count: u32) {
+    for _ in 0..count {
+        if raw.send(0x9, &[0u8]).await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Reads the close of a connection the server has refused, returning its status code.
 async fn refused_close_code(raw: &mut RawSocket) -> Result<u16, Failure> {
     let frame = timeout(WAIT, raw.read_to_close()).await??;
     frame
         .close_code()
         .ok_or_else(|| "the close frame carries no status code".into())
+}
+
+/// A handshake frame the outbound queue will not take seats nobody: the connection is
+/// refused promptly instead of leaving a client waiting for a `room.created` that is
+/// already lost, and the server keeps serving everyone else. The bookkeeping that takes
+/// the placement back is pinned in `crates/selvaged/src/net/session.rs`, where the sizes
+/// are exact.
+#[tokio::test]
+async fn a_handshake_that_cannot_be_delivered_ends_the_connection() {
+    let harness = Harness::start_with(ServerConfig {
+        // A queue not even a fresh room's `room.created` fits in.
+        max_queue_bytes: 128,
+        max_rooms: 1,
+        ..ServerConfig::default()
+    })
+    .await;
+    let mut first = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    first
+        .hello(&serde_json::json!({"display_name": "Ada"}))
+        .await
+        .expect("says hello");
+    // Nothing fits, so nothing arrives, and the socket ends rather than holding a seat
+    // while its client waits.
+    ends_promptly(&mut first).await;
+
+    // Two more connections are accepted and answered the same way: a refused handshake
+    // leaves the server serving.
+    for _ in 0..2 {
+        let mut next = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+            .await
+            .expect("the upgrade still succeeds");
+        next.hello(&serde_json::json!({"display_name": "Bob"}))
+            .await
+            .expect("says hello");
+        ends_promptly(&mut next).await;
+    }
+    let addr = harness.ws_base().trim_start_matches("ws://").to_string();
+    let mut plain = TcpStream::connect(&addr).await.expect("connects");
+    plain
+        .write_all(
+            format!("GET /meta HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .expect("sends a request");
+    let head = read_http_head(&mut plain).await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 200"), "got {head:?}");
+}
+
+/// What a peer sends before it is seated is charged too: the frames a peer never reads an
+/// answer to are the cheapest ones to flood with, and a connection that spends its budget
+/// there is refused like a seated one, with the room never learning it existed.
+#[tokio::test]
+async fn a_pre_seat_flood_is_budgeted_too() {
+    let harness = Harness::start_with(flooded()).await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    // One-byte Ping frames before hello: nothing else rejects them — a control frame
+    // carries at most 125 bytes — so nothing but the budget stops a peer that sends them
+    // back to back.
+    ping_flood(&mut raw, 1200).await;
+    let refusal =
+        next_json_within(&mut raw, "the pre-seat budget refusal").await;
+    assert_eq!(refusal["params"]["code"], RATE_LIMITED);
+    assert_eq!(
+        refused_close_code(&mut raw).await.expect("the close"),
+        close::PROTOCOL_ERROR,
+        "every fault before seating closes, and 4xxx is this server's own range"
+    );
 }
 
 /// A text envelope past the configured bound is refused on its length, and the

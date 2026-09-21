@@ -167,6 +167,21 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Action, String> {
             _ => return Err(format!("unknown argument: {arg}\n{USAGE}")),
         }
     }
+    // The outbound queue has to hold one whole frame, and the largest frame this
+    // configuration can be asked to carry is the room's open-document set echoed to every
+    // peer, the whole grant, or a relayed payload. A queue below that does not bound
+    // memory, it breaks sessions: a handshake frame nobody can queue seats nobody, and a
+    // host is dropped for publishing a grant larger than what the server holds for it.
+    let smallest = config.smallest_queue_bytes();
+    if config.max_queue_bytes < smallest {
+        return Err(format!(
+            "--outbound-queue-bytes {} is below the {smallest} bytes this configuration \
+             needs: the queue has to hold one whole frame, which is the room's \
+             open-document set echoed to every peer, the whole grant, or a relayed \
+             payload. Raise --outbound-queue-bytes, or lower --max-documents-per-room",
+            config.max_queue_bytes
+        ));
+    }
     Ok(Action::Run(Box::new(Run { addr, page, config })))
 }
 
@@ -522,19 +537,19 @@ mod tests {
             "--max-documents-per-room",
             "5",
             "--outbound-queue-bytes",
-            "4194304",
+            "16777216",
         ]);
         assert_eq!(plan.config.max_connections, 8);
         assert_eq!(plan.config.max_rooms, 7);
         assert_eq!(plan.config.max_peers_per_room, 6);
         assert_eq!(plan.config.max_documents_per_room, 5);
-        assert_eq!(plan.config.max_queue_bytes, 4 * 1024 * 1024);
+        assert_eq!(plan.config.max_queue_bytes, 16 * 1024 * 1024);
         let untouched = ServerConfig {
             max_connections: 8,
             max_rooms: 7,
             max_peers_per_room: 6,
             max_documents_per_room: 5,
-            max_queue_bytes: 4 * 1024 * 1024,
+            max_queue_bytes: 16 * 1024 * 1024,
             ..ServerConfig::default()
         };
         assert_eq!(plan.config, untouched);
@@ -662,6 +677,33 @@ mod tests {
                 "{wanted} is not in the help: {help}"
             );
         }
+    }
+
+    /// An outbound queue below what one frame needs is refused at the command line, with
+    /// the flag named: the failure it would otherwise cause is a handshake that seats
+    /// nobody, or a host dropped for publishing a grant its own queue cannot hold.
+    #[test]
+    fn a_queue_that_cannot_hold_a_frame_is_refused() {
+        let smallest = ServerConfig::default().smallest_queue_bytes();
+        let refused = args(&[
+            "--outbound-queue-bytes",
+            &smallest.saturating_sub(1).to_string(),
+        ])
+        .expect_err("a queue below one frame is refused");
+        assert!(refused.contains("--outbound-queue-bytes"), "{refused}");
+        assert!(refused.contains(&smallest.to_string()), "{refused}");
+        // The floor is not a fixed number: a document set past it raises it, so the same
+        // queue is refused for one configuration and accepted for another.
+        let wide = args(&[
+            "--outbound-queue-bytes",
+            &smallest.to_string(),
+            "--max-documents-per-room",
+            "8192",
+        ])
+        .expect_err("an open-document set wider than the queue is refused");
+        assert!(wide.contains("--max-documents-per-room"), "{wide}");
+        let accepted = plan(&["--outbound-queue-bytes", &smallest.to_string()]);
+        assert_eq!(accepted.config.max_queue_bytes, smallest);
     }
 
     /// A byte count reads as the unit a reader sizes a box in, and a count that is not
