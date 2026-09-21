@@ -111,11 +111,11 @@ have (at the defaults, `--max-connections × --outbound-queue-bytes` is 32 GiB).
 | Flag | Value | Why this one |
 |---|---|---|
 | `--max-connections` | 32 | Multiplies the per-connection queue, so it is the term that sizes the process: 32 × 8 MiB is a 256 MiB outbound ceiling, the largest surprise this host can absorb. A demo may have 32 live sockets; the server's own README ("Sizing a box") offers 32 as a defensible set for a box around this size. |
-| `--outbound-queue-bytes` | 8388608 | The server refuses anything below one whole frame, and one whole frame is 8 MiB (`net::MAX_FRAME_BYTES`). 8 MiB is therefore the smallest queue this configuration accepts, not a choice among larger ones. |
+| `--outbound-queue-bytes` | 8388608 | The server refuses anything below the largest frame this configuration can generate, and at these numbers that is one whole frame: 8 MiB (`net::MAX_FRAME_BYTES`). The document set (256 × 4 KiB of paths, twice over for the ones JSON escapes) and the grant the envelope bound admits both fit inside it, so it is the frame bound that is the floor here. 8 MiB is therefore the smallest queue this configuration accepts, not a choice among larger ones. |
 | `--max-rooms` | 64 | Rooms held at once. More than a demo needs, and each one's documents are the other unbounded term, so it is bounded here. |
 | `--max-peers-per-room` | 8 | One room is a session with a friend; 8 peers × 256 paths is the coupling the README warns pairs with the queue. |
 | `--max-documents-per-room` | 256 | The document set is echoed whole to every peer on `doc.open`/`doc.close`, so lowering it is what lowers the echo — and it is what makes the 8 MiB queue the floor rather than something higher. |
-| `--max-envelope-bytes` | 5242880 | The default, unchanged on purpose: the widest legal request is a `doc.grant` carrying 4 MiB of paths, and a smaller bound would refuse a legal one. |
+| `--max-envelope-bytes` | 5242880 | The default, unchanged on purpose: 4 MiB of listing bytes is the policy bound, and 5 MiB is what a `doc.grant` of ordinary paths carrying it wires to. A listing written in `"` or `\` doubles on the wire and is refused with the bound named — at the byte budget the frame is 8 MiB and could not arrive at all — which is the trade this row makes rather than a bound that admits every legal listing. |
 | `--inbound-bytes-per-sec` | 1048576 | Half the default. The bound is on the JSON parse and the room relay, and a keystroke is tens of bytes billed at a 1 KiB floor, so a megabyte a second is still a hundred times what an editor sends. |
 | `--inbound-burst-bytes` | 33554432 | Half the default. A fresh connection starts with the whole burst, so this is the shape a flood of new connections can spend before the rate bites; 32 MiB still clears any initial sync a room this size can have. |
 | `--room-grace-ms` | 30000 | The reference value, deliberately: `/meta` advertises it and both clients size their reconnect budget from it. Changing it here alone would desync them. |
@@ -131,11 +131,46 @@ container is killed inside its own cgroup and `restart: unless-stopped` brings
 it back in seconds, having dropped every room, rather than the kernel picking a
 victim on the host.
 
-The residual, named: 32 connections × 8 MiB is 256 MiB of outbound queue, so a
-server under deliberate abuse could reach most of its own 320 MiB cap before
-the container is the thing that dies. That is the designed outcome and it is
-bounded — the room state goes with it — but it is not free, and the lever if it
-ever matters is `--max-connections`.
+The residual, named. Two independent terms can reach the cap, and only the first of
+them was counted when these numbers were chosen.
+
+- **The outbound queue**: 32 connections × 8 MiB is 256 MiB if all of them hold a full
+  queue, which a peer that stops reading can arrange.
+- **The room state, which outlives the connections that made it**: a room's grant is its
+  host's listing, up to `MAX_GRANT_BYTES` (4 MiB of paths), and a room survives its host
+  for the whole grace window. 64 rooms × 4 MiB is 256 MiB of listing before any queue is
+  full — and a visitor needs no token to mint a room and publish one, because minting a
+  room seats the minter as its host. Measured on the release binary with these flags as
+  they are, the `selvaged` process's resident set reaches **211 MiB at 16 granted rooms,
+  393 MiB at 32, 507 MiB at 48 and 653 MiB at 64**: the cap is crossed with no queue
+  pressure at all. The front's per-source limits (8 sockets, 5 handshakes a second) put
+  that behind four source addresses and about a minute of uploads; they do not bound it.
+  The reproduction and its raw output are in `ai_notes/.tmp/harden-refserver-2026-09-21.md`.
+
+Past the cap the container is killed inside its own cgroup and `restart: unless-stopped`
+brings it back in seconds, having dropped every room. That is still the backstop working as
+designed rather than a surprise. What is wrong is the lever: this paragraph used to name
+`--max-connections` alone, and that bounds only the queue term.
+
+There is a third term, which is why moving one number is not the fix. A publish
+materialises the listing about three times — the text frame, the parsed value, and the
+`Vec<String>` the room keeps — so a host publishing 4 MiB of paths costs \~12 MiB while it
+does so, and up to `--max-connections` hosts may be doing that at once.
+
+| term | worst case as configured | bounded by |
+|---|---|---|
+| outbound queues | 32 × 8 MiB = 256 MiB | `--max-connections`, `--outbound-queue-bytes` |
+| room state | 64 × (4 MiB of paths + 1 MiB of documents) | `--max-rooms`, and the listing by `--max-envelope-bytes` |
+| publish transients | \~12 MiB × the hosts publishing at once | `--max-connections` |
+
+Each of the three can cross 320 MiB on its own, so they have to move together and the
+answer is a set: `--max-connections 8` with `--max-rooms 8` puts the queues at 64 MiB, the
+transients at \~96 MiB and the room state at 32 MiB of listings plus 8 MiB of document
+sets, which fits the cap with headroom. That is a change to what this demo *is* — 8 sockets is one source's whole
+allowance at the front, so a single visitor could fill it — and it belongs to the owner
+rather than to a hardening pass. The tracked shape above therefore still carries the
+numbers that were chosen deliberately; what has changed is that the arithmetic behind them
+now names all three terms, and the fix is one hand install of `compose.yaml`.
 
 ## What the front does that the server cannot
 

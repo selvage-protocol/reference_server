@@ -103,7 +103,7 @@ usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]
 | `--max-rooms N` | rooms held at once; past it a room is not minted (default `1024`) |
 | `--max-peers-per-room N` | peers one room seats at once (default `128`) |
 | `--max-documents-per-room N` | paths one room's open-document set holds (default `1024`) |
-| `--outbound-queue-bytes N` | payload bytes queued but unwritten for one connection before it is dropped as a peer that stopped reading (default `33554432`, 32 MiB; at least one whole frame, so at least `8388608`) |
+| `--outbound-queue-bytes N` | payload bytes queued but unwritten for one connection before it is dropped as a peer that stopped reading (default `33554432`, 32 MiB; the command line refuses one that cannot hold the largest frame this configuration can generate, which is never below one whole frame, `8388608`) |
 | `--max-envelope-bytes N` | the largest inbound text envelope the server will parse, judged on the frame's length before `serde_json` sees it (default `5242880`, 5 MiB) |
 | `--inbound-bytes-per-sec N` | bytes one connection may send a second, refilled continuously (default `2097152`, 2 MiB) |
 | `--inbound-burst-bytes N` | how much of that rate one connection may spend at once (default `67108864`, 64 MiB) |
@@ -149,14 +149,17 @@ lowers first. The document set and the grant are per-room state, and the inbound
 bounds what one connection can spend of the CPU.
 
 The queue is also the floor under every frame the server sends, and it is refused at
-startup if it cannot hold one: the largest frames are a relayed payload (the frame bound,
-8 MiB), the room's open-document set echoed to every peer on every `doc.open`/`doc.close`
-(`--max-documents-per-room` × 4 KiB of paths), and the whole grant (4 MiB). A queue below
-those does not bound memory, it breaks sessions — a handshake frame nobody can queue seats
-nobody, and a host is dropped for publishing a grant larger than what the server holds for
-it — so the command line refuses the combination and says which flag to move. That also
-makes the queue the honest place the echo is paid for: the set is why lowering
-`--max-documents-per-room` is what buys a smaller queue.
+startup if it cannot hold one. The largest frames are a relayed payload (the frame bound,
+8 MiB), the room's open-document set echoed to every peer on every `doc.open`/`doc.close`,
+and the whole grant that host published — and what is counted is the frame, not the path it
+names. JSON writes a `"` or a `\` as two bytes, so `--max-documents-per-room` paths of
+4 KiB each are twice their bytes on the wire when they are written in either, and a queue
+counted in path bytes is not a floor. A queue below the largest of those does not bound
+memory, it breaks sessions — a handshake frame nobody can queue seats nobody, and every
+peer is ejected, the publisher included, for a `doc.open` the server itself echoed — so the
+command line refuses the combination and says which flag to move. That also makes the queue
+the honest place the echo is paid for: the set is why lowering `--max-documents-per-room`
+is what buys a smaller queue.
 
 For a 1 GiB box with something else running on it, these are a defensible set:
 
@@ -169,7 +172,9 @@ selvaged --listen 0.0.0.0:8080 --serve-page /page \
 That is an outbound ceiling of 256 MiB, not a figure anything reaches in a session: it is
 every one of 32 connections holding a full queue of unwritten frames at once, which is what
 the queue's own cap ejects. The two inbound bounds keep their defaults here: 5 MiB is what
-the widest legal `doc.grant` needs, and 2 MiB/s is already far above what an editor sends.
+a `doc.grant` of ordinary paths needs, a listing whose paths all escape carries half the
+path bytes it otherwise would and is refused with the bound named, and 2 MiB/s is already
+far above what an editor sends.
 Lowering `--inbound-bytes-per-sec` below a few tens of kilobytes a second will exile a peer
 for traffic it did not choose to send: a client publishes presence on a timer, and each of
 those frames costs a kilobyte of budget.
