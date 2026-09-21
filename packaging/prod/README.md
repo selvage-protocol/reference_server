@@ -131,11 +131,31 @@ container is killed inside its own cgroup and `restart: unless-stopped` brings
 it back in seconds, having dropped every room, rather than the kernel picking a
 victim on the host.
 
-The residual, named: 32 connections × 8 MiB is 256 MiB of outbound queue, so a
-server under deliberate abuse could reach most of its own 320 MiB cap before
-the container is the thing that dies. That is the designed outcome and it is
-bounded — the room state goes with it — but it is not free, and the lever if it
-ever matters is `--max-connections`.
+The residual, named. Two independent terms can reach the cap, and only the first of
+them was counted when these numbers were chosen.
+
+- **The outbound queue**: 32 connections × 8 MiB is 256 MiB if all of them hold a full
+  queue, which a peer that stops reading can arrange.
+- **The room state, which outlives the connections that made it**: a room's grant is its
+  host's listing, up to `MAX_GRANT_BYTES` (4 MiB of paths), and a room survives its host
+  for the whole grace window. 64 rooms × 4 MiB is 256 MiB of listing before any queue is
+  full — and a visitor needs no token to mint a room and publish one, because minting a
+  room seats the minter as its host. Measured on the release binary with these flags as
+  they are, the `selvaged` process's resident set reaches **211 MiB at 16 granted rooms,
+  393 MiB at 32, 507 MiB at 48 and 653 MiB at 64**: the cap is crossed with no queue
+  pressure at all. The front's per-source limits (8 sockets, 5 handshakes a second) put
+  that behind four source addresses and about a minute of uploads; they do not bound it.
+  The reproduction and its raw output are in `ai_notes/.tmp/harden-refserver-2026-09-21.md`.
+
+Past the cap the container is killed inside its own cgroup and `restart: unless-stopped`
+brings it back in seconds, having dropped every room. That is still the backstop working
+as designed rather than a surprise. What is wrong is the lever: this paragraph used to
+name `--max-connections` alone, and that bounds only the queue term. The room-state term
+is bounded by **`--max-rooms`**, and the listing inside it by `--max-envelope-bytes`. With
+the box at 892 MiB and no swap, the honest fix is to cut `--max-rooms` — 64 to 16 puts the
+room state at about 64 MiB — and to bring the queue term down beside it, since 32 × 8 MiB
+is four fifths of the cap on its own. Both are a hand install of `compose.yaml`, which is
+why the tracked shape still carries the numbers above.
 
 ## What the front does that the server cannot
 
