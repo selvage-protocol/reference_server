@@ -4,6 +4,7 @@
 //! `GET /meta` negotiation endpoint on the same listener. No persistence, no accounts,
 //! no file access: the token is the permission and the room dies with its host.
 
+pub mod budget;
 mod net;
 pub mod page;
 pub mod room;
@@ -22,7 +23,7 @@ use tokio::sync::Mutex;
 
 use room::Registry;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     /// How long a room survives its host disconnecting.
     pub room_grace: Duration,
@@ -56,6 +57,25 @@ pub struct ServerConfig {
     /// How many paths one room's open-document set holds at once. Past it, opening a
     /// new path is refused.
     pub max_documents_per_room: usize,
+    /// How many payload bytes one connection may have queued but unwritten before it is
+    /// disconnected as a peer that stopped reading. The dominant term in what a full
+    /// server can hold, so a small host sizes it rather than its peer count.
+    pub max_queue_bytes: usize,
+    /// The largest inbound text envelope this server will parse, in bytes. Checked on
+    /// the frame's length *before* `serde_json` sees it: the widest legal request is a
+    /// `doc.grant` carrying [`net::MAX_GRANT_BYTES`](crate::net) of paths, and parsing
+    /// megabytes of attacker-chosen JSON to find out it was too big is the cost this
+    /// bound removes. A frame past it is refused `bad_message` on the frame's own
+    /// vocabulary, with the connection left open.
+    pub max_envelope_bytes: usize,
+    /// The bytes per second one connection may send, refilled continuously. Past it the
+    /// connection is told so and ended: the peer's session is over, and its reconnect
+    /// starts with a fresh budget.
+    pub inbound_bytes_per_sec: usize,
+    /// How much of that rate one connection may spend at once. A fresh session starts
+    /// with a whole burst, so a newcomer syncing a room is not throttled before it has
+    /// sent anything; a flooder that spends it is held to the rate.
+    pub inbound_burst_bytes: usize,
     /// Serve a static page from this directory on `GET /` and every other plain
     /// path, from the same origin as `/session` and `/meta`. `None` keeps the
     /// server a server alone: an unknown plain path answers `404`.
@@ -74,6 +94,17 @@ impl Default for ServerConfig {
             max_rooms: 1024,
             max_peers_per_room: 128,
             max_documents_per_room: 1024,
+            max_queue_bytes: room::MAX_QUEUE_BYTES,
+            // 5 MiB: the 4 MiB a full grant's paths may occupy, plus the JSON around
+            // them and the escaping a path may need. A grant that escapes past it is
+            // refused with the bound named rather than parsed.
+            max_envelope_bytes: 5 * 1024 * 1024,
+            // 2 MiB/s sustained, 64 MiB bursting. Above anything an editor does — a
+            // keystroke is tens of bytes, a presence update one a quiescent 100 ms —
+            // and above the largest legitimate burst, a newcomer's initial sync of a
+            // multi-megabyte document.
+            inbound_bytes_per_sec: 2 * 1024 * 1024,
+            inbound_burst_bytes: 64 * 1024 * 1024,
             page_root: None,
         }
     }

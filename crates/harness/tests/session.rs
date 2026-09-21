@@ -3492,6 +3492,504 @@ async fn connections_past_the_cap_are_turned_away() {
     ada.open(PATH).await.expect("the room keeps serving");
 }
 
+/// The outbound queue's byte cap is the configured one rather than a constant: a few
+/// kilobytes of relay eject a peer that stopped reading when the server is sized that way,
+/// where the reference 32 MiB would need tens of mebibytes before noticing. This is the
+/// knob a small host sizes its memory with, so the number it passes has to be the number
+/// enforced.
+#[tokio::test]
+async fn the_configured_outbound_queue_cap_is_the_one_enforced() {
+    let harness = Harness::start_with(ServerConfig {
+        max_queue_bytes: 4096,
+        room_grace: Duration::from_secs(30),
+        ..ServerConfig::default()
+    })
+    .await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let target = guest_target(&room.id, &room.token);
+
+    // A peer that is seated and then never reads again.
+    let mut slow = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the slow peer joins");
+    slow.hello(&serde_json::json!({"display_name": "Bob"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut slow, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+    wait_for_peer(&host, "Bob").await;
+
+    // A second peer relays frames the slow one never drains: four kilobytes are the whole
+    // configured cap, so the fifth frame is past it where the reference cap would see
+    // nothing wrong.
+    let mut flood = RawSocket::open(&harness, &target, &[])
+        .await
+        .expect("the flooding peer joins");
+    flood
+        .hello(&serde_json::json!({"display_name": "Flo"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut flood, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+    let chunk = vec![0xA5u8; 1024];
+    for _ in 0..5 {
+        flood.send(0x2, &chunk).await.expect("relays a frame");
+    }
+
+    // The room is told, and the slow socket ends.
+    wait_for_described_within(
+        EJECTION_WAIT,
+        "the host to see the slow peer leave",
+        || async { format!("{:?}", host.peers().await) },
+        || async {
+            let peers = host.peers().await.ok()?;
+            (!peers.iter().any(|peer| peer.display_name == "Bob")).then_some(())
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            timeout(EJECTION_WAIT, slow.read_to_end())
+                .await
+                .expect("the slow socket ends"),
+            None | Some(ErrorKind::ConnectionReset)
+        ),
+        "the slow socket ends; it does not linger"
+    );
+    // The peer that relayed is untouched, and the room still serves.
+    host.open(PATH).await.expect("the room keeps serving");
+}
+
+/// This server's own code for a connection that sent past its inbound budget: capacity
+/// is policy rather than contract (`PROTOCOL.md` §2.1, §10.1), so it is named in the
+/// reserved `x.` namespace like the room and server caps.
+const RATE_LIMITED: &str = "x.rate_limited";
+
+/// The standard WebSocket code for "try again later": what a connection past its budget
+/// is closed with, because its session is over and a reconnect starts fresh.
+const CLOSE_TRY_AGAIN_LATER: u16 = 1013;
+
+/// The inbound budget these tests configure: a megabyte of burst and nothing refilled,
+/// so the burst is the whole budget and no test here has a clock in it. The rate is a
+/// deployment's knob, not a guard's; what is under test is the ceiling, and its refusing
+/// at all. A live peer's own traffic (a presence frame on the client's timer is a
+/// kilobyte of budget) does not reach a megabyte inside a test that lasts seconds.
+fn flooded() -> ServerConfig {
+    ServerConfig {
+        inbound_bytes_per_sec: 0,
+        inbound_burst_bytes: 1024 * 1024,
+        room_grace: Duration::from_secs(30),
+        ..ServerConfig::default()
+    }
+}
+
+/// Floods a raw connection with `count` small requests, reading each answer as it
+/// arrives: what ends this peer is the inbound budget rather than the outbound queue
+/// behind a socket that never reads. Each request names an unknown method, which the
+/// server answers once and announces to nobody, so the room pays for none of this.
+/// `padding` widens the request, which is how one test prices payloads and another prices
+/// frames.
+///
+/// Returns how many requests were answered and what the refusal said. Writing stops once
+/// the requests are sent, and the refusal is read after that: a socket that is still
+/// writing when the server closes can be reset by its own writes, which would discard the
+/// refusal it had not read yet.
+async fn flood_answered_requests(
+    raw: &mut RawSocket,
+    padding: usize,
+    count: u64,
+) -> (usize, Value) {
+    let mut answers = 0_usize;
+    for id in 2..count.saturating_add(2) {
+        let frame = serde_json::json!({
+            "v": proto::WIRE_VERSION,
+            "id": id,
+            "method": format!("no.such.method{}", "x".repeat(padding)),
+        });
+        if raw.send_json(&frame).await.is_err() {
+            break;
+        }
+        let arrived =
+            next_json_within(raw, "an answer or the budget refusal").await;
+        if arrived.get("event").and_then(Value::as_str)
+            == Some(event::SESSION_ERROR)
+        {
+            return (answers, arrived);
+        }
+        if arrived.get("error").is_some() {
+            answers = answers.saturating_add(1);
+        }
+    }
+    // What is left after writing stops: the answers to the last frames sent, and then the
+    // refusal itself.
+    loop {
+        let arrived = next_json_within(raw, "the budget refusal").await;
+        if arrived.get("event").and_then(Value::as_str)
+            == Some(event::SESSION_ERROR)
+        {
+            return (answers, arrived);
+        }
+        if arrived.get("error").is_some() {
+            answers = answers.saturating_add(1);
+        }
+    }
+}
+
+/// Reads the close of a connection the server has refused, returning its status code.
+async fn refused_close_code(raw: &mut RawSocket) -> Result<u16, Failure> {
+    let frame = timeout(WAIT, raw.read_to_close()).await??;
+    frame
+        .close_code()
+        .ok_or_else(|| "the close frame carries no status code".into())
+}
+
+/// A text envelope past the configured bound is refused on its length, and the
+/// connection stays open. The request inside it is a `doc.open` this server answers
+/// happily on its own terms — its path is well inside the path bound — so what is
+/// refused is the frame's size and nothing about the request in it.
+#[tokio::test]
+async fn an_oversized_text_envelope_is_refused_on_its_length() {
+    let harness = Harness::start_with(ServerConfig {
+        max_envelope_bytes: 1024,
+        ..ServerConfig::default()
+    })
+    .await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({"display_name": "Ada"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut raw, "room.created").await["event"],
+        event::ROOM_CREATED
+    );
+
+    // A 2000-byte path is legal — the path bound is 4096 — and its envelope is over the
+    // 1024-byte bound, which is the fault the server answers.
+    let path = "p".repeat(2000);
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 2,
+        "method": method::DOC_OPEN,
+        "params": {"path": path},
+    }))
+    .await
+    .expect("sends");
+    let refused = next_json_within(&mut raw, "the envelope refusal").await;
+    assert_eq!(refused["event"], event::SESSION_ERROR);
+    assert_eq!(refused["params"]["code"], code::BAD_MESSAGE);
+    let message = refused["params"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("1024"), "the bound is named: {message}");
+    assert!(
+        message.contains("was not parsed"),
+        "the frame, not the request in it, is the fault: {message}"
+    );
+
+    // Still seated, and still served: a frame inside the bound is answered normally.
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 3,
+        "method": method::DOC_OPEN,
+        "params": {"path": PATH},
+    }))
+    .await
+    .expect("sends");
+    assert_eq!(
+        raw_response_for(&mut raw, 3).await["result"]["documents"],
+        serde_json::json!([PATH])
+    );
+}
+
+/// The bound is measured before the parser is handed the frame: a frame past it that is
+/// not JSON at all is refused for its length rather than for the parse error megabytes
+/// of it would raise, which is the difference between bounding the parse and paying for
+/// it first.
+#[tokio::test]
+async fn an_oversized_envelope_is_measured_before_it_is_parsed() {
+    let harness = Harness::start_with(ServerConfig {
+        max_envelope_bytes: 1024,
+        ..ServerConfig::default()
+    })
+    .await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    raw.hello(&serde_json::json!({"display_name": "Ada"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut raw, "room.created").await["event"],
+        event::ROOM_CREATED
+    );
+
+    // Unterminated JSON, four times the bound: a parser would answer with where it gave
+    // up, and the server answers with the bound it never handed over.
+    raw.send(0x1, &vec![b'{'; 4096]).await.expect("sends");
+    let refused = next_json_within(&mut raw, "the envelope refusal").await;
+    let message = refused["params"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("1024") && message.contains("was not parsed"),
+        "the bound answers, not the parser: {message}"
+    );
+}
+
+/// Before the handshake completes every fault closes the connection (`PROTOCOL.md` §11),
+/// and the envelope bound is judged there too: a first frame past it is refused with the
+/// bound named and closed 4000, like any other fault that arrives unseated.
+#[tokio::test]
+async fn an_oversized_first_frame_is_refused_and_closed() {
+    let harness = Harness::start_with(ServerConfig {
+        max_envelope_bytes: 1024,
+        ..ServerConfig::default()
+    })
+    .await;
+    let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
+        .await
+        .expect("the upgrade succeeds");
+    // A `session.hello` whose display name is far past the name bound: over the envelope
+    // bound it is never judged as a name at all, and the refusal says so.
+    raw.send_json(&serde_json::json!({
+        "v": proto::WIRE_VERSION,
+        "id": 1,
+        "method": method::SESSION_HELLO,
+        "params": {"display_name": "n".repeat(2000)},
+    }))
+    .await
+    .expect("sends");
+    let refused = next_json_within(&mut raw, "the unseated refusal").await;
+    assert_eq!(refused["params"]["code"], code::BAD_MESSAGE);
+    let message = refused["params"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("1024"), "the bound is named: {message}");
+    assert_eq!(
+        raw.read_to_close().await.expect("the close").close_code(),
+        Some(close::PROTOCOL_ERROR)
+    );
+}
+
+/// A peer that sends past its inbound budget is told why and ended, and nothing about
+/// the room moves: the requests it sent before the refusal were answered, the room's
+/// document set is what it was, and the seat it held is free for the next peer, whose
+/// budget is its own.
+#[tokio::test]
+async fn a_peer_past_its_inbound_budget_is_told_why_and_exiled() {
+    let harness = Harness::start_with(flooded()).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    host.open(PATH).await.expect("the host opens a document");
+    let mut flood =
+        RawSocket::open(&harness, &guest_target(&room.id, &room.token), &[])
+            .await
+            .expect("the flooder joins");
+    flood
+        .hello(&serde_json::json!({"display_name": "Flo"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut flood, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+    wait_for_peer(&host, "Flo").await;
+
+    // Eight-kilobyte requests: the budget pays for the bytes, and the peer spends its
+    // megabyte in a hundred and twenty-seven of them.
+    let (answered, refused) =
+        flood_answered_requests(&mut flood, 8 * 1024, 130).await;
+    assert!(answered > 0, "requests were answered before the refusal");
+    assert_eq!(refused["params"]["code"], RATE_LIMITED);
+    let message = refused["params"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("1048576"),
+        "the refusal names the budget it passed: {message}"
+    );
+    assert_eq!(
+        refused_close_code(&mut flood).await.expect("the close"),
+        CLOSE_TRY_AGAIN_LATER
+    );
+
+    // The room is whole: the set is what the host left it as, and the host still serves
+    // it while the flooder leaves.
+    wait_for_described_within(
+        EJECTION_WAIT,
+        "the host to see the flooder leave",
+        || async { format!("{:?}", host.peers().await) },
+        || async {
+            let peers = host.peers().await.ok()?;
+            (!peers.iter().any(|peer| peer.display_name == "Flo")).then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        host.documents().await.expect("the set"),
+        vec![PATH.to_string()]
+    );
+    host.open(GUEST_ONLY).await.expect("the host still opens");
+
+    // The seat is free, and the next peer starts with a budget of its own.
+    let late = harness
+        .join(&room, "Bob")
+        .await
+        .expect("the freed seat takes a guest");
+    late.open(PATH).await.expect("the newcomer is served");
+    assert_eq!(
+        late.documents().await.expect("the set"),
+        vec![PATH.to_string(), GUEST_ONLY.to_string()]
+    );
+}
+
+/// A flood of tiny frames is priced like the work it costs rather than like the bytes it
+/// moves: sixty-byte requests spend a megabyte of budget, because each frame costs the
+/// per-frame floor. Without that floor the same flood would cost sixty kilobytes — a
+/// sixteenth of the budget — and this peer would keep the server busy for as long as it
+/// liked.
+#[tokio::test]
+async fn a_flood_of_tiny_frames_spends_the_per_frame_floor() {
+    let harness = Harness::start_with(flooded()).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let mut flood =
+        RawSocket::open(&harness, &guest_target(&room.id, &room.token), &[])
+            .await
+            .expect("the flooder joins");
+    flood
+        .hello(&serde_json::json!({"display_name": "Flo"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut flood, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+    wait_for_peer(&host, "Flo").await;
+
+    // Sixty-byte requests, a thousand and twenty-four of which spend the megabyte.
+    let (answered, refused) =
+        flood_answered_requests(&mut flood, 0, 1100).await;
+    assert!(answered > 0, "requests were answered before the refusal");
+    assert_eq!(refused["params"]["code"], RATE_LIMITED);
+    let message = refused["params"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("1048576"),
+        "the budget, not the bytes sent, is what ran out: {message}"
+    );
+    // A little over a thousand frames of sixty-odd bytes each: the flood's own weight is
+    // a small fraction of the megabyte it spent.
+    let sent = answered.saturating_mul(64);
+    assert!(
+        sent < 256 * 1024,
+        "the frames sent are far below the budget they spent: {sent} bytes"
+    );
+}
+
+/// The budget counts frames the session never parses, too: a relayed payload is copied
+/// once per peer, so a flood of them is what turns a room into an amplifier. Nothing is
+/// answered here — a relay is not a request — and the burst is gone after two frames.
+#[tokio::test]
+async fn a_relayed_frame_flood_is_budgeted_too() {
+    let harness = Harness::start_with(flooded()).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    let mut flood =
+        RawSocket::open(&harness, &guest_target(&room.id, &room.token), &[])
+            .await
+            .expect("the flooder joins");
+    flood
+        .hello(&serde_json::json!({"display_name": "Flo"}))
+        .await
+        .expect("says hello");
+    assert_eq!(
+        next_json_within(&mut flood, "room.joined").await["event"],
+        event::ROOM_JOINED
+    );
+    wait_for_peer(&host, "Flo").await;
+
+    // Two 512 KiB frames are the whole megabyte, so the third is the one refused. They
+    // are sent before the refusal is read, because a relay is not answered and the server
+    // reads faster than the socket takes the writes.
+    let chunk = vec![0xA5u8; 512 * 1024];
+    for _ in 0..3 {
+        flood.send(0x2, &chunk).await.expect("relays a frame");
+    }
+    let refused = next_json_within(&mut flood, "the budget refusal").await;
+    assert_eq!(refused["event"], event::SESSION_ERROR);
+    assert_eq!(refused["params"]["code"], RATE_LIMITED);
+    assert_eq!(
+        refused_close_code(&mut flood).await.expect("the close"),
+        CLOSE_TRY_AGAIN_LATER
+    );
+    // The host is undisturbed, and what the flooder relayed before it was stopped is
+    // what the room saw, not a half-written frame.
+    host.open(PATH).await.expect("the host still opens");
+}
+
+/// Saturation is bounded rather than fatal. Several peers spend their budgets at once,
+/// every one of them is exiled with a reason, the host's session and the room's state
+/// are the same as they were, and the server is still a server afterwards: it seats a
+/// newcomer in the room and mints another room.
+#[tokio::test]
+async fn saturation_exiles_every_flooder_and_leaves_the_room_whole() {
+    let harness = Harness::start_with(flooded()).await;
+    let (host, room) = harness.host("Ada").await.expect("host connects");
+    host.open(PATH).await.expect("the host opens a document");
+
+    let mut floods = Vec::new();
+    for n in 0..4 {
+        let mut flood = RawSocket::open(
+            &harness,
+            &guest_target(&room.id, &room.token),
+            &[],
+        )
+        .await
+        .expect("a flooder joins");
+        flood
+            .hello(&serde_json::json!({"display_name": format!("Flo{n}")}))
+            .await
+            .expect("says hello");
+        assert_eq!(
+            next_json_within(&mut flood, "room.joined").await["event"],
+            event::ROOM_JOINED
+        );
+        floods.push(flood);
+    }
+    wait_for_peer(&host, "Flo3").await;
+
+    for flood in &mut floods {
+        let (_, refused) = flood_answered_requests(flood, 8 * 1024, 130).await;
+        assert_eq!(refused["params"]["code"], RATE_LIMITED);
+    }
+
+    wait_for_described_within(
+        EJECTION_WAIT,
+        "the room to see every flooder leave",
+        || async { format!("{:?}", host.peers().await) },
+        || async {
+            let peers = host.peers().await.ok()?;
+            (!peers
+                .iter()
+                .any(|peer| peer.display_name.starts_with("Flo")))
+            .then_some(())
+        },
+    )
+    .await;
+
+    // The room is whole: the set is what it was, and the host still edits it.
+    assert_eq!(
+        host.documents().await.expect("the set"),
+        vec![PATH.to_string()]
+    );
+    host.open(GUEST_ONLY).await.expect("the host still opens");
+
+    // And the server is still a server.
+    let late = harness.join(&room, "Late").await.expect("a seat is free");
+    late.open(PATH).await.expect("the newcomer is served");
+    assert_eq!(
+        late.documents().await.expect("the set"),
+        vec![PATH.to_string(), GUEST_ONLY.to_string()]
+    );
+    let (_bob, second) = harness.host("Bob").await.expect("another room mints");
+    assert_ne!(second.id, room.id);
+}
+
 /// A request head that runs past the bound with no blank line is refused `431`,
 /// not dropped silently: the client hears that its head — not the server — is the
 /// problem. One write past the 16 KiB bound always fits the socket buffers, so the

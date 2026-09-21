@@ -2,7 +2,6 @@
 //! a seated connection answers.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -120,9 +119,9 @@ struct Seating<'a> {
 pub async fn handshake(
     stream: &mut SessionStream,
     claims_host: bool,
-    hello_timeout: Duration,
+    config: &ServerConfig,
 ) -> Result<Hello, Refusal> {
-    let text = match timeout(hello_timeout, next_text(stream)).await {
+    let text = match timeout(config.hello_timeout, next_text(stream)).await {
         Ok(Ok(text)) => text,
         Ok(Err(reason)) => return Err((code::BAD_MESSAGE, reason)),
         Err(_) => {
@@ -132,6 +131,9 @@ pub async fn handshake(
             ));
         }
     };
+    if text.len() > config.max_envelope_bytes {
+        return Err(envelope_too_large(text.len(), config.max_envelope_bytes));
+    }
     let msg: proto::ClientMessage = proto::ClientMessage::from_text(&text)
         .map_err(|e| {
             envelope_refusal("first message is not a session envelope", &e)
@@ -214,6 +216,27 @@ async fn next_text(stream: &mut SessionStream) -> Result<String, String> {
 
 fn envelope_refusal(what: &str, error: &serde_json::Error) -> Refusal {
     (code::BAD_MESSAGE, format!("{what}: {error}"))
+}
+
+/// The refusal for a text frame longer than this server parses, naming both the bound
+/// and the frame so an operator can see which of the two is wrong.
+///
+/// The bound is judged on the frame's length *before* `serde_json` is handed it. What
+/// that buys is the whole point of the bound: megabytes of attacker-chosen JSON are
+/// never materialized as a `Value` and a `Vec<String>` to be refused afterwards, and a
+/// frame that could not be a legal request is refused for the reason it actually has
+/// rather than for whichever parse error it happens to produce first. It stays a
+/// session fault rather than a transport one — the frame was received whole, so there is
+/// a session to refuse on — and the connection stays open, since a peer that sends one
+/// oversized envelope can send a smaller one next (`PROTOCOL.md` §2.1, §11).
+fn envelope_too_large(found: usize, limit: usize) -> Refusal {
+    (
+        code::BAD_MESSAGE,
+        format!(
+            "a text envelope is at most {limit} bytes; this frame is {found} bytes and \
+             was not parsed"
+        ),
+    )
 }
 
 /// Maps an admission failure to its refusal. `Unknown` and `TokenMismatch` stay
@@ -761,6 +784,16 @@ impl Session {
     /// a `params` object with two of one member is last-wins to a JSON reader, and one
     /// frame must not mean two things (`PROTOCOL.md` §4).
     async fn dispatch_text(&self, text: &str, shared: &Shared) {
+        // Judged on the frame, before the parser sees it (`PROTOCOL.md` §2.1): the
+        // envelope bound is the one check that has to happen on the way in rather than
+        // on what came out.
+        if text.len() > shared.config.max_envelope_bytes {
+            let (code, message) = envelope_too_large(
+                text.len(),
+                shared.config.max_envelope_bytes,
+            );
+            return self.alert(code, message);
+        }
         let msg = match proto::ClientMessage::from_text(text) {
             Ok(msg) => msg,
             Err(e) => return self.alert(code::BAD_MESSAGE, e.to_string()),
@@ -1079,7 +1112,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::room::{MAX_QUEUE_FRAMES, peer_channel};
+    use crate::room::{MAX_QUEUE_BYTES, MAX_QUEUE_FRAMES, peer_channel};
 
     /// Fills a fresh queue exactly: a full queue's worth of frames fits, so the
     /// session holding it is alive — and the next frame past it is refused.
@@ -1095,12 +1128,15 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_alert_ends_the_session_on_the_same_frame() {
         let mut registry = Registry::default();
-        let (host, _rx) = peer_channel(PeerInfo {
-            peer_id: "p-host".to_string(),
-            display_name: "Ada".to_string(),
-            role: Role::Host,
-            awareness_client_id: None,
-        });
+        let (host, _rx) = peer_channel(
+            PeerInfo {
+                peer_id: "p-host".to_string(),
+                display_name: "Ada".to_string(),
+                role: Role::Host,
+                awareness_client_id: None,
+            },
+            MAX_QUEUE_BYTES,
+        );
         assert_eq!(
             registry
                 .create(
@@ -1115,12 +1151,15 @@ mod tests {
                 .as_deref(),
             Some("r-1")
         );
-        let (guest, _rx) = peer_channel(PeerInfo {
-            peer_id: "p-slow".to_string(),
-            display_name: "Bob".to_string(),
-            role: Role::Guest,
-            awareness_client_id: None,
-        });
+        let (guest, _rx) = peer_channel(
+            PeerInfo {
+                peer_id: "p-slow".to_string(),
+                display_name: "Bob".to_string(),
+                role: Role::Guest,
+                awareness_client_id: None,
+            },
+            MAX_QUEUE_BYTES,
+        );
         let queue = guest.queue.clone();
         registry
             .admit(
@@ -1166,12 +1205,15 @@ mod tests {
         listing: Vec<String>,
     ) -> (Shared, Peer, mpsc::Receiver<Outbound>) {
         let mut registry = Registry::default();
-        let (host, _host_rx) = peer_channel(PeerInfo {
-            peer_id: "p-host".to_string(),
-            display_name: "Ada".to_string(),
-            role: Role::Host,
-            awareness_client_id: None,
-        });
+        let (host, _host_rx) = peer_channel(
+            PeerInfo {
+                peer_id: "p-host".to_string(),
+                display_name: "Ada".to_string(),
+                role: Role::Host,
+                awareness_client_id: None,
+            },
+            MAX_QUEUE_BYTES,
+        );
         assert!(
             registry
                 .create(
@@ -1189,12 +1231,15 @@ mod tests {
             .room_mut("r-1")
             .expect("the room is minted")
             .set_grant(listing);
-        let (newcomer, frames) = peer_channel(PeerInfo {
-            peer_id: "p-new".to_string(),
-            display_name: "Zoe".to_string(),
-            role: Role::Guest,
-            awareness_client_id: None,
-        });
+        let (newcomer, frames) = peer_channel(
+            PeerInfo {
+                peer_id: "p-new".to_string(),
+                display_name: "Zoe".to_string(),
+                role: Role::Guest,
+                awareness_client_id: None,
+            },
+            MAX_QUEUE_BYTES,
+        );
         let shared = Shared::new(
             ServerConfig::default(),
             Arc::new(Mutex::new(registry)),

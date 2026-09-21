@@ -31,6 +31,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use selvage_protocol as proto;
 use selvage_protocol::{code, event};
 
+use crate::budget::InboundBudget;
 use crate::page;
 use crate::room::{Outbound, Queue, Registry};
 use crate::{ServerConfig, random_hex};
@@ -66,6 +67,18 @@ const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// RFC 6455 allows 125 bytes in a control-frame payload, and a close frame spends two of
 /// them on its status code.
 const MAX_CLOSE_REASON: usize = 123;
+
+/// The standard WebSocket code for "try again later": what a peer hears when this
+/// connection cannot be served right now — the server is full, or this connection has
+/// sent past its inbound budget. The 4xxx range is `selvage/1`'s own (`PROTOCOL.md`
+/// §11); this one is IANA's, which is why it is named here rather than in the protocol
+/// crate.
+const TRY_AGAIN_LATER: u16 = 1013;
+
+/// The code a connection is told it passed its inbound budget with. Like the other
+/// capacity codes it is this server's policy and not the protocol's (`PROTOCOL.md`
+/// §2.1, §10.1), so it is named in the reserved `x.` namespace.
+const RATE_LIMITED: &str = "x.rate_limited";
 
 /// A WebSocket session from a client, upgraded off a plain TCP stream.
 pub type SessionSocket =
@@ -269,7 +282,7 @@ impl Shared {
         // 1013: try again later. The reason fits a control frame many times over.
         let _ = ws
             .send(Message::Close(Some(CloseFrame {
-                code: 1013u16.into(),
+                code: TRY_AGAIN_LATER.into(),
                 reason: "server full, try again later".to_string().into(),
             })))
             .await;
@@ -283,7 +296,7 @@ impl Shared {
     /// one, and `token_invalid` is what a room whose named token is not the room's already
     /// answers with — so the close is 4002 (§11).
     async fn serve_session(&self, ws: SessionSocket, query: &str) {
-        let mut wire = Wire::new(ws);
+        let mut wire = Wire::new(ws, self.config.max_queue_bytes);
         let join = match proto::parse_join_query(query) {
             Ok(join) => join,
             Err(error) => {
@@ -293,8 +306,7 @@ impl Shared {
         };
         let claims_host = join.room.is_none();
         let greeted =
-            handshake(&mut wire.stream, claims_host, self.config.hello_timeout)
-                .await;
+            handshake(&mut wire.stream, claims_host, &self.config).await;
         let seated = match greeted {
             Ok(hello) => {
                 let (poison_tx, poison_rx) = oneshot::channel();
@@ -339,6 +351,10 @@ impl Shared {
             ping,
             poison,
             missed_pings: AtomicU32::new(0),
+            budget: InboundBudget::new(
+                self.config.inbound_bytes_per_sec,
+                self.config.inbound_burst_bytes,
+            ),
         };
         pump(&mut live, self).await;
         live.session.leave(self).await;
@@ -360,9 +376,9 @@ pub struct Wire {
 }
 
 impl Wire {
-    fn new(ws: SessionSocket) -> Self {
+    fn new(ws: SessionSocket, max_queue_bytes: usize) -> Self {
         let (sink, stream) = ws.split();
-        let (queue, rx) = Queue::channel();
+        let (queue, rx) = Queue::channel(max_queue_bytes);
         let queued = queue.queued_counter();
         Self {
             stream,
@@ -416,6 +432,10 @@ struct Live {
     /// The server's pings since the last Pong: what [`Live::heartbeat`] bounds. Atomic
     /// because the turn loop is a spawned task and the counter rides in its future.
     missed_pings: AtomicU32,
+    /// What this connection may still send. Every inbound frame is charged to it before
+    /// the session sees the frame, so a peer that sends past its budget is stopped
+    /// during a flood rather than after one.
+    budget: InboundBudget,
 }
 
 /// The turn loop: protocol pings, session methods and inbound frames.
@@ -450,9 +470,16 @@ impl Live {
     }
 
     /// One inbound frame. A Pong is the answer to this connection's own ping and nothing
-    /// else; every other frame belongs to the session.
+    /// else; every other frame belongs to the session, and is charged to the connection's
+    /// inbound budget first.
+    ///
+    /// A frame past the budget ends the session the way a clean refusal does: the peer is
+    /// told `x.rate_limited` and closed `1013`, then the turn loop stops, `leave`
+    /// announces `peer.left`, and the writer drains what was queued. Nothing about the
+    /// room is left half-done: the peer is simply gone, as it would be had its socket
+    /// dropped, and its reconnect starts with a fresh budget.
     async fn handle(
-        &self,
+        &mut self,
         incoming: Option<Result<Message, WireError>>,
         shared: &Shared,
     ) -> bool {
@@ -460,7 +487,47 @@ impl Live {
             self.missed_pings.store(0, Ordering::Relaxed);
             return true;
         }
+        if let Some(Ok(frame)) = &incoming
+            && !self.budget.try_take(payload_len(frame))
+        {
+            self.over_budget(shared);
+            return false;
+        }
         self.session.handle_frame(incoming, shared).await
+    }
+
+    /// Tells a peer that it is past its inbound budget, then leaves the session to end.
+    /// The queue is what carries the news: the frames it takes are drained by the
+    /// writer, and a queue that will not take them means the peer had stopped reading
+    /// long before its budget ran out.
+    fn over_budget(&self, shared: &Shared) {
+        let message = format!(
+            "this connection sent past its inbound budget of {} bytes a second (burst {}); \
+             the session is over and a reconnect starts with a fresh budget",
+            shared.config.inbound_bytes_per_sec,
+            shared.config.inbound_burst_bytes
+        );
+        let event = proto::ServerMessage::event(
+            event::SESSION_ERROR,
+            serde_json::json!({ "code": RATE_LIMITED, "message": message }),
+        );
+        if let Some(frame) = frame_of(&event) {
+            let _ = self.wire.queue.try_queue(frame);
+        }
+        let _ = self
+            .wire
+            .queue
+            .try_queue(Outbound::Close(TRY_AGAIN_LATER, message));
+    }
+}
+
+/// What one inbound frame carries, in bytes. A Pong is `0`: it is the answer to a ping
+/// this server sent, so charging it would bill a peer for the keepalive.
+fn payload_len(frame: &Message) -> usize {
+    match frame {
+        Message::Text(text) => text.len(),
+        Message::Binary(bytes) | Message::Ping(bytes) => bytes.len(),
+        Message::Close(_) | Message::Pong(_) | Message::Frame(_) => 0,
     }
 }
 

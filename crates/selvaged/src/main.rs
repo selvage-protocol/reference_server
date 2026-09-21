@@ -9,8 +9,15 @@ use selvage_protocol::SERVER_NAME;
 use selvaged::{Server, ServerConfig, page};
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:8080";
-const USAGE: &str =
-    "usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]";
+/// The usage line: the flags wrapped across lines, so `--help` and an unknown-argument
+/// refusal stay readable as the surface grows.
+const USAGE: &str = concat!(
+    "usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]\n",
+    "                [--max-connections N] [--max-rooms N] [--max-peers-per-room N]\n",
+    "                [--max-documents-per-room N] [--outbound-queue-bytes N]\n",
+    "                [--max-envelope-bytes N] [--inbound-bytes-per-sec N]\n",
+    "                [--inbound-burst-bytes N]",
+);
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -30,18 +37,14 @@ async fn main() -> io::Result<()> {
             println!("{SERVER_NAME}");
             return Ok(());
         }
-        Action::Run(addr, room_grace, page) => {
-            run(addr, room_grace, page).await
-        }
+        Action::Run(plan) => run(*plan).await,
     }
 }
 
-async fn run(
-    addr: SocketAddr,
-    room_grace: Duration,
-    page: Option<PathBuf>,
-) -> io::Result<()> {
-    if let Some(root) = &page
+/// What the process was asked to do: where to listen, which page to serve if any, and
+/// the server's own limits.
+async fn run(mut plan: Run) -> io::Result<()> {
+    if let Some(root) = &plan.page
         && !root.is_dir()
     {
         eprintln!(
@@ -54,7 +57,7 @@ async fn run(
     // The page handler keeps a served file inside the page root by asking an open
     // descriptor what it is, through `page::FD_DIR`. A platform without it would
     // answer every page request with a 404, so it is refused once, here, instead.
-    if page.is_some() && !Path::new(page::FD_DIR).exists() {
+    if plan.page.is_some() && !Path::new(page::FD_DIR).exists() {
         eprintln!(
             "--serve-page cannot run here: it keeps a served file inside its \
              root through {}, which this platform does not have. Drop the flag \
@@ -63,30 +66,36 @@ async fn run(
         );
         exit(2);
     }
-    let config = ServerConfig {
-        room_grace,
-        page_root: page.clone(),
-        ..ServerConfig::default()
-    };
-    let server = match Server::bind(addr, config).await {
+    plan.config.page_root = plan.page.clone();
+    let server = match Server::bind(plan.addr, plan.config.clone()).await {
         Ok(server) => server,
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("{}", addr_in_use_hint(addr));
+            eprintln!("{}", addr_in_use_hint(plan.addr));
             exit(1);
         }
         Err(error) => return Err(error),
     };
-    for line in startup_lines(server.local_addr(), room_grace, page.as_deref())
-    {
+    for line in startup_lines(server.local_addr(), &plan.config) {
         println!("{line}");
     }
     server.run().await;
     Ok(())
 }
 
+/// A parsed command line that starts a server.
+#[derive(Debug, PartialEq, Eq)]
+struct Run {
+    addr: SocketAddr,
+    page: Option<PathBuf>,
+    /// Every limit the server enforces, as the flags set it.
+    config: ServerConfig,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
-    Run(SocketAddr, Duration, Option<PathBuf>),
+    /// Boxed: the config is the size of the enum, and the two other variants carry
+    /// nothing.
+    Run(Box<Run>),
     Help,
     Version,
 }
@@ -98,7 +107,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Action, String> {
     let mut addr: SocketAddr = DEFAULT_ADDRESS
         .parse()
         .map_err(|e| format!("bad default address: {e}"))?;
-    let mut room_grace = ServerConfig::default().room_grace;
+    let mut config = ServerConfig::default();
     let mut page: Option<PathBuf> = None;
     let mut args = raw.into_iter();
     while let Some(arg) = args.next() {
@@ -115,7 +124,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Action, String> {
                 let value = args.next().ok_or(
                     "--room-grace-ms wants a number of milliseconds, e.g. 30000",
                 )?;
-                room_grace = grace(&value)?;
+                config.room_grace = grace(&value)?;
             }
             "--serve-page" => {
                 let value = args
@@ -123,24 +132,235 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Action, String> {
                     .ok_or("--serve-page wants a directory, e.g. /page")?;
                 page = Some(PathBuf::from(value));
             }
+            // The capacity flags, each defaulting to the reference value so an
+            // existing deployment changes by nothing but the flags it now passes.
+            "--max-connections" => {
+                config.max_connections = limit(&mut args, "--max-connections")?;
+            }
+            "--max-rooms" => {
+                config.max_rooms = limit(&mut args, "--max-rooms")?;
+            }
+            "--max-peers-per-room" => {
+                let flag = "--max-peers-per-room";
+                config.max_peers_per_room = limit(&mut args, flag)?;
+            }
+            "--max-documents-per-room" => {
+                let flag = "--max-documents-per-room";
+                config.max_documents_per_room = limit(&mut args, flag)?;
+            }
+            "--outbound-queue-bytes" => {
+                let flag = "--outbound-queue-bytes";
+                config.max_queue_bytes = limit(&mut args, flag)?;
+            }
+            "--max-envelope-bytes" => {
+                let flag = "--max-envelope-bytes";
+                config.max_envelope_bytes = limit(&mut args, flag)?;
+            }
+            "--inbound-bytes-per-sec" => {
+                let flag = "--inbound-bytes-per-sec";
+                config.inbound_bytes_per_sec = byte_rate(&mut args, flag)?;
+            }
+            "--inbound-burst-bytes" => {
+                let flag = "--inbound-burst-bytes";
+                config.inbound_burst_bytes = byte_rate(&mut args, flag)?;
+            }
             _ => return Err(format!("unknown argument: {arg}\n{USAGE}")),
         }
     }
-    Ok(Action::Run(addr, room_grace, page))
+    Ok(Action::Run(Box::new(Run { addr, page, config })))
+}
+
+/// Reads one numeric flag's value, refusing a missing or non-numeric one by naming the
+/// flag and the value it defaults to.
+fn limit(
+    args: &mut impl Iterator<Item = String>,
+    flag: &str,
+) -> Result<usize, String> {
+    let (value, example) = demanded(args, flag)?;
+    value
+        .parse()
+        .map_err(|_| format!("{flag} wants a whole number, e.g. {example}"))
+}
+
+/// [`limit`] for a rate or a byte count, refused in the unit a reader sizes with.
+fn byte_rate(
+    args: &mut impl Iterator<Item = String>,
+    flag: &str,
+) -> Result<usize, String> {
+    let (value, example) = demanded(args, flag)?;
+    value.parse().map_err(|_| {
+        format!("{flag} wants a whole number of bytes, e.g. {example}")
+    })
+}
+
+/// The value a flag was given, and the value it defaults to, so that a refusal can show
+/// both. The default is looked up from the flag's own name, which is the one place the
+/// two could drift apart.
+fn demanded(
+    args: &mut impl Iterator<Item = String>,
+    flag: &str,
+) -> Result<(String, String), String> {
+    let default = default_for(flag);
+    let value = args
+        .next()
+        .ok_or_else(|| format!("{flag} wants a value, e.g. {default}"))?;
+    Ok((value, default))
+}
+
+/// What `flag` defaults to, printed in the unit its own help line uses.
+fn default_for(flag: &str) -> String {
+    let default = ServerConfig::default();
+    match flag {
+        "--max-connections" => default.max_connections.to_string(),
+        "--max-rooms" => default.max_rooms.to_string(),
+        "--max-peers-per-room" => default.max_peers_per_room.to_string(),
+        "--max-documents-per-room" => {
+            default.max_documents_per_room.to_string()
+        }
+        "--outbound-queue-bytes" => default.max_queue_bytes.to_string(),
+        "--max-envelope-bytes" => default.max_envelope_bytes.to_string(),
+        "--inbound-bytes-per-sec" => default.inbound_bytes_per_sec.to_string(),
+        "--inbound-burst-bytes" => default.inbound_burst_bytes.to_string(),
+        _ => String::new(),
+    }
 }
 
 fn help_text() -> String {
-    format!(
-        "{USAGE}\n\nA memory-only room server. It mints nothing to share on its own: \
-        connect a client, and the client's output carries the invite link.\n\n  --listen ADDR       \
-        address to bind (default {DEFAULT_ADDRESS})\n  --room-grace-ms MS  \
-        how long a room survives its host disconnecting, in milliseconds \
-        (default {}s)\n  --serve-page DIR    \
-        serve the browser page from DIR, on the same origin as /session and /meta\n  \
-        --help, -h          print this help\n  --version           \
-        print the server version",
-        ServerConfig::default().room_grace.as_secs()
-    )
+    let default = ServerConfig::default();
+    let mut lines = vec![
+        USAGE.to_string(),
+        String::new(),
+        "A memory-only room server. It mints nothing to share on its own: connect a \
+         client, and the client's output carries the invite link."
+            .to_string(),
+        String::new(),
+    ];
+    let mut flags = endpoint_help(&default);
+    flags.extend(capacity_help(&default));
+    flags.extend(abuse_help(&default));
+    flags.push(("--help, -h", "print this help".to_string()));
+    flags.push((
+        "--version",
+        format!("print the server version ({SERVER_NAME})"),
+    ));
+    let width = flags
+        .iter()
+        .map(|(name, _)| name.len())
+        .max()
+        .unwrap_or_default()
+        .saturating_add(2);
+    for (name, description) in flags {
+        lines.push(format!("  {name:width$}{description}"));
+    }
+    lines.join("\n")
+}
+
+/// The flags that say where the server listens and what it serves.
+fn endpoint_help(default: &ServerConfig) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "--listen ADDR",
+            format!("address to bind (default {DEFAULT_ADDRESS})"),
+        ),
+        (
+            "--room-grace-ms MS",
+            format!(
+                "how long a room survives its host disconnecting, in milliseconds \
+                 (default {}s)",
+                default.room_grace.as_secs()
+            ),
+        ),
+        (
+            "--serve-page DIR",
+            "serve the browser page from DIR, on the same origin as /session and /meta"
+                .to_string(),
+        ),
+    ]
+}
+
+/// The flags that size what one server holds. Each is a bound on this process's own
+/// memory, which only this process can enforce, and each defaults to the reference
+/// value so an existing deployment changes by nothing but the flags it passes.
+fn capacity_help(default: &ServerConfig) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "--max-connections N",
+            format!(
+                "connections held at once, counted past the request head (default {})",
+                default.max_connections
+            ),
+        ),
+        (
+            "--max-rooms N",
+            format!(
+                "rooms held at once; past it a room is not minted (default {})",
+                default.max_rooms
+            ),
+        ),
+        (
+            "--max-peers-per-room N",
+            format!(
+                "peers one room seats at once (default {})",
+                default.max_peers_per_room
+            ),
+        ),
+        (
+            "--max-documents-per-room N",
+            format!(
+                "paths one room's open-document set holds (default {})",
+                default.max_documents_per_room
+            ),
+        ),
+        (
+            "--outbound-queue-bytes N",
+            format!(
+                "payload bytes queued but unwritten for one connection; past it the \
+                 peer is dropped as one that stopped reading (default {})",
+                mib_label(default.max_queue_bytes)
+            ),
+        ),
+    ]
+}
+
+/// The flags that bound what one connection may send.
+fn abuse_help(default: &ServerConfig) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "--max-envelope-bytes N",
+            format!(
+                "largest inbound text envelope, judged before the JSON parse \
+                 (default {})",
+                mib_label(default.max_envelope_bytes)
+            ),
+        ),
+        (
+            "--inbound-bytes-per-sec N",
+            format!(
+                "bytes one connection may send a second, refilled continuously \
+                 (default {}/s)",
+                mib_label(default.inbound_bytes_per_sec)
+            ),
+        ),
+        (
+            "--inbound-burst-bytes N",
+            format!(
+                "how much of that rate one connection may spend at once (default {})",
+                mib_label(default.inbound_burst_bytes)
+            ),
+        ),
+    ]
+}
+
+/// A byte count in the largest whole unit that does not lie about it: a limit of
+/// 1,000,000 bytes is not "0 MiB".
+fn mib_label(bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    match bytes.checked_div(MIB) {
+        Some(whole) if whole.saturating_mul(MIB) == bytes => {
+            format!("{whole} MiB")
+        }
+        _ => format!("{bytes} bytes"),
+    }
 }
 
 fn address(value: &str) -> Result<SocketAddr, String> {
@@ -167,18 +387,33 @@ fn addr_in_use_hint(addr: SocketAddr) -> String {
     )
 }
 
-/// The startup lines: what is listening, how long rooms outlive their host, and what
-/// the host does next. The invite itself is minted host-side by the client library,
-/// so this points at it rather than printing one.
-fn startup_lines(
-    local: SocketAddr,
-    room_grace: Duration,
-    page: Option<&Path>,
-) -> Vec<String> {
-    let mut lines = vec![format!(
-        "selvaged listening on ws://{local}/session (meta at http://{local}/meta)"
-    )];
-    if let Some(root) = page {
+/// The startup lines: what is listening, the limits this process enforces, how long
+/// rooms outlive their host, and what the host does next. The invite itself is minted
+/// host-side by the client library, so this points at it rather than printing one.
+///
+/// The limits are printed rather than left to `--help`: a deployment reads its own
+/// container's log, and a limit that is not what its operator thought it was is exactly
+/// the mistake this line exists to make visible.
+fn startup_lines(local: SocketAddr, config: &ServerConfig) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "selvaged listening on ws://{local}/session (meta at http://{local}/meta)"
+        ),
+        format!(
+            "limits: {} connections, {} rooms, {} peers per room, {} documents per \
+             room, {} outbound per connection, {} inbound text envelope, {}/s inbound \
+             with a {} burst",
+            config.max_connections,
+            config.max_rooms,
+            config.max_peers_per_room,
+            config.max_documents_per_room,
+            mib_label(config.max_queue_bytes),
+            mib_label(config.max_envelope_bytes),
+            mib_label(config.inbound_bytes_per_sec),
+            mib_label(config.inbound_burst_bytes),
+        ),
+    ];
+    if let Some(root) = &config.page_root {
         lines.push(format!(
             "serving the page from {} at http://{local}/",
             root.display()
@@ -201,7 +436,7 @@ fn startup_lines(
     lines.push(format!(
         "rooms live {}s after their host disconnects — rejoin with the same invite \
         link within the window to keep the room",
-        room_grace.as_secs_f64()
+        config.room_grace.as_secs_f64()
     ));
     lines.push(
         "connect a client to mint a room; the client prints the invite link to share. \
@@ -219,6 +454,30 @@ mod tests {
         parse_args(items.iter().map(ToString::to_string))
     }
 
+    /// A parsed run of `flags` on top of the defaults.
+    fn plan(flags: &[&str]) -> Run {
+        match args(flags).expect("the flags parse") {
+            Action::Run(plan) => *plan,
+            other @ (Action::Help | Action::Version) => {
+                panic!("a run was expected, got {other:?}")
+            }
+        }
+    }
+
+    /// The default plan, which is what no flags at all must produce.
+    fn defaults() -> Run {
+        plan(&[])
+    }
+
+    /// A config differing from the defaults only in the grace period, for the startup
+    /// lines of a test that does not care about the limits.
+    fn config_with_grace(seconds: u64) -> ServerConfig {
+        ServerConfig {
+            room_grace: Duration::from_secs(seconds),
+            ..ServerConfig::default()
+        }
+    }
+
     #[test]
     fn help_and_version_flags_win() {
         assert_eq!(args(&["--help"]), Ok(Action::Help));
@@ -228,51 +487,117 @@ mod tests {
 
     #[test]
     fn defaults_bind_loopback_with_the_reference_grace() {
-        let default_grace = ServerConfig::default().room_grace;
+        let plan = defaults();
         assert_eq!(
-            args(&[]),
-            Ok(Action::Run(
-                DEFAULT_ADDRESS.parse().expect("the default binds"),
-                default_grace,
-                None
-            ))
+            plan.addr,
+            DEFAULT_ADDRESS.parse().expect("the default binds")
         );
+        assert_eq!(plan.page, None);
+        assert_eq!(plan.config, ServerConfig::default());
     }
 
     #[test]
     fn flags_set_the_bind_address_and_the_grace() {
-        let action =
-            args(&["--listen", "0.0.0.0:9000", "--room-grace-ms", "5000"])
-                .expect("valid flags parse");
+        let plan =
+            plan(&["--listen", "0.0.0.0:9000", "--room-grace-ms", "5000"]);
         assert_eq!(
-            action,
-            Action::Run(
-                "0.0.0.0:9000".parse().expect("the test address parses"),
-                Duration::from_secs(5),
-                None
-            )
+            plan.addr,
+            "0.0.0.0:9000".parse().expect("the test address parses")
         );
+        assert_eq!(plan.config.room_grace, Duration::from_secs(5));
+        assert_eq!(plan.page, None);
+    }
+
+    /// Every capacity flag reaches the field it names, and nothing else moves: a
+    /// deployment that sizes its box passes these instead of rebuilding the server.
+    #[test]
+    fn the_capacity_flags_set_their_own_limits() {
+        let plan = plan(&[
+            "--max-connections",
+            "8",
+            "--max-rooms",
+            "7",
+            "--max-peers-per-room",
+            "6",
+            "--max-documents-per-room",
+            "5",
+            "--outbound-queue-bytes",
+            "4194304",
+        ]);
+        assert_eq!(plan.config.max_connections, 8);
+        assert_eq!(plan.config.max_rooms, 7);
+        assert_eq!(plan.config.max_peers_per_room, 6);
+        assert_eq!(plan.config.max_documents_per_room, 5);
+        assert_eq!(plan.config.max_queue_bytes, 4 * 1024 * 1024);
+        let untouched = ServerConfig {
+            max_connections: 8,
+            max_rooms: 7,
+            max_peers_per_room: 6,
+            max_documents_per_room: 5,
+            max_queue_bytes: 4 * 1024 * 1024,
+            ..ServerConfig::default()
+        };
+        assert_eq!(plan.config, untouched);
+    }
+
+    /// The two bounds that close the text-envelope and rate-limit findings are flags
+    /// too, and they land in the fields the server reads them from.
+    #[test]
+    fn the_abuse_flags_set_their_own_limits() {
+        let plan = plan(&[
+            "--max-envelope-bytes",
+            "262144",
+            "--inbound-bytes-per-sec",
+            "1048576",
+            "--inbound-burst-bytes",
+            "2097152",
+        ]);
+        assert_eq!(plan.config.max_envelope_bytes, 256 * 1024);
+        assert_eq!(plan.config.inbound_bytes_per_sec, 1024 * 1024);
+        assert_eq!(plan.config.inbound_burst_bytes, 2 * 1024 * 1024);
+    }
+
+    /// A limit that is not a whole number names its flag and shows the value it should
+    /// have taken, so the operator does not have to read `--help` to find the mistake.
+    #[test]
+    fn a_limit_that_is_not_a_number_names_its_flag() {
+        for (flag, wanted) in [
+            ("--max-connections", "1024"),
+            ("--max-rooms", "1024"),
+            ("--max-peers-per-room", "128"),
+            ("--max-documents-per-room", "1024"),
+            ("--outbound-queue-bytes", "33554432"),
+            ("--max-envelope-bytes", "5242880"),
+            ("--inbound-bytes-per-sec", "2097152"),
+            ("--inbound-burst-bytes", "67108864"),
+        ] {
+            let missing = args(&[flag]).expect_err("a bare limit fails");
+            assert!(
+                missing.contains(flag) && missing.contains(wanted),
+                "{flag} names itself and its default: {missing}"
+            );
+            let words =
+                args(&[flag, "lots"]).expect_err("words are not limits");
+            assert!(
+                words.contains(flag) && words.contains(wanted),
+                "{flag} names itself and its default: {words}"
+            );
+        }
     }
 
     #[test]
     fn serve_page_takes_a_directory() {
-        let expected = Action::Run(
-            DEFAULT_ADDRESS.parse().expect("the default binds"),
-            ServerConfig::default().room_grace,
-            Some(PathBuf::from("/page")),
+        assert_eq!(
+            plan(&["--serve-page", "/page"]).page,
+            Some(PathBuf::from("/page"))
         );
-        assert_eq!(args(&["--serve-page", "/page"]), Ok(expected));
     }
 
     #[test]
     fn the_last_serve_page_wins() {
         assert_eq!(
-            args(&["--serve-page", "/a", "--serve-page", "/b"]),
-            Ok(Action::Run(
-                DEFAULT_ADDRESS.parse().expect("the default binds"),
-                ServerConfig::default().room_grace,
-                Some(PathBuf::from("/b")),
-            ))
+            plan(&["--serve-page", "/a", "--serve-page", "/b"]).page,
+            Some(PathBuf::from("/b"))
         );
     }
 
@@ -299,14 +624,54 @@ mod tests {
         assert!(not_a_number.contains("30000"), "{not_a_number}");
     }
 
+    /// The help names every flag and every default a flag takes, including the ones
+    /// whose default is a byte count the reader would otherwise have to look up.
     #[test]
     fn help_names_every_flag_with_its_default() {
         let help = help_text();
         assert!(help.contains(USAGE), "{help}");
         assert!(help.contains(DEFAULT_ADDRESS), "{help}");
         assert!(help.contains("30s"), "{help}");
-        assert!(help.contains("--serve-page"), "{help}");
-        assert!(help.contains("--version"), "{help}");
+        for flag in [
+            "--serve-page",
+            "--max-connections",
+            "--max-rooms",
+            "--max-peers-per-room",
+            "--max-documents-per-room",
+            "--outbound-queue-bytes",
+            "--max-envelope-bytes",
+            "--inbound-bytes-per-sec",
+            "--inbound-burst-bytes",
+            "--version",
+        ] {
+            assert!(help.contains(flag), "{flag} is not in the help: {help}");
+        }
+        let default = ServerConfig::default();
+        for wanted in [
+            default.max_connections.to_string(),
+            default.max_rooms.to_string(),
+            default.max_peers_per_room.to_string(),
+            default.max_documents_per_room.to_string(),
+            "32 MiB".to_string(),
+            "5 MiB".to_string(),
+            "2 MiB".to_string(),
+            "64 MiB".to_string(),
+        ] {
+            assert!(
+                help.contains(&wanted),
+                "{wanted} is not in the help: {help}"
+            );
+        }
+    }
+
+    /// A byte count reads as the unit a reader sizes a box in, and a count that is not
+    /// a whole number of them is not rounded into a lie.
+    #[test]
+    fn byte_labels_do_not_round_the_truth_away() {
+        assert_eq!(mib_label(32 * 1024 * 1024), "32 MiB");
+        assert_eq!(mib_label(1024 * 1024), "1 MiB");
+        assert_eq!(mib_label(1_000_000), "1000000 bytes");
+        assert_eq!(mib_label(0), "0 MiB");
     }
 
     #[test]
@@ -331,8 +696,7 @@ mod tests {
     #[test]
     fn startup_points_loopback_hosts_at_the_next_step() {
         let local: SocketAddr = "127.0.0.1:8080".parse().expect("parses");
-        let lines = startup_lines(local, Duration::from_secs(30), None);
-        let joined = lines.join("\n");
+        let joined = startup_lines(local, &config_with_grace(30)).join("\n");
         assert!(joined.contains("ws://127.0.0.1:8080/session"), "{joined}");
         assert!(joined.contains("loopback-only"), "{joined}");
         assert!(joined.contains("0.0.0.0"), "{joined}");
@@ -345,11 +709,37 @@ mod tests {
         assert!(joined.contains("Ctrl-C ends all rooms"), "{joined}");
     }
 
+    /// The startup line reports the limits this process actually enforces, which is what
+    /// makes a mis-sized deployment visible in its own log.
+    #[test]
+    fn startup_names_the_limits_in_force() {
+        let local: SocketAddr = "127.0.0.1:8080".parse().expect("parses");
+        let config = ServerConfig {
+            max_connections: 8,
+            max_rooms: 7,
+            max_peers_per_room: 6,
+            max_documents_per_room: 5,
+            max_queue_bytes: 4 * 1024 * 1024,
+            max_envelope_bytes: 1024 * 1024,
+            inbound_bytes_per_sec: 512 * 1024,
+            inbound_burst_bytes: 2 * 1024 * 1024,
+            ..config_with_grace(30)
+        };
+        let joined = startup_lines(local, &config).join("\n");
+        for wanted in [
+            "limits: 8 connections, 7 rooms, 6 peers per room, 5 documents per room",
+            "4 MiB outbound per connection",
+            "1 MiB inbound text envelope",
+            "524288 bytes/s inbound with a 2 MiB burst",
+        ] {
+            assert!(joined.contains(wanted), "{wanted} is not named: {joined}");
+        }
+    }
+
     #[test]
     fn startup_guides_a_wildcard_bind() {
         let local: SocketAddr = "0.0.0.0:8080".parse().expect("parses");
-        let joined =
-            startup_lines(local, Duration::from_secs(30), None).join("\n");
+        let joined = startup_lines(local, &config_with_grace(30)).join("\n");
         assert!(!joined.contains("loopback-only"), "{joined}");
         assert!(
             joined.contains("replace the wildcard"),
@@ -360,8 +750,7 @@ mod tests {
     #[test]
     fn startup_stays_quiet_for_a_specific_address() {
         let local: SocketAddr = "192.0.2.7:8080".parse().expect("parses");
-        let joined =
-            startup_lines(local, Duration::from_secs(30), None).join("\n");
+        let joined = startup_lines(local, &config_with_grace(30)).join("\n");
         assert!(!joined.contains("loopback-only"), "{joined}");
         assert!(!joined.contains("wildcard"), "{joined}");
         assert!(joined.contains("same invite link"), "{joined}");
@@ -370,12 +759,11 @@ mod tests {
     #[test]
     fn startup_names_the_served_page() {
         let local: SocketAddr = "127.0.0.1:8080".parse().expect("parses");
-        let joined = startup_lines(
-            local,
-            Duration::from_secs(30),
-            Some(Path::new("/page")),
-        )
-        .join("\n");
+        let config = ServerConfig {
+            page_root: Some(PathBuf::from("/page")),
+            ..config_with_grace(30)
+        };
+        let joined = startup_lines(local, &config).join("\n");
         assert!(joined.contains("serving the page from /page"), "{joined}");
     }
 }
