@@ -21,6 +21,9 @@ those facts; this directory owns the files, and the two must agree.
 |---|---|---|
 | `compose.yaml` | `/etc/selvage/compose.yaml` | The three services, the hardening and the memory limits |
 | `.env.example` | `/etc/selvage/.env` | The two image references the next `up` runs |
+| `deploy.py` | `/usr/local/sbin/selvage-deploy` | The deploy: reads one request on stdin, verifies the shape, pulls and ups |
+| `deployci.sudoers` | `/etc/sudoers.d/selvage-deploy` | The one root command the CI user on this box may run |
+| `test_deploy.py` | nowhere; run where it is | What the request grammar refuses, and that a shape mismatch touches nothing |
 | `proxy/Dockerfile` | build context `/etc/selvage/proxy/` | The front's image, from the two files below it |
 | `proxy/nginx.conf` | baked into that image | Process and http scope: the log policy, the temp paths, the per-source zones |
 | `proxy/conf.d/default.conf` | baked into that image | The server block: TLS, the routes, the limits, the terms page |
@@ -193,7 +196,11 @@ link is a *page* link — `/?room=…&token=…` — so it lands on `selvage-web
 that image keeps an nginx access log on its stdout. The cutover found it doing
 exactly that on the public URL:
 
-    172.18.0.4 - - [21/Sep/2026:13:28:45 +0000] "GET /?room=r-LEAKTEST&token=SUPERSECRETTOKEN HTTP/1.1" 200 32281 "-" "curl/8.22.0"
+    172.18.0.4 - - [21/Sep/2026:13:28:45 +0000] "GET /?room=r-LEAKTEST&token=<probe token> HTTP/1.1" 200 32281 "-" "curl/8.22.0"
+
+The probe invented both the room and the token; the token is elided here because
+`ripsecrets`, which this repository runs on every commit, reads a literal
+`token=`-followed-by-a-value as one of its patterns, and it was right to.
 
 `selvage-web` therefore runs with Docker's `none` logging driver: its output is
 discarded outright. Discarding rather than filtering is the point — it holds
@@ -240,8 +247,7 @@ sudo docker compose -f /etc/selvage/compose.yaml up -d
 ```
 
 One command: it builds the front from `/etc/selvage/proxy/`, pulls whatever
-`.env` names, creates the network and starts the three services. `up -d` on an
-unchanged deployment recreates nothing.
+`.env` names, creates the network and starts the three services.
 
 Two settings make that one command honest about a change:
 
@@ -254,6 +260,24 @@ Two settings make that one command honest about a change:
   once, at startup, and a recreated container can come back on a different
   address — a proxy left running would go on dialling the old one.
 
+**That rebuild has a cost worth knowing before you run the command by hand.**
+With BuildKit's default attestations the built image's manifest — and so its
+image ID — is stamped per build even when `proxy/` has not changed at all, and
+Compose recreates any container whose image ID moved. So this command replaces
+the front *every* time, which drops the WebSockets through it and makes the origin
+unreachable for a second or two. Rooms survive: `selvaged` is not recreated, and
+the clients reconnect on their own. Three builds of one context on this box,
+with nothing edited between them:
+
+    sha256:702235e5…  sha256:74fb7a39…  sha256:6f4c1cdd…
+
+`deploy.py` sets `BUILDX_NO_DEFAULT_ATTESTATIONS=1` for the Compose it runs, which
+makes that rebuild content-addressed instead — the same three builds then produce
+one image ID — so a deployment whose images have not changed recreates nothing at
+all. That is why the automated path is quieter than this command, and the only
+reason the two differ. The front's image is local and nothing is published from
+it, so the attestations are worth nothing here; Compose's own `build.provenance: false` was tried first and did not take effect on Compose 2.40.3.
+
 Bootstrap, once, from a checkout of `reference_server`:
 
 ```sh
@@ -263,10 +287,18 @@ git archive <sha> packaging/prod | ssh selvage@selvage-protocol-prod 'sudo tar -
 
 ### Moving an image
 
-`.env` names the images. Resolve a release tag to its index digest through the
-registry's anonymous pull flow, put `ghcr.io/selvage-protocol/selvaged@sha256:…`
-in `/etc/selvage/.env`, and run the `up -d` above. **A digest, not a tag**: a tag
-is a name someone else can repoint, and this is the public origin.
+`.env` names the images. Resolve a release version to its index digest, put
+`ghcr.io/selvage-protocol/selvaged@sha256:…` in `/etc/selvage/.env`, and run the
+`up -d` above. **A digest, not a tag**: a tag is a name someone else can repoint,
+and this is the public origin.
+
+```sh
+scripts/image-digest.py ghcr.io/selvage-protocol/selvaged:0.2.0
+```
+
+That is the same anonymous pull flow `assert-multiarch-layers.py` uses
+(`scripts/registry.py`), and it is what the deploy workflow calls. By hand, the
+one line of it a deploy needs is:
 
 ```sh
 repo=selvage-protocol/selvaged; tag=0.2.0
@@ -278,20 +310,88 @@ curl -sI -H "Authorization: Bearer $tok" \
   | grep -i docker-content-digest
 ```
 
-That is the flow `scripts/assert-multiarch-layers.py` already implements for its
-own purpose; this is the one line of it a deploy needs.
-
 `docker compose up -d` is safe to run while the demo is live, and it does not
 preserve sessions: `selvaged` is memory-only, so a recreate ends every room and
 a guest sees the room gone. There is no reclaim after a restart.
 
 ### Rollback
 
-`.env` holds one generation, so keep the previous one beside it
-(`/etc/selvage/.env.prev`) before an upgrade, and roll back by restoring it and
-running the same `up -d`. The front has no version of its own to roll back to and
-does not need one: it is built from the files in this directory, so an older
-front is that directory at an older commit and the same `up -d`.
+`.env` holds one generation and `deploy.py` keeps the file it replaced as
+`/etc/selvage/.env.prev`, so rolling back by hand is restoring that file and
+running the `up -d` above. The automated path is a dispatch of the same workflow
+with the older `server_version` — the same mechanism as a deploy, which is why it
+is exercised by every deploy rather than rotting until the day it is needed.
+
+Either way, rolling back `selvaged` ends every live room a second time. That is
+what the approval gate is for. The front has no version of its own to roll back
+to and does not need one: it is built from the files in this directory, so an
+older front is that directory at an older commit and the same `up -d`.
+
+## Deploying a release from CI
+
+`.github/workflows/deploy-prod.yml` in `reference_server`: a manual dispatch that
+joins the tailnet, hands this box one request over Tailscale SSH and then checks
+the *public* origin reports the version it deployed.
+
+```sh
+gh workflow run deploy-prod.yml --ref main -f server_version=0.2.1
+gh workflow run deploy-prod.yml --ref main -f web_version=0.1.1
+gh workflow run deploy-prod.yml --ref main -f server_version=0.3.0 -f web_version=0.2.0
+```
+
+An input it is not given means **leave that service exactly as it is**, so a page
+release and a server release are separable and a rollback is a dispatch with an
+older version. The run then waits on the GitHub environment `prod`, whose
+required reviewer is the owner: the approval *is* the moment the credential
+exists, and it is the moment the live-session cost above is chosen.
+
+What a run may change is bounded by construction rather than by convention. It
+handed the box two digest-pinned references and the sha256 of `compose.yaml`,
+and nothing else: `deploy.py` matches every value against one fixed pattern and
+**verifies** the compose file against that hash instead of writing it. A run
+cannot add a port, drop a capability, mount a certificate or raise a memory
+limit, and it cannot rewrite the shape to do so later. Anything else it might
+want is a pull request and a hand install.
+
+Getting in is Tailscale SSH as `deployci`, a local user on the box with no
+password, no key, no group but its own, and exactly one permitted root command —
+`/usr/local/sbin/selvage-deploy`, with **no argument wildcard** in the sudoers
+rule, which is why the request arrives on stdin. `sudo -l -U deployci` on the box
+is the whole of the privilege model, and `deployci.sudoers` is the tracked copy
+of that line. The account `selvage` is deliberately not used: it has blanket
+passwordless sudo, so a shell as `selvage` is a shell as root, and lending that
+to CI would make the deploy credential a root credential.
+
+Installing the two files by hand, from a checkout at the merged commit, so the
+repository and the box agree:
+
+```sh
+box=selvage@selvage-protocol-prod
+scp packaging/prod/deploy.py         "$box:/tmp/selvage-deploy"
+scp packaging/prod/deployci.sudoers  "$box:/tmp/selvage-deploy.sudoers"
+ssh "$box" 'set -e
+  sudo install -o root -g root -m 0755 /tmp/selvage-deploy /usr/local/sbin/selvage-deploy
+  sudo visudo -c -f /tmp/selvage-deploy.sudoers
+  sudo install -o root -g root -m 0440 /tmp/selvage-deploy.sudoers /etc/sudoers.d/selvage-deploy
+  rm -f /tmp/selvage-deploy /tmp/selvage-deploy.sudoers
+  sudo -l -U deployci'
+```
+
+The installed name has no `.py`: `/usr/local/sbin/selvage-deploy` is the path the
+sudoers rule names, and the shebang makes it the program. `visudo -c` reads it
+before it is installed, so a syntax error cannot lock the box out of `sudo`.
+
+The user itself is separate, because it is not a file:
+
+```sh
+ssh "$box" 'sudo adduser --system --group --home /var/lib/selvage-deploy --shell /bin/bash deployci'
+```
+
+`deployci` needs a real shell because Tailscale SSH runs the login shell, and
+`/usr/sbin/nologin` would refuse the session rather than the command. It is
+created with no password (`--system`) and no `authorized_keys`, so the tailnet
+policy is the only way in. That policy is not in this repository: the runbook in
+`ai_notes` owns it.
 
 ## Certificate
 

@@ -242,13 +242,27 @@
           # The TLS front's idle logic (`packaging/pi-demo/tls-proxy.py`): a quiet half
           # of a tunnel is not a dead one, and nothing else in this repository can see
           # that. Stdlib Python only, so it needs neither the Pi nor a certificate.
-          tls-proxy = pkgs.runCommand "tls-proxy-test" {
-            nativeBuildInputs = [pkgs.python3];
-          } ''
-            cd ${./packaging/pi-demo}
-            python3 -B test_tls_proxy.py
-            touch $out
-          '';
+          tls-proxy =
+            pkgs.runCommand "tls-proxy-test" {
+              nativeBuildInputs = [pkgs.python3];
+            } ''
+              cd ${./packaging/pi-demo}
+              python3 -B test_tls_proxy.py
+              touch $out
+            '';
+
+          # The guard around `packaging/prod/deploy.py`, which is the whole of the
+          # public demo's privilege model: `/usr/local/sbin/selvage-deploy` is the
+          # only root command the CI user on that box may run. Nothing else in this
+          # repository can see what its request grammar refuses.
+          prod-deploy =
+            pkgs.runCommand "prod-deploy-test" {
+              nativeBuildInputs = [pkgs.python3];
+            } ''
+              cd ${./packaging/prod}
+              python3 -B test_deploy.py
+              touch $out
+            '';
         };
 
         devShells.default = craneLib.devShell {

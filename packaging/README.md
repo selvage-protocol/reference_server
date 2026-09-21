@@ -5,7 +5,7 @@ Four shapes, for four audiences:
 | Path | Who it is for | What it is |
 |---|---|---|
 | `pi-demo/` | The live Pi demo, exactly as it runs | The TLS front and the user units that are deployed — tracked here so a deployment artefact is reviewable |
-| `prod/` | The live public demo, exactly as it runs | The TLS front, the router and the three-service compose file for one public origin — the Pi's pattern with a page container of its own |
+| `prod/` | The live public demo, exactly as it runs | The TLS front, the router and the three-service compose file for one public origin — the Pi's pattern with a page container of its own — plus the deploy script that box's CI user may run as root |
 | `systemd/` | A self-hoster on their own machine | A user unit plus install docs — the proven path, generalized, with no front |
 | `Dockerfile` + `compose.yaml` | Strangers self-hosting on their own machines | A multi-arch image and a one-service compose file — never the Pi |
 The server is memory-only under all four: restarts end all rooms, and
