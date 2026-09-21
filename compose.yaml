@@ -11,7 +11,7 @@
 services:
   selvaged:
     build: .
-    image: ghcr.io/selvage-protocol/selvaged:0.1.2
+    image: ghcr.io/selvage-protocol/selvaged:0.2.0
     ports:
       # Loopback by default: a stranger evaluating locally reaches it, and
       # nothing else does. To serve other machines, rebind deliberately, e.g.
