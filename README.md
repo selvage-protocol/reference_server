@@ -10,13 +10,13 @@ two-client harness that gates it in CI.
 its surface. The shortest route to a running server is the published image:
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.1.2
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.2.0
 ```
 
-The GHCR package is public, so a pull needs no account and no `docker login`. `0.1.2` is
-the current release and the first built separately for each architecture; `0.1.0` and
-`0.1.1` carry the amd64 binary in their `linux/arm64` leg. `packaging/README.md` owns the
-full tag list and what each tag contains.
+The GHCR package is public, so a pull needs no account and no `docker login`. `0.2.0` is
+the current release; `0.1.2` was the first built separately for each architecture, and
+`0.1.0` and `0.1.1` carry the amd64 binary in their `linux/arm64` leg.
+`packaging/README.md` owns the full tag list and what each tag contains.
 
 ### From a checkout
 
