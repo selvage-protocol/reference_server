@@ -207,9 +207,9 @@ against it. `scripts/ci-local.sh image` runs that smoke anywhere nix does.
 
 ### Published releases
 
-The package holds `0.1.0-7d64cbb`, `0.1.0`, `0.1.1-a3f4b12`, `0.1.1` and the moving
-`latest`, which is `0.1.1` as this is written (2026-09-21). `v0.1.0` (2026-09-19, at
-`7d64cbb`, the merge of \#25) was the first: its tag run —
+The package holds `0.1.0-7d64cbb`, `0.1.0`, `0.1.1-a3f4b12`, `0.1.1`, `0.1.2-adc0ae2`,
+`0.1.2` and the moving `latest`, which is `0.1.2` as this is written (2026-09-21).
+`v0.1.0` (2026-09-19, at `7d64cbb`, the merge of \#25) was the first: its tag run —
 https://github.com/selvage-protocol/reference\_server/actions/runs/35428735910 —
 published `ghcr.io/selvage-protocol/selvaged:0.1.0-7d64cbb`, `:0.1.0` and `:latest`
 from the `publish` job.
@@ -222,25 +222,34 @@ organization's **Package Creation** setting, which decides whether members may c
 public packages at all.
 
 **`0.1.0` and `0.1.1` carry the amd64 binary in their `linux/arm64` leg**, so the tag says
-nothing about the architecture inside it: the published image runs on `linux/amd64`, and an
-ARM machine builds from a checkout. `scripts/assert-multiarch-layers.py <tag>` reads a
-tag's two platform manifests out of the registry and checks each one's `/selvaged` for the
-ELF machine its platform claims. Against `0.1.0` and `0.1.1` it reports this and exits
-non-zero:
+nothing about the architecture inside it: those two are for `linux/amd64`, and an ARM
+machine builds from a checkout. `0.1.2` is the first release whose legs are separate
+builds. `scripts/assert-multiarch-layers.py <tag>` reads a tag's two platform manifests out
+of the registry and checks each one's `/selvaged` for the ELF machine its platform claims.
+Against `0.1.0` and `0.1.1` it reports this and exits non-zero:
 
 ```text
 linux/amd64 and linux/arm64 carry the exact same layer digests: the arm64 leg was not built separately from the amd64 one
 linux/arm64: /selvaged has ELF e_machine 62, want 183
 ```
 
+and against `0.1.2`:
+
+```text
+layer digests OK: amd64 and arm64 differ
+ELF OK on linux/amd64: e_machine 62
+ELF OK on linux/arm64: e_machine 183
+multiarch OK: ghcr.io/selvage-protocol/selvaged:0.1.2 carries a genuine binary per platform
+```
+
 `publish` and `publish-rehearsal` both run that assertion, after the push: a tag whose legs
-are the same build is already on GHCR when the job goes red, which is the state `0.1.1` is
-in.
+are the same build is already on GHCR when the job goes red, which is how `0.1.0` and
+`0.1.1` were published and what `0.1.2` fixed.
 
 A stranger pulls it with no account:
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.1.2
 ```
 
 and `compose.yaml`'s `build: .` remains the route for an image built from a checkout.
