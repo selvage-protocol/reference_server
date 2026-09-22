@@ -270,6 +270,12 @@ pub struct PeerSession {
     /// a seat the roster never knew from one that departed.
     departed: BTreeSet<String>,
     announced_at: Option<Duration>,
+    /// The clock of the first content frame this client refused since its last `SyncStep1`,
+    /// which is §13.6's interval. `None` means there is nothing to re-sync about.
+    resync_from: Option<Duration>,
+    /// The clock of the last `SyncStep1` this client sent, which is what the re-sync is
+    /// bounded by: one is sent per renewal interval however many frames were refused.
+    handshaken_at: Option<Duration>,
     /// The edition of the state this client holds, or `None` before one has been applied
     /// (§13.3's waiting rules and §13.10's closing both turn on it).
     state_issued: Option<u64>,
@@ -326,6 +332,8 @@ impl PeerSession {
             leases: BTreeMap::new(),
             departed: BTreeSet::new(),
             announced_at: None,
+            resync_from: None,
+            handshaken_at: None,
             state_issued: None,
             host_away_since: None,
             published: 0,
@@ -479,6 +487,7 @@ impl PeerSession {
         let ended = self.reader.ended;
         let verdict = self.reader.read(frame);
         if !verdict.ok {
+            self.note_refusal(clock, &verdict);
             return self.refuse(index, verdict.reason.as_deref());
         }
         let kind = verdict.kind.unwrap_or_default();
@@ -509,6 +518,7 @@ impl PeerSession {
             return;
         }
         self.reannounce(clock);
+        self.resync(clock);
         self.announce_holds(clock);
     }
 
@@ -588,6 +598,15 @@ impl Ending {
 // --- the rules, in the order §13 states them ------------------------------------
 
 impl PeerSession {
+    /// §13.6: a refused *content* frame opens an interval this client re-syncs in. The
+    /// envelope's `kind` is readable before any signature is verified, so that is a claim about
+    /// the bytes and not about the reason the frame was refused.
+    fn note_refusal(&mut self, clock: Duration, verdict: &Verdict) {
+        if verdict.kind == Some(0) {
+            let _ = self.resync_from.get_or_insert(clock);
+        }
+    }
+
     /// One refused frame: §13.2's local report, which is never sent anywhere.
     fn refuse(&mut self, frame: u64, reason: Option<&str>) -> Outcome {
         // Every refusal carries the step that refused it; one without a reason would be a bug
@@ -629,7 +648,7 @@ impl PeerSession {
         if self.commits_ours() {
             // §13.1's step 6: the sync handshake, once, now that this client's key is one a
             // peer can attribute and everything the relay handed it before is refused.
-            self.sync_step1();
+            self.sync_step1(clock);
         } else {
             // §13.1's step 4: a state that does not commit this key is what a re-announcement
             // is for, and the renewal clock alone would wait a whole window for it.
@@ -838,7 +857,7 @@ impl PeerSession {
 
     /// §13.1's step 6: a `SyncStep1` with this replica's state vector, so the room can tell a
     /// client that has been refusing frames from one that has been applying them.
-    fn sync_step1(&mut self) {
+    fn sync_step1(&mut self, clock: Duration) {
         let vector = {
             let txn = self.awareness.doc().transact();
             txn.state_vector()
@@ -846,6 +865,24 @@ impl PeerSession {
         let message =
             encode_y_message(&YMessage::Sync(SyncMessage::SyncStep1(vector)));
         self.publish(Published::Sync, &message);
+        self.handshaken_at = Some(clock);
+    }
+
+    /// §13.6: a client that refused a content frame re-syncs, and no more than once per renewal
+    /// interval however many it refused — the lower bound is what keeps a peer that floods
+    /// refused frames from being answered frame for frame.
+    fn resync(&mut self, clock: Duration) {
+        if self.resync_from.is_none() || !self.may_publish() {
+            return;
+        }
+        let due = match self.handshaken_at {
+            None => true,
+            Some(at) => clock.saturating_sub(at) >= self.renew,
+        };
+        if due {
+            self.resync_from = None;
+            self.sync_step1(clock);
+        }
     }
 
     /// One frame sealed under the frame key and signed by this connection's session key.
@@ -1241,6 +1278,27 @@ mod tests {
         );
         assert_eq!(session.published(), 1, "nothing was published in answer");
         assert_eq!(session.text("README.md"), "", "and nothing was applied");
+
+        // §13.6: the refusal opens an interval, and the client re-syncs in it — once per
+        // renewal interval, however many content frames it refused.
+        assert!(session.take_outbound().is_empty());
+        session.tick(millis(2 + 300));
+        let after = session.take_outbound();
+        assert_eq!(after.len(), 1, "§13.6's re-sync");
+        assert_eq!(session.handshake(), 2, "§13.1's step 6, then §13.6's");
+        assert_eq!(
+            session.published(),
+            1,
+            "a handshake frame is not a publication"
+        );
+        assert_eq!(
+            Envelope::parse(&after[0]).unwrap().kind,
+            0,
+            "a `kind = 0` frame carrying the SyncStep1"
+        );
+        session.tick(millis(2 + 301));
+        session.tick(millis(2 + 302));
+        assert!(session.take_outbound().is_empty(), "once per interval");
     }
 
     #[test]
