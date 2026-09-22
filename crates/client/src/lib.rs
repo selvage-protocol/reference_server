@@ -15,6 +15,7 @@ pub mod editor;
 mod engine;
 pub mod error;
 pub mod presence;
+pub mod sealed;
 pub mod session;
 
 use std::sync::{Arc, Mutex};
