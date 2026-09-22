@@ -165,40 +165,32 @@ jobs:
             '/usr/bin/sudo /usr/local/sbin/selvage-deploy' \
             <"$RUNNER_TEMP/deploy-request"
 
-      # A deploy that goes green because `docker compose` exited zero is a
-      # deploy nobody checked. This reads the *public* origin — over Cloudflare,
-      # through the front — and fails on the last observed value if it never
-      # reports the version that was asked for.
-      - name: verify the public origin reports what was deployed
+      # A deploy that goes green because `docker compose` exited zero is a deploy
+      # nobody checked, so this asserts what is actually serving: the origin, read
+      # on the box through the front over the SSH path step 5 already opened —
+      # `https://127.0.0.1/meta` and the page — and the run fails unless it reports
+      # the version this dispatch asked for.
+      #
+      # The *public* URL is read too, but as a report rather than an assertion.
+      # Cloudflare serves a managed challenge to a programmatic client on a
+      # datacenter address — this runner, and the box itself — so a read from here
+      # is refused at the edge whatever the deployment is doing. The attempt says
+      # so in plain words and ends at the first challenge response instead of
+      # polling a deadline it cannot pass, and a challenge never turns a healthy
+      # deploy red. When the edge does let a client like this one through the read
+      # is compared, so the assertion comes back on its own.
+      #
+      # `scripts/verify_deploy.py` is both reads, and `packaging/prod/README.md`
+      # has the evidence for the challenge. Each read polls a real predicate with
+      # its own 60 s deadline and reports what it last observed, so a step that
+      # cannot pass says so in about a minute instead of looking hung.
+      - name: verify the origin serves what was deployed
         env:
           SERVER_VERSION: ${{ inputs.server_version }}
         run: |
           set -euo pipefail
-          url=https://selvage.dontblameme.dev
+          args=(--ssh-target deployci@selvage-protocol-prod)
           if [ -n "$SERVER_VERSION" ]; then
-            got=''
-            deadline=$((SECONDS + 180))
-            while :; do
-              body=$(curl -fsS --max-time 10 "$url/meta" || true)
-              got=$(printf '%s' "$body" | jq -r '.server // ""' 2>/dev/null || true)
-              if [ "$got" = "selvaged/$SERVER_VERSION" ]; then
-                echo "$url/meta reports $got"
-                break
-              fi
-              if [ "$SECONDS" -ge "$deadline" ]; then
-                echo "$url/meta did not report selvaged/$SERVER_VERSION within 180s; it says '${got}'" >&2
-                exit 1
-              fi
-              sleep 5
-            done
-          else
-            echo "no server version was dispatched, so /meta is read but not asserted"
-            curl -fsS --max-time 10 "$url/meta"
-            echo
+            args+=(--expect-version "$SERVER_VERSION")
           fi
-          code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 10 "$url/")
-          if [ "$code" != "200" ]; then
-            echo "the page answered $code, not 200" >&2
-            exit 1
-          fi
-          echo "the page answers 200"
+          scripts/verify_deploy.py "${args[@]}"

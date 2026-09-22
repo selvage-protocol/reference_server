@@ -3,7 +3,8 @@
 # Runs the steps of .github/workflows/ci.yml on this machine, without containers (this host
 # has no Docker or Podman, so `act` cannot run here).
 #
-#   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval, the TLS front, lint, typos
+#   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval, the TLS front, the two
+#                                 # demos' deploy and front checks, the deploy workflow's verification, lint, typos
 #   scripts/ci-local.sh nightly   # coverage, the rest of cargo-deny and cargo-audit (slow)
 #   scripts/ci-local.sh lint      # actionlint over the workflow files, on its own
 #   scripts/ci-local.sh image     # the `image` workflow's smoke: nix-built image,
@@ -68,6 +69,11 @@ job_checks() {
   # proxy, so neither can be read out of the configuration.
   say "checks: the public demo's front limits"
   nix build .#checks.x86_64-linux.prod-front --no-link --print-build-logs
+  # The deploy workflow's verification: what it asserts (the origin, on the box
+  # through the front) and what it only reports (the public URL, behind an edge
+  # that answers a datacenter client with a challenge).
+  say "checks: the deploy workflow's verification"
+  nix build .#checks.x86_64-linux.deploy-verify --no-link --print-build-logs
   say "checks: lint the workflows"
   nix develop . -c actionlint
   # The same check the pre-commit hook runs: a commit made outside the dev shell cannot

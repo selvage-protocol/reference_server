@@ -434,11 +434,44 @@ what the approval gate is for. The front has no version of its own to roll back
 to and does not need one: it is built from the files in this directory, so an
 older front is that directory at an older commit and the same `up -d`.
 
+## Cloudflare answers a datacenter client with a challenge
+
+`curl https://selvage.dontblameme.dev/meta` from a GitHub runner, and from this
+box, is refused at the edge:
+
+```console
+HTTP/2 403
+cf-mitigated: challenge
+server: cloudflare
+<title>Just a moment...</title>
+```
+
+It is a **managed challenge**, a zone-level Cloudflare setting aimed at
+automated traffic, and a programmatic client cannot pass it: there is no
+browser to run the challenge's script and no `cf_clearance` cookie to carry.
+What triggers it here is the *address*, not the request — the two reads that
+answer are the box's own front (`curl -sk https://127.0.0.1/meta`, 200 with the
+right body) and the same public read from a residential host (200). The origin
+and the front are healthy; the edge is the layer saying no.
+
+**What that means:** nothing on a datacenter address can read this deployment's
+public URL, so no CI job can assert against it — not `curl` in a workflow, not
+`curl` on the box. The honest source for what is running is the origin read
+through the front on the box, and that is what
+`.github/workflows/deploy-prod.yml` asserts over the Tailscale SSH path its
+deploy step already opened; its read of the public URL is a report that names
+this challenge in words and ends at the first challenge response rather than
+polling a deadline it cannot pass. A Cloudflare bypass, a `cf_clearance` cookie
+kept anywhere, or a change to the zone's bot settings are all the wrong answer
+to this, and the next reader should not spend a cycle finding that out again.
+
 ## Deploying a release from CI
 
 `.github/workflows/deploy-prod.yml` in `reference_server`: a manual dispatch that
-joins the tailnet, hands this box one request over Tailscale SSH and then checks
-the *public* origin reports the version it deployed.
+joins the tailnet, hands this box one request over Tailscale SSH and then asserts,
+over that same SSH path, that the origin is serving the version it deployed —
+`https://127.0.0.1/meta` through the front, and the page answering 200. The
+public URL is read too, as a report behind the challenge above.
 
 ```sh
 gh workflow run deploy-prod.yml --ref main -f server_version=0.2.1
