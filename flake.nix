@@ -277,6 +277,22 @@
               FRONT_LIMITS_WORKDIR="''${TMPDIR:-/build}/front-limits" python3 -B test_front_limits.py
               touch $out
             '';
+
+          # The deploy workflow's verification: what it asserts (the origin,
+          # read on the box through the front over the SSH path the deploy itself
+          # used) and what it only reports (the public URL, behind an edge that
+          # serves a managed challenge to a programmatic client on a datacenter
+          # address). The second half turned a healthy deploy red once, and the
+          # first is the half that has to fail when the box serves the wrong
+          # version; nothing else in this repository can see either.
+          deploy-verify =
+            pkgs.runCommand "deploy-verify-test" {
+              nativeBuildInputs = [pkgs.python3];
+            } ''
+              cd ${./scripts}
+              python3 -B test_verify_deploy.py
+              touch $out
+            '';
         };
 
         devShells.default = craneLib.devShell {
