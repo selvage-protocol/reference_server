@@ -15,5 +15,12 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 yrs.workspace = true
 
+# `selvage/2`'s sealed frame (`CANONICAL.md` §6.1).
+aes-gcm.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+
 [lints]
 workspace = true

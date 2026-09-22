@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Error as WireError;
 use tokio_tungstenite::tungstenite::Message;
 
 use selvage_protocol as proto;
-use selvage_protocol::{close, code, event, method};
+use selvage_protocol::{Keepalive, close, code, event, method};
 
 use crate::ServerConfig;
 use crate::room::{
@@ -95,6 +95,9 @@ pub struct Applicant {
 /// The result of the handshake.
 pub struct Hello {
     params: proto::HelloParams,
+    /// The wire version this connection speaks. It pins the room when it mints one, and
+    /// decides the shape of the reply and the method surface.
+    version: proto::Version,
     /// A connection without a room in the URL is minting one.
     claims_host: bool,
 }
@@ -104,10 +107,18 @@ pub struct Hello {
 /// for a guest join, which announce nothing beyond `peer.joined`. Plain data only: the
 /// reply is serialized by the caller while it still holds the registry lock, because the
 /// order of the newcomer's first frames is part of what seating decides (see `seat`).
-type Placement = (
-    (&'static str, proto::SessionParams),
-    Option<proto::PeerInfo>,
-);
+/// What seating a newcomer produces: the reply's event name and params, the wire version
+/// of the room it is seated in, whether the room was minted, and the peer record the room
+/// is told about when a host reclaims it — `None` for a mint and for a guest join, which
+/// announce nothing beyond `peer.joined`.
+struct Placement {
+    event: &'static str,
+    body: Value,
+    room_id: String,
+    minted: bool,
+    version: proto::Version,
+    attached: Option<proto::PeerInfo>,
+}
 
 /// Everything that decides where a newcomer is seated.
 struct Seating<'a> {
@@ -163,12 +174,21 @@ pub async fn handshake(
     // checks: a first frame that is both a non-hello method and an incompatible version
     // was answered `hello_required`, which tells the client the wrong thing about why it
     // was refused. The envelope and the id are judged first, the method after the version.
-    if !proto::is_compatible(&msg.v) {
-        return Err((
-            code::UNSUPPORTED_VERSION,
-            format!("unsupported wire version {}", msg.v),
-        ));
-    }
+    // The version is judged before the method's params and by §10's compatibility rule:
+    // a version this server does not seat, including `selvage/2` on a server configured
+    // without it, is refused before seating and the room is untouched.
+    let version = match proto::version_of(&msg.v) {
+        Some(proto::Version::V1) => proto::Version::V1,
+        Some(proto::Version::V2) if config.serve_version_2 => {
+            proto::Version::V2
+        }
+        _ => {
+            return Err((
+                code::UNSUPPORTED_VERSION,
+                format!("unsupported wire version {}", msg.v),
+            ));
+        }
+    };
     if msg.method != method::SESSION_HELLO {
         return Err((
             code::HELLO_REQUIRED,
@@ -179,26 +199,51 @@ pub async fn handshake(
             ),
         ));
     }
-    let mut params: proto::HelloParams = serde_json::from_value(msg.params)
-        .map_err(|e| envelope_refusal("bad session.hello params", &e))?;
-    // A control character is judged on the received value, before the trim: `"\tAda"`
-    // would otherwise be seated as `"Ada"`, a name its owner did not choose. Blankness
-    // and the bound are judged on the trimmed value that is kept, so `"  "` stays
-    // blank and a padded name is stored as it will be echoed.
-    if proto::has_control_characters(&params.display_name) {
+    let mut params = match version {
+        proto::Version::V1 => {
+            serde_json::from_value::<proto::HelloParams>(msg.params)
+                .map_err(|e| envelope_refusal("bad session.hello params", &e))?
+        }
+        proto::Version::V2 => {
+            let read: proto::HelloParamsV2 = serde_json::from_value(msg.params)
+                .map_err(|e| {
+                    envelope_refusal("bad session.hello params", &e)
+                })?;
+            proto::HelloParams {
+                awareness_client_id: read.awareness_client_id,
+                capabilities: read.capabilities,
+                client: read.client,
+                display_name: read.display_name,
+                role: None,
+            }
+        }
+    };
+    validate_name(&mut params.display_name)?;
+    Ok(Hello {
+        params,
+        version,
+        claims_host,
+    })
+}
+
+/// The one place a display name is judged, for both versions and both the handshake and
+/// a rename (`PROTOCOL.md` §5): non-blank, no control character, at most 32 UTF-16 code
+/// units, judged on the received value before the trim.
+fn validate_name(display_name: &mut String) -> Result<(), Refusal> {
+    if proto::has_control_characters(display_name) {
         return Err((
             code::BAD_PARAMS,
             "display_name contains control characters".to_string(),
         ));
     }
-    params.display_name = params.display_name.trim().to_string();
-    if params.display_name.is_empty() {
+    *display_name = display_name.trim().to_string();
+    if display_name.is_empty() {
         return Err((
             code::BAD_PARAMS,
-            "session.hello requires a display_name".to_string(),
+            "a display_name is required".to_string(),
         ));
     }
-    if proto::display_name_over_limit(&params.display_name) {
+    if proto::display_name_over_limit(display_name) {
         return Err((
             code::BAD_PARAMS,
             format!(
@@ -207,10 +252,7 @@ pub async fn handshake(
             ),
         ));
     }
-    Ok(Hello {
-        params,
-        claims_host,
-    })
+    Ok(())
 }
 
 /// The next text frame on a connection that is still in the handshake. Every frame read
@@ -301,6 +343,13 @@ fn refusal_for(error: SeatError, room_id: &str) -> Refusal {
         SeatError::RoomFull => {
             (ROOM_FULL, "the room seats no more peers".to_string())
         }
+        // A room is pinned to the version its minting connection spoke, so a connection
+        // speaking the other one names a room that is not its own. §10 refuses a version
+        // mismatch `unsupported_version`, before seating.
+        SeatError::VersionMismatch => (
+            code::UNSUPPORTED_VERSION,
+            format!("room {room_id} is another wire version"),
+        ),
     }
 }
 
@@ -339,32 +388,10 @@ fn document_path(raw: Value) -> Result<String, Refusal> {
 /// or over-long are all `bad_params`; unlike the handshake the refusal is a response, not a
 /// close.
 fn rename_name(raw: Value) -> Result<String, Refusal> {
-    let params = serde_json::from_value::<proto::RenameParams>(raw)
+    let mut params = serde_json::from_value::<proto::RenameParams>(raw)
         .map_err(|e| (code::BAD_PARAMS, e.to_string()))?;
-    // A control character is judged on the received value, before the trim, as in the
-    // handshake: a padded `"\tAda"` would otherwise be announced as `"Ada"`.
-    if proto::has_control_characters(&params.display_name) {
-        return Err((
-            code::BAD_PARAMS,
-            "display_name contains control characters".to_string(),
-        ));
-    }
-    // Stored trimmed, like the handshake's: the rename is announced to the whole
-    // room, so padding would land in every peer's view under the mover's name.
-    let display_name = params.display_name.trim().to_string();
-    if display_name.is_empty() {
-        return Err((code::BAD_PARAMS, "display_name is required".to_string()));
-    }
-    if proto::display_name_over_limit(&display_name) {
-        return Err((
-            code::BAD_PARAMS,
-            format!(
-                "display_name is longer than {} UTF-16 code units",
-                proto::DISPLAY_NAME_MAX_UTF16
-            ),
-        ));
-    }
-    Ok(display_name)
+    validate_name(&mut params.display_name)?;
+    Ok(params.display_name)
 }
 
 /// The `paths` of a `doc.grant` request (`PROTOCOL.md` §5): the host's whole listing, in the
@@ -412,10 +439,17 @@ fn grant_paths(raw: Value) -> Result<Vec<String>, Refusal> {
 }
 
 /// A peer taken out of the room under the lock: what its announcements need after it.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "whether it was the host and whether the room is now empty are two different questions"
+)]
 struct DetachedPeer {
     peer_id: String,
     was_host: bool,
     generation: u64,
+    version: proto::Version,
+    /// The room holds nobody after this leave, which is what arms `selvage/2`'s grace.
+    empty: bool,
     /// Dropping this ends the connection's task. A removed peer is gone either way;
     /// ending its task is what closes its socket.
     poison: Option<oneshot::Sender<()>>,
@@ -435,6 +469,8 @@ fn detach_locked(
         peer_id: peer_id.to_string(),
         was_host: detach.was_host,
         generation: detach.generation,
+        version: detach.version,
+        empty: detach.empty,
         poison,
     })
 }
@@ -464,13 +500,18 @@ fn unseat(
 }
 
 /// The `peer.left` a departure is announced with.
-fn peer_left_frame(peer_id: &str) -> Option<Outbound> {
-    event_frame(event::PEER_LEFT, serde_json::json!({ "peer_id": peer_id }))
+fn peer_left_frame(version: proto::Version, peer_id: &str) -> Option<Outbound> {
+    event_frame(
+        version,
+        event::PEER_LEFT,
+        serde_json::json!({ "peer_id": peer_id }),
+    )
 }
 
 /// The `host.detached` a host's departure is announced with.
 fn host_detached_frame(grace_ms: u64) -> Option<Outbound> {
     event_frame(
+        proto::Version::V1,
         event::HOST_DETACHED,
         serde_json::json!({ "grace_ms": grace_ms }),
     )
@@ -543,8 +584,14 @@ async fn eject_into(
             pending.push((None, gone));
         }
         reap_later(shared.clone(), room_id.to_string(), removed.generation);
+    } else if removed.version == proto::Version::V2 && removed.empty {
+        reap_later_empty(
+            shared.clone(),
+            room_id.to_string(),
+            removed.generation,
+        );
     }
-    if let Some(left) = peer_left_frame(&removed.peer_id) {
+    if let Some(left) = peer_left_frame(removed.version, &removed.peer_id) {
         pending.push((None, left));
     }
     drop(removed.poison);
@@ -561,20 +608,107 @@ async fn remove_peer(shared: &Shared, room_id: &str, peer_id: &str) {
     let Some(removed) = detached else {
         return;
     };
-    deliver(shared, room_id, None, peer_left_frame(&removed.peer_id)).await;
+    deliver(
+        shared,
+        room_id,
+        None,
+        peer_left_frame(removed.version, &removed.peer_id),
+    )
+    .await;
     if removed.was_host {
         let grace = grace_ms(&shared.config);
         deliver(shared, room_id, None, host_detached_frame(grace)).await;
         reap_later(shared.clone(), room_id.to_string(), removed.generation);
+    } else if removed.version == proto::Version::V2 && removed.empty {
+        reap_later_empty(
+            shared.clone(),
+            room_id.to_string(),
+            removed.generation,
+        );
     }
     drop(removed.poison);
 }
 
-fn capabilities() -> Vec<String> {
-    proto::CAPABILITIES
-        .iter()
-        .map(ToString::to_string)
-        .collect()
+/// The capabilities a version's server advertises (`PROTOCOL.md` §2, §10).
+fn capabilities_for(version: proto::Version) -> Vec<String> {
+    let names = match version {
+        proto::Version::V1 => proto::CAPABILITIES,
+        proto::Version::V2 => proto::CAPABILITIES_V2,
+    };
+    names.iter().map(ToString::to_string).collect()
+}
+
+/// What a handshake reply takes from the room, snapshotted under the registry lock.
+struct RoomView {
+    capabilities: Vec<String>,
+    keepalive: Keepalive,
+    documents: Vec<String>,
+}
+
+/// The params of `room.created`/`room.joined` for a version, serialized.
+///
+/// `selvage/2`'s shape has no `documents` and its `PeerInfo` has no `role`
+/// (`PROTOCOL.md` §6.1): what the server holds in a version-2 room is membership, so the
+/// params carry membership and nothing else.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a reply names its version, its room, its token, its own seat and the room it is seated into"
+)]
+fn reply_body(
+    version: proto::Version,
+    room_id: String,
+    token: Option<String>,
+    self_info: &proto::PeerInfo,
+    peers: Vec<proto::PeerInfo>,
+    view: RoomView,
+) -> Result<Value, Refusal> {
+    let params = match version {
+        proto::Version::V1 => serde_json::to_value(proto::SessionParams {
+            room_id,
+            token,
+            self_peer: self_info.clone(),
+            peers,
+            documents: view.documents,
+            capabilities: view.capabilities,
+            keepalive: view.keepalive,
+        }),
+        proto::Version::V2 => serde_json::to_value(proto::SessionParamsV2 {
+            room_id,
+            token,
+            self_peer: peer_info_v2(self_info),
+            peers: peers.iter().map(peer_info_v2).collect(),
+            capabilities: view.capabilities,
+            keepalive: view.keepalive,
+        }),
+    };
+    params.map_err(|error| bad_body(&error))
+}
+
+/// The `peer.joined` announcement for a seat, in the version's `PeerInfo` shape.
+fn peer_joined_frame(
+    version: proto::Version,
+    peer: &proto::PeerInfo,
+) -> Option<Outbound> {
+    let params = match version {
+        proto::Version::V1 => serde_json::json!({ "peer": peer }),
+        proto::Version::V2 => serde_json::json!({ "peer": peer_info_v2(peer) }),
+    };
+    event_frame(version, event::PEER_JOINED, params)
+}
+
+/// `selvage/2`'s record of a seat: its `PeerInfo` without `role` (`PROTOCOL.md` §6.1).
+fn peer_info_v2(peer: &proto::PeerInfo) -> proto::PeerInfoV2 {
+    proto::PeerInfoV2 {
+        awareness_client_id: peer.awareness_client_id,
+        display_name: peer.display_name.clone(),
+        peer_id: peer.peer_id.clone(),
+    }
+}
+
+/// `selvage/1`'s grant as the room holds it, or `None` when there is none to hand back.
+fn join_grant_of(room: Option<&Room>) -> Option<Vec<String>> {
+    let held = room?;
+    (!held.grant().is_empty()).then(|| held.grant().to_vec())
 }
 
 /// The `doc.granted` a connection seated into a room receives right after its `room.joined`,
@@ -587,7 +721,11 @@ fn join_grant(grant: Option<&[String]>) -> Option<Outbound> {
     if paths.is_empty() {
         return None;
     }
-    event_frame(event::DOC_GRANTED, serde_json::json!({ "paths": paths }))
+    event_frame(
+        proto::Version::V1,
+        event::DOC_GRANTED,
+        serde_json::json!({ "paths": paths }),
+    )
 }
 
 impl Applicant {
@@ -595,14 +733,16 @@ impl Applicant {
     /// mints that room, so it is its host whatever `session.hello` claims: honouring a
     /// claimed `guest` would create a room with no host, whose real host would then be
     /// refused it.
-    const fn role(&self) -> proto::Role {
+    fn role(&self) -> proto::Role {
+        // `selvage/2` seats nobody as anything (`PROTOCOL.md` §1.2): there is no claim to
+        // make and no server-side host, so every connection is a guest to the server.
+        if self.hello.version == proto::Version::V2 {
+            return proto::Role::Guest;
+        }
         if self.hello.claims_host {
             return proto::Role::Host;
         }
-        match self.hello.params.role {
-            Some(role) => role,
-            None => proto::Role::Guest,
-        }
+        self.hello.params.role.unwrap_or(proto::Role::Guest)
     }
 
     fn info(&self, role: proto::Role) -> proto::PeerInfo {
@@ -631,7 +771,6 @@ impl Applicant {
     pub async fn seat(self, shared: &Shared) -> Result<Session, Refusal> {
         let role = self.role();
         let info = self.info(role);
-        let minted = self.join.room.is_none();
         let seating = Seating {
             applicant: &self,
             config: &shared.config,
@@ -641,18 +780,24 @@ impl Applicant {
             peer: Peer::new(info.clone(), self.queue.clone()),
         };
         let mut guard = shared.registry.lock().await;
-        let ((event_name, params), attached_peer) =
-            seating.place(&mut guard)?;
+        let Placement {
+            event: event_name,
+            body,
+            room_id,
+            minted,
+            version,
+            attached: attached_peer,
+        } = seating.place(&mut guard)?;
         guard.set_task(&self.peer_id, self.poison);
-        let granted = guard.room(&params.room_id).and_then(|room| {
-            (!room.grant().is_empty()).then(|| room.grant().to_vec())
-        });
-        let joined_peer = params.token.is_none().then(|| info.clone());
-        let room_id = params.room_id.clone();
+        // A grant is `selvage/1`'s: a version-2 room holds no listing for the server to
+        // hand back, so there is no join-time `doc.granted` to send.
+        let granted = (version == proto::Version::V1)
+            .then(|| join_grant_of(guard.room(&room_id)))
+            .flatten();
+        let joined_peer = (!minted).then(|| info.clone());
         let peer_id = self.peer_id.clone();
         let queue = self.queue.clone();
 
-        let body = serde_json::to_value(&params).map_err(|e| bad_body(&e))?;
         // A joining connection learns the room's grant straight after its `room.joined`, so
         // it needs no round trip and `room.joined` needs no fifth member. Both go out under
         // the lock: see this method's comment.
@@ -665,7 +810,7 @@ impl Applicant {
         // set below the largest frame this server generates
         // (`ServerConfig::smallest_queue_bytes`), so a deployment does not reach this by
         // flag; it is the backstop for a configuration built past that.
-        let seated = event_frame(event_name, body)
+        let seated = event_frame(version, event_name, body)
             .is_some_and(|frame| self.queue.try_queue(frame));
         let announced_grant = granted.as_deref().is_none_or(|paths| {
             join_grant(Some(paths))
@@ -688,11 +833,11 @@ impl Applicant {
         drop(guard);
 
         // Late arrivals must be announced to the peers already in the room.
-        let joined = joined_peer.and_then(|peer| {
-            event_frame(event::PEER_JOINED, serde_json::json!({ "peer": peer }))
-        });
+        let joined =
+            joined_peer.and_then(|peer| peer_joined_frame(version, &peer));
         let attached = attached_peer.and_then(|peer| {
             event_frame(
+                version,
                 event::HOST_ATTACHED,
                 serde_json::json!({ "peer": peer }),
             )
@@ -700,8 +845,9 @@ impl Applicant {
         deliver(shared, &room_id, Some(&peer_id), attached).await;
         deliver(shared, &room_id, Some(&peer_id), joined).await;
         Ok(Session {
-            peer_id: self.peer_id,
-            room_id: params.room_id,
+            peer_id,
+            room_id,
+            version,
             queue,
             poisoned: AtomicBool::new(false),
         })
@@ -714,20 +860,15 @@ fn bad_body(error: &serde_json::Error) -> Refusal {
 
 impl Seating<'_> {
     /// Seats the newcomer: its reply, and the reclaim frame for the room if any.
-    fn place(self, registry: &mut Registry) -> Result<Placement, Refusal> {
-        match self.room_id {
-            None => self.mint(registry),
-            Some(room_id) => self.admit(registry, room_id),
-        }
-    }
-
     fn mint(self, registry: &mut Registry) -> Result<Placement, Refusal> {
         let token = mint_token();
+        let version = self.applicant.hello.version;
         let room_id = registry
             .create(
                 NewRoom {
                     id: mint_room_id(),
                     token: token.clone(),
+                    version,
                     keepalive: self.config.keepalive,
                 },
                 self.peer,
@@ -742,21 +883,26 @@ impl Seating<'_> {
                     ),
                 )
             })?;
-        Ok((
-            (
-                event::ROOM_CREATED,
-                proto::SessionParams {
-                    room_id,
-                    token: Some(token),
-                    self_peer: self.info.clone(),
-                    peers: Vec::new(),
-                    documents: Vec::new(),
-                    capabilities: capabilities(),
-                    keepalive: self.config.keepalive,
-                },
-            ),
-            None,
-        ))
+        let body = reply_body(
+            version,
+            room_id.clone(),
+            Some(token),
+            self.info,
+            Vec::new(),
+            RoomView {
+                capabilities: capabilities_for(version),
+                keepalive: self.config.keepalive,
+                documents: Vec::new(),
+            },
+        )?;
+        Ok(Placement {
+            event: event::ROOM_CREATED,
+            body,
+            room_id,
+            minted: true,
+            version,
+            attached: None,
+        })
     }
 
     fn admit(
@@ -764,6 +910,7 @@ impl Seating<'_> {
         registry: &mut Registry,
         room_id: &str,
     ) -> Result<Placement, Refusal> {
+        let version = self.applicant.hello.version;
         let host_was_present =
             registry.room(room_id).is_some_and(Room::host_present);
         registry
@@ -772,6 +919,7 @@ impl Seating<'_> {
                     room_id,
                     token: self.applicant.join.token.as_deref(),
                     role: self.role,
+                    version,
                 },
                 self.peer,
                 self.config.max_peers_per_room,
@@ -786,11 +934,12 @@ impl Seating<'_> {
                 ),
                 SeatError::Unknown
                 | SeatError::TokenMismatch
-                | SeatError::HostPresent => refusal_for(error, room_id),
+                | SeatError::HostPresent
+                | SeatError::VersionMismatch => refusal_for(error, room_id),
             })?;
         // `host.attached` is a host reclaiming the room (§6, §9.1): a guest joining
-        // while the room is between hosts is a `peer.joined` and nothing more.
-        // The record travels unserialized; the frame is built after the lock drops.
+        // while the room is between hosts is a `peer.joined` and nothing more, and a
+        // `selvage/2` room has no host for the server to know about.
         let attached = if !host_was_present && self.role == proto::Role::Host {
             Some(self.info.clone())
         } else {
@@ -799,21 +948,33 @@ impl Seating<'_> {
         let room = registry
             .room(room_id)
             .ok_or_else(|| (code::ROOM_GONE, "the room is gone".to_string()))?;
-        Ok((
-            (
-                event::ROOM_JOINED,
-                proto::SessionParams {
-                    room_id: room.id.clone(),
-                    token: None,
-                    self_peer: self.info.clone(),
-                    peers: room.peers_except(&self.applicant.peer_id),
-                    documents: room.documents().to_vec(),
-                    capabilities: capabilities(),
-                    keepalive: room.keepalive,
-                },
-            ),
+        let body = reply_body(
+            version,
+            room.id.clone(),
+            None,
+            self.info,
+            room.peers_except(&self.applicant.peer_id),
+            RoomView {
+                capabilities: capabilities_for(version),
+                keepalive: room.keepalive,
+                documents: room.documents().to_vec(),
+            },
+        )?;
+        Ok(Placement {
+            event: event::ROOM_JOINED,
+            body,
+            room_id: room.id.clone(),
+            minted: false,
+            version,
             attached,
-        ))
+        })
+    }
+
+    fn place(self, registry: &mut Registry) -> Result<Placement, Refusal> {
+        match self.room_id {
+            None => self.mint(registry),
+            Some(room_id) => self.admit(registry, room_id),
+        }
     }
 }
 
@@ -821,6 +982,9 @@ impl Seating<'_> {
 pub struct Session {
     peer_id: String,
     room_id: String,
+    /// The room's wire version, which every frame this session authors carries and which
+    /// decides the method surface (`PROTOCOL.md` §4, §5).
+    version: proto::Version,
     queue: Queue,
     /// Set when a reply found the queue full: the peer stopped reading. `handle_text`
     /// ends the session on the same frame the reply was dropped on.
@@ -893,23 +1057,36 @@ impl Session {
             self.alert(code::BAD_MESSAGE, "a request needs an id");
             return;
         };
-        if !proto::is_compatible(&msg.v) {
+        // §10: the version is checked on every later request against the room's, so a
+        // `selvage/2` room refuses a version-1 request and the other way round.
+        if !self.version.accepts(&msg.v) {
             self.expire(id, &msg.v);
             return;
         }
         let proto::ClientMessage { method, params, .. } = msg;
         let request = Request { id, params };
-        match method.as_str() {
-            method::DOC_OPEN => self.open_document(request, shared).await,
-            method::DOC_CLOSE => self.close_document(request, shared).await,
-            method::DOC_GRANT => self.grant(request, shared).await,
-            method::SESSION_RENAME => self.rename(request, shared).await,
-            method::SESSION_HELLO => self.reply(&proto::ServerMessage::error(
-                id,
-                code::ALREADY_SEATED,
-                "this connection already completed the handshake",
-            )),
-            other => self.reply(&proto::ServerMessage::error(
+        // `PROTOCOL.md` §5: `session.hello` and `session.rename` are `selvage/2`'s whole
+        // method surface. The three `doc.*` rows are `selvage/1`'s, so a version-2
+        // connection that sends one gets the answer any unknown method gets.
+        match (self.version, method.as_str()) {
+            (_, method::SESSION_RENAME) => self.rename(request, shared).await,
+            (_, method::SESSION_HELLO) => {
+                self.reply(&proto::ServerMessage::error(
+                    id,
+                    code::ALREADY_SEATED,
+                    "this connection already completed the handshake",
+                ));
+            }
+            (proto::Version::V1, method::DOC_OPEN) => {
+                self.open_document(request, shared).await;
+            }
+            (proto::Version::V1, method::DOC_CLOSE) => {
+                self.close_document(request, shared).await;
+            }
+            (proto::Version::V1, method::DOC_GRANT) => {
+                self.grant(request, shared).await;
+            }
+            (_, other) => self.reply(&proto::ServerMessage::error(
                 id,
                 code::UNKNOWN_METHOD,
                 format!("no such method: {other}"),
@@ -948,7 +1125,7 @@ impl Session {
         });
         self.announce_documents(
             shared,
-            event_frame(event::DOC_OPENED, announced),
+            event_frame(proto::Version::V1, event::DOC_OPENED, announced),
         )
         .await;
     }
@@ -975,7 +1152,7 @@ impl Session {
         });
         self.announce_documents(
             shared,
-            event_frame(event::DOC_CLOSED, announced),
+            event_frame(proto::Version::V1, event::DOC_CLOSED, announced),
         )
         .await;
     }
@@ -1011,7 +1188,7 @@ impl Session {
         });
         self.announce_documents(
             shared,
-            event_frame(event::PEER_RENAMED, announced),
+            event_frame(self.version, event::PEER_RENAMED, announced),
         )
         .await;
     }
@@ -1058,7 +1235,7 @@ impl Session {
         let announced = serde_json::json!({ "paths": paths });
         self.announce_documents(
             shared,
-            event_frame(event::DOC_GRANTED, announced),
+            event_frame(proto::Version::V1, event::DOC_GRANTED, announced),
         )
         .await;
     }
@@ -1124,7 +1301,9 @@ impl Session {
     /// room is told `peer.left`; nothing unsent is kept for the peer, and no reply is
     /// presented as delivered that was not queued.
     fn reply(&self, msg: &proto::ServerMessage) {
-        let Some(frame) = super::frame_of(msg) else {
+        let Some(frame) =
+            super::frame_of(&msg.clone().for_version(self.version))
+        else {
             return;
         };
         if !self.queue.try_queue(frame) {
@@ -1159,6 +1338,22 @@ impl Session {
     }
 }
 
+/// Waits out `room_grace_ms`, then destroys a `selvage/2` room that still holds nobody.
+///
+/// The deadline can only be reached with no connection seated, so the destruction has no
+/// recipient (`PROTOCOL.md` §6, §9): no `room.gone` is sent, the id is gone for good, and
+/// the next connection that names it learns so as `room_unknown`.
+fn reap_later_empty(shared: Shared, room_id: String, generation: u64) {
+    tokio::spawn(async move {
+        sleep(shared.config.room_grace).await;
+        let mut guard = shared.registry.lock().await;
+        // A room that emptied and was reoccupied since this timer was armed is at a later
+        // generation, and `reap_if_empty` leaves it alone; an empty one holds no task to
+        // end and nobody to tell.
+        drop(guard.reap_if_empty(&room_id, generation));
+    });
+}
+
 /// Waits out the host grace period, then destroys the room if the host stayed away.
 fn reap_later(shared: Shared, room_id: String, generation: u64) {
     tokio::spawn(async move {
@@ -1178,6 +1373,7 @@ fn reap_later(shared: Shared, room_id: String, generation: u64) {
 /// already ended, and the socket goes with it.
 fn tell_room_gone(room_id: &str, peers: Vec<Peer>) {
     let frame = event_frame(
+        proto::Version::V1,
         event::ROOM_GONE,
         serde_json::json!({ "room_id": room_id, "reason": "host did not return" }),
     );
@@ -1215,6 +1411,7 @@ mod tests {
                 display_name: name.to_string(),
                 role: None,
             },
+            version: proto::Version::V1,
             claims_host,
         }
     }
@@ -1272,6 +1469,7 @@ mod tests {
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
+                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     host,
@@ -1301,6 +1499,7 @@ mod tests {
                 NewRoom {
                     id: "r-1".to_string(),
                     token: "t".to_string(),
+                    version: proto::Version::V1,
                     keepalive: Keepalive::default(),
                 },
                 host,
@@ -1376,6 +1575,7 @@ mod tests {
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
+                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     host,
@@ -1400,6 +1600,7 @@ mod tests {
                     room_id: "r-1",
                     token: Some("t"),
                     role: Role::Guest,
+                    version: proto::Version::V1,
                 },
                 guest,
                 usize::MAX,
@@ -1419,6 +1620,7 @@ mod tests {
         let session = Session {
             peer_id: "p-slow".to_string(),
             room_id: "r-1".to_string(),
+            version: proto::Version::V1,
             queue,
             poisoned: AtomicBool::new(false),
         };
@@ -1453,6 +1655,7 @@ mod tests {
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
+                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     host,
@@ -1497,6 +1700,7 @@ mod tests {
                     display_name: "Zoe".to_string(),
                     role: None,
                 },
+                version: proto::Version::V1,
                 claims_host: false,
             },
             queue: newcomer.queue.clone(),
@@ -1566,6 +1770,7 @@ mod tests {
             "r-1",
             None,
             event_frame(
+                proto::Version::V1,
                 event::DOC_GRANTED,
                 serde_json::json!({ "paths": listed }),
             ),

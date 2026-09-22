@@ -30,6 +30,9 @@ use serde_json::Value;
 /// Wire version carried in every session envelope.
 pub const WIRE_VERSION: &str = "selvage/1";
 
+/// The revision's wire version, which this server also speaks.
+pub const WIRE_VERSION_V2: &str = "selvage/2";
+
 /// WebSocket endpoint path.
 pub const ENDPOINT_PATH: &str = "/session";
 
@@ -43,6 +46,48 @@ pub const CAPABILITIES: &[&str] = &[
     "open-document-set",
     "host-reclaim",
 ];
+
+/// The two names `selvage/2` defines for a server (`PROTOCOL.md` §2).
+pub const CAPABILITIES_V2: &[&str] = &["y-protocols/1", "awareness"];
+
+/// A wire version this server can seat (`PROTOCOL.md` §10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Version {
+    V1,
+    V2,
+}
+
+impl Version {
+    /// The string this version writes in `v`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => WIRE_VERSION,
+            Self::V2 => WIRE_VERSION_V2,
+        }
+    }
+
+    /// Whether a frame's `v` names this version under §10's compatibility rule: same
+    /// major, and nothing else, since neither version is at major 0.
+    #[must_use]
+    pub fn accepts(self, version: &str) -> bool {
+        version_of(version) == Some(self)
+    }
+}
+
+/// The version a `v` member names, by major alone; `None` outside the grammar.
+///
+/// `PROTOCOL.md` §10: at major `1` or `2` the minor is not decisive, so every
+/// `selvage/1.x` is version 1 and every `selvage/2.x` is version 2, while
+/// `selvage/0.x`, `selvage/3` and every string outside the grammar name none.
+#[must_use]
+pub fn version_of(version: &str) -> Option<Version> {
+    match parse_wire_version(version)?.0 {
+        1 => Some(Version::V1),
+        2 => Some(Version::V2),
+        _ => None,
+    }
+}
 
 /// The longest `display_name` a server seats, in UTF-16 code units (`PROTOCOL.md` §5).
 ///
@@ -296,6 +341,15 @@ impl ServerMessage {
         }
     }
 
+    /// The same frame carrying another wire version in `v`. A `selvage/2` connection is
+    /// answered in `selvage/2` (`PROTOCOL.md` §4), so every frame the server authors for
+    /// it is stamped at the one place it leaves the server.
+    #[must_use]
+    pub fn for_version(mut self, version: Version) -> Self {
+        self.v = version.as_str().to_string();
+        self
+    }
+
     /// Serializes the envelope.
     ///
     /// # Errors
@@ -318,6 +372,46 @@ impl ServerMessage {
         no_duplicate_members(text)?;
         serde_json::from_str(text)
     }
+}
+
+/// `session.hello` params in `selvage/2`: the v1 shape with `role` gone
+/// (`PROTOCOL.md` §5). A `role` member a caller sends is ignored as an unknown name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelloParamsV2 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awareness_client_id: Option<u64>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    pub display_name: String,
+}
+
+/// A peer as `selvage/2` records it: `PROTOCOL.md` §6.1's `PeerInfo` without `role`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerInfoV2 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awareness_client_id: Option<u64>,
+    pub display_name: String,
+    pub peer_id: String,
+}
+
+/// `selvage/2`'s `room.created` / `room.joined` params: the members that carried the
+/// server's state are gone and nothing took their place (`PROTOCOL.md` §6.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionParamsV2 {
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub keepalive: Keepalive,
+    #[serde(default)]
+    pub peers: Vec<PeerInfoV2>,
+    pub room_id: String,
+    #[serde(rename = "self")]
+    pub self_peer: PeerInfoV2,
+    /// Present only for the connection that minted the room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// `session.hello` params — the client's half of the handshake.
@@ -466,7 +560,9 @@ pub struct Meta {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub keepalive: MetaKeepalive,
-    #[serde(default)]
+    /// The roles this server seats. A server that does not serve `selvage/1` has nothing
+    /// to put here, and the member leaves with that version (`PROTOCOL.md` §2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
     pub server: String,
     pub wire_versions: Vec<String>,
@@ -486,6 +582,37 @@ impl Meta {
             roles: vec!["host".to_string(), "guest".to_string()],
             server: SERVER_NAME.to_string(),
             wire_versions: vec![WIRE_VERSION.to_string()],
+        }
+    }
+
+    /// What a server that seats every version in `versions` advertises.
+    ///
+    /// A server that implements both lists both (`PROTOCOL.md` §2): the list is what it
+    /// accepts, and §10 forbids a client that can speak `selvage/2` to take an earlier
+    /// version from it. `roles` stays while `selvage/1` is served, because a version-1
+    /// client reads it, and the two names only that version's server machinery needs
+    /// (`open-document-set`, `host-reclaim`) stay with it.
+    #[must_use]
+    pub fn for_versions(
+        keepalive: Keepalive,
+        room_grace_ms: u64,
+        versions: &[Version],
+    ) -> Self {
+        let v1 = versions.contains(&Version::V1);
+        let names = if v1 { CAPABILITIES } else { CAPABILITIES_V2 };
+        Self {
+            capabilities: names.iter().map(ToString::to_string).collect(),
+            keepalive: MetaKeepalive::from((keepalive, room_grace_ms)),
+            roles: if v1 {
+                vec!["host".to_string(), "guest".to_string()]
+            } else {
+                Vec::new()
+            },
+            server: SERVER_NAME.to_string(),
+            wire_versions: versions
+                .iter()
+                .map(|version| version.as_str().to_string())
+                .collect(),
         }
     }
 }

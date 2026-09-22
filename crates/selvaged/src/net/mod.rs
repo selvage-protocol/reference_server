@@ -599,9 +599,14 @@ fn frame_of(msg: &proto::ServerMessage) -> Option<Outbound> {
     msg.to_text().ok().map(Outbound::Text)
 }
 
-/// Builds an event frame ready to write.
-pub fn event_frame(name: &str, params: Value) -> Option<Outbound> {
-    frame_of(&proto::ServerMessage::event(name, params))
+/// Builds an event frame ready to write, carrying the wire version of the room it is
+/// addressed to (`PROTOCOL.md` §4): a `selvage/2` connection is answered in `selvage/2`.
+pub fn event_frame(
+    version: proto::Version,
+    name: &str,
+    params: Value,
+) -> Option<Outbound> {
+    frame_of(&proto::ServerMessage::event(name, params).for_version(version))
 }
 
 fn frame_of_outbound(out: Outbound) -> Message {
@@ -818,9 +823,11 @@ async fn respond_plain(
     // every implementation. The grace is this server's configured value: it is the one
     // number a client needs before it has a session, since `host.detached` never reaches
     // the host whose budget has to fit inside it.
-    let meta = serde_json::to_string(&proto::Meta::reference(
+    let versions = config.wire_versions();
+    let meta = serde_json::to_string(&proto::Meta::for_versions(
         config.keepalive,
         grace_ms(config),
+        &versions,
     ))
     .map_err(io::Error::other)?;
     respond_status(tcp, Status::Ok, &meta, &head.method).await
