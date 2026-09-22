@@ -1,0 +1,85 @@
+{
+  "id": "117",
+  "title": "A path `PROTOCOL.md` §5 refuses is dropped from a listing and a hold set, not refused",
+  "spec": "PROTOCOL.md#133-the-room-state-as-a-receiver",
+  "notes": "The state is applied and the message is applied; what is dropped is the path, and the rest of the listing, the rest of the set and the state's roles go in. The alternative — refusing the frame — would put two conforming receivers at opposite verdicts about one state, and a control character in a filename is legal on the platform a client runs on, which is why the rule is a drop and why `schema/sealed.json` deliberately accepts such a path. This is the counterpart of vector 110: step 8 reads the member set and the types, and a value a rule elsewhere governs is that rule's.",
+  "layer": "peer",
+  "kind": "frame",
+  "fixture": "fixture/keys.json",
+  "catches": "refuse-bad-path",
+  "steps": [
+    {
+      "op": "seal",
+      "frame": "state",
+      "recipe": {
+        "sign": "host-key",
+        "kind": 1,
+        "counter": 1,
+        "nonce": "021e2f3a4b5c6d7e8f90a1b2",
+        "payload": {
+          "issued": 1,
+          "listing": [
+            "README.md",
+            "src/main\u0000.rs"
+          ],
+          "peers": {
+            "yeQcki8lji6brz0cCL5o8k2xOcL_VSsMtpFo6WMsSto": {
+              "peer_id": "p-0f1e2d3c4b5a6978",
+              "role": "host"
+            },
+            "mwSkxeRytFUs0XcaBujkAxuamFmfjb9gAG1V1aYUkEw": {
+              "peer_id": "p-8796a5b4c3d2e1f0",
+              "role": "guest"
+            }
+          }
+        }
+      },
+      "hex": "03 23 18 ee 09 4d 9d be 01 00 01 02 1e 2f 3a 4b 5c 6d 7e 8f 90 a1 b2 8d 02 49 ce 18 dd 9f f3 f1 74 12 3d b2 53 e8 bd 59 ff f0 f8 1e e4 af 95 00 b9 58 94 9f 9c d8 be ce 47 b8 ca 35 f2 cf 98 98 0e e0 45 6a 19 62 3b 7e d2 04 76 d3 33 14 ee 2e b9 4a 09 70 c8 26 60 27 d7 fc 57 86 b1 7a 86 33 b7 22 98 49 d2 ab cc 21 94 31 bf 43 20 be 89 60 b0 5f 70 6e 36 2c e5 ed d7 d1 f2 22 d4 ca 98 52 79 2b 63 4e 28 c7 ed 02 15 ad 71 8e 93 12 15 4d bf 9d 87 26 42 73 0a 0b d1 c4 86 1a 73 f7 b9 fa 76 e7 28 f5 e3 a1 cd 85 36 f0 b5 9a a5 4f 06 e5 32 7d 21 fc 99 a9 e8 63 48 a6 d3 38 17 51 a2 f4 e5 61 31 b1 22 4a 05 8c 47 e4 ea 8a c3 3c 25 f2 37 0b e9 22 88 5a 4e 4f 01 75 7c 85 0b 44 8c 62 36 dc ec 60 9a c2 16 44 db 14 ff 0d ed 0f 3f 64 b8 6c ce eb 82 bf 27 b1 fa 29 04 9a f8 3a f2 d8 76 d8 9b ea 08 b0 63 26 e4 14 23 bd c5 f7 be e6 31 a5 bf 2f 27 d0 6d 6f 74 01 ac cb 26 7a 65 39 4d 30 e4 cc 22 5b f9 d1 87 7c 17 78 bc 3a b7 5c ec 7f 3a ba 87 69 3f 06 b8 67 1a f3 a8 e9 30 65 3d 35 d1 a5 ec 5b 17 04 23 4c d8 84 f0 28 fc 86 3d 32 f8 22 a5 ea 2c 4f 9c 5b 2a 3a 4b 3a 98 c5 b3 21 0a f8 72 04"
+    },
+    {
+      "op": "expectVerify",
+      "frame": "state"
+    },
+    {
+      "op": "expectListing",
+      "listing": [
+        "README.md"
+      ]
+    },
+    {
+      "op": "seal",
+      "frame": "holds",
+      "recipe": {
+        "sign": "guest-1",
+        "kind": 3,
+        "counter": 1,
+        "nonce": "031e2f3a4b5c6d7e8f90a1b2",
+        "payload": {
+          "holds": [
+            "src/main.rs",
+            "",
+            "src/main\t.rs"
+          ]
+        }
+      },
+      "hex": "de 5e bd 17 c0 83 7e af 03 00 01 03 1e 2f 3a 4b 5c 6d 7e 8f 90 a1 b2 3c 73 0a d7 d2 2e 98 7f 48 21 ae 0a 73 18 d3 b3 f1 ec 1e 49 51 5b 39 64 38 90 8b 7f 45 15 b9 3e 11 14 bd e8 43 93 5c e4 d1 aa 1c 37 8f 66 4b c4 15 c1 2a 68 49 9f a6 b6 42 88 4d 72 a2 45 7e 37 43 a1 53 0e 18 ee da b6 3b 07 70 60 9b d7 b0 db 3c fa 8d 01 6f dd 6f 7e 6f 6b 7a f2 aa bd dc 7c d6 94 ce 1d 73 da 09 c7 f1 d2 6b 76 f6 39 f4 27 9f 32 81 e7 43 4c 5d 0b 3c 5a cb b1 0b"
+    },
+    {
+      "op": "expectVerify",
+      "frame": "holds"
+    },
+    {
+      "op": "expectHolds",
+      "sign": "guest-1",
+      "holds": [
+        "src/main.rs"
+      ]
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1",
+  "secret": [
+    "README.md",
+    "src/main.rs"
+  ]
+}

@@ -1,0 +1,10 @@
+# `vectors/` is vendored test data, not this repository's prose: it is authored in
+# `selvage-protocol/specification` and copied here by `scripts/sync-vectors.sh`, and the copy
+# is compared against the canonical directory rather than edited. A spell-checker has nothing
+# to say about a transcript of bytes, and it has plenty to say about one: the peer corpus's
+# ciphertexts, nonces and base64url public keys trip `ba`, `Fo` and the rest of the
+# dictionary's shorter entries, and every frame added to the corpus will trip some of them.
+# The rest of the tree is checked, and a misspelling in a vector is fixed where the vector is
+# written.
+[files]
+extend-exclude = ["vectors/"]

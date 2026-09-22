@@ -1,0 +1,45 @@
+{
+  "note": "Fixed test values, not secrets. They exist so that a sealed frame in a vector is a constant two implementations can be held to, and they are in a public repository: their authority is reproducibility and not secrecy, and they are never a room's. Every key here is a complete Ed25519 pair a vector seals and signs with. In a real session the keys a state commits are minted per connection and never persisted; the fixture's stand in for them so that a frame is a constant, which is why a name here says which key it is and not which peer holds it.",
+  "room": {
+    "id": "R7f3a2c19",
+    "key": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    "host": "host-key"
+  },
+  "keys": {
+    "host-key": {
+      "alg": "ed25519",
+      "purpose": "the room's host key: the value an invite's `h` carries, and the only key that signs a `kind = 1` room state or a `kind = 2` closing (CANONICAL.md §6.1)",
+      "key_id": "032318ee094d9dbe",
+      "public": "0d5687e6d290a96df4a32b86c65aaf35129d3765970f5a72b82d6adc764dd3ff",
+      "private": "ac41293e107f1dcf0ab966f8e81b5bc5ff1131d22ecc3396d6351a3581b38457"
+    },
+    "host-session": {
+      "alg": "ed25519",
+      "purpose": "the host connection's session key: the state's one `host` entry, and the key the host's own `kind = 0`, `3` and `4` frames are signed with",
+      "key_id": "d02b4542e320205b",
+      "public": "c9e41c922f258e2e9baf3d1c08be68f24db139c2ff552b0cb69168e9632c4ada",
+      "private": "f499ba5e106c15e3caeeb67a629b70f339a529fc14c90b80e8f67f364fa1f3fe"
+    },
+    "guest-1": {
+      "alg": "ed25519",
+      "purpose": "a guest's session key, committed by a state and the one a `kind = 0` content frame is signed with; a state that gives it role `viewer` is what refuses that frame",
+      "key_id": "de5ebd17c0837eaf",
+      "public": "9b04a4c5e472b4552cd1771a06e8e4031b9a98599f8dbf60006d55d5a614904c",
+      "private": "68d264c3597ba827163db80f05b175f4190d02c61f202d9ab2fd2cabf00d9564"
+    },
+    "guest-2": {
+      "alg": "ed25519",
+      "purpose": "a second guest's session key: what a later state commits where an earlier one committed `guest-1`, which is what makes the key a state drops uncommitted",
+      "key_id": "e3f4ef4364d653f7",
+      "public": "aff1f00073b23215397130a297790da7a9a9eecbbc3e1e7e3566da367d496038",
+      "private": "d2dd5ee57d301494fd7c7915946e682ec36cb7c4bbdfba7e3f4bc1d1e7da80d8"
+    },
+    "mallory-1": {
+      "alg": "ed25519",
+      "purpose": "a key no state commits: it announces itself, and its content frames are refused `uncommitted_key` because an announcement is a claim about a key and the state is the room's answer to it",
+      "key_id": "b2135c91aafa67ce",
+      "public": "7adfd2e1637ea95ccfe288e370aa63d1f2983118f6fde85a5b672eeee03d14c0",
+      "private": "2305edf933ecaa22bf93b67efec6b2abae5db7ec6185f6e6a26bb71e4d62c5f8"
+    }
+  }
+}

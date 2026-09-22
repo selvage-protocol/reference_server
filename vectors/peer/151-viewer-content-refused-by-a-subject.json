@@ -1,0 +1,102 @@
+{
+  "id": "151",
+  "title": "A committed viewer's content verifies and the subject does not apply it",
+  "spec": "PROTOCOL.md#135-a-viewers-content",
+  "notes": "The decision twin of vector 111, and the difference between them is the whole of why the peer layer needs both: 111 asserts a *receiver's* verdict and this asserts what a real client did — its replica unchanged, its `dropped` naming the reason, and its `published` count unmoved. A client that swallowed the frame and republished a sync request would pass a vector that asserted only the reason.",
+  "layer": "peer",
+  "kind": "decision",
+  "fixture": "fixture/keys.json",
+  "catches": "ignore-roles",
+  "scenario": {
+    "keepalive": {
+      "awareness_expire_ms": 900,
+      "awareness_renew_ms": 300,
+      "ping_interval_ms": 30000,
+      "room_grace_ms": 30000
+    }
+  },
+  "steps": [
+    {
+      "op": "start",
+      "conn": "peer",
+      "key": "guest-1",
+      "invite": "/session?room=$room&token=$token#k=$room_key&h=$host_key"
+    },
+    {
+      "op": "deliver",
+      "conn": "peer",
+      "frame": "state",
+      "recipe": {
+        "sign": "host-key",
+        "kind": 1,
+        "counter": 1,
+        "nonce": "031e2f3a4b5c6d7e8f90a1b2",
+        "payload": {
+          "issued": 1,
+          "listing": [
+            "README.md",
+            "src/main.rs"
+          ],
+          "peers": {
+            "yeQcki8lji6brz0cCL5o8k2xOcL_VSsMtpFo6WMsSto": {
+              "peer_id": "p-0f1e2d3c4b5a6978",
+              "role": "host"
+            },
+            "mwSkxeRytFUs0XcaBujkAxuamFmfjb9gAG1V1aYUkEw": {
+              "peer_id": "p-8796a5b4c3d2e1f0",
+              "role": "guest"
+            },
+            "et_S4WN-qVzP4ojjcKpj0fKYMRj2_ehaW2cu7uA9FMA": {
+              "peer_id": "p-99aabbccddeeff00",
+              "role": "viewer"
+            }
+          }
+        }
+      },
+      "hex": "03 23 18 ee 09 4d 9d be 01 00 01 03 1e 2f 3a 4b 5c 6d 7e 8f 90 a1 b2 e6 02 73 0a d6 ce 31 89 69 0e 39 cf 19 2c 48 dc f5 ef f9 1e 49 18 0b 70 1d 36 e0 ec 12 23 2b 8e 73 53 1d fe ad 0f bc 5a a9 8c b4 5f 03 9c bd 8e 21 d3 45 bb 4b e7 5a de d4 ff 55 ce d1 a4 1e 87 56 6a 7e 54 b6 d2 50 24 1d 17 c2 d6 46 5d 77 1e 26 86 7b f6 2f c9 52 47 a1 08 1d 08 39 51 ec 0e ae da 63 59 a3 31 81 5a 43 9b 04 da 94 a4 29 33 1a 83 ae 54 84 83 76 2c 39 86 a2 7a 14 90 10 7d dd 8d 9c fb ac aa c2 d3 f6 82 8c 40 da 9c a5 69 f9 b8 32 7e c1 04 09 95 cd aa ab 0f 3c bf ae b0 d5 37 64 6a 15 4b 8c bb f0 66 d9 ec 3d 61 f3 87 0a 1e 1a 0f 2c 0f ad 87 0e e9 59 56 c4 ee 61 97 03 36 47 25 3b 57 b7 ee bd cc 5d 77 13 b5 e5 17 9e 79 33 21 7f 10 b0 e3 cb 73 a9 69 05 b5 e9 8c f4 a2 60 cc d2 88 03 f9 e3 7b 76 8c 1d 04 83 25 86 81 4a 02 ce f8 7c 6a fe 84 68 1a 27 75 6a a0 88 d8 f5 ff 2d c4 8b 92 bb ce 37 66 c4 de 26 1c 2d 90 5a b7 c5 d0 e8 44 cc 5d 15 73 93 e9 39 fd 35 d7 6a 11 c3 3a 40 f8 27 e1 c1 02 16 71 ee 7b ca b2 4f 99 f0 47 43 6c 88 5f a7 b0 d5 e2 ad 8b 2f 52 92 fc ab 06 fd af a5 7c 8b 41 57 f6 38 80 2c c0 46 5e 71 1b ae 71 29 71 6a 08 40 8c 09 fc 10 be 6f 04 41 31 66 01 58 15 1d 7e b7 19 f0 0b fe 0c e9 94 78 da 30 c8 2b 42 40 cd 1b 41 5b 2e d8 0d 9e 8f b8 a8 c4 98 60 d2 50 18 ff eb 62 a9 5e 9b 86 23 5b a0 4d ef 3f 16 80 04 ee 6a 9a b2 a7 65 fe a1 2d 6b b8 08"
+    },
+    {
+      "op": "deliver",
+      "conn": "peer",
+      "frame": "content",
+      "recipe": {
+        "sign": "mallory-1",
+        "kind": 0,
+        "counter": 1,
+        "nonce": "041e2f3a4b5c6d7e8f90a1b2",
+        "plaintext": "00 01 1b 01 01 01 00 04 01 0b 73 72 63 2f 6d 61 69 6e 2e 72 73 07 61 f0 9f 98 80 62 63 00"
+      },
+      "hex": "b2 13 5c 91 aa fa 67 ce 00 00 01 04 1e 2f 3a 4b 5c 6d 7e 8f 90 a1 b2 2e 40 2a 78 77 b3 e1 c6 ec d9 87 9d 15 28 7c 1e b5 59 8c d8 b5 7d ac 35 6d 4e f4 4d 6b e0 bd b2 6f 99 5f 72 3f fd ac d3 f6 ad 59 b2 6c d2 50 4d eb 05 d4 f0 9d 98 ce c0 04 3c 78 8b c6 78 4b d5 37 09 cb 2c cb 53 96 3b a7 9f a4 b9 99 ff 9f 86 bc a4 73 c4 35 2b d4 94 2b 90 fa 7d 42 c7 21 dc 81 e3 31 bf 20 bb 0b 02 6a be 5e 6d d1 f5 0d"
+    },
+    {
+      "op": "expectSubject",
+      "conn": "peer",
+      "applied": [
+        {
+          "frame": 0,
+          "kind": 1
+        }
+      ],
+      "dropped": [
+        {
+          "frame": 1,
+          "reason": "unauthorised_content"
+        }
+      ],
+      "published": 1,
+      "ended": false,
+      "text": {},
+      "holds": {}
+    },
+    {
+      "op": "stop",
+      "conn": "peer"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1",
+  "secret": [
+    "README.md",
+    "src/main.rs"
+  ]
+}

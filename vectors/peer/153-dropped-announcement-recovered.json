@@ -1,0 +1,97 @@
+{
+  "id": "153",
+  "title": "An announcement the relay drops is re-announced on the session's renewal clock",
+  "spec": "PROTOCOL.md#131-the-order-of-operations-at-a-join",
+  "notes": "A client cannot tell a dropped announcement from a slow host, so §13.1's step 4 makes the recovery run on `awareness_renew_ms` rather than wait for a state that may be the thing that went missing. The frame's counter advances with each re-announcement and the client stops once it applies a state that commits its key — which is the pair this vector asserts: `published` above 1 while nothing has committed the key, and unmoved after the state that does.",
+  "layer": "peer",
+  "kind": "decision",
+  "fixture": "fixture/keys.json",
+  "catches": "announce-once",
+  "scenario": {
+    "keepalive": {
+      "awareness_expire_ms": 900,
+      "awareness_renew_ms": 300,
+      "ping_interval_ms": 30000,
+      "room_grace_ms": 30000
+    },
+    "relay_withholds": [
+      "kind4"
+    ]
+  },
+  "steps": [
+    {
+      "op": "start",
+      "conn": "peer",
+      "key": "guest-1",
+      "invite": "/session?room=$room&token=$token#k=$room_key&h=$host_key"
+    },
+    {
+      "op": "expectSubject",
+      "conn": "peer",
+      "published": 1,
+      "ended": false
+    },
+    {
+      "op": "expectSubject",
+      "conn": "peer",
+      "at_least": {
+        "published": 2
+      },
+      "within_ms": 1400
+    },
+    {
+      "op": "deliver",
+      "conn": "peer",
+      "frame": "state",
+      "recipe": {
+        "sign": "host-key",
+        "kind": 1,
+        "counter": 1,
+        "nonce": "041e2f3a4b5c6d7e8f90a1b2",
+        "payload": {
+          "issued": 1,
+          "listing": [
+            "README.md",
+            "src/main.rs"
+          ],
+          "peers": {
+            "yeQcki8lji6brz0cCL5o8k2xOcL_VSsMtpFo6WMsSto": {
+              "peer_id": "p-0f1e2d3c4b5a6978",
+              "role": "host"
+            },
+            "mwSkxeRytFUs0XcaBujkAxuamFmfjb9gAG1V1aYUkEw": {
+              "peer_id": "p-8796a5b4c3d2e1f0",
+              "role": "guest"
+            }
+          }
+        }
+      },
+      "hex": "03 23 18 ee 09 4d 9d be 01 00 01 04 1e 2f 3a 4b 5c 6d 7e 8f 90 a1 b2 87 02 3b 09 0a 05 c1 95 a3 8c fa b6 df 4b 69 3f 1a a7 44 8b 98 a0 2c 91 0f bf 83 29 8c 4d ce f8 74 9f c8 01 35 a9 d0 28 2a be 5a ae 20 b9 e0 60 e2 92 2e 3b ac 62 24 e4 1a d4 33 8f e4 c0 69 e8 48 53 38 dd 08 95 07 f2 ae ad af 3f 78 2a 90 87 a9 da 62 47 75 41 c5 cb b3 1c 5b 0a 5e 7e 9a 17 6b 7e 2c 90 60 25 4e 61 c1 00 47 cd 6a b3 f8 af 49 e5 8a 83 50 40 f3 e9 71 1d f5 8b 7f 92 dd 5a 02 06 c1 f7 eb 13 63 d8 25 43 63 17 f6 78 52 0b a8 da b7 9a b3 fe 35 f5 b7 93 e1 11 cf 4b 2b 26 57 81 67 60 99 33 b4 cc a7 54 9e 81 3c 72 5b 76 ed 04 c5 1f 3b e8 5e ab 8a 34 2b 02 ae 79 b6 f1 14 47 c1 f7 75 2e b2 a2 41 69 ee b0 d2 d7 7b c8 4a 18 06 c3 74 4a b8 42 57 99 5a 86 17 53 01 5d e9 d3 d7 96 58 ea 01 25 0a 82 c3 90 43 73 f5 c3 de 7a 53 d1 e3 b6 58 3b 9e 7e 44 49 1b 88 4e 82 30 21 97 34 38 fa 23 e3 35 07 f7 2b a6 18 45 9b e9 a3 a0 fa d5 29 42 ba e1 81 1b 6a 3f 46 70 14 39 a5 8a e3 ea dd ba 7f 91 51 b9 69 09 de 48 dd bd 3d f8 99 72 04 89 44 91 ea 16 02 39 74 ed 87 61 fe f0 fb 05 b6 72 1b 0a"
+    },
+    {
+      "op": "expectSubject",
+      "conn": "peer",
+      "applied": [
+        {
+          "frame": 0,
+          "kind": 1
+        }
+      ],
+      "frozen": [
+        "published"
+      ],
+      "within_ms": 1400,
+      "ended": false
+    },
+    {
+      "op": "stop",
+      "conn": "peer"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1",
+  "secret": [
+    "README.md",
+    "src/main.rs"
+  ]
+}
