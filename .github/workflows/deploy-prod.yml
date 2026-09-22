@@ -180,8 +180,9 @@ jobs:
       # is refused at the edge whatever the deployment is doing. The attempt says
       # so in plain words and ends at the first challenge response instead of
       # polling a deadline it cannot pass, and a challenge never turns a healthy
-      # deploy red. When the edge does let a client like this one through the read
-      # is compared, so the assertion comes back on its own.
+      # deploy red. When the edge does let a client like this one through, the read
+      # is compared and printed, so the check comes back on its own; it is still a
+      # report, and never the thing the run is decided by.
       #
       # `scripts/verify_deploy.py` is both reads, and `packaging/prod/README.md`
       # has the evidence for the challenge. Each read polls a real predicate with

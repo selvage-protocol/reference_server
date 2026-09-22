@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify that the box a deploy just reached serves what was asked for.
 
-Two reads, and only one of them is an assertion.
+Two reads, and only one of them decides the run's colour.
 
 * **The origin**, over the Tailscale SSH path the deploy itself used, through the
   front on the box's own loopback: `https://127.0.0.1/meta` and the page at `/`.
@@ -10,11 +10,12 @@ Two reads, and only one of them is an assertion.
   version served, and when the page stops answering 200.
 * **The public origin**, over Cloudflare, from this runner. Cloudflare answers a
   programmatic client on a datacenter address with a managed challenge, so this
-  read is a **report**: the challenge is named in plain words, the attempt ends at
-  the first challenge response rather than polling a deadline it cannot pass, and
-  a challenge never turns a healthy deploy red. When the edge does let a client
-  like this one through the read is compared, so the assertion comes back on its
-  own and no flag has to be remembered to turn it back on.
+  read is a **report in every shape it can come back in**: the challenge is named
+  in plain words, the attempt ends at the first challenge response rather than
+  polling a deadline it cannot pass, and nothing the edge says turns a healthy
+  deploy red. A read that does get through is compared and printed, so the check
+  comes back on its own when the edge permits one; it is still never what the run
+  is decided by, because the edge is not something a deploy can fix.
 
 The origin read needs `-k`: the certificate is the Cloudflare Origin CA pair
 issued for the public name, which is in no trust store and does not match
@@ -27,6 +28,7 @@ nothing from the dispatch reaches the remote shell.
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -96,10 +98,6 @@ class OriginAssertion(Exception):
     """The origin did not serve what was asked for before the deadline."""
 
 
-class PublicAssertion(Exception):
-    """The edge answered without a challenge and still did not report the version."""
-
-
 def json_server(body: str) -> str:
     """The `server` field of a `/meta` body, or "" when it does not carry one."""
     try:
@@ -147,7 +145,7 @@ def wait_for_origin(
 ) -> Origin:
     """Poll the origin until it serves what was asked for, or the deadline passes.
 
-    A dead line with a stated observation, not a sleep and a hope: every failure
+    A dead line with a stated observation, not a sleep and a hope: the failure
     carries what the last read actually said.
     """
     started = time.monotonic()
@@ -183,8 +181,11 @@ def classify_public(reading: Public, expect_version: str | None) -> tuple[str, s
 def wait_for_public(read, expect_version: str | None, deadline: float, interval: float) -> tuple[str, str]:
     """Read the public origin, ending at the first challenge rather than polling it.
 
-    A challenge is an answer about the edge, not about the deployment, and it
-    cannot be passed by waiting: the attempt is over the moment it arrives.
+    Every shape it can come back in is returned, and none of them is a failure: a
+    challenge is an answer about the edge, not about the deployment, and it cannot
+    be passed by waiting, so the attempt is over the moment it arrives. Anything
+    else is worth retrying to the deadline, because a front that a deploy has just
+    recreated answers again in seconds.
     """
     started = time.monotonic()
     while True:
@@ -192,13 +193,22 @@ def wait_for_public(read, expect_version: str | None, deadline: float, interval:
         if verdict in (CHALLENGE, REPORTED):
             return verdict, detail
         if time.monotonic() - started >= deadline:
-            raise PublicAssertion(detail)
+            return UNREADABLE, detail
         time.sleep(interval)
+
+
+def remote_read(origin_url: str) -> str:
+    """The command `deployci` runs on the box, with the URL quoted into it.
+
+    The SSH client hands this string to the remote user's shell, so a
+    `--origin-url` carrying shell syntax has to arrive as data rather than as
+    syntax. The seconds placeholder is a number this module owns.
+    """
+    return REMOTE_READ.replace("@MAX@", str(CURL_MAX_SECONDS)).replace("@URL@", shlex.quote(origin_url))
 
 
 def read_origin(ssh_target: str, origin_url: str) -> Origin:
     """One read of the front on the box, as `deployci` over Tailscale SSH."""
-    command = REMOTE_READ.replace("@MAX@", str(CURL_MAX_SECONDS)).replace("@URL@", origin_url)
     argv = [
         "ssh",
         "-o",
@@ -208,7 +218,7 @@ def read_origin(ssh_target: str, origin_url: str) -> Origin:
         "-o",
         "StrictHostKeyChecking=accept-new",
         ssh_target,
-        command,
+        remote_read(origin_url),
     ]
     try:
         done = subprocess.run(
@@ -216,6 +226,8 @@ def read_origin(ssh_target: str, origin_url: str) -> Origin:
         )
     except subprocess.TimeoutExpired:
         return Origin("", "", f"ssh to {ssh_target} did not answer within {SPAWN_TIMEOUT_SECONDS}s")
+    except OSError as failed:
+        return Origin("", "", f"ssh could not be run: {failed}")
     if done.returncode != 0:
         return Origin(
             "", "", f"ssh to {ssh_target} exited {done.returncode}: {done.stderr.strip()}"
@@ -236,7 +248,9 @@ def read_public(public_url: str) -> Public:
     """One read of the public origin from here, headers and body kept.
 
     `-f` is deliberately absent: the body and the headers of a refusal are the
-    whole of what this read is for.
+    whole of what this read is for. Any non-zero exit is a read that produced no
+    answer, whatever status code got as far as being printed — a transfer that
+    timed out mid-body is not a response.
     """
     with tempfile.TemporaryDirectory() as workdir:
         headers = Path(workdir) / "headers"
@@ -260,10 +274,12 @@ def read_public(public_url: str) -> Public:
             )
         except subprocess.TimeoutExpired:
             return Public("", "", "", f"curl did not answer within {SPAWN_TIMEOUT_SECONDS}s")
+        except OSError as failed:
+            return Public("", "", "", f"curl could not be run: {failed}")
         status = done.stdout.strip()
         header_text = headers.read_text(encoding="utf-8", errors="replace") if headers.exists() else ""
         body_text = body.read_text(encoding="utf-8", errors="replace") if body.exists() else ""
-        if done.returncode != 0 and status in ("", "000"):
+        if done.returncode != 0:
             return Public(status, header_text, body_text, f"curl exited {done.returncode}: {done.stderr.strip()}")
     return Public(status, header_text, body_text)
 
@@ -285,8 +301,15 @@ the public read: {url}/meta was answered with a Cloudflare challenge, so it is n
   request reaches this origin, and no programmatic client on a datacenter address can pass it:
   not this runner, and not the Azure box itself. The same read from a residential address does
   answer, which is how the edge was told apart from the deployment. What is asserted above is the
-  origin's own answer, read on the box through the front. This read is a report; it is compared,
-  and does fail the run, whenever the edge does let a client like this one through."""
+  origin's own answer, read on the box through the front. This read is a report and not what the
+  run is decided by."""
+
+UNREADABLE_REPORT = """\
+the public read: {url}/meta did not report {expected} within {seconds:g}s; the last answer was
+  {detail}. This read is a report and did not fail the run: what is asserted is the origin's own
+  answer, read on the box through the front above, and an edge that answers a datacenter client
+  badly is not something a deploy can fix. A public path that answers this way while the origin is
+  serving the version that was asked for is still worth a look."""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -316,25 +339,23 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(origin_sentence(origin, args.origin_url, args.ssh_target, args.expect_version))
 
-    try:
-        verdict, detail = wait_for_public(
-            partial(read_public, args.public_url),
-            args.expect_version,
-            args.public_deadline,
-            args.poll_interval,
-        )
-    except PublicAssertion as failed:
-        print(
-            "the public origin answered without a challenge and did not report what was "
-            f"deployed: {failed}. The origin on the box above did answer, so this is the "
-            "public path from this runner rather than the deployment.",
-            file=sys.stderr,
-        )
-        return 1
+    verdict, detail = wait_for_public(
+        partial(read_public, args.public_url),
+        args.expect_version,
+        args.public_deadline,
+        args.poll_interval,
+    )
     if verdict == CHALLENGE:
         print(CHALLENGE_REPORT.format(url=args.public_url, detail=detail))
-    else:
+    elif verdict == REPORTED:
         print(f"the public read: {args.public_url}/meta reports {detail}")
+    else:
+        expected = f"selvaged/{args.expect_version}" if args.expect_version else "a server version"
+        print(
+            UNREADABLE_REPORT.format(
+                url=args.public_url, expected=expected, seconds=args.public_deadline, detail=detail
+            )
+        )
     return 0
 
 
