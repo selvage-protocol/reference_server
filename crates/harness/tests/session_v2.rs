@@ -327,6 +327,45 @@ async fn a_version_two_room_is_destroyed_after_its_last_connection()
     Ok(())
 }
 
+/// A timer armed by one empty window cannot reap a room that emptied again later: the
+/// grace is measured from the **last** connection's leave, and a stale timer that fired
+/// early would destroy a room whose grace had only just started.
+#[tokio::test]
+async fn a_stale_grace_timer_does_not_reap_a_room_that_emptied_later()
+-> Result<(), Failure> {
+    let harness = Harness::start_with(ServerConfig {
+        room_grace: Duration::from_millis(400),
+        ..transitional()
+    })
+    .await;
+    let (host, created) =
+        Peer::join(&harness.ws_base(), "selvage/2", "", "Ada").await?;
+    let query = join_query(&created)?;
+    host.close().await;
+
+    sleep(Duration::from_millis(120)).await;
+    let (guest, _joined) =
+        Peer::join(&harness.ws_base(), "selvage/2", &query, "Bob").await?;
+    guest.close().await;
+
+    // Past the first timer's deadline and before the second's: the room is still here.
+    sleep(Duration::from_millis(380)).await;
+    let (again, joined) =
+        Peer::join(&harness.ws_base(), "selvage/2", &query, "Cara").await?;
+    assert_eq!(
+        joined["event"], "room.joined",
+        "the stale timer reaped a room whose grace had only just started: {joined}"
+    );
+    again.close().await;
+
+    // And the timer the last leave armed does reap it.
+    sleep(Duration::from_millis(500)).await;
+    let (_late, reply) =
+        Peer::join(&harness.ws_base(), "selvage/2", &query, "Dan").await?;
+    assert_eq!(reply["params"]["code"], "room_unknown");
+    Ok(())
+}
+
 /// `/meta` is what the configuration advertises: both versions when both are served, and
 /// one when one is (`PROTOCOL.md` §2).
 #[tokio::test]

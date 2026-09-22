@@ -246,6 +246,13 @@ impl Room {
         self.generation
     }
 
+    /// Advances the generation without changing anything else, which invalidates a timer
+    /// armed before it.
+    pub const fn bump_generation(&mut self) -> u64 {
+        self.generation = self.generation.saturating_add(1);
+        self.generation
+    }
+
     /// Records a peer's hold on a path, returning whether the path is newly in the
     /// room's set — or `None` when the set is at its cap and the path is not in it. A
     /// path the room already holds is always fine: re-opening one grows nothing.
@@ -498,8 +505,13 @@ impl Registry {
         let was_host = room.host.as_deref() == Some(peer_id);
         room.peers.remove(peer_id)?;
         room.forget_claims(peer_id);
+        // Every leave a version-2 room sees advances the generation, so the timer armed by
+        // a leave that emptied it cannot outlive a later leave that armed its own: the
+        // stale timer finds a generation that is no longer the room's and reaps nothing.
         let generation = if was_host {
             room.detach_host()
+        } else if room.version == proto::Version::V2 {
+            room.bump_generation()
         } else {
             room.generation()
         };
@@ -532,18 +544,22 @@ impl Registry {
         self.rooms.get_mut(room_id)
     }
 
-    /// Tears a room down if no connection is seated in it, returning the peers that were
-    /// (`selvage/2`'s life, `PROTOCOL.md` §9): the timer arms when the room's **last**
-    /// connection ends, so the predicate is exactly "the room holds nobody". A connection
-    /// seated in the window makes this return nothing, and a later last-leave arms a fresh
-    /// timer.
+    /// Tears a room down if it holds nobody and is still at `generation`, returning the
+    /// peers that were (`selvage/2`'s life, `PROTOCOL.md` §9). The timer arms when the
+    /// room's **last** connection ends, so the predicate is "the room holds nobody", and
+    /// the generation keeps a timer armed by an earlier empty window from reaping a room
+    /// whose grace has only just started. A connection seated in the window makes this
+    /// return nothing, and a later last-leave arms a fresh timer.
     #[must_use]
-    pub fn reap_if_empty(&mut self, room_id: &str) -> Vec<Peer> {
-        if self
-            .rooms
-            .get(room_id)
-            .is_some_and(|room| !room.peers.is_empty())
-        {
+    pub fn reap_if_empty(
+        &mut self,
+        room_id: &str,
+        generation: u64,
+    ) -> Vec<Peer> {
+        let stale = self.rooms.get(room_id).is_none_or(|room| {
+            room.generation() != generation || !room.peers.is_empty()
+        });
+        if stale {
             return Vec::new();
         }
         self.rooms

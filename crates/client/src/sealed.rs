@@ -257,7 +257,13 @@ pub fn read_varuint(
             SealedError::new("the bytes run out inside a varUint")
         })?;
         cursor = cursor.saturating_add(1);
-        let part = u64::from(byte & 0x7f).checked_shl(shift).unwrap_or(0);
+        let low = byte & 0x7f;
+        // A byte read at shift 63 may set only bit 0. Anything above it is a value past
+        // 64 bits, which a silent `checked_shl` would truncate into a different counter.
+        if shift == 63 && low & 0x7e != 0 {
+            return Err(SealedError::new("a varUint longer than 64 bits"));
+        }
+        let part = u64::from(low).checked_shl(shift).unwrap_or(0);
         value |= part;
         if byte & 0x80 == 0 {
             return Ok((value, cursor));
@@ -627,6 +633,17 @@ impl Reader {
         self.by_key_id(id).into_iter().next()
     }
 
+    /// The role the applied state gives **this** key, which is the role a frame that
+    /// verified against it is read with (§13.4). A key id resolves to an entry by lookup;
+    /// a key resolves to its own entry exactly.
+    #[must_use]
+    pub fn role_of_key(&self, key: PublicKey) -> Option<&str> {
+        self.committed
+            .values()
+            .find(|peer| peer.key == key)
+            .map(|peer| peer.role.as_str())
+    }
+
     /// §6.1's table, in its order, with the first step that refuses the frame reported.
     #[must_use]
     pub fn read(&mut self, frame: &[u8]) -> Verdict {
@@ -691,22 +708,30 @@ impl Reader {
 
     fn read_ordinary(&mut self, envelope: &Envelope) -> Verdict {
         // A `kind = 1` or `2` frame verifies against the host key the fragment names; a
-        // `kind = 0` or `3` one against a committed session key.
-        let held: Vec<PublicKey> = if matches!(envelope.kind, 1 | 2) {
-            vec![self.host_key]
+        // `kind = 0` or `3` one against the committed keys its `key_id` indexes. §6.1
+        // makes the id an index and not an identity, so a collision is resolved by
+        // verifying: every key the id names is tried and the frame belongs to the one
+        // that verified. A collision therefore costs a verification that fails, never a
+        // misattribution.
+        let candidates: Vec<PublicKey> = if matches!(envelope.kind, 1 | 2) {
+            // Only the host key may sign these two, and only if the frame's id names it:
+            // a state signed by a committed session key is `uncommitted_key`, not a
+            // signature failure.
+            (self.host_key.id() == envelope.key_id)
+                .then_some(self.host_key)
+                .into_iter()
+                .collect()
         } else {
             self.by_key_id(envelope.key_id)
                 .into_iter()
                 .map(|peer| peer.key)
                 .collect()
         };
-        let Some(key) =
-            held.into_iter().find(|key| key.id() == envelope.key_id)
-        else {
+        if candidates.is_empty() {
             return Verdict::refused("uncommitted_key", Some(envelope));
-        };
+        }
         if matches!(envelope.kind, 0 | 3)
-            && self.replayed(key.id(), envelope.counter)
+            && self.replayed(envelope.key_id, envelope.counter)
         {
             return Verdict::refused("replayed_counter", Some(envelope));
         }
@@ -716,9 +741,13 @@ impl Reader {
             envelope.epoch,
             envelope.key_id,
         );
-        if !key.verifies(&signing_input(&aad, envelope), &envelope.signature) {
+        let signed = signing_input(&aad, envelope);
+        let Some(key) = candidates
+            .into_iter()
+            .find(|key| key.verifies(&signed, &envelope.signature))
+        else {
             return Verdict::refused("bad_signature", Some(envelope));
-        }
+        };
         let Ok(plaintext) = opens(&self.frame_key, &self.room_id, envelope)
         else {
             return Verdict::refused("bad_aead", Some(envelope));
@@ -736,7 +765,7 @@ impl Reader {
         // Step 10: a committed `viewer` may not send document content.
         if envelope.kind == 0
             && is_content(&plaintext)
-            && self.role_of(key.id()) == Some("viewer")
+            && self.role_of_key(key) == Some("viewer")
         {
             return Verdict::refused("unauthorised_content", Some(envelope));
         }

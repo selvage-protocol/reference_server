@@ -585,7 +585,11 @@ async fn eject_into(
         }
         reap_later(shared.clone(), room_id.to_string(), removed.generation);
     } else if removed.version == proto::Version::V2 && removed.empty {
-        reap_later_empty(shared.clone(), room_id.to_string());
+        reap_later_empty(
+            shared.clone(),
+            room_id.to_string(),
+            removed.generation,
+        );
     }
     if let Some(left) = peer_left_frame(removed.version, &removed.peer_id) {
         pending.push((None, left));
@@ -616,7 +620,11 @@ async fn remove_peer(shared: &Shared, room_id: &str, peer_id: &str) {
         deliver(shared, room_id, None, host_detached_frame(grace)).await;
         reap_later(shared.clone(), room_id.to_string(), removed.generation);
     } else if removed.version == proto::Version::V2 && removed.empty {
-        reap_later_empty(shared.clone(), room_id.to_string());
+        reap_later_empty(
+            shared.clone(),
+            room_id.to_string(),
+            removed.generation,
+        );
     }
     drop(removed.poison);
 }
@@ -1335,12 +1343,14 @@ impl Session {
 /// The deadline can only be reached with no connection seated, so the destruction has no
 /// recipient (`PROTOCOL.md` §6, §9): no `room.gone` is sent, the id is gone for good, and
 /// the next connection that names it learns so as `room_unknown`.
-fn reap_later_empty(shared: Shared, room_id: String) {
+fn reap_later_empty(shared: Shared, room_id: String, generation: u64) {
     tokio::spawn(async move {
         sleep(shared.config.room_grace).await;
         let mut guard = shared.registry.lock().await;
-        // Empty by definition, so no task is left to end and nobody is there to tell.
-        drop(guard.reap_if_empty(&room_id));
+        // A room that emptied and was reoccupied since this timer was armed is at a later
+        // generation, and `reap_if_empty` leaves it alone; an empty one holds no task to
+        // end and nobody to tell.
+        drop(guard.reap_if_empty(&room_id, generation));
     });
 }
 
