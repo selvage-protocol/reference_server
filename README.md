@@ -319,11 +319,9 @@ drive the same binary:
 python3 runner/run_peer.py --subject <checkout>/reference_server/target/debug/selvage-subject
 ```
 
-Five of the six decision vectors pass. The sixth, `154-lease-expires-a-silent-peer`, asserts
-something no conforming client can do and `crates/harness/tests/decisions.rs` says why in
-full: its state commits two keys and its holds message is signed by a third, which
-`PROTOCOL.md` §13.4 and `CANONICAL.md` §6.1's step 4 refuse `uncommitted_key`. The test pins
-the defect rather than passing it, so it goes red when the corpus is corrected.
+All six decision vectors pass, and each goes red under the guard it declares it catches: the
+same suite removes the one guard a vector names and shows the vector fail, so a rule vector
+cannot pass by asserting nothing.
 
 ## The client library and the harness
 
