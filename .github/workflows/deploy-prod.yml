@@ -14,7 +14,10 @@ name: deploy-prod
 # says are not secrets, exchanged for a short-lived node together with a
 # GitHub-signed OIDC token whose `sub` claim carries this job's environment. The
 # tailnet's federated identity is constrained to exactly
-# `repo:selvage-protocol/reference_server:environment:prod`, which is why the
+# `repo:selvage-protocol@328844633/reference_server@1368869493:environment:prod` —
+# the immutable form, with the owner's and the repository's numeric ids, because
+# this organisation has ID-based OIDC subject claims enabled; the plain form is
+# rejected with a 403 at the exchange. That is why the
 # `environment:` line below matters: a job without it is still issued a token, but
 # the claim names the ref rather than the environment, so that rule rejects the
 # exchange. With the line, the approval gate and the credential's scope are the
