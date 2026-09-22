@@ -1,0 +1,100 @@
+{
+  "id": "102",
+  "title": "A frame with one bit flipped inside its GCM tag is refused `bad_signature`",
+  "spec": "CANONICAL.md#61-sealed-frames-selvage2",
+  "notes": "`bad_signature` and not `bad_tag`, and that is measured rather than chosen: the signature input covers the counter, the nonce and the ciphertext, so a corrupted tag is a corrupted signature and the AEAD's own failure is unreachable as a distinct report — which is why `bad_tag` is not in the vocabulary at all. The frame refused here is the one step 5 would not stop: it carries counter 2 under `guest-1`, above the mark of 1 the previous frame left. The last two steps are the half that matters: the same counter arrives again untampered and is applied, because a frame a receiver refuses never moves a mark (`CANONICAL.md` §6.1).",
+  "layer": "peer",
+  "kind": "frame",
+  "fixture": "fixture/keys.json",
+  "catches": "no-verify",
+  "steps": [
+    {
+      "op": "seal",
+      "frame": "state",
+      "recipe": {
+        "sign": "host-key",
+        "kind": 1,
+        "counter": 1,
+        "nonce": "011e2f3a4b5c6d7e8f90a1b2",
+        "payload": {
+          "issued": 1,
+          "listing": [
+            "README.md",
+            "src/main.rs"
+          ],
+          "peers": {
+            "yeQcki8lji6brz0cCL5o8k2xOcL_VSsMtpFo6WMsSto": {
+              "peer_id": "p-0f1e2d3c4b5a6978",
+              "role": "host"
+            },
+            "mwSkxeRytFUs0XcaBujkAxuamFmfjb9gAG1V1aYUkEw": {
+              "peer_id": "p-8796a5b4c3d2e1f0",
+              "role": "guest"
+            }
+          }
+        }
+      },
+      "hex": "03 23 18 ee 09 4d 9d be 01 00 01 01 1e 2f 3a 4b 5c 6d 7e 8f 90 a1 b2 87 02 ee bd 11 63 ad d6 f3 5d 10 3c c4 c7 6c 3a e7 f3 8e fe 0b c9 a6 c1 ac 26 12 99 53 6a 1b 31 bb 69 bc fc 45 a8 d6 77 14 37 fb 1e b1 a5 82 5b a0 9d 6a 23 37 a1 e1 b7 4a 27 10 09 7d f0 1f 9f c1 08 32 bc b0 bf 95 df b0 05 4a 6c 1c fe f6 e7 9c fe 2d 86 8e 1f 26 ca 69 f0 92 8f 3c e2 f7 00 94 9f 6f 76 41 26 5a a1 a5 72 61 82 b8 af 95 b6 a7 2e 8b 06 97 d5 e7 5f bc c7 d4 71 99 b0 74 75 b6 92 3d 60 99 41 f4 6a ee 2f 1c f5 95 d2 02 ca 29 f6 b5 a5 9a 17 ae 6a bc a7 39 b3 35 ec b2 ec 25 c1 98 64 e5 38 76 42 81 bf 63 de 9f 73 79 89 cb db f4 b4 6b ee 5b 54 e3 65 c4 ab 3a 67 1e f7 ec 2f ab bd ad 3c 6a f1 02 13 a9 86 57 46 c9 f0 61 f1 9d 0f 58 b5 4d 7b 7a 50 3a 68 3f d7 35 56 e5 68 db 75 d6 45 de 09 71 cd f0 fe 46 67 08 5a fc 63 9d 87 03 2e 43 4f 12 02 67 c4 74 fc b7 cc 45 36 b1 23 c0 00 9e bc 72 18 75 d3 91 ee a8 a0 af c3 9a 6b cd 87 1b dd fd 53 07 df 19 6c db 51 b7 64 c2 3f 2b cc 20 fd 0c 12 cc b4 06 04 37 d0 7c 7d 02 03 bd 8c a6 35 ab ee 71 59 a7 44 9f fe c7 d5 23 8a a6 2b b2 a2 06"
+    },
+    {
+      "op": "expectVerify",
+      "frame": "state"
+    },
+    {
+      "op": "seal",
+      "frame": "edit-1",
+      "recipe": {
+        "sign": "guest-1",
+        "kind": 0,
+        "counter": 1,
+        "nonce": "021e2f3a4b5c6d7e8f90a1b2",
+        "plaintext": "00 01 1b 01 01 01 00 04 01 0b 73 72 63 2f 6d 61 69 6e 2e 72 73 07 61 f0 9f 98 80 62 63 00"
+      },
+      "hex": "de 5e bd 17 c0 83 7e af 00 00 01 02 1e 2f 3a 4b 5c 6d 7e 8f 90 a1 b2 2e 32 ed 6a af ed 87 94 14 31 0c f0 0d a9 fe 5d ed ed ff 5e f1 fe a8 3a 6b 95 49 5e ba f6 fb 43 ff ea 7f 2f db b9 e5 d1 7f 1e 22 81 b7 c1 ad 1d 65 cb 4c 02 8f 89 23 c4 c3 68 d7 d5 a1 12 24 92 56 7b 8a 35 1d 64 e9 3a ea 40 ae b0 94 10 cc f2 97 02 3b 9b fa 08 2a 17 22 76 61 9d f4 f6 78 11 f0 bb 29 4a 65 38 73 9e 9b a8 b6 3b ba 28 05"
+    },
+    {
+      "op": "expectVerify",
+      "frame": "edit-1"
+    },
+    {
+      "op": "seal",
+      "frame": "edit-2",
+      "recipe": {
+        "sign": "guest-1",
+        "kind": 0,
+        "counter": 2,
+        "nonce": "031e2f3a4b5c6d7e8f90a1b2",
+        "plaintext": "00 02 0c 01 01 01 05 c4 01 03 01 04 01 58 00"
+      },
+      "hex": "de 5e bd 17 c0 83 7e af 00 00 02 03 1e 2f 3a 4b 5c 6d 7e 8f 90 a1 b2 1f 08 2a b3 bc 43 fd 09 ae 1a f6 29 04 6b e8 9c 6f 81 d6 ce a8 53 5f eb f1 a5 79 e3 29 57 44 ee 8a a6 0f d6 36 4a ce a1 88 e9 a5 c9 20 72 1f f5 2c 32 5a 66 ec 0c e8 ee 3d b2 cd be 79 f4 4d 01 9d 72 e1 70 8a e5 80 b4 41 b8 3b ca 40 19 ea a0 33 23 76 1f 2e a7 b6 f6 22 83 c9 16 37 84 2a 04"
+    },
+    {
+      "op": "corrupt",
+      "frame": "edit-2",
+      "as": "tampered",
+      "at": 40,
+      "xor": 1,
+      "hex": "de 5e bd 17 c0 83 7e af 00 00 02 03 1e 2f 3a 4b 5c 6d 7e 8f 90 a1 b2 1f 08 2a b3 bc 43 fd 09 ae 1a f6 29 04 6b e8 9c 6f 80 d6 ce a8 53 5f eb f1 a5 79 e3 29 57 44 ee 8a a6 0f d6 36 4a ce a1 88 e9 a5 c9 20 72 1f f5 2c 32 5a 66 ec 0c e8 ee 3d b2 cd be 79 f4 4d 01 9d 72 e1 70 8a e5 80 b4 41 b8 3b ca 40 19 ea a0 33 23 76 1f 2e a7 b6 f6 22 83 c9 16 37 84 2a 04"
+    },
+    {
+      "op": "expectReject",
+      "frame": "tampered",
+      "reason": "bad_signature"
+    },
+    {
+      "op": "expectVerify",
+      "frame": "edit-2"
+    },
+    {
+      "op": "expectDoc",
+      "path": "src/main.rs",
+      "text": "a😀bXc"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1",
+  "secret": [
+    "README.md",
+    "src/main.rs"
+  ]
+}

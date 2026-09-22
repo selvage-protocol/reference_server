@@ -1,0 +1,67 @@
+{
+  "id": "115",
+  "title": "A kind this version does not define is refused `unknown_kind`",
+  "spec": "CANONICAL.md#61-sealed-frames-selvage2",
+  "notes": "Values above `4` are this version's to leave unused: a later revision defines one, and a receiver of this version refuses a frame that uses one rather than reading it by the nearest rule it knows. The frame sealed here is a valid envelope in every other respect — authentic, with a plaintext that a `kind = 0` frame would carry and a counter above the sender's mark — so what refuses it is the kind and only the kind, and a receiver that guessed `kind = 0` would apply it.",
+  "layer": "peer",
+  "kind": "frame",
+  "fixture": "fixture/keys.json",
+  "catches": "lenient-kind",
+  "steps": [
+    {
+      "op": "seal",
+      "frame": "state",
+      "recipe": {
+        "sign": "host-key",
+        "kind": 1,
+        "counter": 1,
+        "nonce": "021e2f3a4b5c6d7e8f90a1b2",
+        "payload": {
+          "issued": 1,
+          "listing": [
+            "README.md",
+            "src/main.rs"
+          ],
+          "peers": {
+            "yeQcki8lji6brz0cCL5o8k2xOcL_VSsMtpFo6WMsSto": {
+              "peer_id": "p-0f1e2d3c4b5a6978",
+              "role": "host"
+            },
+            "mwSkxeRytFUs0XcaBujkAxuamFmfjb9gAG1V1aYUkEw": {
+              "peer_id": "p-8796a5b4c3d2e1f0",
+              "role": "guest"
+            }
+          }
+        }
+      },
+      "hex": "03 23 18 ee 09 4d 9d be 01 00 01 02 1e 2f 3a 4b 5c 6d 7e 8f 90 a1 b2 87 02 49 ce 18 dd 9f f3 f1 74 12 3d b2 53 e8 bd 59 ff f0 f8 1e e4 af 95 00 b9 58 94 9f 9c d8 be ce 47 b8 ca 35 f2 cf 98 98 0e e0 45 6a 19 10 3c 3d c0 69 6a df 31 02 a9 01 e6 4a 43 6e 8f 39 64 56 86 ff 10 b9 bf 5d ab 1e a1 40 b9 5e f5 bc ca 7b a7 13 a6 74 34 b9 a4 4c ae 40 73 3a 17 00 c4 b6 e3 d9 f4 3a c6 90 8b 14 3a 48 4d 07 1d d5 aa 4a 31 e6 65 c9 cc 42 3a 09 e3 88 84 32 53 6b 50 08 8b c1 83 1d 74 f2 bc f9 30 f9 6f b6 ea fd 8a 8b 2e a0 bd 83 a5 1e 48 e5 28 24 66 f6 88 da f6 24 03 e7 da 03 1d 0c a9 be f3 3b 3b c4 0c 0d 10 84 4f 95 de f0 cf 48 11 96 1c 37 c7 1a a7 4a 72 0a 1b 4c 7f 90 10 1d f9 15 3e ad e8 6a dd 8a 32 0f cf 53 a0 5d c2 4b 6b 20 b3 2b 8c a2 81 ba 22 b6 fd 2c 01 c0 fb 60 e5 95 62 93 c3 be 4f be 7b 76 e3 17 35 eb dd a8 ab f4 40 00 20 85 ee c8 40 26 f8 c8 1d c0 8a 55 26 d9 74 28 c5 d5 8e 27 3b 4c ee 13 46 d9 86 39 72 8e ad a4 a6 c6 68 ce b4 3b 96 9e 16 35 6c ca ca 97 e1 54 40 85 dc 80 51 b7 a4 8d 41 de ad d4 cc f2 35 a1 32 7d 4f c5 14 8d 4a d4 74 1f 80 83 3b 08"
+    },
+    {
+      "op": "expectVerify",
+      "frame": "state"
+    },
+    {
+      "op": "seal",
+      "frame": "kind-5",
+      "recipe": {
+        "sign": "guest-1",
+        "kind": 5,
+        "counter": 1,
+        "nonce": "031e2f3a4b5c6d7e8f90a1b2",
+        "plaintext": "00 00 01 00"
+      },
+      "hex": "de 5e bd 17 c0 83 7e af 05 00 01 03 1e 2f 3a 4b 5c 6d 7e 8f 90 a1 b2 14 08 28 be bd 30 c0 c9 0c ec 78 5d a9 41 9c 40 93 0b 40 e8 7b 9d 2f 64 98 12 4b bf 38 82 af fc f2 b8 46 10 86 4f cd 31 9a 8c df cc 08 8a aa 1a c4 6e f3 b3 1c 15 91 60 9a 4f 89 f8 16 18 eb 55 4c d4 ff 17 12 f0 77 c7 53 b5 97 50 42 22 35 90 77 83 99 9a 0f"
+    },
+    {
+      "op": "expectReject",
+      "frame": "kind-5",
+      "reason": "unknown_kind"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1",
+  "secret": [
+    "README.md",
+    "src/main.rs"
+  ]
+}

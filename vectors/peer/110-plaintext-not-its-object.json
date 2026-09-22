@@ -1,0 +1,57 @@
+{
+  "id": "110",
+  "title": "A plaintext that is not an object of the members its kind fixes is refused `bad_payload`",
+  "spec": "PROTOCOL.md#132-verify-before-apply",
+  "notes": "The two legs are a `kind = 1` frame whose plaintext is a bare JSON string and one whose `issued` is a string: the frame is authentic, at an advancing counter, and its AEAD opens, and none of the reasons about the envelope reaches it. Step 8 reads the member set and each member's *type*, and reads them after the AEAD rather than at step 1, because the plaintext is not visible until it opens. What step 8 does *not* read is a value a rule elsewhere governs: vector 117 is the other half of that, where a path `PROTOCOL.md` §5 refuses is dropped and the state applies.",
+  "layer": "peer",
+  "kind": "frame",
+  "fixture": "fixture/keys.json",
+  "catches": "no-payload",
+  "steps": [
+    {
+      "op": "seal",
+      "frame": "not-an-object",
+      "recipe": {
+        "sign": "host-key",
+        "kind": 1,
+        "counter": 1,
+        "nonce": "021e2f3a4b5c6d7e8f90a1b2",
+        "plaintext": "22 68 65 6c 6c 6f 22"
+      },
+      "hex": "03 23 18 ee 09 4d 9d be 01 00 01 02 1e 2f 3a 4b 5c 6d 7e 8f 90 a1 b2 17 10 84 14 c2 80 e9 b6 12 40 89 e3 f2 5e e9 d6 06 c8 03 f4 ac ad 15 a0 91 8a b1 70 c8 f5 54 ad b0 a4 f4 87 2d 75 ab a9 3f 7e 60 c4 ea fa 19 fa 26 62 6c a0 61 6c 8d 01 81 b2 3c 55 7d 2b 6b 7a 43 33 d7 18 61 06 1e c0 35 88 7f db 9e 31 f9 d1 25 71 82 e8 81 d7 36 0d"
+    },
+    {
+      "op": "expectPlaintext",
+      "frame": "not-an-object",
+      "plaintext": "22 68 65 6c 6c 6f 22"
+    },
+    {
+      "op": "expectReject",
+      "frame": "not-an-object",
+      "reason": "bad_payload"
+    },
+    {
+      "op": "seal",
+      "frame": "issued-is-a-string",
+      "recipe": {
+        "sign": "host-key",
+        "kind": 1,
+        "counter": 1,
+        "nonce": "031e2f3a4b5c6d7e8f90a1b2",
+        "payload": {
+          "issued": "2",
+          "listing": [],
+          "peers": {}
+        }
+      },
+      "hex": "03 23 18 ee 09 4d 9d be 01 00 01 03 1e 2f 3a 4b 5c 6d 7e 8f 90 a1 b2 36 73 0a d6 ce 31 89 69 0e 39 cf 0a 32 48 9c be f0 e4 04 53 16 47 2d 64 2e e9 f4 7f 45 16 ae 38 4c 0a fe bb 56 b2 55 91 09 19 a1 b1 61 ec c0 df 0b db 66 a3 d9 c2 eb 8e 07 70 9f 92 2b 50 61 3f 2c 24 b9 6d 92 89 e4 f8 96 81 5f dc bf 4a 9d 7f 53 54 1b 2f 6f a8 3e 46 b8 6d ea df ec d1 85 de 4b 5a 82 6f 8d e4 e4 a9 e3 b7 cb 20 cd fa 04 42 8c 9e 66 c7 03 d2 0d"
+    },
+    {
+      "op": "expectReject",
+      "frame": "issued-is-a-string",
+      "reason": "bad_payload"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}

@@ -1,0 +1,49 @@
+{
+  "id": "156",
+  "title": "A client seated with no state ends at the no-state window, and not before",
+  "spec": "PROTOCOL.md#133-the-room-state-as-a-receiver",
+  "notes": "The window is `awareness_expire_ms`, read from `room.created` and not a number of the client's own; it runs from the moment the client is seated, on the session's clock. While this client stays seated the room is never destroyed, so ending is what makes the room's death and the `room_unknown` path reachable at all. `wait` is here for the reason the wire corpus's `wait` is: it waits out a timer the vector is testing, and the assertion is on `ended` and not on the duration.",
+  "layer": "peer",
+  "kind": "decision",
+  "fixture": "fixture/keys.json",
+  "catches": "wait-for-ever",
+  "scenario": {
+    "keepalive": {
+      "awareness_expire_ms": 900,
+      "awareness_renew_ms": 300,
+      "ping_interval_ms": 30000,
+      "room_grace_ms": 30000
+    }
+  },
+  "steps": [
+    {
+      "op": "start",
+      "conn": "peer",
+      "key": "guest-1",
+      "invite": "/session?room=$room&token=$token#k=$room_key&h=$host_key"
+    },
+    {
+      "op": "wait",
+      "ms": 500
+    },
+    {
+      "op": "expectSubject",
+      "conn": "peer",
+      "ended": false,
+      "applied": [],
+      "dropped": []
+    },
+    {
+      "op": "expectSubject",
+      "conn": "peer",
+      "ended": true,
+      "within_ms": 1400
+    },
+    {
+      "op": "stop",
+      "conn": "peer"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}
