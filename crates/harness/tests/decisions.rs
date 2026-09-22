@@ -16,8 +16,6 @@
 //! *driver* are deliberate — the same argument `peer_vectors.rs` makes for replaying the frame
 //! layer in both languages — and the layer under test is one client either way.
 //!
-//! **154's corpus defect is pinned, not passed.** See
-//! `the_holds_vector_cannot_pass_and_the_corpus_is_what_is_wrong`.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -749,10 +747,8 @@ fn recipe_plaintext(where_: &str, recipe: &Value) -> Result<Vec<u8>, String> {
 
 // --- the vectors ----------------------------------------------------------------
 
-/// The five decision vectors a conforming client passes.
-///
-/// 154 is not among them and cannot be: see the pin below.
-const PASSABLE: [&str; 5] = ["151", "152", "153", "155", "156"];
+/// The six decision vectors a conforming client passes.
+const PASSABLE: [&str; 6] = ["151", "152", "153", "154", "155", "156"];
 
 fn fixture() -> Result<Fixture, String> {
     Fixture::load(&vectors_root().join("fixture").join("keys.json"))
@@ -818,102 +814,4 @@ fn the_decision_vectors_go_red_under_the_guard_they_declare() {
         );
     }
     assert_eq!(ran, PASSABLE.len());
-}
-
-/// **154 cannot pass, and the corpus is what is wrong.**
-///
-/// `PROTOCOL.md` §13.4 resolves a `kind = 3` frame against the keys the applied room state
-/// commits, and `CANONICAL.md` §6.1's step 4 refuses one from any other key
-/// `uncommitted_key`. `§13.11`'s own table says the same twice over: a holds message applies
-/// "under a fixture state that commits it", and "a holds message signed by a key the fixture
-/// state does not name" is the row for `uncommitted_key`.
-///
-/// Vector 154's state commits `host-session` and `guest-1` as its two peers and then delivers
-/// a holds message signed by **`guest-2`**, which that state does not commit; its
-/// `expectSubject` asserts that frame in `applied` and its paths in `holds`. A conforming
-/// client refuses it, so the vector asserts something no client can do. Its own fixture line
-/// asks for "a peer that announces once and is then silent", which is a *committed* peer — so
-/// the state is missing the entry the vector's premise needs, and the fix is to re-seal the
-/// state with `guest-2` in `peers` and update the `hex`.
-///
-/// This pin describes that defect rather than replaying the vector, because a red test with no
-/// words is worse than none: when the corpus is fixed this fails, says so, and the next reader
-/// deletes it and moves 154 into `PASSABLE`.
-#[test]
-fn the_holds_vector_cannot_pass_and_the_corpus_is_what_is_wrong() {
-    let fixture = match fixture() {
-        Ok(fixture) => fixture,
-        Err(error) => panic!("{error}"),
-    };
-    let vectors =
-        load_decision_vectors().unwrap_or_else(|error| panic!("{error}"));
-    let vector = vectors
-        .iter()
-        .find(|vector| vector.get("id").and_then(Value::as_str) == Some("154"))
-        .unwrap_or_else(|| panic!("the corpus no longer holds vector 154"));
-    let steps = vector["steps"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no steps"));
-
-    // The key each delivered frame is signed with, and the keys the states commit.
-    let mut signed_with = Vec::new();
-    let mut committed = Vec::new();
-    for step in steps {
-        let recipe = step.get("recipe").cloned().unwrap_or(Value::Null);
-        if let Some(signer) = recipe.get("sign").and_then(Value::as_str) {
-            signed_with.push((
-                recipe["kind"].as_u64().unwrap_or_default(),
-                signer.to_string(),
-            ));
-        }
-        if let Some(peers) = recipe
-            .get("payload")
-            .and_then(|payload| payload.get("peers"))
-            .and_then(Value::as_object)
-        {
-            committed.extend(peers.keys().cloned());
-        }
-    }
-    let Some((_, sends_holds)) =
-        signed_with.iter().find(|(kind, _)| *kind == 3)
-    else {
-        panic!("154 delivers no holds message");
-    };
-    let spelling = encode_key(&fixture.key(sends_holds).unwrap().public);
-    assert!(
-        !committed.contains(&spelling),
-        "vector 154's state now commits {sends_holds}: the corpus is fixed, so move 154 into \
-         PASSABLE and delete this pin"
-    );
-
-    // And what this client does with it, which is what §13.4 says any conforming client does.
-    let mut subject =
-        Subject::start().unwrap_or_else(|error| panic!("{error}"));
-    let start = steps
-        .iter()
-        .find(|step| step.get("op").and_then(Value::as_str) == Some("start"))
-        .unwrap_or_else(|| panic!("154 has no `start`"));
-    subject
-        .request(&join_command(&fixture, vector, start).unwrap())
-        .unwrap_or_else(|error| panic!("{error}"));
-    for step in steps {
-        if step.get("op").and_then(Value::as_str) != Some("deliver") {
-            continue;
-        }
-        let raw = delivered("154", &fixture, step)
-            .unwrap_or_else(|error| panic!("{error}"));
-        subject
-            .request(&json!({"cmd": "deliver", "frame": hex_of(&raw)}))
-            .unwrap_or_else(|error| panic!("{error}"));
-    }
-    let report = subject
-        .report(&json!({"cmd": "report"}))
-        .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(
-        report["dropped"],
-        json!([{"frame": 1, "reason": "uncommitted_key"}]),
-        "a holds message from a key no state commits is refused and does not end the session"
-    );
-    assert_eq!(report["holds"], json!({}));
-    assert_eq!(report["ended"], json!(false));
 }
