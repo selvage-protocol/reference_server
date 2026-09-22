@@ -1,10 +1,6 @@
-# The added entries are addresses that resolve only where a deployment runs, so
-# they are not links anything can fetch and not links to check. The first two are
-# the public demo's front proxying to its sibling containers by their Compose
-# service names (`packaging/prod/`), which resolve only inside that deployment's
-# own network. The third is the front on the box itself, at loopback, which the
-# deploy workflow's verification reads over the tailnet (`https://127.0.0.1/meta`
-# and the page beside it) and nothing outside that host can answer.
+# `exclude` is the addresses lychee cannot read as live links from here. The ones
+# that belong to a deployment say what they answer where that deployment runs;
+# none of them is a broken link.
 #
 # `root_dir` is what lets a root-relative link be checked at all: without one,
 # lychee refuses to resolve `/...` out of a file on disk rather than trying. The
@@ -15,7 +11,22 @@
 root_dir = "."
 exclude = [
   "https://fsf.org/",
+  # The public demo's front proxying to its sibling containers by their Compose
+  # service names (`packaging/prod/`). Those names resolve only inside that
+  # deployment's own network.
   "http://selvaged:8080",
   "http://selvage-web:8080",
-  "https://127.0.0.1/",
+  # Loopback is an address on whichever machine is running the proof — the image
+  # smoke's own server on 18080 (`scripts/image-smoke.sh`), the front's limits
+  # harness, and the deploy workflow's `https://127.0.0.1/meta` read on the public
+  # demo's box. It answers only while that is running, and it is never a link
+  # anything can check from a checkout.
+  "^https?://127\\.0\\.0\\.1[:/]",
+  # The Pi demo's **server** origin, where 404 is the right answer: that
+  # deployment is two-origin, so its page is `http://100.64.0.3/` (200) and only
+  # `/meta` and `/session` exist on `:8080`. The URL is in
+  # `packaging/pi-demo/tls-proxy.py`'s docstring as the destination that proxy
+  # relays to, which is the documented shape of that deployment; a check reading
+  # it as a broken link would be a check disagreeing with the design.
+  "http://100.64.0.3:8080/",
 ]

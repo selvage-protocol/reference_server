@@ -174,15 +174,20 @@ jobs:
       # `https://127.0.0.1/meta` and the page — and the run fails unless it reports
       # the version this dispatch asked for.
       #
-      # The *public* URL is read too, but as a report rather than an assertion.
-      # Cloudflare serves a managed challenge to a programmatic client on a
-      # datacenter address — this runner, and the box itself — so a read from here
-      # is refused at the edge whatever the deployment is doing. The attempt says
-      # so in plain words and ends at the first challenge response instead of
-      # polling a deadline it cannot pass, and a challenge never turns a healthy
-      # deploy red. When the edge does let a client like this one through, the read
-      # is compared and printed, so the check comes back on its own; it is still a
-      # report, and never the thing the run is decided by.
+      # The *public* URL is read in three shapes, and only one of them decides the
+      # run. Cloudflare serves a managed challenge to a programmatic client on a
+      # datacenter address — this runner, and the box itself — and an edge is not
+      # something a deploy can fix, so a challenge, an unreadable read, and any
+      # other answer that is not a version are reports: each says in plain words
+      # what came back, a challenge ends the attempt at the first challenge
+      # response instead of polling a deadline it cannot pass, and none of them
+      # turns a healthy deploy red. A read that answers 200 reporting a version
+      # *other* than the one this dispatch named is red — there the origin above is
+      # right and the edge is serving something this deploy did not put behind it,
+      # a stale cache or a route pointing elsewhere, which is what this step exists
+      # to catch and what the origin read cannot see. A read reporting the version
+      # deployed is green, so where the edge does let a client like this one through
+      # the check comes back on its own.
       #
       # `scripts/verify_deploy.py` is both reads, and `packaging/prod/README.md`
       # has the evidence for the challenge. Each read polls a real predicate with
