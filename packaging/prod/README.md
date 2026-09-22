@@ -547,6 +547,52 @@ created with no password (`--system`) and no `authorized_keys`, so the tailnet
 policy is the only way in. That policy is not in this repository: the runbook in
 `ai_notes` owns it.
 
+### What a page-only dispatch does not assert
+
+A dispatch naming only `web_version` leaves the verification at the page itself:
+the origin's `/` must answer 200 and `/meta` must be readable, the page container
+is asserted to run the digest the dispatch resolved, and the public read compares
+nothing, because there is no server version in it. **It cannot tell which page
+build is being served**, and that is worth knowing plainly rather than
+discovering.
+
+The page has no version read to lean on. `dist/index.html` carries no version, and
+the only version-shaped string in the page is `web_client/0.1.0` inside
+`dist/app.js` — the same on every build, and a separate staleness in
+`web_client`'s own release rather than a handle here. The two candidates for an
+expectation both fail on their own terms:
+
+- **The committed `dist/`** is not something this repository can hold as an
+  expectation. The deploy workflow checks out `reference_server`, not `web_client`,
+  so it would need that repository at the released tag as a second source; and the
+  checkout's own working tree would lie the moment `main` moved past the tag.
+- **The image's own bytes**, read anonymously from the registry, would be honest
+  and cheap enough — the whole page image is under 10 MB of layers for 0.2.1 — but a
+  byte comparison has to name a file, and **the bytes a visitor receives are
+  rewritten twice**: the front's `sub_filter` injects the non-commercial notice into
+  `</body>`, and Cloudflare Rocket Loader rewrites `index.html` in flight, which is
+  why the delivered HTML is not byte-reproducible through that edge. Only a file
+  neither hop rewrites could be compared, and a production deploy step pinned to
+  "this file happens not to be rewritten" is a coupling to another repository's
+  asset layout, able to fail only for a reason the deployment does not own.
+
+What a byte comparison would prove is asserted around it, by the repository that
+owns each half. `web_client`'s `publish` job runs `scripts/assert-image-page.sh`
+against the image it has just pushed, and that asserts the version label and then,
+per architecture, that a *running* image serves `/index.html`, `/app.js`,
+`/site.webmanifest` and a content-hashed chunk with the sha256 of the committed
+`dist/` (`scripts/check-page.sh`); this deployment's `deploy.py` asserts the page
+container runs the digest the dispatch resolved. Under a digest pin those bytes
+cannot drift, so the reads that remain worth making are the ones that are made:
+the container runs what was named, and the front answers its page.
+
+**The honest way to give the page a version read is to publish one as a value** —
+a `version.json`, or a `<meta>` in the built page, written by `web_client`'s build
+at release time and read on the box through the front the way `/meta` is. A read
+survives both rewrites; a byte comparison does not. Until that exists, a page-only
+dispatch is verified weakly on purpose: it asserts that the front serves a page,
+not which build that page is.
+
 ## Certificate
 
 The certificate is a Cloudflare Origin Certificate for
