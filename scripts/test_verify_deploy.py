@@ -5,11 +5,13 @@ The two reads it separates cost a session to tell apart, so both are pinned here
 * The **origin**, read on the box through the front, is the assertion: a version
   that is not the one asked for, or a page that stops answering, fails the run and
   says what it saw.
-* The **public** read, over an edge that answers a programmatic client on a
-  datacenter address with a managed challenge, is a report in every shape it comes
-  back in. The classifier is fed the response Cloudflare really sent — recorded
-  from a runner — and the attempt is asserted to end on the first challenge rather
-  than polling a deadline it cannot pass.
+* The **public** read is three shapes, and only one of them decides the run. A
+  challenge, an unreadable read and any other answer that is not a version are
+  reports, exit 0; a 200 that parses to a version other than the one this deploy
+  named is red, because in that scenario the origin is right and the edge is
+  serving something else. The classifier is fed the response Cloudflare really sent
+  — recorded from a runner — and the attempt is asserted to end on the first
+  challenge rather than polling a deadline it cannot pass.
 
 The poll loops are driven with real, tiny deadlines and injected reads, and the
 one test that has to see several iterations stops its own loop from the fake read
@@ -113,10 +115,23 @@ class ThePublicReadTest(unittest.TestCase):
         verdict, detail = verify.classify_public(public("200", meta("0.2.1")), "0.2.1")
         self.assertEqual((verdict, detail), (verify.REPORTED, "selvaged/0.2.1"))
 
-    def test_another_version_is_unreadable_rather_than_a_failure(self):
+    def test_another_version_is_a_mismatch(self):
         verdict, detail = verify.classify_public(public("200", meta("0.2.0")), "0.2.1")
-        self.assertEqual(verdict, verify.UNREADABLE)
-        self.assertIn("selvaged/0.2.0", detail)
+        self.assertEqual(verdict, verify.MISMATCH)
+        self.assertEqual(detail, "selvaged/0.2.0")
+
+    def test_a_mismatch_is_retried_to_the_deadline_before_it_is_reported(self):
+        calls = []
+
+        def read():
+            calls.append(1)
+            if len(calls) == 3:
+                raise Enough
+            return public("200", meta("0.2.0"))
+
+        with self.assertRaises(Enough):
+            verify.wait_for_public(read, "0.2.1", deadline=60.0, interval=0.01)
+        self.assertEqual(len(calls), 3, "a mismatch is worth retrying; only a challenge is not")
 
     def test_an_edge_that_never_answers_ends_at_the_deadline_with_what_it_said(self):
         calls = []
@@ -153,9 +168,10 @@ class ThePublicReadTest(unittest.TestCase):
         verdict, detail = verify.classify_public(public("200", meta("0.1.0")), None)
         self.assertEqual((verdict, detail), (verify.REPORTED, "selvaged/0.1.0"))
 
-    def test_a_200_without_a_server_field_is_not_an_answer(self):
-        verdict, _ = verify.classify_public(public("200", "<html>nope</html>"), "0.2.1")
+    def test_a_200_without_a_server_field_is_a_report(self):
+        verdict, detail = verify.classify_public(public("200", "<html>nope</html>"), "0.2.1")
         self.assertEqual(verdict, verify.UNREADABLE)
+        self.assertIn("no server field", detail)
 
 
 class TheOriginTest(unittest.TestCase):
@@ -202,7 +218,7 @@ class TheOriginTest(unittest.TestCase):
 
 
 class TheEndingTest(unittest.TestCase):
-    """`main`'s endings: the origin decides the colour, and the edge never does."""
+    """`main`'s endings: the origin decides the colour, and so does a readable mismatch."""
 
     def run_main(self, origin_read, public_read, expect="0.2.1"):
         argv = ["--origin-deadline", "0.05", "--public-deadline", "0.05", "--poll-interval", "0.01"]
@@ -240,13 +256,23 @@ class TheEndingTest(unittest.TestCase):
         self.assertIn("selvaged/0.2.1", out)
         self.assertEqual(out.count("the origin:"), 1)
 
-    def test_a_public_read_of_another_version_is_reported_and_green(self):
+    def test_a_readable_mismatch_is_red(self):
         code, out, err = self.run_main(
             lambda *a: origin(version="0.2.1"), lambda *a: public("200", meta("0.2.0"))
         )
+        self.assertEqual(code, 1)
+        self.assertEqual(out.count("the origin:"), 1)
+        self.assertIn("selvaged/0.2.0", err)
+        self.assertIn("selvaged/0.2.1", err)
+        self.assertIn("fails the run", err)
+
+    def test_a_200_without_a_server_field_is_reported_and_green(self):
+        code, out, err = self.run_main(
+            lambda *a: origin(version="0.2.1"), lambda *a: public("200", "<html>nope</html>")
+        )
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
-        self.assertIn("selvaged/0.2.0", out)
+        self.assertIn("did not fail the run", out)
 
     def test_a_wrong_origin_is_red_before_the_public_read_happens(self):
         public_calls = []

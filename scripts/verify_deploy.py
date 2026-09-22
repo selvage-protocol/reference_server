@@ -8,14 +8,22 @@ Two reads, and only one of them decides the run's colour.
   That is the honest source — it is what is running, with no edge between the
   reader and it — so it **fails the run** when the version asked for is not the
   version served, and when the page stops answering 200.
-* **The public origin**, over Cloudflare, from this runner. Cloudflare answers a
-  programmatic client on a datacenter address with a managed challenge, so this
-  read is a **report in every shape it can come back in**: the challenge is named
-  in plain words, the attempt ends at the first challenge response rather than
-  polling a deadline it cannot pass, and nothing the edge says turns a healthy
-  deploy red. A read that does get through is compared and printed, so the check
-  comes back on its own when the edge permits one; it is still never what the run
-  is decided by, because the edge is not something a deploy can fix.
+* **The public origin**, over Cloudflare, from this runner. It is read in three
+  shapes and only one of them decides the run's colour:
+
+  - a **challenge**, an **unreadable** read or any other answer that is not a
+    version is a **report**. Cloudflare serves a managed challenge to a
+    programmatic client on a datacenter address and an edge is not something a
+    deploy can fix, so a challenge is named in plain words and ends the attempt
+    at the first challenge response rather than polling a deadline it cannot
+    pass;
+  - a read that answers 200 with a parsed `server` that is **not** the version
+    this deploy named is **red**. The origin assertion cannot see that: in that
+    scenario the origin is right and the edge is serving something else — a stale
+    cache, a different origin, a route pointing elsewhere — which is the failure
+    this step exists to catch;
+  - a read that answers 200 reporting **that** version is green, so where the edge
+    does let a client through the check comes back on its own.
 
 The origin read needs `-k`: the certificate is the Cloudflare Origin CA pair
 issued for the public name, which is in no trust store and does not match
@@ -63,6 +71,7 @@ printf 'origin-meta:%s\\n' "$(curl -sk --max-time @MAX@ @URL@/meta | tr -d '\\n'
 
 CHALLENGE = "challenge"
 REPORTED = "reported"
+MISMATCH = "mismatch"
 UNREADABLE = "unreadable"
 
 # The header is the reliable half of the observation — Cloudflare's managed
@@ -172,20 +181,27 @@ def classify_public(reading: Public, expect_version: str | None) -> tuple[str, s
         return CHALLENGE, detail
     if reading.status == "200":
         served = json_server(reading.body)
-        if served and (expect_version is None or served == f"selvaged/{expect_version}"):
+        if not served:
+            # A 200 carrying nothing parseable is the edge being unhelpful rather than
+            # the deployment disagreeing: what `/meta` must look like is asserted on
+            # the origin above, where nothing can rewrite the answer.
+            return UNREADABLE, "200 reporting no server field"
+        if expect_version is None or served == f"selvaged/{expect_version}":
             return REPORTED, served
-        return UNREADABLE, f"200 reporting {(served or 'no server field')!r}"
+        return MISMATCH, served
     return UNREADABLE, f"{reading.status or 'no status'}"
 
 
 def wait_for_public(read, expect_version: str | None, deadline: float, interval: float) -> tuple[str, str]:
     """Read the public origin, ending at the first challenge rather than polling it.
 
-    Every shape it can come back in is returned, and none of them is a failure: a
-    challenge is an answer about the edge, not about the deployment, and it cannot
-    be passed by waiting, so the attempt is over the moment it arrives. Anything
-    else is worth retrying to the deadline, because a front that a deploy has just
-    recreated answers again in seconds.
+    A challenge is an answer about the edge, not about the deployment, and it cannot
+    be passed by waiting, so the attempt is over the moment it arrives. Anything else
+    that is not a matching version is worth retrying to the deadline — a front a
+    deploy has just recreated answers again in seconds, and a stale cache expires —
+    and the **last** read is the one that is reported: a mismatch that persists to
+    the deadline is the edge serving something the deploy did not put behind it, and
+    that fails the run.
     """
     started = time.monotonic()
     while True:
@@ -193,7 +209,7 @@ def wait_for_public(read, expect_version: str | None, deadline: float, interval:
         if verdict in (CHALLENGE, REPORTED):
             return verdict, detail
         if time.monotonic() - started >= deadline:
-            return UNREADABLE, detail
+            return verdict, detail
         time.sleep(interval)
 
 
@@ -311,6 +327,13 @@ the public read: {url}/meta did not report {expected} within {seconds:g}s; the l
   badly is not something a deploy can fix. A public path that answers this way while the origin is
   serving the version that was asked for is still worth a look."""
 
+MISMATCH_REPORT = """\
+the public read: {url}/meta reports {served}, not {expected}.
+  The origin on the box above is serving {expected}, read through the front, so the public path is
+  answering with a version this deploy did not put behind it — a stale cache, a different origin, or
+  a route pointing elsewhere. The origin assertion cannot see that: in this scenario the origin is
+  right and the edge is wrong, which is why it fails the run."""
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -349,6 +372,17 @@ def main(argv: list[str] | None = None) -> int:
         print(CHALLENGE_REPORT.format(url=args.public_url, detail=detail))
     elif verdict == REPORTED:
         print(f"the public read: {args.public_url}/meta reports {detail}")
+    elif verdict == MISMATCH:
+        # The origin line has been printed, and a reader of the log wants it before the
+        # reason the run is red rather than after it.
+        sys.stdout.flush()
+        print(
+            MISMATCH_REPORT.format(
+                url=args.public_url, served=detail, expected=f"selvaged/{args.expect_version}"
+            ),
+            file=sys.stderr,
+        )
+        return 1
     else:
         expected = f"selvaged/{args.expect_version}" if args.expect_version else "a server version"
         print(

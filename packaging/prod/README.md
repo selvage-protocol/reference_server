@@ -459,14 +459,16 @@ public URL, so no CI job can assert against it — not `curl` in a workflow, not
 `curl` on the box. The honest source for what is running is the origin read
 through the front on the box, and that is what
 `.github/workflows/deploy-prod.yml` asserts over the Tailscale SSH path its
-deploy step already opened. Its read of the public URL is a report in every shape
-it comes back in: a challenge is named in words and ends the attempt at the first
-challenge response rather than polling a deadline it cannot pass, a read that does
-get through is compared and printed, and nothing the edge says decides the run's
-colour — an edge is not something a deploy can fix. A Cloudflare bypass, a
-`cf_clearance` cookie kept anywhere, or a change to the zone's bot settings are all
-the wrong answer to this, and the next reader should not spend a cycle finding that
-out again.
+deploy step already opened. Its read of the public URL is read in three shapes:
+a challenge, an unreadable read and any other answer that is not a version are
+**reports** — each says in words what came back, a challenge ends the attempt at
+the first challenge response rather than polling a deadline it cannot pass, and
+none of them turns a healthy deploy red, because an edge is not something a deploy
+can fix — while a 200 reporting a version *other* than the one the dispatch named
+is **red**, because there the origin is right and the edge is serving something
+this deploy did not put behind it. A Cloudflare bypass, a `cf_clearance` cookie
+kept anywhere, or a change to the zone's bot settings are all the wrong answer to
+this, and the next reader should not spend a cycle finding that out again.
 
 ## Deploying a release from CI
 
@@ -474,8 +476,10 @@ out again.
 joins the tailnet, hands this box one request over Tailscale SSH and then asserts,
 over that same SSH path, that the origin is serving the version it deployed —
 `https://127.0.0.1/meta` through the front, and the page answering 200. The
-public URL is read too, and is a report in every shape it comes back in, behind
-the challenge above.
+public URL is read too: a challenge, an unreadable read or any other answer that
+is not a version is a report, and a 200 reporting a version other than the one
+the dispatch named fails the run (the challenge above is why the first three
+cannot fail it).
 
 ```sh
 gh workflow run deploy-prod.yml --ref main -f server_version=0.2.1
