@@ -10,7 +10,7 @@
 //! state), `2` (the closing), `3` (the sender's holds) and `4` (the session-key
 //! announcement). `PROTOCOL.md` §7.1 says what each carries; this module is the bytes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error as StdError;
 use std::fmt;
 
@@ -46,7 +46,8 @@ pub const REASONS: [&str; 10] = [
 pub struct SealedError(String);
 
 impl SealedError {
-    fn new(message: impl Into<String>) -> Self {
+    /// What the crate's own layers report a frame, a key or a payload with.
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }
@@ -128,10 +129,20 @@ pub fn key_id(public: &[u8; 32]) -> [u8; 8] {
 }
 
 /// The room key every frame of a room is sealed under, 32 bytes from the invite's `k`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoomKey(pub [u8; 32]);
 
 impl RoomKey {
+    /// The key a canonical base64url value spells, or `None`.
+    ///
+    /// The fragment's `k` is written the way its `h` is (`PROTOCOL.md` §5.1): 32 bytes,
+    /// base64url, unpadded, and as canonical as a public key's
+    /// ([`crate::sealed::PublicKey::parse`]).
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        decode_key(text).map(Self)
+    }
+
     /// The frame key: `HKDF-SHA256(ikm = room key, salt = room id, info = "selvage/2
     /// frame", L = 32)`.
     #[must_use]
@@ -145,7 +156,7 @@ impl RoomKey {
 
 /// The key a sealed frame is sealed under. It carries no identity and is never on the
 /// wire; every member of a room derives the same one.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct FrameKey([u8; 32]);
 
 impl FrameKey {
@@ -559,6 +570,40 @@ pub struct Committed {
     pub peer_id: String,
 }
 
+/// One of `CANONICAL.md` §6.1's ten read steps that is also a client rule, so that a client's
+/// mutation census has to remove it from the byte layer to see what the rule was doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Guard {
+    /// Step 9: a state or a closing at or below the mark is applied anyway.
+    Issued,
+    /// Step 10: a committed `viewer`'s document content is applied.
+    Roles,
+}
+
+/// The guards a receiver has had removed, for `PROTOCOL.md` §13.11's mutation census.
+///
+/// The frame layer's own census is `specification/runner/run_peer.py --mutation-census`,
+/// which removes `runner/sealed.py`'s thirteen. The subset here is the two that are also
+/// client rules; every other guard a subject mutation removes is the session's own and lives
+/// in [`crate::peer`].
+#[derive(Debug, Clone, Default)]
+pub struct Mutations {
+    removed: BTreeSet<Guard>,
+}
+
+impl Mutations {
+    /// Removes a guard, which is what a census does to make a vector go red.
+    pub fn remove(&mut self, guard: Guard) {
+        let _ = self.removed.insert(guard);
+    }
+
+    /// Whether a guard has been removed.
+    #[must_use]
+    pub fn contains(&self, guard: Guard) -> bool {
+        self.removed.contains(&guard)
+    }
+}
+
 /// A conforming receiver's byte layer: §6.1's marks, and §13.3's committed keys and roles.
 ///
 /// It holds the frame key and the host key the invite's fragment carries, and the marks
@@ -574,6 +619,9 @@ pub struct Reader {
     pub host_key: PublicKey,
     /// The keys an applied state commits, under the canonical spelling of each key.
     pub committed: BTreeMap<String, Committed>,
+    /// The guards a *client's* mutation census removes from the ten-step read
+    /// (`runner/sealed.py`'s table, as much of it as a subject's mutation needs).
+    pub mutations: Mutations,
     marks: HashMap<KeyId, u64>,
     /// The listing of the last applied state, with §5's refused paths dropped.
     pub listing: Vec<String>,
@@ -592,6 +640,7 @@ impl Reader {
             frame_key: room_key.frame_key(room_id),
             host_key,
             committed: BTreeMap::new(),
+            mutations: Mutations::default(),
             marks: HashMap::new(),
             listing: Vec::new(),
             holds: HashMap::new(),
@@ -759,12 +808,14 @@ impl Reader {
         // Step 9: a state or a closing is ordered by its own `issued`.
         if let Some(issued) = payload_issued(payload.as_ref())
             && issued <= self.issued
+            && !self.mutations.contains(Guard::Issued)
         {
             return Verdict::refused("stale_issued", Some(envelope));
         }
         // Step 10: a committed `viewer` may not send document content.
         if envelope.kind == 0
             && is_content(&plaintext)
+            && !self.mutations.contains(Guard::Roles)
             && self.role_of_key(key) == Some("viewer")
         {
             return Verdict::refused("unauthorised_content", Some(envelope));
