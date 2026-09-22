@@ -450,6 +450,15 @@ impl PeerSession {
             .collect()
     }
 
+    /// The length of a document's text in UTF-16 code units, the unit yjs, every editor's
+    /// `offsetAt` and every peer on the wire count an offset in (`PROTOCOL.md` §8.1).
+    #[must_use]
+    pub fn length(&self, path: &str) -> u32 {
+        let doc = self.awareness.doc();
+        let text = doc.get_or_insert_text(path);
+        text.len(&doc.transact())
+    }
+
     /// The text this replica holds at a path, which is what a decision vector reads.
     #[must_use]
     pub fn text(&self, path: &str) -> String {
@@ -645,13 +654,12 @@ impl PeerSession {
         self.state_issued = Some(issued);
         self.refresh_host_away(clock, true);
         self.drop_departed_holds();
+        // §13.1's steps 6 and 4: a state that commits this key is where the handshake belongs,
+        // and one that does not is what a re-announcement is for — the renewal clock alone would
+        // wait a whole window for it.
         if self.commits_ours() {
-            // §13.1's step 6: the sync handshake, once, now that this client's key is one a
-            // peer can attribute and everything the relay handed it before is refused.
-            self.sync_step1(clock);
+            self.handshake_once(clock);
         } else {
-            // §13.1's step 4: a state that does not commit this key is what a re-announcement
-            // is for, and the renewal clock alone would wait a whole window for it.
             self.announce(clock);
         }
     }
@@ -855,6 +863,16 @@ impl PeerSession {
         false
     }
 
+    /// §13.1's step 6's handshake, run when this connection's own key *becomes* committed and
+    /// not for every state that commits it: a host republishes its state on every `peer.joined`
+    /// and on every announcement it accepts, so a handshake per state would be a frame per
+    /// republish.
+    fn handshake_once(&mut self, clock: Duration) {
+        if self.handshaken_at.is_none() {
+            self.sync_step1(clock);
+        }
+    }
+
     /// §13.1's step 6: a `SyncStep1` with this replica's state vector, so the room can tell a
     /// client that has been refusing frames from one that has been applying them.
     fn sync_step1(&mut self, clock: Duration) {
@@ -967,7 +985,8 @@ impl PeerSession {
     ///
     /// # Errors
     ///
-    /// Returns an error when the platform's CSPRNG cannot be read.
+    /// Returns an error when `index` is past the end of the text, and when the platform's
+    /// CSPRNG cannot be read.
     #[expect(
         clippy::too_many_arguments,
         reason = "the path, the offset and the text are the three members of one edit"
@@ -982,6 +1001,14 @@ impl PeerSession {
             let txn = self.awareness.doc().transact();
             txn.state_vector()
         };
+        // An index past the end of the text is the caller's bug, and `yrs` answers one by
+        // panicking — the type is not there. A client any caller can kill with an offset is not
+        // one a decision vector can drive, so it is refused as an error like any other.
+        if index > self.length(path) {
+            return Err(SealedError::new(format!(
+                "there is no offset {index} in {path:?}"
+            )));
+        }
         {
             let doc = self.awareness.doc_mut();
             let handle = doc.get_or_insert_text(path);
@@ -1213,6 +1240,47 @@ mod tests {
         assert_eq!(read_varuint(&plaintext, 1).unwrap().0, 0, "SyncStep1");
         assert_eq!(session.listing(), ["README.md"]);
         assert!(session.state_held());
+    }
+
+    #[test]
+    fn a_second_state_that_commits_our_key_sends_no_second_handshake() {
+        // §13.1's step 6 is a handshake *once*, and a host republishes its state on every
+        // `peer.joined` and on every announcement it accepts: a handshake per state would be a
+        // frame per republish.
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let first = state(&host(), 1, &[(&ours(), "guest", "p-self")]);
+        assert_eq!(
+            session.deliver(millis(1), &first),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(session.handshake(), 1);
+
+        let republished = state(&host(), 2, &[(&ours(), "guest", "p-self")]);
+        assert_eq!(
+            session.deliver(millis(2), &republished),
+            Outcome::Applied { kind: 1 }
+        );
+        session.tick(millis(2 + 300));
+        assert!(session.take_outbound().is_empty());
+        assert_eq!(session.handshake(), 1, "one handshake per connection");
+    }
+
+    #[test]
+    fn an_edit_past_the_end_of_the_text_is_refused_and_not_a_panic() {
+        // `yrs` answers an offset that is not there by panicking, and a client a caller can
+        // kill with an index is not one a decision vector can drive.
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let state = state(&host(), 1, &[(&ours(), "guest", "p-self")]);
+        let _ = session.deliver(millis(1), &state);
+        assert!(session.insert("README.md", 0, "hello").unwrap());
+        assert!(session.insert("README.md", 5, "!").unwrap());
+        assert_eq!(session.length("README.md"), 6);
+        let refused = session.insert("README.md", 7, "!");
+        assert!(refused.is_err(), "past the end is refused");
+        assert_eq!(session.length("README.md"), 6, "and nothing was applied");
     }
 
     #[test]

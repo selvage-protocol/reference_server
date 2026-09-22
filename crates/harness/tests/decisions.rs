@@ -802,11 +802,19 @@ fn the_decision_vectors_go_red_under_the_guard_they_declare() {
                 panic!("vector {id} declares no mutation to catch")
             });
         ran += 1;
-        // The guard removed, the vector must fail: a rule vector that stays green under its
-        // own mutation is not testing the rule it names.
+        // The guard removed, the vector must fail: a rule vector that stays green under its own
+        // mutation is not testing the rule it names. And it must fail *at an expectation*: a
+        // subject that refused to remove the guard, a recipe that drifted from its bytes or a
+        // step the runner would not take are failures of the harness, and counting one of them
+        // as the red run would let a vector with no guard at all pass the census.
+        let red = replay(vector, &fixture, Some(catches))
+            .err()
+            .unwrap_or_else(|| {
+                panic!("vector {id} is green under `{catches}`")
+            });
         assert!(
-            replay(vector, &fixture, Some(catches)).is_err(),
-            "vector {id} is green under `{catches}`"
+            red.contains("(`expectSubject`)"),
+            "vector {id} failed under `{catches}` before any expectation: {red}"
         );
     }
     assert_eq!(ran, PASSABLE.len());
