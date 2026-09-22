@@ -75,6 +75,9 @@ async fn join(options: &Options) -> Result<SyncEngine, Failure> {
 }
 
 /// One command per line until stdin ends or a `quit` arrives.
+///
+/// Reading blocks the thread this runs on, which costs nothing here: the engine is
+/// a task of its own, and this loop is the only thing the caller paces.
 async fn serve(engine: &SyncEngine, path: &str) -> Result<(), Failure> {
     let stdin = io::stdin();
     for next in stdin.lock().lines() {
@@ -214,6 +217,7 @@ async fn vector_of(engine: &SyncEngine) -> Result<Vec<(u64, u32)>, Failure> {
     Ok(vector)
 }
 
+/// `stdout` is line-buffered, so a reply is on the wire as soon as it is printed.
 fn emit(value: &Value) {
     println!("{value}");
 }
