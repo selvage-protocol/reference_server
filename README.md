@@ -257,8 +257,8 @@ buildx; a pull request's checks are where they run.
 |---|---|
 | `crates/protocol` | `selvage/1` session envelope, method/event/error vocabulary, invite URLs. No I/O. |
 | `crates/selvaged` | the server: rooms, membership, the open-document set, payload-opaque relay, `GET /meta` |
-| `crates/client` | the sync engine (one `Y.Doc` per session, one `Y.Text` per document, y-protocols, awareness) and the `EditorAdapter` seam |
-| `crates/harness` | one server plus N clients, driven programmatically; also a runnable transcript, and the vector replay over `vectors/` |
+| `crates/client` | the sync engine (one `Y.Doc` per session, one `Y.Text` per document, y-protocols, awareness), the `EditorAdapter` seam, and `selvage/2`'s peer session (`peer.rs`) over the sealed frame (`sealed.rs`) |
+| `crates/harness` | one server plus N clients, driven programmatically; also a runnable transcript, the vector replay over `vectors/`, and `selvage-subject`, the client the peer corpus's decision layer drives |
 | `vectors/` | the wire vectors, vendored from the specification; `scripts/sync-vectors.sh` refreshes them |
 
 ## The server's shape
@@ -298,8 +298,32 @@ the next connection that names the id is told `room_unknown`.
 
 `selvage/2`'s peer side — the sealed frame, the room state, the holds and the client's own
 rules — is specified in `PROTOCOL.md` §7.1 and §13. This server's part of it is only the
-relay and the membership; the corpus's seventeen frame vectors are replayed against this
-workspace's sealed-frame layer by `crates/harness/tests/peer_vectors.rs`.
+relay and the membership.
+
+The client's part of it is `crates/client/src/peer.rs`: `crates/client/src/sealed.rs` is
+`CANONICAL.md` §6.1's bytes, and `peer.rs` is `PROTOCOL.md` §13 on top of them — the session
+keypair and its announcement, the order of operations at a join, what may be published
+before and after a state commits the connection's key, attribution by the key that verified,
+the holds and their lease, and the two windows that end a session. It holds no socket: a
+frame goes in, the decisions come out, and every clock is a value the caller passes in, which
+is what lets the corpus drive it.
+
+Two suites hold that layer. `crates/harness/tests/peer_vectors.rs` replays the corpus's
+seventeen **frame** vectors against the sealed layer, and `crates/harness/tests/decisions.rs`
+drives its six **decision** vectors against the client through `selvage-subject`, the binary
+that speaks the corpus's subject protocol
+(`cargo run -p selvage-harness --bin selvage-subject`). The specification's own runner can
+drive the same binary:
+
+```
+python3 runner/run_peer.py --subject <checkout>/reference_server/target/debug/selvage-subject
+```
+
+Five of the six decision vectors pass. The sixth, `154-lease-expires-a-silent-peer`, asserts
+something no conforming client can do and `crates/harness/tests/decisions.rs` says why in
+full: its state commits two keys and its holds message is signed by a third, which
+`PROTOCOL.md` §13.4 and `CANONICAL.md` §6.1's step 4 refuse `uncommitted_key`. The test pins
+the defect rather than passing it, so it goes red when the corpus is corrected.
 
 ## The client library and the harness
 
@@ -370,10 +394,15 @@ outside the Cargo workspace, so `flake.nix` hands the directory in explicitly.
 No persistence, no accounts, no file access, no read-only guests, no E2EE, no editor
 integration. `PROTOCOL.md` §12 lists every decision the design record leaves open.
 
-Neither client library in this workspace speaks `selvage/2` yet: `crates/client` is a
-version-1 engine, and the decision half of the peer corpus needs a version-2 client and a
-relay to drive it. The server's version-2 support is reachable today with a raw socket or
-another implementation's client.
+`crates/client` speaks `selvage/2` as a **peer session** and not yet as a connected client:
+`peer::PeerSession` implements `PROTOCOL.md` §13 for a connection another layer feeds frames
+over, which is what the corpus's decision layer drives, and the socket, the handshake and the
+editor adapter for a version-2 connection are not wired to it. `SyncEngine` is still the
+version-1 engine, and no client here hosts or joins a version-2 room over a socket yet. What
+`PROTOCOL.md` §13 leaves to the host's own half — publishing a state at mint, on every
+`peer.joined` and on every announcement it accepts — is §7.1's producer rule and is
+unimplemented: `PeerSession` holds the room state a receiver needs and does not author one.
+Awareness is applied and not published, so a version-2 session shows no cursor.
 
 ## Licence
 
