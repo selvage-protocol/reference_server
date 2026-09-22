@@ -14,6 +14,7 @@
 pub mod editor;
 mod engine;
 pub mod error;
+pub mod peer;
 pub mod presence;
 pub mod sealed;
 pub mod session;
