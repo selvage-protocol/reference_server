@@ -91,7 +91,7 @@ usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]
                 [--max-connections N] [--max-rooms N] [--max-peers-per-room N]
                 [--max-documents-per-room N] [--outbound-queue-bytes N]
                 [--max-envelope-bytes N] [--inbound-bytes-per-sec N]
-                [--inbound-burst-bytes N]
+                [--inbound-burst-bytes N] [--serve-version-2]
 ```
 
 | Flag | What it does |
@@ -99,6 +99,7 @@ usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]
 | `--listen ADDR` | bind `ADDR` (default `127.0.0.1:8080`) |
 | `--room-grace-ms MS` | how long a room survives its host disconnecting, in milliseconds (default `30000`, printed as 30s) |
 | `--serve-page DIR` | serve the browser page from `DIR` on the same origin as `/session` and `/meta` |
+| `--serve-version-2` | seat `selvage/2` as well as `selvage/1`, so `/meta` advertises both. Off by default: every published client speaks `selvage/1`. A room is pinned to the version its minting connection spoke, and a connection speaking the other version is refused `unsupported_version` (close `4005`) |
 | `--max-connections N` | connections held at once, counted past the request head (default `1024`) |
 | `--max-rooms N` | rooms held at once; past it a room is not minted (default `1024`) |
 | `--max-peers-per-room N` | peers one room seats at once (default `128`) |
@@ -274,6 +275,32 @@ awareness payload, and the relay between peers is opaque to both. A peer's role 
 or `guest`, the invite token is the permission, and the room is removed after the grace
 period if its host does not reclaim it. There are no accounts and no file access.
 
+### `selvage/2`, while both versions are served
+
+`--serve-version-2` lets one process seat both wire versions, which is the transitional
+shape: the published clients speak `selvage/1`, and `selvage/2` is what the revision's
+clients will speak. A room is pinned to the version its **minting connection** spoke — a
+version-1 room expects the server to hold the document set and a version-2 one requires
+that it does not, so one room cannot serve both — and a connection that speaks the other
+version is refused `unsupported_version` with close **4005** before it is seated
+(`PROTOCOL.md` §10). Nothing else changes for a version-1 client: the same methods, the
+same events, the same refusals, and the same `/meta` body when the flag is off.
+
+A version-2 room is smaller than a version-1 one. The server records membership — a
+`peer_id`, a display name and an awareness client id per connection — and it holds no
+host, no open-document set, no grant and no document of any kind. Its method surface is
+`session.hello` and `session.rename`; a `doc.*` request is `unknown_method` and the
+connection stays open. A binary frame is a sealed frame the server relays byte for byte
+and cannot read, and no frame it authors carries a path, a role or a document name. The
+room's life is its **last** connection rather than its host's: the grace timer arms when
+the room's last connection ends, and the destruction has no recipient, so it is silent and
+the next connection that names the id is told `room_unknown`.
+
+`selvage/2`'s peer side — the sealed frame, the room state, the holds and the client's own
+rules — is specified in `PROTOCOL.md` §7.1 and §13. This server's part of it is only the
+relay and the membership; the corpus's seventeen frame vectors are replayed against this
+workspace's sealed-frame layer by `crates/harness/tests/peer_vectors.rs`.
+
 ## The client library and the harness
 
 `crates/client` is the sync engine (one `Y.Doc` per session, one `Y.Text` per document,
@@ -286,8 +313,9 @@ where the runnable transcript and the vector replay live.
 ## GET /meta
 
 `GET /meta` answers a JSON body with the server string (`selvaged/<version>`, the same one
-`--version` prints), the wire versions it speaks (`selvage/1`), the roles it seats (`host`,
-`guest`), its capabilities, and the keepalive and room-grace values it is configured with.
+`--version` prints), the wire versions it speaks (`selvage/1`, or both versions with
+`--serve-version-2`), the roles it seats (`host`, `guest`), its capabilities, and the
+keepalive and room-grace values it is configured with.
 
 ## Serving the page
 
@@ -341,6 +369,11 @@ outside the Cargo workspace, so `flake.nix` hands the directory in explicitly.
 
 No persistence, no accounts, no file access, no read-only guests, no E2EE, no editor
 integration. `PROTOCOL.md` §12 lists every decision the design record leaves open.
+
+Neither client library in this workspace speaks `selvage/2` yet: `crates/client` is a
+version-1 engine, and the decision half of the peer corpus needs a version-2 client and a
+relay to drive it. The server's version-2 support is reachable today with a raw socket or
+another implementation's client.
 
 ## Licence
 

@@ -16,7 +16,7 @@ const USAGE: &str = concat!(
     "                [--max-connections N] [--max-rooms N] [--max-peers-per-room N]\n",
     "                [--max-documents-per-room N] [--outbound-queue-bytes N]\n",
     "                [--max-envelope-bytes N] [--inbound-bytes-per-sec N]\n",
-    "                [--inbound-burst-bytes N]",
+    "                [--inbound-burst-bytes N] [--serve-version-2]",
 );
 
 #[tokio::main]
@@ -125,6 +125,11 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Action, String> {
                     "--room-grace-ms wants a number of milliseconds, e.g. 30000",
                 )?;
                 config.room_grace = grace(&value)?;
+            }
+            // The transitional flag: a server that seats `selvage/2` as well as
+            // `selvage/1`. A room is pinned to the version that minted it either way.
+            "--serve-version-2" => {
+                config.serve_version_2 = true;
             }
             "--serve-page" => {
                 let value = args
@@ -290,6 +295,13 @@ fn endpoint_help(default: &ServerConfig) -> Vec<(&'static str, String)> {
         (
             "--serve-page DIR",
             "serve the browser page from DIR, on the same origin as /session and /meta"
+                .to_string(),
+        ),
+        (
+            "--serve-version-2",
+            "seat `selvage/2` too, so `/meta` advertises both versions; off while every \
+             published client speaks `selvage/1`. A room is pinned to the version that \
+             minted it either way"
                 .to_string(),
         ),
     ]

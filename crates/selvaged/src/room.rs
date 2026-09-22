@@ -8,6 +8,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use selvage_protocol as proto;
 use selvage_protocol::{Keepalive, PeerInfo, Role};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::oneshot;
@@ -154,6 +155,11 @@ impl Peer {
 pub struct Room {
     pub id: String,
     pub token: String,
+    /// The wire version this room was minted in. A room cannot serve both: a `selvage/1`
+    /// client expects the server to hold the document set, and a `selvage/2` one requires
+    /// that it does not, so the minting connection pins the version and a connection
+    /// speaking the other one is refused `unsupported_version` (§10).
+    pub version: proto::Version,
     pub keepalive: Keepalive,
     pub peers: HashMap<String, Peer>,
     /// The paths peers have declared open, in first-opened order. The set belongs to the
@@ -322,19 +328,23 @@ impl Room {
     }
 }
 
-/// A room about to be minted: its id, its invite token and the keepalive it advertises.
+/// A room about to be minted: its id, its invite token, the wire version the minting
+/// connection pinning it, and the keepalive it advertises.
 pub struct NewRoom {
     pub id: String,
     pub token: String,
+    pub version: proto::Version,
     pub keepalive: Keepalive,
 }
 
-/// A connection's claim on a room: which room, with which token, in which role.
+/// A connection's claim on a room: which room, with which token, in which role, and the
+/// wire version it speaks.
 #[derive(Debug, Clone, Copy)]
 pub struct Claim<'a> {
     pub room_id: &'a str,
     pub token: Option<&'a str>,
     pub role: Role,
+    pub version: proto::Version,
 }
 
 /// Queues one frame on every snapshotted queue, returning the ids whose queue
@@ -356,6 +366,8 @@ pub enum SeatError {
     TokenMismatch,
     HostPresent,
     RoomFull,
+    /// The room is pinned to the other wire version.
+    VersionMismatch,
 }
 
 #[derive(Default)]
@@ -394,6 +406,7 @@ impl Registry {
         let mut room = Room {
             id: new.id.clone(),
             token: new.token,
+            version: new.version,
             keepalive: new.keepalive,
             peers: HashMap::new(),
             documents: Vec::new(),
@@ -403,7 +416,11 @@ impl Registry {
             generation: 0,
             arrivals: 0,
         };
-        room.attach_host(&host.info.peer_id);
+        if new.version == proto::Version::V1 {
+            // `selvage/1`'s host is a value the server keeps; `selvage/2`'s is whoever
+            // holds the host key, and the server records a peer like any other.
+            room.attach_host(&host.info.peer_id);
+        }
         room.seat(host);
         self.rooms.insert(new.id, room);
         Some(id)
@@ -433,17 +450,28 @@ impl Registry {
             .rooms
             .get_mut(claim.room_id)
             .ok_or(SeatError::Unknown)?;
+        // The version is judged before the token, as §11 orders the checks on a frame: a
+        // connection speaking the other version is a version fault whatever else it got
+        // wrong, and the room it named is not its room.
+        if room.version != claim.version {
+            return Err(SeatError::VersionMismatch);
+        }
         if Some(room.token.as_str()) != claim.token {
             return Err(SeatError::TokenMismatch);
         }
-        if claim.role == Role::Host && room.host_present() {
+        if room.version == proto::Version::V1
+            && claim.role == Role::Host
+            && room.host_present()
+        {
             return Err(SeatError::HostPresent);
         }
-        let reclaiming = claim.role == Role::Host && !room.host_present();
+        let reclaiming = room.version == proto::Version::V1
+            && claim.role == Role::Host
+            && !room.host_present();
         if room.peers.len() >= max_peers && !reclaiming {
             return Err(SeatError::RoomFull);
         }
-        if claim.role == Role::Host {
+        if reclaiming {
             room.attach_host(&peer.info.peer_id);
         }
         room.seat(peer);
@@ -478,6 +506,10 @@ impl Registry {
         Some(Detach {
             was_host,
             generation,
+            version: room.version,
+            // `selvage/2`'s room survives its last connection for `room_grace_ms`, so the
+            // caller arms the timer on exactly this: the leave that emptied the room.
+            empty: room.peers.is_empty(),
         })
     }
 
@@ -498,6 +530,26 @@ impl Registry {
 
     pub fn room_mut(&mut self, room_id: &str) -> Option<&mut Room> {
         self.rooms.get_mut(room_id)
+    }
+
+    /// Tears a room down if no connection is seated in it, returning the peers that were
+    /// (`selvage/2`'s life, `PROTOCOL.md` §9): the timer arms when the room's **last**
+    /// connection ends, so the predicate is exactly "the room holds nobody". A connection
+    /// seated in the window makes this return nothing, and a later last-leave arms a fresh
+    /// timer.
+    #[must_use]
+    pub fn reap_if_empty(&mut self, room_id: &str) -> Vec<Peer> {
+        if self
+            .rooms
+            .get(room_id)
+            .is_some_and(|room| !room.peers.is_empty())
+        {
+            return Vec::new();
+        }
+        self.rooms
+            .remove(room_id)
+            .map(|room| room.peers.into_values().collect())
+            .unwrap_or_default()
     }
 
     /// Tears a room down if it is still host-less at `generation`, returning the
@@ -521,9 +573,15 @@ impl Registry {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "whether it was the host and whether the room is now empty are two different questions"
+)]
 pub struct Detach {
     pub was_host: bool,
     pub generation: u64,
+    pub version: proto::Version,
+    pub empty: bool,
 }
 
 #[must_use]
@@ -557,6 +615,7 @@ mod tests {
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
+                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     peer,
@@ -594,6 +653,7 @@ mod tests {
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
+                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     peer,
@@ -640,6 +700,7 @@ mod tests {
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
+                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     peer,
@@ -683,6 +744,7 @@ mod tests {
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
+                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     host,
@@ -705,6 +767,7 @@ mod tests {
                 NewRoom {
                     id: "r-1".to_string(),
                     token: "t".to_string(),
+                    version: proto::Version::V1,
                     keepalive: Keepalive::default(),
                 },
                 guest,
@@ -734,6 +797,7 @@ mod tests {
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
+                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     peer,
