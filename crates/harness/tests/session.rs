@@ -757,7 +757,14 @@ async fn joining_needs_the_room_and_the_token() {
 /// try again with a hello it still could not seat.
 #[tokio::test]
 async fn an_incompatible_first_frame_is_refused_for_its_version() {
-    let harness = Harness::start(Duration::from_secs(5)).await;
+    // `selvage/1` alone, so `selvage/2` is the version this server does not seat; on the
+    // default it seats it, and the ordering this test is about would not be reached.
+    let harness = Harness::start_with(ServerConfig {
+        serve_version_1_only: true,
+        room_grace: Duration::from_secs(5),
+        ..ServerConfig::default()
+    })
+    .await;
     let mut raw = RawSocket::open(&harness, proto::ENDPOINT_PATH, &[])
         .await
         .expect("the upgrade succeeds");

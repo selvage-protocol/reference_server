@@ -1040,8 +1040,13 @@ pub async fn replay(vector: &Vector) -> Result<(), Failure> {
         )
         .into());
     }
+    // The corpus is the version-1 one, so it is replayed against a server that seats
+    // `selvage/1` alone: its `/meta` (vector 001) advertises one version and vector 005
+    // has a `selvage/2` hello refused, and both are claims about that server rather than
+    // about the default, which seats both.
     let config = ServerConfig {
         room_grace: Duration::from_millis(vector.harness.room_grace_ms),
+        serve_version_1_only: true,
         ..ServerConfig::default()
     };
     let harness = Harness::start_with(config).await;
