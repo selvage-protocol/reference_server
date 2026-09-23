@@ -1,6 +1,6 @@
-//! The `selvage/2` relay against the real `selvaged`, run with `--serve-version-2`: two relays,
-//! one room, a host and a guest, exchanging an edit through a server that never sees a file name
-//! or a byte of either replica.
+//! The `selvage/2` relay against a real `selvaged` on its defaults, which seat both versions:
+//! two relays, one room, a host and a guest, exchanging an edit through a server that never
+//! sees a file name or a byte of either replica.
 //!
 //! This is the proof that the version's two halves (`PROTOCOL.md` §7.1 and §13) can be handed a
 //! socket and a room and come out the other side agreeing, which is the wiring the Rust client
@@ -37,14 +37,6 @@ const SEED: &str = "a room two relays share\n";
 /// `awareness_expire` after the host's seat left. A wait that means to report which ending it
 /// was has to outlast it rather than time out on it.
 const HOST_AWAY_WINDOW: Duration = Duration::from_secs(15);
-
-/// A transitional server: it seats `selvage/2` as well as `selvage/1`.
-fn transitional() -> ServerConfig {
-    ServerConfig {
-        serve_version_2: true,
-        ..ServerConfig::default()
-    }
-}
 
 /// A shorter renewal interval than the server advertises, so the session's own clocks run
 /// during a test: §7.1's answer to an announcement is bounded by that window, and §13.7's holds
@@ -154,7 +146,7 @@ fn listing_of(session: &RelaySession) -> Option<Vec<String>> {
 #[tokio::test]
 async fn a_version_two_host_mints_and_a_guest_joins_by_the_wire_link()
 -> Result<(), Failure> {
-    let server = Harness::start_with(transitional()).await;
+    let server = Harness::start_with(ServerConfig::default()).await;
     let listing = Listing::of(&[PATH, OTHER]);
     let host = host_of(&server, &listing, None).await?;
     // §7.1's mint state is folded into the host's own receiver, so the listing it published is
@@ -218,7 +210,7 @@ async fn a_version_two_host_mints_and_a_guest_joins_by_the_wire_link()
 /// fragment must survive the reading back to the connection URL the relay dials.
 #[tokio::test]
 async fn a_version_two_guest_joins_by_the_page_link() -> Result<(), Failure> {
-    let server = Harness::start_with(transitional()).await;
+    let server = Harness::start_with(ServerConfig::default()).await;
     let listing = Listing::of(&[PATH]);
     let host = host_of(&server, &listing, None).await?;
     let wire = host.invite().ok_or("the host is handed a link to send")?;
@@ -246,7 +238,7 @@ async fn a_version_two_guest_joins_by_the_page_link() -> Result<(), Failure> {
 #[tokio::test]
 async fn an_edit_crosses_a_real_server_in_both_directions()
 -> Result<(), Failure> {
-    let server = Harness::start_with(transitional()).await;
+    let server = Harness::start_with(ServerConfig::default()).await;
     let listing = Listing::of(&[PATH]);
     let host = host_of(&server, &listing, None).await?;
     let invite = host.invite().ok_or("the host is handed a link")?;
@@ -305,7 +297,7 @@ async fn an_edit_crosses_a_real_server_in_both_directions()
 /// §7.1's store: the host key and the `issued` it published, which is what a reload continues.
 #[tokio::test]
 async fn the_host_store_carries_the_issued_series() -> Result<(), Failure> {
-    let server = Harness::start_with(transitional()).await;
+    let server = Harness::start_with(ServerConfig::default()).await;
     let listing = Listing::of(&[PATH]);
     let store = Arc::new(Store::default());
     let host = host_of(&server, &listing, Some(Arc::clone(&store))).await?;
@@ -344,7 +336,7 @@ async fn the_host_store_carries_the_issued_series() -> Result<(), Failure> {
 /// ends where §13.10 says.
 #[tokio::test]
 async fn the_hosts_closing_ends_the_guest() -> Result<(), Failure> {
-    let server = Harness::start_with(transitional()).await;
+    let server = Harness::start_with(ServerConfig::default()).await;
     let listing = Listing::of(&[PATH]);
     let host = host_of(&server, &listing, None).await?;
     let invite = host.invite().ok_or("the host is handed a link")?;
@@ -375,7 +367,7 @@ async fn the_hosts_closing_ends_the_guest() -> Result<(), Failure> {
 #[tokio::test]
 async fn a_host_that_closes_and_disconnects_at_once_still_ends_the_guest()
 -> Result<(), Failure> {
-    let server = Harness::start_with(transitional()).await;
+    let server = Harness::start_with(ServerConfig::default()).await;
     let listing = Listing::of(&[PATH]);
     let host = host_of(&server, &listing, None).await?;
     let invite = host.invite().ok_or("the host is handed a link")?;
@@ -443,7 +435,7 @@ async fn a_fragment_less_link_is_refused_before_a_socket_is_opened()
 /// failing somewhere inside a handshake.
 #[tokio::test]
 async fn a_tls_base_is_refused_by_name() -> Result<(), Failure> {
-    let server = Harness::start_with(transitional()).await;
+    let server = Harness::start_with(ServerConfig::default()).await;
     let listing = Listing::of(&[PATH]);
     let minted = RelaySession::host(RelayHostOptions {
         base_url: server.ws_base().replace("ws://", "wss://"),
@@ -469,7 +461,7 @@ async fn a_tls_base_is_refused_by_name() -> Result<(), Failure> {
 #[tokio::test]
 async fn a_host_handed_a_room_key_and_a_host_seed_carries_them_in_its_invite()
 -> Result<(), Failure> {
-    let server = Harness::start_with(transitional()).await;
+    let server = Harness::start_with(ServerConfig::default()).await;
     let listing = Listing::of(&[PATH]);
     let room_key = RoomKey([7; 32]);
     let host_seed = [3; 32];

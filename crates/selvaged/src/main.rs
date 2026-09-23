@@ -16,7 +16,7 @@ const USAGE: &str = concat!(
     "                [--max-connections N] [--max-rooms N] [--max-peers-per-room N]\n",
     "                [--max-documents-per-room N] [--outbound-queue-bytes N]\n",
     "                [--max-envelope-bytes N] [--inbound-bytes-per-sec N]\n",
-    "                [--inbound-burst-bytes N] [--serve-version-2]",
+    "                [--inbound-burst-bytes N] [--serve-version-1-only]",
 );
 
 #[tokio::main]
@@ -126,10 +126,10 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Action, String> {
                 )?;
                 config.room_grace = grace(&value)?;
             }
-            // The transitional flag: a server that seats `selvage/2` as well as
-            // `selvage/1`. A room is pinned to the version that minted it either way.
-            "--serve-version-2" => {
-                config.serve_version_2 = true;
+            // The flag that narrows the default: a server that seats `selvage/1` alone.
+            // A room is pinned to the version that minted it either way.
+            "--serve-version-1-only" => {
+                config.serve_version_1_only = true;
             }
             "--serve-page" => {
                 let value = args
@@ -298,10 +298,11 @@ fn endpoint_help(default: &ServerConfig) -> Vec<(&'static str, String)> {
                 .to_string(),
         ),
         (
-            "--serve-version-2",
-            "seat `selvage/2` too, so `/meta` advertises both versions; off while every \
-             published client speaks `selvage/1`. A room is pinned to the version that \
-             minted it either way"
+            "--serve-version-1-only",
+            "seat `selvage/1` alone. Every version is seated by default, so `/meta` \
+             advertises `selvage/2` too; a server that must refuse a version-2 hello \
+             — the version-1 corpus's own shape — names this. A room is pinned to \
+             the version that minted it either way"
                 .to_string(),
         ),
     ]
@@ -525,6 +526,23 @@ mod tests {
         assert_eq!(plan.config, ServerConfig::default());
     }
 
+    /// Both wire versions are seated by default, and the one flag that narrows it reaches
+    /// the field `/meta` and the handshake both read.
+    #[test]
+    fn the_default_seats_both_wire_versions_and_one_flag_narrows_it() {
+        assert_eq!(
+            defaults().config.wire_versions(),
+            vec![selvage_protocol::Version::V1, selvage_protocol::Version::V2],
+            "a server with no flags seats both versions"
+        );
+        let only = plan(&["--serve-version-1-only"]);
+        assert!(only.config.serve_version_1_only);
+        assert_eq!(
+            only.config.wire_versions(),
+            vec![selvage_protocol::Version::V1]
+        );
+    }
+
     #[test]
     fn flags_set_the_bind_address_and_the_grace() {
         let plan =
@@ -663,6 +681,7 @@ mod tests {
         assert!(help.contains("30s"), "{help}");
         for flag in [
             "--serve-page",
+            "--serve-version-1-only",
             "--max-connections",
             "--max-rooms",
             "--max-peers-per-room",

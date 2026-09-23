@@ -81,15 +81,15 @@ pub struct ServerConfig {
     /// with a whole burst, so a newcomer syncing a room is not throttled before it has
     /// sent anything; a flooder that spends it is held to the rate.
     pub inbound_burst_bytes: usize,
-    /// Whether this server seats `selvage/2` as well as `selvage/1` (`PROTOCOL.md` §10).
+    /// Whether to seat `selvage/1` alone (`PROTOCOL.md` §10).
     ///
-    /// A room is pinned to the version its minting connection speaks, so a server that
-    /// serves both refuses a connection speaking the other version to a room rather than
-    /// seating it. Off by default: every published client speaks `selvage/1`, and the
-    /// corpus's transcripts pin a version-1 server's `/meta` and its refusal of a
-    /// `selvage/2` hello, so the transitional behaviour is a configuration rather than a
-    /// default until the release wave.
-    pub serve_version_2: bool,
+    /// The default seats both versions (`--serve-version-1-only` is what narrows it): a
+    /// version-1-only server is the shape the specification's version-1 corpus pins — its
+    /// `/meta` advertises one version and a `selvage/2` hello is refused — and the shape a
+    /// client that must be shown a refusal is pointed at. A room is pinned to the version
+    /// its minting connection speaks either way, so a server that seats both refuses a
+    /// connection speaking the other version to a room rather than seating it.
+    pub serve_version_1_only: bool,
     /// Serve a static page from this directory on `GET /` and every other plain
     /// path, from the same origin as `/session` and `/meta`. `None` keeps the
     /// server a server alone: an unknown plain path answers `404`.
@@ -100,10 +100,10 @@ impl ServerConfig {
     /// The wire versions this configuration seats, in the order `/meta` writes them.
     #[must_use]
     pub fn wire_versions(&self) -> Vec<selvage_protocol::Version> {
-        if self.serve_version_2 {
-            vec![selvage_protocol::Version::V1, selvage_protocol::Version::V2]
-        } else {
+        if self.serve_version_1_only {
             vec![selvage_protocol::Version::V1]
+        } else {
+            vec![selvage_protocol::Version::V1, selvage_protocol::Version::V2]
         }
     }
 }
@@ -134,7 +134,7 @@ impl Default for ServerConfig {
             // multi-megabyte document.
             inbound_bytes_per_sec: 2 * 1024 * 1024,
             inbound_burst_bytes: 64 * 1024 * 1024,
-            serve_version_2: false,
+            serve_version_1_only: false,
             page_root: None,
         }
     }

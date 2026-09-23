@@ -175,11 +175,11 @@ pub async fn handshake(
     // was answered `hello_required`, which tells the client the wrong thing about why it
     // was refused. The envelope and the id are judged first, the method after the version.
     // The version is judged before the method's params and by §10's compatibility rule:
-    // a version this server does not seat, including `selvage/2` on a server configured
-    // without it, is refused before seating and the room is untouched.
+    // a version this server does not seat is refused before seating and the room is
+    // untouched, which for a `--serve-version-1-only` server includes `selvage/2`.
     let version = match proto::version_of(&msg.v) {
         Some(proto::Version::V1) => proto::Version::V1,
-        Some(proto::Version::V2) if config.serve_version_2 => {
+        Some(proto::Version::V2) if !config.serve_version_1_only => {
             proto::Version::V2
         }
         _ => {
