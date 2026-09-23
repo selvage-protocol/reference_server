@@ -632,8 +632,8 @@ fn the_frame_layer_holds_the_corpus_it_was_written_for() {
         load_frame_vectors().expect("the peer vector directory is readable");
     assert_eq!(
         vectors.len(),
-        17,
-        "the peer layer has 17 frame vectors; this run found {}",
+        19,
+        "the peer layer has 19 frame vectors; this run found {}",
         vectors.len()
     );
     assert_eq!(encode_key(&[0u8; 32]).len(), 43);
