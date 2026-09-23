@@ -177,7 +177,8 @@ exist, and none of it is a file in this repository:
 | A `deployci` user on the Pi | Not a file: `adduser --system --group --home /var/lib/selvage-deploy --shell /bin/bash deployci`, the same account the public demo has, created with no password and no key so the tailnet policy is the only way in. `getent passwd deployci` on the Pi finds nothing today |
 | The sudoers line bounding that user | `/etc/sudoers.d/selvage-deploy-pi` on the Pi, tracked here as `deployci.sudoers`. There is no line in `/etc/sudoers.d` on the Pi today, so the user would have no privilege at all until it is installed |
 
-Until those exist, a dispatch of `deploy-pi.yml` fails in its first SSH step,
-having touched nothing: the request is built on the runner and the box is never
-reached. The deploy is a hand `up -d` with a hand-edited `.env` in the meantime,
-which is what `ai_notes/docs/runbook-pi-demo.md` records.
+Until those exist, a dispatch of `deploy-pi.yml` fails before it reaches the box: the
+tailnet drops the runner's packets, so the wait for `deployci` never succeeds. The
+request is built on the runner and nothing on the box is touched. The deploy is a
+hand `up -d` with a hand-edited `.env` in the meantime, which is what
+`ai_notes/docs/runbook-pi-demo.md` records.

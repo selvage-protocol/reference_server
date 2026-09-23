@@ -19,8 +19,9 @@ name: deploy-pi
 # against and never written from. A `deployci` account, a sudoers line for it and
 # a tailnet rule admitting `tag:ci` are what this needs on the box, and none of
 # the three exists yet — `packaging/pi/README.md` has the gap table. Until they
-# do, a dispatch of this workflow fails in the reachability step below, having
-# built a request on the runner and touched nothing.
+# do, a dispatch of this workflow fails before it reaches the box: the tailnet
+# drops the runner's packets, so the loop below never opens a session, and the
+# request it built on the runner touches nothing.
 #
 # `workflow_dispatch` only, and the deploy that runs is the reviewed one on
 # `main`: no branch can deploy itself, and the *images* are chosen by the inputs.
