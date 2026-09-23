@@ -11,8 +11,10 @@ use std::error::Error as StdError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use selvage_client::relay::{RelayEnding, RelayHostOptions, RelayJoinOptions, RelaySession};
 use selvage_client::host::{HostStore, PersistedHost};
+use selvage_client::relay::{
+    RelayEnding, RelayHostOptions, RelayJoinOptions, RelaySession,
+};
 use selvage_client::sealed::{RoomKey, SessionKey, encode_key};
 use selvage_client::session::KeepaliveConfig;
 use selvage_harness::{Harness, ServerConfig, wait_for, wait_for_described};
@@ -138,7 +140,8 @@ fn listing_of(session: &RelaySession) -> Option<Vec<String>> {
 
 /// A host mints, and a guest joining the wire link applies the state it publishes.
 #[tokio::test]
-async fn a_version_two_host_mints_and_a_guest_joins_by_the_wire_link() -> Result<(), Failure> {
+async fn a_version_two_host_mints_and_a_guest_joins_by_the_wire_link()
+-> Result<(), Failure> {
     let server = Harness::start_with(transitional()).await;
     let listing = Listing::of(&[PATH, OTHER]);
     let host = host_of(&server, &listing, None).await?;
@@ -151,9 +154,7 @@ async fn a_version_two_host_mints_and_a_guest_joins_by_the_wire_link() -> Result
     assert!(invite.contains("#k="));
     assert!(invite.contains("&h="));
     assert_eq!(invite.matches('#').count(), 1);
-    let address = invite
-        .split_once('#')
-        .map(|(before, _)| before.to_string());
+    let address = invite.split_once('#').map(|(before, _)| before.to_string());
     assert!(
         address.is_some_and(|wire| !wire.contains('#')),
         "the socket URL carries no fragment: {invite}"
@@ -176,11 +177,7 @@ async fn a_version_two_host_mints_and_a_guest_joins_by_the_wire_link() -> Result
     let seen = wait_for_described(
         "the host to see the guest in the room",
         || async { format!("{:?}", host.peers()) },
-        || async {
-            host.peers()
-                .into_iter()
-                .find(|peer| peer.peer_id == seat)
-        },
+        || async { host.peers().into_iter().find(|peer| peer.peer_id == seat) },
     )
     .await;
     assert_eq!(seen.display_name, "Bob");
@@ -203,15 +200,17 @@ async fn a_version_two_guest_joins_by_the_page_link() -> Result<(), Failure> {
     let listing = Listing::of(&[PATH]);
     let host = host_of(&server, &listing, None).await?;
     let wire = host.invite().ok_or("the host is handed a link to send")?;
-    let page = wire
-        .replace("ws://", "http://")
-        .replace("/session?", "/?");
-    assert!(page.contains("#k="), "the fragment survives the form change");
+    let page = wire.replace("ws://", "http://").replace("/session?", "/?");
+    assert!(
+        page.contains("#k="),
+        "the fragment survives the form change"
+    );
 
     let guest = guest_of(&page, "Bob").await?;
-    let applied = wait_for("the guest joining by page link to apply the state", || async {
-        listing_of(&guest)
-    })
+    let applied = wait_for(
+        "the guest joining by page link to apply the state",
+        || async { listing_of(&guest) },
+    )
     .await;
     assert_eq!(applied, [PATH]);
     assert_eq!(host.session_info().room_id, guest.session_info().room_id);
@@ -223,7 +222,8 @@ async fn a_version_two_guest_joins_by_the_page_link() -> Result<(), Failure> {
 
 /// An edit crosses a real server in both directions, and a hold crosses with it.
 #[tokio::test]
-async fn an_edit_crosses_a_real_server_in_both_directions() -> Result<(), Failure> {
+async fn an_edit_crosses_a_real_server_in_both_directions()
+-> Result<(), Failure> {
     let server = Harness::start_with(transitional()).await;
     let listing = Listing::of(&[PATH]);
     let host = host_of(&server, &listing, None).await?;
@@ -267,11 +267,12 @@ async fn an_edit_crosses_a_real_server_in_both_directions() -> Result<(), Failur
         guest.insert(PATH, 0, "guest: ")?,
         "the room accepted the guest's edit"
     );
-    let back_at_host = wait_for("the guest's edit to reach the host", || async {
-        let text = host.text(PATH);
-        (text == format!("guest: {SEED}")).then_some(text)
-    })
-    .await;
+    let back_at_host =
+        wait_for("the guest's edit to reach the host", || async {
+            let text = host.text(PATH);
+            (text == format!("guest: {SEED}")).then_some(text)
+        })
+        .await;
     assert_eq!(back_at_host, format!("guest: {SEED}"));
 
     host.disconnect();
@@ -288,7 +289,9 @@ async fn the_host_store_carries_the_issued_series() -> Result<(), Failure> {
     let host = host_of(&server, &listing, Some(Arc::clone(&store))).await?;
 
     let minted = {
-        let saved = store.load().ok_or("the mint state is saved with the key that signed it")?;
+        let saved = store
+            .load()
+            .ok_or("the mint state is saved with the key that signed it")?;
         assert_eq!(saved.host_seed.len(), 32);
         assert!(saved.issued >= 1, "§7.1's first state carries `1`");
         saved.issued
@@ -331,10 +334,9 @@ async fn the_hosts_closing_ends_the_guest() -> Result<(), Failure> {
     .await;
 
     assert!(host.close_room()?, "the host publishes a closing");
-    let ended = wait_for("the guest to hear the closing", || async {
-        guest.ending()
-    })
-    .await;
+    let ended =
+        wait_for("the guest to hear the closing", || async { guest.ending() })
+            .await;
     assert_eq!(ended, RelayEnding::Closing);
     assert_eq!(guest.ending_sentence(), Some("the room closed"));
     assert_eq!(host.ending(), Some(RelayEnding::Closing));
@@ -347,7 +349,8 @@ async fn the_hosts_closing_ends_the_guest() -> Result<(), Failure> {
 /// A link with no fragment carries neither of §5.1's two keys, and a join is refused before a
 /// socket exists rather than handed a room it cannot read.
 #[tokio::test]
-async fn a_fragment_less_link_is_refused_before_a_socket_is_opened() -> Result<(), Failure> {
+async fn a_fragment_less_link_is_refused_before_a_socket_is_opened()
+-> Result<(), Failure> {
     let server = Harness::start_with(transitional()).await;
     let joined = RelaySession::join(RelayJoinOptions {
         invite: format!("{}/session?room=r-1&token=t-1", server.ws_base()),
@@ -393,7 +396,8 @@ async fn a_tls_base_is_refused_by_name() -> Result<(), Failure> {
 /// A host handed §5.1's two values builds the same fragment from them, which is what a host
 /// that means to keep hosting after a reload has to hand back.
 #[tokio::test]
-async fn a_host_handed_a_room_key_and_a_host_seed_carries_them_in_its_invite() -> Result<(), Failure> {
+async fn a_host_handed_a_room_key_and_a_host_seed_carries_them_in_its_invite()
+-> Result<(), Failure> {
     let server = Harness::start_with(transitional()).await;
     let listing = Listing::of(&[PATH]);
     let room_key = RoomKey([7; 32]);
@@ -412,7 +416,8 @@ async fn a_host_handed_a_room_key_and_a_host_seed_carries_them_in_its_invite() -
     let invite = host.invite().ok_or("the host is handed a link")?;
     let host_key = SessionKey::from_seed(host_seed).public().encode();
     assert!(
-        invite.ends_with(&format!("#k={}&h={host_key}", encode_key(&room_key.0))),
+        invite
+            .ends_with(&format!("#k={}&h={host_key}", encode_key(&room_key.0))),
         "§5.1's fragment, in the order the version writes it: {invite}"
     );
 

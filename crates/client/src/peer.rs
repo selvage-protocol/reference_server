@@ -68,9 +68,10 @@ impl PeerInvite {
         let (address, fragment) = invite
             .split_once('#')
             .ok_or_else(|| MISSING_FRAGMENT.to_string())?;
-        let parsed = proto::parse_session_url(&wire_invite(address)).ok_or_else(|| {
-            format!("{address:?} does not address the session endpoint")
-        })?;
+        let parsed = proto::parse_session_url(&wire_invite(address))
+            .ok_or_else(|| {
+                format!("{address:?} does not address the session endpoint")
+            })?;
         let room = parsed
             .join
             .room
@@ -146,6 +147,10 @@ const MISSING_FRAGMENT: &str = "the invite carries no fragment, so neither its r
 /// labels its own connection's seat, and there is nothing to write without one.
 const HOST_NEEDS_SEAT: &str =
     "a host session publishes its own seat, and the handshake gave it none";
+
+/// What a host is told when §7.1's closing could not be sealed: a host cannot refuse to close
+/// without somewhere to say so, and a driver that never looks is a driver closing nothing.
+const CLOSING_UNSEALED: &str = "the closing could not be sealed";
 
 /// The two keys a fragment carries: `k` and `h`, each at most once, and an unknown parameter
 /// ignored as an unknown query parameter is.
@@ -400,12 +405,9 @@ impl PeerSession {
         let own_key = session.public();
         let host = match &options.host {
             None => None,
-            Some(host_options) => Some(host_producer(
-                options,
-                frame_key,
-                host_options,
-                own_key,
-            )?),
+            Some(host_options) => {
+                Some(host_producer(options, frame_key, host_options, own_key)?)
+            }
         };
         let mut roster = options.roster.clone();
         if let (Some(seat), true) = (options.seat.as_ref(), host.is_some()) {
@@ -526,9 +528,7 @@ impl PeerSession {
     /// one. This is §7.1's `issued` series, which a host that keeps hosting continues.
     #[must_use]
     pub fn published_issued(&self) -> u64 {
-        self.host
-            .as_ref()
-            .map_or(0, HostProducer::published_issued)
+        self.host.as_ref().map_or(0, HostProducer::published_issued)
     }
 
     /// The edition of the state this client holds, or `None` before one is applied.
@@ -879,7 +879,11 @@ impl PeerSession {
     /// A peer that is not the host owes it nothing at all — the state is the only source of
     /// the keys a receiver keeps, and an announcement is read for the host's sake (§13.3) — so
     /// the host's answer is the whole of what this decision is.
-    fn hear_announcement(&mut self, clock: Duration, announcement: &Announcement) {
+    fn hear_announcement(
+        &mut self,
+        clock: Duration,
+        announcement: &Announcement,
+    ) {
         if self.host.is_none() {
             return;
         }
@@ -1306,10 +1310,9 @@ impl PeerSession {
         };
         let closing = host.closing();
         let failure = host.failure().map(ToString::to_string);
+        let failed = failure.unwrap_or_else(|| CLOSING_UNSEALED.to_string());
         let Some(publication) = closing else {
-            let reason = failure
-                .unwrap_or_else(|| "the closing could not be sealed".to_string());
-            self.fault.get_or_insert(reason);
+            self.fault.get_or_insert(failed);
             return false;
         };
         self.outbound.push_back(publication.frame);
@@ -2066,13 +2069,15 @@ mod tests {
     }
 
     #[test]
-    fn the_page_link_is_the_same_room_token_and_fragment_over_the_browsers_scheme() {
+    fn the_page_link_is_the_same_room_token_and_fragment_over_the_browsers_scheme()
+     {
         // `PROTOCOL.md` §5.1's second form: the page the room's server serves, over the scheme
         // a browser speaks, with the same host, port and path prefix and nothing else in it.
         let room = encode_key(&room_key().0);
         let host_key = host().public().encode();
-        let page =
-            format!("http://h:8080/?room={ROOM}&token=t-1#k={room}&h={host_key}");
+        let page = format!(
+            "http://h:8080/?room={ROOM}&token=t-1#k={room}&h={host_key}"
+        );
         let wire = format!("ws://h:8080/session?room={ROOM}&token=t-1");
         let wire_with_fragment = format!("{wire}#k={room}&h={host_key}");
         assert_eq!(
@@ -2092,7 +2097,9 @@ mod tests {
 
         // A path prefix survives the reading: the page is served under it and the endpoint is
         // under it too.
-        let mounted = format!("https://h/page/?room={ROOM}&token=t-1#k={room}&h={host_key}");
+        let mounted = format!(
+            "https://h/page/?room={ROOM}&token=t-1#k={room}&h={host_key}"
+        );
         assert_eq!(
             PeerInvite::parse(&mounted).unwrap().socket_url,
             format!("wss://h/page/session?room={ROOM}&token=t-1")

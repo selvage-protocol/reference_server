@@ -366,7 +366,8 @@ mod tests {
     /// §5.1: the fragment's two keys are what make a link a `selvage/2` one, so a link without
     /// one stays the version-1 connection the engine speaks.
     #[test]
-    fn the_fragment_decides_the_version_and_a_link_without_one_stays_version_one() {
+    fn the_fragment_decides_the_version_and_a_link_without_one_stays_version_one()
+     {
         let plain = ConnectOptions::from_invite_url(
             "ws://h:8080/session?room=r-1&token=t-1",
             "Ada",
@@ -378,7 +379,8 @@ mod tests {
         assert_eq!(plain.token.as_deref(), Some("t-1"));
         assert_eq!(plain.role, Some(Role::Guest));
 
-        let sealed = ConnectOptions::from_invite_url(&sealed_link(), "Ada").unwrap();
+        let sealed =
+            ConnectOptions::from_invite_url(&sealed_link(), "Ada").unwrap();
         let invite = sealed.sealed_invite.unwrap();
         assert_eq!(invite.room, "r-1");
         assert_eq!(invite.token, "t-1");
@@ -388,7 +390,8 @@ mod tests {
 
         // The page form is the same link over the scheme a browser speaks, and it resolves to
         // the same room, token and two keys.
-        let page = sealed_link().replace("ws://h:8080/session?", "http://h:8080/?");
+        let page =
+            sealed_link().replace("ws://h:8080/session?", "http://h:8080/?");
         let from_page = ConnectOptions::from_invite_url(&page, "Ada").unwrap();
         assert_eq!(from_page.base_url, "ws://h:8080");
         assert_eq!(from_page.sealed_invite, Some(invite));

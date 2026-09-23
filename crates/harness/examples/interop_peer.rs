@@ -78,7 +78,12 @@ fn options() -> Result<Options, Failure> {
             "--invite" => invite = args.next(),
             "--path" => path = args.next(),
             "--name" => name = args.next(),
-            "--version" => version = args.next().map(|value| parse_version(&value)).transpose()?,
+            "--version" => {
+                version = args
+                    .next()
+                    .map(|value| parse_version(&value))
+                    .transpose()?;
+            }
             other => {
                 return Err(format!("unknown argument {other:?}").into());
             }
@@ -121,9 +126,11 @@ enum Peer {
 impl Peer {
     /// Reads the link, settles which wire version it names, and joins.
     async fn join(options: &Options) -> Result<Self, Failure> {
-        let connect =
-            ConnectOptions::from_invite_url(&options.invite, options.name.as_str())
-                .ok_or("--invite is not a session URL this client can join with")?;
+        let connect = ConnectOptions::from_invite_url(
+            &options.invite,
+            options.name.as_str(),
+        )
+        .ok_or("--invite is not a session URL this client can join with")?;
         let sealed = connect.sealed_invite.is_some();
         let version = choose(options, sealed)?;
         match version {
@@ -140,7 +147,9 @@ impl Peer {
                 })
                 .await?,
             )),
-            WireVersion::One => Ok(Self::Plain(SyncEngine::connect(connect).await?)),
+            WireVersion::One => {
+                Ok(Self::Plain(SyncEngine::connect(connect).await?))
+            }
         }
     }
 
@@ -336,7 +345,10 @@ fn report_sealed(relay: &RelaySession, path: &str) -> Value {
 }
 
 /// Everything the caller can check this side of a `selvage/1` room against.
-async fn report_plain(engine: &SyncEngine, path: &str) -> Result<Value, Failure> {
+async fn report_plain(
+    engine: &SyncEngine,
+    path: &str,
+) -> Result<Value, Failure> {
     let session = engine.session();
     Ok(json!({
         "event": "report",

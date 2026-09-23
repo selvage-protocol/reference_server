@@ -26,8 +26,8 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 
 use crate::sealed::{
-    FrameKey, PeerEntry, PublicKey, Recipe, RoomState, SealedError, SessionKey, fresh_nonce,
-    seal, usable_path,
+    FrameKey, PeerEntry, PublicKey, Recipe, RoomState, SealedError, SessionKey,
+    fresh_nonce, seal, usable_path,
 };
 
 /// The room's working tree as this host enumerates it: names, and no content (§7.1).
@@ -224,7 +224,8 @@ impl HostProducer {
             standing: Standing::Live,
             faulted: None,
         };
-        if let Some(persisted) = producer.store.as_ref().and_then(|store| store.load())
+        if let Some(persisted) =
+            producer.store.as_ref().and_then(|store| store.load())
             && persisted.host_seed == options.host_seed
             && persisted.issued > 0
         {
@@ -528,7 +529,9 @@ impl HostProducer {
         let _ = (self.listing)()
             .into_iter()
             .position(|path| !bounded.add(path));
-        bounded.paths.sort_by(|left, right| utf16_order(left, right));
+        bounded
+            .paths
+            .sort_by(|left, right| utf16_order(left, right));
         bounded.paths
     }
 
@@ -612,7 +615,10 @@ fn same_paths(left: &[String], right: &[String]) -> bool {
 }
 
 /// Whether two `peers` maps say the same thing, key for key and member for member.
-fn same_peers(left: &BTreeMap<String, PeerEntry>, right: &BTreeMap<String, PeerEntry>) -> bool {
+fn same_peers(
+    left: &BTreeMap<String, PeerEntry>,
+    right: &BTreeMap<String, PeerEntry>,
+) -> bool {
     left == right
 }
 
@@ -740,7 +746,8 @@ mod tests {
     }
 
     #[test]
-    fn an_announcement_is_committed_under_a_free_seat_and_answered_once_a_window() {
+    fn an_announcement_is_committed_under_a_free_seat_and_answered_once_a_window()
+     {
         let mut host = producer(None);
         host.seat_joined("p-guest");
         let _ = host.publish(Duration::ZERO, HostReason::Roster);
@@ -750,7 +757,8 @@ mod tests {
         );
 
         host.announcement(peer_key().public(), Some("viewer"));
-        let answered = host.publish(millis(2), HostReason::Announcement).unwrap();
+        let answered =
+            host.publish(millis(2), HostReason::Announcement).unwrap();
         let state = state_of(&answered);
         assert_eq!(
             state.peers[&peer_key().public().encode()].role,
@@ -778,16 +786,16 @@ mod tests {
         let mut host = producer(None);
         let mint = host.publish(Duration::ZERO, HostReason::Mint).unwrap();
         host.announcement(our_key().public(), None);
-        let again = host
-            .publish(millis(500), HostReason::Announcement)
-            .unwrap();
+        let again =
+            host.publish(millis(500), HostReason::Announcement).unwrap();
         assert!(!again.fresh, "§7.1 re-sends the state it already holds");
         assert_eq!(again.issued, mint.issued);
         assert_eq!(again.frame, mint.frame, "the bytes it received, unchanged");
     }
 
     #[test]
-    fn the_store_carries_the_issued_series_and_a_returning_host_continues_above_it() {
+    fn the_store_carries_the_issued_series_and_a_returning_host_continues_above_it()
+     {
         let store: Arc<Memory> = Arc::new(Memory::default());
         let kept: Arc<dyn HostStore> = Arc::clone(&store) as Arc<dyn HostStore>;
         let mut host = producer(Some(kept));
@@ -806,7 +814,8 @@ mod tests {
 
         // A host that comes back with the key and the series continues it: a state at or below
         // the room's edition is refused by every peer and nothing carries that refusal back.
-        let returning = producer(Some(Arc::clone(&store) as Arc<dyn HostStore>));
+        let returning =
+            producer(Some(Arc::clone(&store) as Arc<dyn HostStore>));
         assert_eq!(returning.published_issued(), closing.issued);
         assert!(returning.published_issued() > 0);
     }
@@ -827,7 +836,8 @@ mod tests {
     }
 
     #[test]
-    fn the_closing_is_above_every_state_and_the_host_publishes_nothing_after_it() {
+    fn the_closing_is_above_every_state_and_the_host_publishes_nothing_after_it()
+     {
         let mut host = producer(None);
         let mint = host.publish(Duration::ZERO, HostReason::Mint).unwrap();
         let closing = host.closing().unwrap();

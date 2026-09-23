@@ -33,11 +33,13 @@ use tokio_tungstenite::tungstenite::Message;
 use selvage_protocol as proto;
 use selvage_protocol::{event, method};
 
+use crate::Error;
 use crate::host::{HostOptions, HostStore, ListingSource};
 use crate::peer::{Ending, Outcome, PeerInvite, PeerOptions, PeerSession};
-use crate::sealed::{RoomKey, SealedError, SessionKey, encode_key, fresh_nonce};
+use crate::sealed::{
+    RoomKey, SealedError, SessionKey, encode_key, fresh_nonce,
+};
 use crate::session::KeepaliveConfig;
-use crate::Error;
 
 type Socket = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = SplitSink<Socket, Message>;
@@ -220,7 +222,10 @@ impl RelaySession {
     /// sealed from the invite's two keys.
     pub async fn host(options: RelayHostOptions) -> Result<Self, Error> {
         let base = session_base(&options.base_url).ok_or_else(|| {
-            Error::Invite(format!("not a session address: {}", options.base_url))
+            Error::Invite(format!(
+                "not a session address: {}",
+                options.base_url
+            ))
         })?;
         let room_key = match options.room_key {
             Some(key) => key,
@@ -235,7 +240,11 @@ impl RelaySession {
         let url = proto::session_url(&base, None, None);
         let dial = dial(
             &url,
-            &hello(&options.display_name, options.client.as_ref(), awareness_client_id),
+            &hello(
+                &options.display_name,
+                options.client.as_ref(),
+                awareness_client_id,
+            ),
             options.keepalive.as_ref(),
         )
         .await?;
@@ -279,7 +288,8 @@ impl RelaySession {
     /// a link with no fragment, which carries neither of §5.1's two keys — and [`Error`] when
     /// the socket cannot be opened or the server refuses the session.
     pub async fn join(options: RelayJoinOptions) -> Result<Self, Error> {
-        let invite = PeerInvite::parse(&options.invite).map_err(Error::Invite)?;
+        let invite =
+            PeerInvite::parse(&options.invite).map_err(Error::Invite)?;
         let awareness_client_id = mint_awareness_client_id()?;
         let dial = dial(
             &invite.socket_url,
@@ -376,7 +386,8 @@ impl RelaySession {
     #[must_use]
     pub fn open_documents(&self) -> Vec<String> {
         let state = self.read();
-        let mut paths: Vec<String> = state.session.held().iter().cloned().collect();
+        let mut paths: Vec<String> =
+            state.session.held().iter().cloned().collect();
         for held in state.session.peer_holds().values() {
             paths.extend(held.iter().cloned());
         }
@@ -400,7 +411,10 @@ impl RelaySession {
     /// The seat the applied state names as the host connection, if any (`§13.4`).
     #[must_use]
     pub fn named_host_seat(&self) -> Option<String> {
-        self.read().session.named_host_seat().map(ToString::to_string)
+        self.read()
+            .session
+            .named_host_seat()
+            .map(ToString::to_string)
     }
 
     /// Whether this connection holds the host key, which is the whole of what being the host is.
@@ -490,8 +504,18 @@ impl RelaySession {
         clippy::too_many_arguments,
         reason = "a path, an offset and the text are the three things an insert is"
     )]
-    pub fn insert(&self, path: &str, index: u32, text: &str) -> Result<bool, Error> {
-        self.moving(|state| state.session.insert(path, index, text).map_err(|error| sealed(&error)))
+    pub fn insert(
+        &self,
+        path: &str,
+        index: u32,
+        text: &str,
+    ) -> Result<bool, Error> {
+        self.moving(|state| {
+            state
+                .session
+                .insert(path, index, text)
+                .map_err(|error| sealed(&error))
+        })
     }
 
     /// Changes this connection's display name (`PROTOCOL.md` §5). The server answers the mover
@@ -595,10 +619,7 @@ impl RelaySession {
     }
 
     fn send(&self, frame: Outbound) -> Result<(), Error> {
-        self.relay
-            .outgoing
-            .send(frame)
-            .map_err(|_| Error::Closed)
+        self.relay.outgoing.send(frame).map_err(|_| Error::Closed)
     }
 
     /// The lock, with a poisoned one treated as held: nothing here leaves shared state half
@@ -733,7 +754,9 @@ async fn socket_loop(
 async fn send_frame(sink: &mut Sink, frame: Outbound) -> bool {
     match frame {
         Outbound::Text(text) => sink.send(Message::text(text)).await.is_ok(),
-        Outbound::Binary(bytes) => sink.send(Message::binary(bytes)).await.is_ok(),
+        Outbound::Binary(bytes) => {
+            sink.send(Message::binary(bytes)).await.is_ok()
+        }
         Outbound::Close => {
             let _ = sink.close().await;
             false
@@ -883,7 +906,11 @@ impl RelayState {
         }
     }
 
-    fn hear_joined(&mut self, clock: Duration, params: Option<&serde_json::Value>) {
+    fn hear_joined(
+        &mut self,
+        clock: Duration,
+        params: Option<&serde_json::Value>,
+    ) {
         let Some(peer) = params.and_then(peer_of) else {
             return;
         };
@@ -892,7 +919,11 @@ impl RelayState {
         self.session.seat_joined(clock, &peer.peer_id);
     }
 
-    fn hear_left(&mut self, clock: Duration, params: Option<&serde_json::Value>) {
+    fn hear_left(
+        &mut self,
+        clock: Duration,
+        params: Option<&serde_json::Value>,
+    ) {
         let named = params
             .and_then(|record| record.get("peer_id"))
             .and_then(serde_json::Value::as_str);
@@ -910,10 +941,8 @@ impl RelayState {
         let (Some(peer_id), Some(display_name)) = (seat, name) else {
             return;
         };
-        let renamed = self
-            .peers
-            .iter_mut()
-            .find(|held| held.peer_id == peer_id);
+        let renamed =
+            self.peers.iter_mut().find(|held| held.peer_id == peer_id);
         if let Some(held) = renamed {
             display_name.clone_into(&mut held.display_name);
         }
@@ -977,7 +1006,9 @@ fn fault_sentence(message: &proto::ServerMessage) -> String {
     message
         .error
         .as_ref()
-        .map_or("the server reported a fault", |error| error.message.as_str())
+        .map_or("the server reported a fault", |error| {
+            error.message.as_str()
+        })
         .to_string()
 }
 
@@ -989,7 +1020,8 @@ fn seats_of(peers: &[RelayPeer]) -> BTreeSet<String> {
 /// One `PeerInfo` from a `peer.joined`'s params, which wraps its record under `peer`.
 fn peer_of(params: &serde_json::Value) -> Option<RelayPeer> {
     let record = params.get("peer").unwrap_or(params);
-    let peer: proto::PeerInfoV2 = serde_json::from_value(record.clone()).ok()?;
+    let peer: proto::PeerInfoV2 =
+        serde_json::from_value(record.clone()).ok()?;
     Some(RelayPeer {
         peer_id: peer.peer_id,
         display_name: peer.display_name,
@@ -1008,7 +1040,11 @@ fn session_base(url: &str) -> Option<String> {
 }
 
 /// `session.hello` at `selvage/2`: no `role`, because the version seats nobody as anything.
-fn hello(display_name: &str, client: Option<&String>, awareness_client_id: u64) -> String {
+fn hello(
+    display_name: &str,
+    client: Option<&String>,
+    awareness_client_id: u64,
+) -> String {
     let params = proto::HelloParamsV2 {
         awareness_client_id: Some(awareness_client_id),
         capabilities: proto::CAPABILITIES_V2
@@ -1155,7 +1191,8 @@ fn random_room_key() -> Result<RoomKey, Error> {
 /// The host key's seed, from the platform's CSPRNG.
 fn random_seed() -> Result<[u8; 32], Error> {
     let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed).map_err(|e| Error::Invite(format!("no randomness: {e}")))?;
+    getrandom::fill(&mut seed)
+        .map_err(|e| Error::Invite(format!("no randomness: {e}")))?;
     Ok(seed)
 }
 
