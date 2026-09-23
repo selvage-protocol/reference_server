@@ -29,8 +29,10 @@
 //!   the same `guest` fallback the shared engine uses for a key no state names yet.
 //! - `session.documents` is the room's open-document set in `selvage/1` and §13.7's union of the
 //!   live holds in `selvage/2`.
-//! - `presence` is empty in `selvage/2`: this client's session applies no awareness and
-//!   publishes none yet, so `select` is answered `unsupported` rather than `ok`.
+//! - `presence` is empty in `selvage/2`: this client's session publishes no awareness and
+//!   reads none back, so `select` is answered `unsupported` rather than `ok` — and the
+//!   version's hello advertises `y-protocols/1` alone for the same reason, because §10
+//!   defines `awareness` as "the peer publishes presence".
 //! - `insert`'s reply carries `published` in `selvage/2` — whether the frame went out, which is
 //!   `false` until a state commits this connection's key (§13.1's step 4).
 //!
@@ -344,8 +346,8 @@ fn report_sealed(relay: &RelaySession, path: &str) -> Value {
         "text": relay.text(path),
         "documents": relay.documents(),
         "peers": peers,
-        // No awareness is applied and none is published: §8's producer half is not in this
-        // session yet.
+        // §8's producer half is not in this session: it publishes no awareness state and
+        // reads none back, so this connection shows no cursor.
         "presence": Vec::<Value>::new(),
         "state_vector": relay.state_vector(),
     })

@@ -540,6 +540,13 @@ pub enum Payload {
 }
 
 /// What a receiver did with one frame: accepted it, or refused it and why.
+///
+/// The two flags answer two questions the reason does not: whether the frame was accepted, and
+/// whether the refusal was the equal-`issued` one §13.3 asks a client to tell apart.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "accepted, and refused at the mark: two questions the reason alone does not answer"
+)]
 #[derive(Debug, Clone)]
 pub struct Verdict {
     pub ok: bool,
@@ -550,6 +557,11 @@ pub struct Verdict {
     pub counter: Option<u64>,
     pub plaintext: Vec<u8>,
     pub payload: Option<Payload>,
+    /// §13.3's equal-`issued` refusal, which the reason does not distinguish: the frame was a
+    /// room state at exactly the edition this receiver holds, so two states were published at
+    /// one `issued` and this is the second. The reason stays `stale_issued` and this is the
+    /// local annotation beside it, which is what the `SHOULD` asks a client to be able to say.
+    pub conflict: bool,
 }
 
 impl Verdict {
@@ -562,6 +574,7 @@ impl Verdict {
             counter: envelope.map(|e| e.counter),
             plaintext: Vec::new(),
             payload: None,
+            conflict: false,
         }
     }
 }
@@ -573,6 +586,21 @@ pub struct Committed {
     pub role: String,
     pub peer_id: String,
 }
+
+/// The highest counter a receiver has not refused from one key, and when it last moved
+/// (`CANONICAL.md` §6.1).
+#[derive(Debug, Clone, Copy)]
+struct Mark {
+    counter: u64,
+    /// The order the marks were last moved in, which is what [`Reader::cap_marks`] evicts by.
+    seen: u64,
+}
+
+/// How many marks a receiver keeps for keys its applied state does not commit
+/// (`PROTOCOL.md` §13.3's `MAY`). A room's roster is tens of seats on a busy day and each
+/// committed key has a mark of its own, so this bounds the announcement-driven growth without
+/// touching an honest room. It is not a bound on the keys themselves: nothing here holds one.
+const UNCOMMITTED_MARKS: usize = 64;
 
 /// One of `CANONICAL.md` §6.1's ten read steps that is also a client rule, so that a client's
 /// mutation census has to remove it from the byte layer to see what the rule was doing.
@@ -626,7 +654,9 @@ pub struct Reader {
     /// The guards a *client's* mutation census removes from the ten-step read
     /// (`runner/sealed.py`'s table, as much of it as a subject's mutation needs).
     pub mutations: Mutations,
-    marks: HashMap<KeyId, u64>,
+    marks: HashMap<KeyId, Mark>,
+    /// How many marks have been moved, which orders them for the cap in [`Reader::cap_marks`].
+    marks_moved: u64,
     /// The listing of the last applied state, with §5's refused paths dropped.
     pub listing: Vec<String>,
     /// Each key's held paths, by key id.
@@ -646,6 +676,7 @@ impl Reader {
             committed: BTreeMap::new(),
             mutations: Mutations::default(),
             marks: HashMap::new(),
+            marks_moved: 0,
             listing: Vec::new(),
             holds: HashMap::new(),
             issued: 0,
@@ -746,8 +777,7 @@ impl Reader {
         if self.replayed(key.id(), envelope.counter) {
             return Verdict::refused("replayed_counter", Some(envelope));
         }
-        let mark = self.marks.entry(key.id()).or_insert(0);
-        *mark = (*mark).max(envelope.counter);
+        self.mark(key.id(), envelope.counter);
         Verdict {
             ok: true,
             reason: None,
@@ -756,6 +786,7 @@ impl Reader {
             counter: Some(envelope.counter),
             plaintext,
             payload: Some(Payload::Announcement(announcement)),
+            conflict: false,
         }
     }
 
@@ -814,7 +845,13 @@ impl Reader {
             && issued <= self.issued
             && !self.mutations.contains(Guard::Issued)
         {
-            return Verdict::refused("stale_issued", Some(envelope));
+            let mut verdict = Verdict::refused("stale_issued", Some(envelope));
+            // §13.3: two connections of one host can publish states at one edition, and a
+            // second state at the mark is that divergence rather than an old state. A closing
+            // at the mark is not: it is one frame of one series, refused like any other.
+            verdict.conflict = issued == self.issued
+                && matches!(payload, Some(Payload::RoomState(_)));
+            return verdict;
         }
         // Step 10: a committed `viewer` may not send document content.
         if envelope.kind == 0
@@ -828,7 +865,60 @@ impl Reader {
     }
 
     fn replayed(&self, id: KeyId, counter: u64) -> bool {
-        counter <= self.marks.get(&id).copied().unwrap_or(0)
+        counter <= self.marks.get(&id).map_or(0, |mark| mark.counter)
+    }
+
+    /// Moves a key's mark to `counter` (`CANONICAL.md` §6.1). Only an accepted frame does: a
+    /// frame a receiver refuses never moves a mark, whatever step refused it.
+    fn mark(&mut self, id: KeyId, counter: u64) {
+        self.marks_moved = self.marks_moved.saturating_add(1);
+        let seen = self.marks_moved;
+        let mark = self.marks.entry(id).or_insert(Mark { counter: 0, seen });
+        mark.counter = mark.counter.max(counter);
+        mark.seen = seen;
+        self.cap_marks();
+    }
+
+    /// `PROTOCOL.md` §13.3's `MAY`: a peer that holds the room key can announce keys without
+    /// bound, and a receiver that kept a mark for every one carries that state for the life of
+    /// the room. The marks of the keys the applied state commits are kept — they are what the
+    /// room has told this receiver (`CANONICAL.md` §6.1) — and the rest are kept as far as
+    /// [`UNCOMMITTED_MARKS`], the most recently moved first.
+    ///
+    /// What the cap gives up is the mark of a key no state commits, and the cost is bounded to
+    /// one thing: such a key's *announcement* is read against its mark (step 5 is the only mark
+    /// read before the key is resolved), so a replayed announcement from an evicted key is
+    /// accepted again. Every other frame of that key is refused `uncommitted_key` whatever mark
+    /// stands against it. That is the trade §13.3 states rather than a defect.
+    fn cap_marks(&mut self) {
+        // The uncommitted count cannot exceed the number of marks there are, so below the cap
+        // nothing can be evicted and the set and the scan below are what the count would cost.
+        if self.marks.len() <= UNCOMMITTED_MARKS {
+            return;
+        }
+        let committed: BTreeSet<KeyId> =
+            self.committed.values().map(|peer| peer.key.id()).collect();
+        let uncommitted = self
+            .marks
+            .keys()
+            .filter(|id| !committed.contains(*id))
+            .count();
+        if uncommitted <= UNCOMMITTED_MARKS {
+            return;
+        }
+        let mut evictable: Vec<(u64, KeyId)> = self
+            .marks
+            .iter()
+            .filter(|(id, _)| !committed.contains(*id))
+            .map(|(id, mark)| (mark.seen, *id))
+            .collect();
+        evictable.sort_unstable();
+        for (_, id) in evictable
+            .into_iter()
+            .take(uncommitted.saturating_sub(UNCOMMITTED_MARKS))
+        {
+            let _ = self.marks.remove(&id);
+        }
     }
 
     #[expect(
@@ -843,8 +933,7 @@ impl Reader {
         payload: Option<Payload>,
     ) -> Verdict {
         if matches!(envelope.kind, 0 | 3) {
-            let mark = self.marks.entry(sender).or_insert(0);
-            *mark = (*mark).max(envelope.counter);
+            self.mark(sender, envelope.counter);
         }
         match payload.as_ref() {
             Some(Payload::RoomState(state)) => self.apply_state(state),
@@ -871,6 +960,7 @@ impl Reader {
             counter: Some(envelope.counter),
             plaintext,
             payload,
+            conflict: false,
         }
     }
 
@@ -1244,6 +1334,63 @@ mod tests {
         let (value, at) = read_varuint(&[0xac, 0x02, 0xff], 0).unwrap();
         assert_eq!(value, 300);
         assert_eq!(at, 2);
+    }
+
+    /// n2: `PROTOCOL.md` §13.3's `MAY`. A peer that holds the room key can announce keys
+    /// without bound, and a mark per key is state a receiver carries for the life of the room.
+    #[test]
+    fn the_marks_kept_for_keys_no_state_commits_are_capped() {
+        let key = room_key();
+        let frame_key = key.frame_key("R7f3a2c19");
+        let mut reader = Reader::new("R7f3a2c19", key, PublicKey([1u8; 32]));
+        let mut announced = Vec::new();
+        for index in 0..(UNCOMMITTED_MARKS + 8) {
+            let seed = u8::try_from(index).unwrap().saturating_add(1);
+            let signer = SessionKey::from_seed([seed; 32]);
+            let public = signer.public();
+            let frame = seal(
+                &Recipe {
+                    room_id: "R7f3a2c19",
+                    frame_key: &frame_key,
+                    kind: 4,
+                    epoch: 0,
+                    counter: 1,
+                    nonce: [seed; 12],
+                    signer: &signer,
+                },
+                format!("{{\"key\":\"{}\"}}", public.encode()).as_bytes(),
+            )
+            .unwrap()
+            .bytes();
+            let verdict = reader.read(&frame);
+            assert!(verdict.ok, "an announcement verifies on its own");
+            announced.push((public.id(), frame));
+        }
+        assert_eq!(
+            reader.marks.len(),
+            UNCOMMITTED_MARKS,
+            "the cap holds where no state commits anything"
+        );
+
+        // The oldest is what the cap gave up, and the mark it gave up is the one its
+        // announcement is read against: the same bytes are accepted again.
+        let (oldest_id, oldest_frame) =
+            announced.first().expect("an announcement was made");
+        assert!(!reader.marks.contains_key(oldest_id));
+        assert_eq!(
+            reader.read(oldest_frame).reason,
+            None,
+            "the evicted mark is the cost §13.3 states"
+        );
+
+        // The newest keep theirs, and a replay of one is still refused.
+        let (newest_id, newest_frame) =
+            announced.last().expect("an announcement was made");
+        assert!(reader.marks.contains_key(newest_id));
+        assert_eq!(
+            reader.read(newest_frame).reason.as_deref(),
+            Some("replayed_counter")
+        );
     }
 
     #[test]

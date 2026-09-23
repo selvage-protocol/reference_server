@@ -156,6 +156,12 @@ struct Replica {
 /// convenience, not the handshake, and an unreachable one decides nothing (§9.1).
 const META_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How much of a `/meta` response this client reads before refusing it. `META_TIMEOUT` bounds
+/// the time a server may take and not the bytes it may send, and the request goes to an
+/// authority an invite names: the meta document is a few hundred bytes at the reference server,
+/// so a longer one is not an answer about anything.
+const MAX_META_BYTES: u64 = 64 * 1024;
+
 /// Runs one connection attempt: socket, handshake, and the reply. Never retried here:
 /// a first connect that fails is a failure the caller sees, and a reconnect decides for
 /// itself whether another attempt is worth making.
@@ -199,12 +205,20 @@ pub async fn connect(
 /// is "the room reported nothing to size against", which is the same as a `/meta` that
 /// never answered, carried a body this client cannot read, or was not a `200`.
 pub async fn advertised_grace(base_url: &str) -> Option<Duration> {
+    let meta = read_meta(base_url).await?;
+    Some(Duration::from_millis(meta.keepalive.room_grace_ms))
+}
+
+/// `GET /meta`, read best-effort and bounded (`PROTOCOL.md` §2). `None` is "the room reported
+/// nothing": a read that did not answer, was not a `200`, or carried a body this client cannot
+/// read. A caller that decided something on a `None` would be deciding on the absence of a
+/// frame, and §2 says a `/meta` that could not be read is not an answer.
+pub async fn read_meta(base_url: &str) -> Option<proto::Meta> {
     let (authority, path) = meta_target(base_url)?;
     let body = timeout(META_TIMEOUT, http_get(&authority, &path))
         .await
         .ok()??;
-    let meta: proto::Meta = serde_json::from_str(&body).ok()?;
-    Some(Duration::from_millis(meta.keepalive.room_grace_ms))
+    serde_json::from_str(&body).ok()
 }
 
 /// The `host:port` and request path a `GET /meta` has to use, taken from the base URL
@@ -238,7 +252,18 @@ async fn http_get(authority: &str, path: &str) -> Option<String> {
     );
     stream.write_all(request.as_bytes()).await.ok()?;
     let mut response = String::new();
-    stream.read_to_string(&mut response).await.ok()?;
+    // One byte past the cap, so a body that is exactly the cap is read and a longer one is
+    // refused rather than truncated into a document that parses.
+    // One byte past the cap, so a body that is exactly the cap is read and a longer one is
+    // refused rather than truncated into a document that parses.
+    stream
+        .take(MAX_META_BYTES + 1)
+        .read_to_string(&mut response)
+        .await
+        .ok()?;
+    if response.len() as u64 > MAX_META_BYTES {
+        return None;
+    }
     let (head, body) = response.split_once("\r\n\r\n")?;
     head.starts_with("HTTP/1.1 200").then(|| body.to_string())
 }
@@ -1835,6 +1860,7 @@ mod tests {
     use std::time::Duration;
 
     use futures_util::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::{broadcast, mpsc, oneshot};
     use tokio::time::timeout;
@@ -1848,8 +1874,8 @@ mod tests {
     use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact};
 
     use super::{
-        EngineTask, MAX_INBOUND_BINARY_BYTES, Sink, Stream, encode_y_message,
-        fresh_doc, is_terminal_code, seed_update,
+        EngineTask, MAX_INBOUND_BINARY_BYTES, MAX_META_BYTES, Sink, Stream,
+        encode_y_message, fresh_doc, is_terminal_code, read_meta, seed_update,
     };
     use crate::editor::EngineEvent;
     use crate::engine::EditOp;
@@ -2462,6 +2488,68 @@ mod tests {
             );
         };
         Ok(code)
+    }
+
+    /// A server that answers one `GET` with `body` and closes, at an address of its own.
+    async fn meta_server(body: &str) -> Result<String, Box<dyn StdError>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        // The reader is given no `content-length` to trust: what bounds it is the cap, and a
+        // length header is exactly what a hostile server would lie about.
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}"
+        );
+        tokio::spawn(serve_once(listener, response));
+        Ok(format!("ws://{addr}"))
+    }
+
+    /// One request answered with `response`, then the socket closed.
+    async fn serve_once(listener: TcpListener, response: String) {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut request = [0u8; 1024];
+        let _ = socket.read(&mut request).await;
+        let _ = socket.write_all(response.as_bytes()).await;
+        let _ = socket.shutdown().await;
+    }
+
+    /// `GET /meta` is read from an authority an invite names, before any socket is opened, so
+    /// the bytes it may send are bounded and not only the time it may take (`PROTOCOL.md` §2,
+    /// §9.1): a server that answers with more than the cap is refused rather than read into
+    /// memory, and one that answers within it is read.
+    #[tokio::test]
+    async fn a_meta_body_past_the_cap_is_refused_and_one_within_it_is_read()
+    -> Result<(), Box<dyn StdError>> {
+        let served = r#"{"capabilities":[],"keepalive":{"awareness_expire_ms":45000,"awareness_renew_ms":15000,"ping_interval_ms":30000,"room_grace_ms":30000},"server":"selvaged/0.2.1","wire_versions":["selvage/1"]}"#;
+        assert!(
+            usize::try_from(MAX_META_BYTES)? > served.len(),
+            "the control is inside the cap the read is bounded by"
+        );
+        let within = meta_server(served).await?;
+        let read = timeout(Duration::from_secs(2), read_meta(&within)).await?;
+        assert_eq!(
+            read.map(|meta| meta.server).as_deref(),
+            Some("selvaged/0.2.1"),
+            "a meta within the cap is read"
+        );
+        let past = format!(
+            "{},\"padding\":\"{}\"}}",
+            &served[..served.len() - 1],
+            "x".repeat(usize::try_from(MAX_META_BYTES)? + 1)
+        );
+        assert!(
+            past.len() > usize::try_from(MAX_META_BYTES)?,
+            "the body refused below is past the cap"
+        );
+        let refused = meta_server(&past).await?;
+        assert!(
+            timeout(Duration::from_secs(2), read_meta(&refused))
+                .await?
+                .is_none(),
+            "a body past the cap was read into memory instead of refused"
+        );
+        Ok(())
     }
 
     /// An auth denial whose reason is not UTF-8: present on the wire but undecodable.

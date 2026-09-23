@@ -32,9 +32,10 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
 
 use selvage_protocol as proto;
-use selvage_protocol::{event, method};
+use selvage_protocol::{code, event, method};
 
 use crate::Error;
+use crate::engine::read_meta;
 use crate::host::{HostOptions, HostStore, ListingSource};
 use crate::peer::{Ending, Outcome, PeerInvite, PeerOptions, PeerSession};
 use crate::sealed::{
@@ -60,6 +61,19 @@ const EVENT_BACKLOG: usize = 64;
 /// stopped reading must not hold the task, its relay and its state alive for the life of the
 /// process, and past this bound the socket is ended like any other dropped one.
 pub const CLOSE_GRACE: Duration = Duration::from_secs(5);
+
+/// What this client says it speaks in every `selvage/2` hello, which is the whole of what it
+/// advertises (`PROTOCOL.md` §10).
+///
+/// `awareness` is deliberately not here. §10 defines the name as "the peer publishes
+/// presence", and this session publishes none: it takes an awareness frame in and applies it
+/// (`crate::peer::PeerSession::deliver`), and publishes no state of its own, renews none and
+/// forgets none (§8.2's `MUST`s). An advertisement is a claim a peer may size its UI on, so
+/// the honest list is the one capability this client does speak — §7's document sync. Adding
+/// the name back owes §8's producer half: publish a state, renew it every
+/// `keepalive.awareness_renew_ms`, forget a remote state not renewed inside
+/// `keepalive.awareness_expire_ms`, and republish on a `peer.joined` (§8.3's step 2).
+pub const CLIENT_CAPABILITIES_V2: &[&str] = &["y-protocols/1"];
 
 /// A peer as `selvage/2` records it: `PROTOCOL.md` §6.1's `PeerInfo` without `role`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,11 +240,14 @@ pub struct RelaySession {
 impl RelaySession {
     /// Mints a room; this connection is its host by holding the host key's private half.
     ///
+    /// `GET /meta` is read first (§2) and a server that names no version at major 2 this client
+    /// can speak is refused locally, before a socket is opened.
+    ///
     /// # Errors
     ///
     /// Returns [`Error`] when the socket cannot be opened, the server refuses the session, the
-    /// handshake does not finish inside [`HANDSHAKE_TIMEOUT`], or §7.1's first state cannot be
-    /// sealed from the invite's two keys.
+    /// handshake does not finish inside [`HANDSHAKE_TIMEOUT`], §2's version gate refuses the
+    /// server, or §7.1's first state cannot be sealed from the invite's two keys.
     pub async fn host(options: RelayHostOptions) -> Result<Self, Error> {
         let base = session_base(&options.base_url).ok_or_else(|| {
             Error::Invite(format!(
@@ -238,6 +255,7 @@ impl RelaySession {
                 link_address(&options.base_url)
             ))
         })?;
+        refuse_a_version_this_client_cannot_speak(&base).await?;
         let room_key = match options.room_key {
             Some(key) => key,
             None => random_room_key()?,
@@ -293,14 +311,20 @@ impl RelaySession {
 
     /// Joins the room an invite names; the fragment is read here and never reaches the socket.
     ///
+    /// `GET /meta` is read first (§2), as it is by [`RelaySession::host`].
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Invite`] when the link is not one this client can join with — including
     /// a link with no fragment, which carries neither of §5.1's two keys — and [`Error`] when
-    /// the socket cannot be opened or the server refuses the session.
+    /// §2's version gate refuses the server, the socket cannot be opened, or the server refuses
+    /// the session.
     pub async fn join(options: RelayJoinOptions) -> Result<Self, Error> {
         let invite =
             PeerInvite::parse(&options.invite).map_err(Error::Invite)?;
+        if let Some(base) = session_base(&invite.socket_url) {
+            refuse_a_version_this_client_cannot_speak(&base).await?;
+        }
         let awareness_client_id = mint_awareness_client_id()?;
         let dial = dial(
             &invite.socket_url,
@@ -442,6 +466,14 @@ impl RelaySession {
         self.read().ending
     }
 
+    /// The frames refused as a second state at an edition this client already holds (§13.3),
+    /// by the index the socket handed them as. They are in the session's dropped frames too,
+    /// with the reason `stale_issued`; this is the local annotation beside it.
+    #[must_use]
+    pub fn conflicts(&self) -> Vec<u64> {
+        self.read().session.conflicts().to_vec()
+    }
+
     /// The sentence for that ending, where the version has one.
     #[must_use]
     pub fn ending_sentence(&self) -> Option<&'static str> {
@@ -481,27 +513,31 @@ impl RelaySession {
     // --- what the caller hands in ----------------------------------------------
 
     /// §13.1's join order: a hold is taken once a state commits this connection's key, and the
-    /// whole set goes out when it changes rather than at the next renewal (§13.7).
+    /// whole set goes out when it changes rather than at the next renewal (§13.7) — the change
+    /// is announced on this call, and the clock it is stamped with is this connection's own.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Closed`] when the connection has ended.
     pub fn open(&self, path: &str) -> Result<(), Error> {
         self.moving(|state| {
-            state.session.open(path);
+            let clock = state.start.elapsed();
+            state.session.open(clock, path);
             Ok(())
         })
     }
 
     /// Releases every path. §13.7 asks for the empty set rather than for silence, so the room
-    /// learns in one hop instead of waiting out a lease.
+    /// learns in one hop instead of waiting out a lease — and, like [`Self::open`], on this
+    /// call rather than at the next renewal.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Closed`] when the connection has ended.
     pub fn release(&self) -> Result<(), Error> {
         self.moving(|state| {
-            state.session.release();
+            let clock = state.start.elapsed();
+            state.session.release(clock);
             Ok(())
         })
     }
@@ -1134,7 +1170,7 @@ fn hello(
 ) -> String {
     let params = proto::HelloParamsV2 {
         awareness_client_id: Some(awareness_client_id),
-        capabilities: proto::CAPABILITIES_V2
+        capabilities: CLIENT_CAPABILITIES_V2
             .iter()
             .map(ToString::to_string)
             .collect(),
@@ -1267,6 +1303,40 @@ fn refuse_tls(url: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// `PROTOCOL.md` §2's and §10's local stop: a reachable `/meta` that names no version at major
+/// 2 this client can speak is a refusal **before a socket is opened**, in this client's own
+/// words, and never a fall back to `selvage/1` — a version-2 peer and a version-1 peer cannot
+/// share a room, so a capability would only be a silent downgrade.
+///
+/// A `/meta` that could not be read is not that answer: §2 leaves the decision to the
+/// handshake, which refuses an unreadable server in its own words.
+async fn refuse_a_version_this_client_cannot_speak(
+    base: &str,
+) -> Result<(), Error> {
+    let Some(meta) = read_meta(base).await else {
+        return Ok(());
+    };
+    if meta
+        .wire_versions
+        .iter()
+        .any(|version| proto::version_of(version) == Some(proto::Version::V2))
+    {
+        return Ok(());
+    }
+    let listed = if meta.wire_versions.is_empty() {
+        "no wire version".to_string()
+    } else {
+        meta.wire_versions.join(", ")
+    };
+    Err(Error::Protocol {
+        code: code::UNSUPPORTED_VERSION.to_string(),
+        message: format!(
+            "{base} advertises {listed}: this client needs {WIRE_VERSION_V2} and does not \
+             fall back to an earlier version"
+        ),
+    })
+}
+
 /// A room key from the platform's CSPRNG (`CANONICAL.md` §6.1).
 fn random_room_key() -> Result<RoomKey, Error> {
     let mut bytes = [0u8; 32];
@@ -1317,16 +1387,17 @@ mod tests {
 
     use futures_util::SinkExt;
     use futures_util::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{mpsc, oneshot};
     use tokio::task::JoinHandle;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{
         RelayHostOptions, RelayJoinOptions, RelaySession, RelaySessionInfo,
-        clock_period, lock, session_base, start,
+        clock_period, hello, lock, session_base, start,
     };
     use crate::host::{HostOptions, ListingSource};
     use crate::peer::{PeerOptions, PeerSession};
@@ -1627,9 +1698,17 @@ mod tests {
 
     /// Whether a frame of this kind reached the server end.
     fn sent_kind(arrived: &Mutex<Vec<Arrived>>, kind: u64) -> bool {
-        lock(arrived).iter().any(
-            |frame| matches!(frame, Arrived::Sealed { kind: seen, .. } if *seen == kind),
-        )
+        sent_kinds(arrived, kind) > 0
+    }
+
+    /// How many frames of one kind reached the server end.
+    fn sent_kinds(arrived: &Mutex<Vec<Arrived>>, kind: u64) -> usize {
+        lock(arrived)
+            .iter()
+            .filter(|frame| {
+                matches!(frame, Arrived::Sealed { kind: seen, .. } if *seen == kind)
+            })
+            .count()
     }
 
     /// Whether one of the session's own text frames reached the server end.
@@ -1904,6 +1983,47 @@ mod tests {
         Ok(())
     }
 
+    /// m3: §13.7 asks a holder to re-announce *at once* when its held set changes, and the
+    /// session's tick is the room's own `awareness_renew_ms` — fifteen seconds at the reference
+    /// defaults. The renewal here is a minute, so a holds frame that reaches the server end
+    /// inside [`WAIT`] of the call is the change and not the clock task.
+    #[tokio::test]
+    async fn a_changed_held_set_leaves_without_waiting_for_the_renewal()
+    -> Result<(), Box<dyn StdError>> {
+        let slow = KeepaliveConfig {
+            awareness_renew: Duration::from_secs(60),
+            awareness_expire: Duration::from_secs(120),
+        };
+        let fixture = fixture(slow).await?;
+        let arrived = Arc::clone(&fixture.arrived);
+        assert_eq!(
+            sent_kinds(&arrived, 3),
+            0,
+            "a holder with nothing open and nothing said sends no holds message"
+        );
+
+        fixture.relay.open(PATH)?;
+        assert!(
+            held_within(WAIT, || sent_kinds(&arrived, 3) == 1).await,
+            "the changed set left on the call: {:?} arrived",
+            fixture.arrived()
+        );
+
+        // The release is the same obligation in the other direction: the empty set, and not
+        // silence.
+        fixture.relay.release()?;
+        assert!(
+            held_within(WAIT, || sent_kinds(&arrived, 3) == 2).await,
+            "the empty set left on the call: {:?} arrived",
+            fixture.arrived()
+        );
+        assert!(
+            fixture.relay.held_paths().is_empty(),
+            "the release is the whole set"
+        );
+        Ok(())
+    }
+
     /// §5.1: a base is what every URL this connection builds is made from, and the fragment is
     /// never part of a request — so an address that carries one is not a base.
     #[test]
@@ -1918,6 +2038,28 @@ mod tests {
             "the fragment's keys never reach a request"
         );
         assert_eq!(session_base("ws://h:8080#k=cd8"), None);
+    }
+
+    /// M1: an advertised capability is a claim a peer may act on, and §10 defines `awareness`
+    /// as "the peer publishes presence". This session publishes none — no state of its own, no
+    /// renewal, no expiry — so the hello carries the one name it does speak.
+    #[test]
+    fn the_version_two_hello_advertises_only_what_this_client_speaks() {
+        let client = "selvage-test/0.1.0".to_string();
+        let text = hello("Ada", Some(&client), 7);
+        let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(frame["v"], "selvage/2");
+        assert_eq!(frame["method"], "session.hello");
+        assert_eq!(
+            frame["params"]["capabilities"],
+            serde_json::json!(["y-protocols/1"]),
+            "§7's document sync is spoken here and §8's presence is not"
+        );
+        assert_eq!(
+            frame["params"]["awareness_client_id"],
+            serde_json::json!(7),
+            "the id is claimed in both versions and is an identity in neither (§8.4)"
+        );
     }
 
     /// The two keys a `PROTOCOL.md` §5.1 fragment carries, as a host mints them.
@@ -1942,8 +2084,10 @@ mod tests {
         );
     }
 
-    /// A server that completes the handshake and seats the connection in another room: the
-    /// one reply that makes `RelaySession::join` disagree with the address it dialled.
+    /// A server that answers `GET /meta` and then completes the handshake and seats the
+    /// connection in another room: the one reply that makes `RelaySession::join` disagree with
+    /// the address it dialled. `PROTOCOL.md` §2 has a client read `/meta` before it dials, so a
+    /// fixture that seats a client serves that read first.
     #[expect(
         clippy::excessive_nesting,
         reason = "a task's handshake is one place: the listener, the accept and the reply belong together"
@@ -1955,35 +2099,98 @@ mod tests {
         let addr = listener.local_addr()?;
         let seated = room.to_string();
         tokio::spawn(async move {
-            let Ok((tcp, _)) = listener.accept().await else {
-                return;
-            };
-            let Ok(mut socket) = tokio_tungstenite::accept_async(tcp).await
-            else {
-                return;
-            };
-            // The client's hello, then the seating reply.
-            let _ = socket.next().await;
-            let reply = serde_json::json!({
-                "v": "selvage/2",
-                "event": "room.joined",
-                "params": {
-                    "room_id": seated,
-                    "self": {"peer_id": "p-2", "display_name": "Bob"},
-                    "peers": [],
-                    "capabilities": [],
-                    "keepalive": {
-                        "awareness_renew_ms": 15000,
-                        "awareness_expire_ms": 30000,
-                        "ping_interval_ms": 30000,
-                    },
-                },
-            });
-            let _ = socket.send(Message::text(reply.to_string())).await;
-            // Hold the socket open so the dial reads the reply before any close.
-            let _ = socket.next().await;
+            while let Ok((tcp, _)) = listener.accept().await {
+                // Peeked and not read: the WebSocket handshake that follows a `/meta` read is
+                // read by `accept_async`, which needs those bytes still in the socket.
+                let asks_for_meta = request_line(&tcp)
+                    .await
+                    .is_some_and(|line| line.starts_with("GET /meta"));
+                if !asks_for_meta {
+                    let Ok(mut socket) =
+                        tokio_tungstenite::accept_async(tcp).await
+                    else {
+                        continue;
+                    };
+                    // The client's hello, then the seating reply.
+                    let _ = socket.next().await;
+                    let reply = serde_json::json!({
+                        "v": "selvage/2",
+                        "event": "room.joined",
+                        "params": {
+                            "room_id": seated,
+                            "self": {"peer_id": "p-2", "display_name": "Bob"},
+                            "peers": [],
+                            "capabilities": [],
+                            "keepalive": {
+                                "awareness_renew_ms": 15000,
+                                "awareness_expire_ms": 30000,
+                                "ping_interval_ms": 30000,
+                            },
+                        },
+                    });
+                    let _ = socket.send(Message::text(reply.to_string())).await;
+                    // Hold the socket open so the dial reads the reply before any close.
+                    let _ = socket.next().await;
+                    return;
+                }
+                let mut tcp = tcp;
+                // Consumed before the answer: a socket closed with bytes still unread in it is
+                // reset rather than ended, and this client reads to the end of the body.
+                let _ = drain_request(&mut tcp).await;
+                let body = br#"{"capabilities":["y-protocols/1","awareness"],"server":"selvage-test/0.1.0","wire_versions":["selvage/1","selvage/2"]}"#;
+                let answer = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = tcp.write_all(answer.as_bytes()).await;
+                let _ = tcp.write_all(body).await;
+            }
         });
         Ok(format!("ws://{addr}"))
+    }
+
+    /// The first line of a request, peeked and never consumed, so that the handshake behind it
+    /// can still be read. `None` for a connection that says nothing.
+    async fn request_line(tcp: &TcpStream) -> Option<String> {
+        let mut head = [0u8; 64];
+        let mut read = timeout(WAIT, tcp.peek(&mut head)).await.ok()?.ok()?;
+        while read > 0 && line_end(head.get(..read)?).is_none() {
+            read = timeout(WAIT, tcp.peek(&mut head)).await.ok()?.ok()?;
+        }
+        let arrived = head.get(..read)?;
+        String::from_utf8(arrived.get(..line_end(arrived)?)?.to_vec()).ok()
+    }
+
+    /// Where the first line of one request ends, or `None` while it has not arrived whole.
+    fn line_end(head: &[u8]) -> Option<usize> {
+        head.windows(2).position(|pair| pair == b"\r\n")
+    }
+
+    /// Reads one connection's request to its end, leaving nothing in the socket for the close
+    /// after the answer to turn into a reset.
+    async fn drain_request(tcp: &mut TcpStream) -> Option<()> {
+        let mut request: Vec<u8> = Vec::new();
+        let mut whole = false;
+        while !whole {
+            whole = read_a_chunk(tcp, &mut request).await?;
+        }
+        Some(())
+    }
+
+    /// One chunk of a request, appended, and whether the headers are now whole.
+    async fn read_a_chunk(
+        tcp: &mut TcpStream,
+        request: &mut Vec<u8>,
+    ) -> Option<bool> {
+        let mut chunk = [0u8; 64];
+        let read = timeout(WAIT, tcp.read(&mut chunk)).await.ok()?.ok()?;
+        request.extend_from_slice(chunk.get(..read)?);
+        Some(read == 0 || header_end(request).is_some())
+    }
+
+    /// Where one request's headers end, or `None` while they have not arrived whole.
+    fn header_end(request: &[u8]) -> Option<usize> {
+        request.windows(4).position(|four| four == b"\r\n\r\n")
     }
 
     /// R1: a refusal names the address, never the link. §5.1 forbids the fragment leaving a

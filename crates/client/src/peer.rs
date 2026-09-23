@@ -416,6 +416,10 @@ pub struct PeerSession {
     applied: Vec<Applied>,
     dropped: Vec<Dropped>,
     ignored: Vec<u64>,
+    /// The frames refused because they were a second state at an edition this client already
+    /// holds (§13.3). The reason is `stale_issued` like any other stale state; this is the
+    /// local annotation that says which of the two it was.
+    conflicts: Vec<u64>,
     ending: Option<Ending>,
     mutation: Option<String>,
     /// The first thing that went wrong on the way *out* — a CSPRNG that would not read, an
@@ -491,6 +495,7 @@ impl PeerSession {
             applied: Vec::new(),
             dropped: Vec::new(),
             ignored: Vec::new(),
+            conflicts: Vec::new(),
             ending: None,
             mutation: None,
             fault: None,
@@ -619,6 +624,16 @@ impl PeerSession {
         &self.ignored
     }
 
+    /// The frames refused as a second publication at an edition this client already holds
+    /// (§13.3), by the index they were handed as. They are in `dropped` too, with the reason
+    /// `stale_issued`: §13.3 keeps the reason and asks for the divergence to be visible beside
+    /// it, because two receivers can hold different listings at one edition and nothing on the
+    /// wire says which of the two is the host's latest.
+    #[must_use]
+    pub fn conflicts(&self) -> &[u64] {
+        &self.conflicts
+    }
+
     /// Why the session ended, if it has.
     #[must_use]
     pub const fn ending(&self) -> Option<Ending> {
@@ -718,7 +733,7 @@ impl PeerSession {
         let verdict = self.reader.read(frame);
         if !verdict.ok {
             self.note_refusal(clock, &verdict);
-            return self.refuse(index, verdict.reason.as_deref());
+            return self.refuse(index, &verdict);
         }
         let kind = verdict.kind.unwrap_or_default();
         if matches!(verdict.payload, Some(Payload::RoomState(_))) {
@@ -882,10 +897,19 @@ impl PeerSession {
     }
 
     /// One refused frame: §13.2's local report, which is never sent anywhere.
-    fn refuse(&mut self, frame: u64, reason: Option<&str>) -> Outcome {
+    fn refuse(&mut self, frame: u64, verdict: &Verdict) -> Outcome {
+        // §13.3: the reason stays `stale_issued` for a second state at one edition and for an
+        // older one alike, and this index is the local annotation beside it that says which of
+        // the two the frame was.
+        if verdict.conflict {
+            self.conflicts.push(frame);
+        }
         // Every refusal carries the step that refused it; one without a reason would be a bug
         // in the byte layer and not a decision to report.
-        let named = reason.unwrap_or("bad_envelope").to_string();
+        let named = verdict
+            .reason
+            .clone()
+            .unwrap_or_else(|| "bad_envelope".to_string());
         self.dropped.push(Dropped {
             frame,
             reason: named.clone(),
@@ -998,6 +1022,11 @@ impl PeerSession {
         } else {
             self.announce(clock);
         }
+        // §13.7: a holder's *first* holds message waits for the state that commits its key, so
+        // one that was open when that state landed announces here rather than a renewal late.
+        // Nothing goes out for a session that holds nothing and has said nothing, and nothing
+        // goes out until the key is committed — that test is `announce_holds`' own.
+        self.announce_holds(clock);
     }
 
     /// §13.2 and §13.3: a `kind = 0` plaintext, applied to the session document and answered.
@@ -1308,15 +1337,20 @@ impl PeerSession {
         let _ = self.departed.remove(seat);
         let _ = self.roster.insert(seat.to_string());
         // §13.7: a hold is re-announced when a peer is seated, so a joiner learns the room's
-        // held set without asking for it.
+        // held set without asking for it — on the event itself rather than at the next renewal,
+        // which is a whole window the joiner would spend holding nothing from this peer. The
+        // state goes first: a holds message resolves against the keys the applied state commits
+        // (§13.4), so a joiner that has applied no state yet refuses it `uncommitted_key`.
         self.holds_announced_at = None;
         if self.host.is_some() {
             self.publish_state(clock, HostReason::Roster);
+            self.announce_holds(clock);
             return;
         }
         if let Some(frame) = self.held_state_frame.clone() {
             self.republish(&frame);
         }
+        self.announce_holds(clock);
     }
 
     /// A seat has left, from `peer.left`: §13.8's clock can arm on it and §13.7's holds go.
@@ -1368,14 +1402,34 @@ impl PeerSession {
     }
 
     /// Opens a path: this client offers it, and its whole held set changes (§13.7).
-    pub fn open(&mut self, path: &str) {
+    ///
+    /// The change is announced here rather than left to the caller's next tick: §13.7 asks a
+    /// holder to re-announce at once when its set changes, and the tick's period is the room's
+    /// own `awareness_renew_ms` — fifteen seconds at the reference defaults, which is not
+    /// "at once". Nothing goes out while §13.1's step 4 withholds everything but the
+    /// announcement, and nothing goes out for a set that did not change.
+    pub fn open(&mut self, clock: Duration, path: &str) {
         let _ = self.held.insert(path.to_string());
+        self.announce_holds(clock);
     }
 
     /// Releases every path. §13.7 asks for the empty set rather than for silence, so the room
-    /// learns in one hop instead of waiting out a lease.
-    pub fn release(&mut self) {
+    /// learns in one hop instead of waiting out a lease — and it learns it here, for the reason
+    /// [`Self::open`] gives.
+    pub fn release(&mut self, clock: Duration) {
         self.held.clear();
+        self.announce_holds(clock);
+    }
+
+    /// Holds this one path and nothing else, announced once (§13.7).
+    ///
+    /// A holds message carries the whole set and no delta, so a caller replacing the set with
+    /// one path cannot say so with [`Self::release`] and [`Self::open`]: each announces the
+    /// change it makes, and the room would see an empty set between them.
+    pub fn hold_only(&mut self, clock: Duration, path: &str) {
+        self.held.clear();
+        let _ = self.held.insert(path.to_string());
+        self.announce_holds(clock);
     }
 
     /// A local edit, published as the delta it produced and never as the whole document.
@@ -1765,6 +1819,29 @@ mod tests {
         );
         assert_eq!(session.applied().len(), 1);
         assert_eq!(session.dropped().len(), 1);
+        // m2: §13.3's `SHOULD` — the second state at one edition is the divergence, and a
+        // state *below* the mark is an ordinary stale state. The reason is the same for both.
+        assert_eq!(session.conflicts(), [1]);
+    }
+
+    #[test]
+    fn a_state_below_the_mark_is_stale_and_not_a_conflict() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let first = state(&host(), 5, &[(&ours(), "guest", "p-self")]);
+        let old = state(&host(), 4, &[(&peer(), "guest", "p-other")]);
+        let _ = session.deliver(millis(1), &first);
+        assert_eq!(
+            session.deliver(millis(2), &old),
+            Outcome::Dropped {
+                reason: "stale_issued".to_string()
+            }
+        );
+        assert_eq!(session.dropped().len(), 1, "still refused, still named");
+        assert!(
+            session.conflicts().is_empty(),
+            "an edition below the mark is not two publications at one edition"
+        );
     }
 
     #[test]
@@ -2120,9 +2197,9 @@ mod tests {
         let _ = session.deliver(millis(1), &state);
         let _ = session.take_outbound();
 
-        session.open("README.md");
-        session.open("src/main.rs");
-        session.tick(millis(2));
+        // §13.7: a set that changed goes out with the change, and not at the next renewal —
+        // no `tick` between the two, so nothing else can have published it.
+        session.open(millis(2), "README.md");
         let out = session.take_outbound();
         assert_eq!(out.len(), 1, "a changed set goes out at once");
         let envelope = Envelope::parse(&out[0]).unwrap();
@@ -2130,18 +2207,89 @@ mod tests {
         let plaintext =
             opens(&room_key().frame_key(ROOM), ROOM, &envelope).unwrap();
         let payload: Value = serde_json::from_slice(&plaintext).unwrap();
-        assert_eq!(payload["holds"], json!(["README.md", "src/main.rs"]));
+        assert_eq!(payload["holds"], json!(["README.md"]));
 
-        session.release();
-        session.tick(millis(3));
+        // The whole set and no delta, so the second open carries both paths.
+        session.open(millis(3), "src/main.rs");
         let out = session.take_outbound();
         assert_eq!(out.len(), 1);
+        let envelope = Envelope::parse(&out[0]).unwrap();
+        let plaintext =
+            opens(&room_key().frame_key(ROOM), ROOM, &envelope).unwrap();
+        let payload: Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(payload["holds"], json!(["README.md", "src/main.rs"]));
+
+        // Opening a path that is already held changes nothing, so nothing is published.
+        session.open(millis(4), "README.md");
+        assert!(session.take_outbound().is_empty());
+
+        session.release(millis(5));
+        let out = session.take_outbound();
+        assert_eq!(out.len(), 1, "the empty set is a change like any other");
         assert_eq!(session.held().len(), 0);
         let envelope = Envelope::parse(&out[0]).unwrap();
         let plaintext =
             opens(&room_key().frame_key(ROOM), ROOM, &envelope).unwrap();
         let payload: Value = serde_json::from_slice(&plaintext).unwrap();
         assert_eq!(payload["holds"], json!([] as [&str; 0]));
+
+        // The whole set replaced by one path is one message: `release` and `open` would put an
+        // empty set on the wire between them, which is a release no caller asked for.
+        session.open(millis(6), "README.md");
+        let _ = session.take_outbound();
+        session.hold_only(millis(7), "src/main.rs");
+        let out = session.take_outbound();
+        assert_eq!(out.len(), 1, "a set replaced in one step is one message");
+        let envelope = Envelope::parse(&out[0]).unwrap();
+        let plaintext =
+            opens(&room_key().frame_key(ROOM), ROOM, &envelope).unwrap();
+        let payload: Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(payload["holds"], json!(["src/main.rs"]));
+    }
+
+    /// §13.7's two "at once" moments, which the tick alone does not honour: the state that
+    /// commits this key is where a holder's *first* holds message belongs, and a `peer.joined`
+    /// is where a joiner learns the room's holds.
+    #[test]
+    fn a_first_holds_message_and_a_joiner_are_answered_on_the_event() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        session.open(millis(1), "README.md");
+        assert!(
+            session.take_outbound().is_empty(),
+            "§13.1's step 4 withholds it until a state commits this key"
+        );
+
+        let committing = state(&host(), 1, &[(&ours(), "guest", "p-self")]);
+        let _ = session.deliver(millis(2), &committing);
+        let out = session.take_outbound();
+        let kinds: Vec<u64> = out
+            .iter()
+            .map(|frame| Envelope::parse(frame).unwrap().kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [0, 3],
+            "§13.1's step 6 handshake, then the first holds message: no tick between them"
+        );
+        assert_eq!(session.handshake(), 1);
+        assert_eq!(
+            session.published(),
+            2,
+            "the announcement and the holds message; the handshake is counted apart"
+        );
+
+        // A seat is seated: the state that will commit the joiner's key goes out with the event,
+        // and the room's holds behind it — a holds message resolves against the keys the applied
+        // state commits (§13.4), so one that arrives before the state is refused.
+        session.seat_joined(millis(3), "p-other");
+        let out = session.take_outbound();
+        let kinds: Vec<u64> = out
+            .iter()
+            .map(|frame| Envelope::parse(frame).unwrap().kind)
+            .collect();
+        assert_eq!(kinds, [1, 3], "the state the room holds, then the holds");
     }
 
     #[test]
