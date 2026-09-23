@@ -64,6 +64,10 @@ job_checks() {
   # rather than writes.
   say "checks: the public demo's deploy guard"
   nix build .#checks.x86_64-linux.prod-deploy --no-link --print-build-logs
+  # The same guard for the Pi's copy of the deploy script, which is that box's
+  # privilege model: the same request grammar, against the Pi's module.
+  say "checks: the Pi's deploy guard"
+  nix build .#checks.x86_64-linux.pi-deploy --no-link --print-build-logs
   # The public demo's front under a real nginx: that a source is refused, and that
   # one metered endpoint cannot spend another's budget. Both are about a running
   # proxy, so neither can be read out of the configuration.

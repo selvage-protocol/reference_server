@@ -1,0 +1,77 @@
+# The Pi demo at `100.64.0.3`, and nothing else.
+#
+# Two containers on the tailnet, on a Raspberry Pi 5: the page on port 80 and
+# the session server on 8080, both published on the tailnet address only. The
+# Pi's shape, tracked here so that a deployment artefact has a reviewable home
+# instead of existing only on the machine; `README.md` beside this file owns the
+# live state and the hand install, `packaging/prod/` is the same idea for the
+# public demo, and `packaging/pi-demo/` holds the native shape this replaced.
+#
+# This file is the source of truth for the shape. It installs to
+# `/root/selvage-compose/compose.yaml`; the Pi's copy is installed from this
+# directory by hand once. Which *images* run is not here — it is in `.env`
+# beside the file, one digest-pinned reference each, and `deploy.py` is the only
+# thing that moves them.
+#
+# The two images are interpolated from that file rather than written here, and
+# `${VAR:?…}` is what makes a missing one a refusal instead of an empty image
+# name. A digest is the deployment's record of what runs, so it has one home.
+
+name: selvage-pi-demo
+
+services:
+  # The session server, at the address the desktop clients already dial
+  # (`ws://100.64.0.3:8080`), so their default survives this shape.
+  selvaged:
+    image: ${SELVAGED_IMAGE:?set SELVAGED_IMAGE in .env to the published image, by digest}
+    # The image's own command adds `--serve-page /page`, and the page baked into
+    # it is the one built from the `web_client` revision the Dockerfile pins: a
+    # duplicate of the page that has its own released image below. This shape
+    # serves that image instead, so the flag is gone and the page and the server
+    # are one release each. The grace period is the value `/meta` advertises and
+    # the one both clients size their reconnect budget from.
+    command: ["--listen", "0.0.0.0:8080", "--room-grace-ms", "30000"]
+    ports:
+      # Tailnet address only: never 0.0.0.0, and never loopback (a guest could
+      # not reach loopback, and another process on the host could hold the port).
+      # The port mapping is the boundary; inside the container the wildcard bind
+      # is correct.
+      - "100.64.0.3:8080:8080"
+    # No volumes: the server is memory-only and keeps nothing on disk.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      # `watchtower` runs beside this stack on the Pi and watches every
+      # container on the host by default. Both demo containers are excluded
+      # here rather than by the digest pin alone: an unscoped watchtower honours
+      # `enable=false` without `--label-enable`, and one run with
+      # `--label-enable` monitors only containers that say `true`, so a single
+      # label bounds it either way. `watchtower/compose.yml` beside this file
+      # owns the other half of that arrangement.
+      com.centurylinklabs.watchtower.enable: "false"
+    restart: unless-stopped
+
+  # The browser client's page, on its own origin on the tailnet.
+  selvage-web:
+    image: ${SELVAGE_WEB_IMAGE:?set SELVAGE_WEB_IMAGE in .env to the published image, by digest}
+    ports:
+      # The container listens on 8080 and must: it runs as uid 101
+      # (nginx-unprivileged) with every capability dropped, and a non-root
+      # process cannot bind below 1024. The host side is the standard web port,
+      # narrowed to the tailnet address.
+      - "100.64.0.3:80:8080"
+    # No volumes and no tmpfs entry: the image moves nginx's pid file and its
+    # five temp directories onto /dev/shm, the tmpfs the container runtime
+    # mounts itself, which is what lets it run read-only with nothing writable
+    # mounted.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    restart: unless-stopped

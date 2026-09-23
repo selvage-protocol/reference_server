@@ -61,7 +61,12 @@ membership, or mode bits. Inaccessible files return `404`. With no page director
 server still answers `/meta` and `/session`, and `/` is `404`.
 
 `packaging/README.md` is the rest of it: tags and version truthfulness, the multi-arch
-build, the FSL-1.1-MIT redistribution question, the systemd user unit, and the Pi demo.
+build, the FSL-1.1-MIT redistribution question, the systemd user unit, and the two
+running deployments. The public demo and the Pi are each a tracked shape with a deploy
+script that box's CI user may run as root — `packaging/prod/` and `packaging/pi/` —
+dispatched by `.github/workflows/deploy-prod.yml` and
+`.github/workflows/deploy-pi.yml`. Moving every artefact of a release together is the
+release runbook's job: `ai_notes/docs/runbook-release.md`.
 
 ### Nix
 

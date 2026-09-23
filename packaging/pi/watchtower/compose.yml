@@ -1,0 +1,30 @@
+# The Pi's image updater, tracked here with the pin it needs.
+#
+# This is not part of the demo's stack. It is its own compose project on the Pi,
+# installed at `/home/pi/docker/watchtower/compose.yml`, and it was the one
+# unpinned reference on that host: `watchtower` with no tag resolves to `latest`,
+# and watchtower updates the containers it watches — itself included, by
+# recreating itself from whatever `latest` has become. So the Pi followed a
+# third party's releases, with the Docker socket mounted, and nothing in this
+# project ever proved the image that arrived.
+#
+# The pin below is the image the container is already running, named by its
+# digest. `docker image inspect nickfedor/watchtower:latest --format
+# '{{index .RepoDigests 0}}'` on the Pi is where the value came from.
+#
+# The other half of the bound is in `compose.yaml` beside this directory: both
+# demo containers carry `com.centurylinklabs.watchtower.enable=false`, so they
+# are excluded whether this instance runs scoped, label-filtered or unscoped,
+# and the only thing that can move them is `deploy.py`.
+#
+# This instance otherwise still watches every other container on the host. That
+# is the owner's arrangement and none of this project's business to change, so
+# it is left exactly as it was: the image is pinned, the demo stack is excluded,
+# and nothing else moves.
+services:
+  watchtower:
+    image: nickfedor/watchtower@sha256:2f8f2a9bd21a195b3b650409532a20f6aada8ef5834f00d0d7a999dee0779a81
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

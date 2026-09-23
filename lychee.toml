@@ -40,4 +40,9 @@ exclude = [
   # relays to, which is the documented shape of that deployment; a check reading
   # it as a broken link would be a check disagreeing with the design.
   "http://100.64.0.3:8080/",
+  # The same deployment by its MagicDNS name, which is what
+  # `.github/workflows/deploy-pi.yml` reads: that job joins the tailnet, where
+  # the name resolves, and the name resolves nowhere a checkout runs. Both ports
+  # are covered, because the page and the server are one image each now.
+  "^https?://lumi-raspberrypi[:/]",
 ]

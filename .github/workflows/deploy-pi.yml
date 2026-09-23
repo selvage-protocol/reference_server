@@ -1,0 +1,165 @@
+name: deploy-pi
+
+# The button that redeploys the Pi demo, `lumi-raspberrypi` on the tailnet.
+#
+# This is `deploy-prod.yml`'s shape for the second deployment: one job, behind
+# the `prod` environment, which is the only tailnet credential this project has.
+# The federated identity Tailscale issues the runner is constrained to
+# `repo:selvage-protocol@328844633/reference_server@1368869493:environment:prod`
+# — the immutable form — so a job that does not name that environment is still
+# issued an OIDC token whose `sub` claim names the ref instead, and the exchange
+# rejects it. Naming it here is what makes the approval gate and the credential's
+# scope the same condition: the run waits on the environment's required reviewer,
+# and the environment's secrets are unreadable until that approval passes.
+#
+# Then the tailnet, then Tailscale SSH as `deployci`, then one argument-free root
+# command. What a run may change is which of two already-published images the Pi
+# runs, and nothing else: the request carries two digest-pinned references and
+# the sha256 of `packaging/pi/compose.yaml`, which the box's copy is *verified*
+# against and never written from. A `deployci` account, a sudoers line for it and
+# a tailnet rule admitting `tag:ci` are what this needs on the box, and none of
+# the three exists yet — `packaging/pi/README.md` has the gap table. Until they
+# do, a dispatch of this workflow fails in the reachability step below, having
+# built a request on the runner and touched nothing.
+#
+# `workflow_dispatch` only, and the deploy that runs is the reviewed one on
+# `main`: no branch can deploy itself, and the *images* are chosen by the inputs.
+#
+# Every action is pinned by commit SHA with the version it is in a comment, the
+# same pins `deploy-prod.yml` uses and read back from the action's repository
+# when that file was written.
+on:
+  workflow_dispatch:
+    inputs:
+      server_version:
+        description: 'selvaged version to deploy (e.g. 0.4.0). Empty leaves the running one alone.'
+        required: false
+        default: ''
+      web_version:
+        description: 'selvage-web version to deploy (e.g. 0.4.0). Empty leaves the running one alone.'
+        required: false
+        default: ''
+
+# Two deploys never interleave, and a queued one is not silently dropped: an
+# approval gate in front of a run that another run cancels is a gate that lies.
+concurrency:
+  group: deploy-pi
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: prod
+    # `id-token: write` is what mints the OIDC token the Tailscale federated
+    # identity exchange needs, and it is only obtainable because this job names
+    # the environment above. Nothing here needs a write to the repository.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The request is built here, before the tailnet is joined and before
+      # anything reaches the box: every version is resolved to the digest the
+      # registry reports for it, so what runs is a digest and not a tag a
+      # publisher can repoint later. An input that is empty means "leave that
+      # service as it is" and its line is simply absent.
+      - name: resolve the versions to digests
+        env:
+          SERVER_VERSION: ${{ inputs.server_version }}
+          WEB_VERSION: ${{ inputs.web_version }}
+        run: |
+          set -euo pipefail
+          request="$RUNNER_TEMP/deploy-request"
+          echo "COMPOSE_SHA256=$(sha256sum packaging/pi/compose.yaml | cut -d' ' -f1)" >"$request"
+          if [ -n "$SERVER_VERSION" ]; then
+            digest=$(scripts/image-digest.py "ghcr.io/selvage-protocol/selvaged:$SERVER_VERSION")
+            echo "SELVAGED_IMAGE=ghcr.io/selvage-protocol/selvaged@$digest" >>"$request"
+          fi
+          if [ -n "$WEB_VERSION" ]; then
+            digest=$(scripts/image-digest.py "ghcr.io/selvage-protocol/selvage-web:$WEB_VERSION")
+            echo "SELVAGE_WEB_IMAGE=ghcr.io/selvage-protocol/selvage-web@$digest" >>"$request"
+          fi
+          if [ "$(wc -l <"$request")" -lt 2 ]; then
+            echo "nothing to deploy: name server_version, web_version or both" >&2
+            exit 1
+          fi
+          cat "$request"
+
+      # `ping` and the loop below are the answer to the tailnet being eventually
+      # consistent about a peer that came up seconds ago: verify reachability,
+      # then poll the predicate with a deadline rather than sleep and hope. The
+      # ephemeral node is logged out again in the action's post step, so nothing
+      # is left joined between runs. A tailnet rule naming `tag:ci` is what this
+      # needs and does not have yet; the loop is also where a missing one reports
+      # itself, as a `ssh` refused by policy or a connection that never answers.
+      - uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888 # v4.1.3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+          ping: lumi-raspberrypi
+
+      - name: wait for the box to answer as deployci
+        run: |
+          set -euo pipefail
+          last=''
+          deadline=$((SECONDS + 150))
+          while :; do
+            if last=$(ssh -o BatchMode=yes -o ConnectTimeout=10 \
+                -o StrictHostKeyChecking=accept-new \
+                deployci@lumi-raspberrypi true 2>&1); then
+              echo "deployci@lumi-raspberrypi answers"
+              break
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "deployci@lumi-raspberrypi did not answer within 150s; last: $last" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+      # The only privileged thing this job does, and it is one argument-free
+      # command line: `deployci` may run nothing else as root. The request goes
+      # in on stdin because the sudoers rule deliberately has no argument
+      # wildcard, and the script refuses every value that is not one of the two
+      # digest-pinned images or the compose file's own sha256.
+      - name: deploy
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o ConnectTimeout=10 \
+            deployci@lumi-raspberrypi \
+            '/usr/bin/sudo /usr/local/sbin/selvage-pi-deploy' \
+            <"$RUNNER_TEMP/deploy-request"
+
+      # A deploy that goes green because `docker compose` exited zero is a deploy
+      # nobody checked, so this reads what is actually serving, over the tailnet
+      # from the runner: the server's `/meta`, which must report the version this
+      # dispatch named, and the page, which must answer.
+      #
+      # Both reads go straight to the box. There is no front here — the tailnet is
+      # the boundary and each container publishes its own port — so there is no
+      # name for a read to present and nothing between the runner and the answer.
+      #
+      # `check-server-version.sh` polls `/meta` with its own deadline and reports
+      # what it last observed, and the page read is `curl`'s own bounded retry.
+      # What the page read proves is that a page is served, not which build it is:
+      # the page has no version read, which `packaging/prod/README.md` explains at
+      # length for the same reason.
+      - name: verify the box serves what was deployed
+        env:
+          SERVER_VERSION: ${{ inputs.server_version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SERVER_VERSION" ]; then
+            scripts/check-server-version.sh http://lumi-raspberrypi:8080 "$SERVER_VERSION"
+          fi
+          curl -sS --fail --max-time 5 --retry 5 --retry-delay 2 --retry-connrefused \
+            -o /dev/null http://lumi-raspberrypi/
+          echo "the page answers at http://lumi-raspberrypi/"
