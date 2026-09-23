@@ -154,15 +154,12 @@ pub struct RelayJoinOptions {
     pub keepalive: Option<KeepaliveConfig>,
 }
 
-/// The frames a session published while a change was made, in the order it produced them.
-type Published = Vec<Vec<u8>>;
-
-/// What one change to a session produced: its value, the frames it published, and the events
-/// the change is reported as.
+/// What one change to a session produced: its value, the events the change is reported as, and
+/// whether the socket's queue took every frame the change published.
 struct Moved<T> {
     value: T,
-    frames: Published,
     events: Vec<RelayEvent>,
+    queued: bool,
 }
 
 /// One frame on its way to the socket, or the socket's own end.
@@ -583,22 +580,24 @@ impl RelaySession {
 
     // --- the two paths every mutation takes -------------------------------------
 
-    /// Applies a change to the session, then puts what it published on the socket and reports
-    /// what the change is.
+    /// Applies a change to the session, puts what it published on the socket while the state
+    /// is still held, and reports what the change is.
     fn moving<T>(
         &self,
         change: impl FnOnce(&mut RelayState) -> Result<T, Error>,
     ) -> Result<T, Error> {
         let moved = self.moved(change)?;
         self.relay.emit(moved.events);
-        for frame in moved.frames {
-            self.send(Outbound::Binary(frame))?;
+        if !moved.queued {
+            return Err(Error::Closed);
         }
         Ok(moved.value)
     }
 
-    /// Runs a change under the lock and takes what the session published with it, so that no
-    /// frame is put on the socket while the state is held.
+    /// Runs a change under the lock and takes what the session published with it.
+    ///
+    /// The frames are handed to the socket's queue by the same lock the session assigned their
+    /// counters under ([`Relay::queue`]), so the counter order is the queue order.
     fn moved<T>(
         &self,
         change: impl FnOnce(&mut RelayState) -> Result<T, Error>,
@@ -608,13 +607,13 @@ impl RelaySession {
             return Err(Error::Closed);
         }
         let value = change(&mut state)?;
-        let frames = drain(&mut state);
+        let queued = Relay::queue(&mut state, &self.relay.outgoing);
         let events = report(&mut state);
         drop(state);
         Ok(Moved {
             value,
-            frames,
             events,
+            queued,
         })
     }
 
@@ -660,17 +659,12 @@ fn start(
             last_peers: peers,
         }),
         events: broadcast::channel(EVENT_BACKLOG).0,
-        outgoing: outgoing.clone(),
+        outgoing,
     });
     let (sink, stream) = socket.split();
-    let clock_task = tokio::spawn(clock(Arc::clone(&relay), outgoing.clone()));
-    let socket_task = tokio::spawn(socket_loop(
-        sink,
-        stream,
-        Arc::clone(&relay),
-        outgoing,
-        incoming,
-    ));
+    let clock_task = tokio::spawn(clock(Arc::clone(&relay)));
+    let socket_task =
+        tokio::spawn(socket_loop(sink, stream, Arc::clone(&relay), incoming));
     let me = RelaySession {
         relay,
         tasks: Mutex::new(vec![clock_task, socket_task]),
@@ -688,34 +682,44 @@ fn start(
 }
 
 /// The clock task (`§13.8`): the session's own timer, which nothing else moves it on.
-async fn clock(relay: Arc<Relay>, outgoing: mpsc::UnboundedSender<Outbound>) {
-    let renew = relay.read().info.keepalive.awareness_renew;
-    let mut ticker = interval(renew);
+///
+/// It ends with the session it belongs to. A socket that closed or errored ends the session as
+/// `room-gone` without destroying it, and a clock left ticking into an ended session would hold
+/// the relay, its state and its event channel alive for the rest of the process while
+/// publishing nothing.
+async fn clock(relay: Arc<Relay>) {
+    let mut ticker = interval(clock_period(&relay.read().info.keepalive));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        let frames = relay.tick_once();
-        if relay.read().destroyed {
-            return;
-        }
-        let sent = frames.into_iter().all(|frame| outgoing.send(frame).is_ok());
-        if !sent {
+        let queued = relay.tick_once();
+        let state = relay.read();
+        if state.destroyed || state.ending.is_some() || !queued {
             return;
         }
     }
 }
 
+/// The period the clock task runs at.
+///
+/// `interval` panics on a zero period, and the value is either the room's advertised keepalive
+/// — §8.2 asks a server for "anything positive", which a client cannot enforce — or the
+/// caller's override, so it is floored here rather than trusted. A renewal that is not a
+/// duration at all is not a session quietly ticking nothing.
+fn clock_period(keepalive: &KeepaliveConfig) -> Duration {
+    keepalive.awareness_renew.max(Duration::from_millis(1))
+}
+
 /// The socket task: one inbound frame at a time, and whatever the session produced after it.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the two halves of the socket, the relay and its two channels are what the task owns"
+    reason = "the two halves of the socket, the relay and its inbound queue are what the task owns"
 )]
 async fn socket_loop(
     mut sink: Sink,
     mut stream: Stream,
     relay: Arc<Relay>,
-    outgoing: mpsc::UnboundedSender<Outbound>,
     mut incoming: mpsc::UnboundedReceiver<Outbound>,
 ) {
     loop {
@@ -725,17 +729,16 @@ async fn socket_loop(
                     relay.closed();
                     return;
                 };
-                let produced = match message {
+                let queued = match message {
                     Ok(Message::Binary(frame)) => relay.deliver(&frame),
                     Ok(Message::Text(text)) => relay.hear(&text),
-                    Ok(_) => Vec::new(),
+                    Ok(_) => true,
                     Err(_) => {
                         relay.closed();
                         return;
                     }
                 };
-                let sent = produced.into_iter().all(|frame| outgoing.send(frame).is_ok());
-                if !sent {
+                if !queued {
                     return;
                 }
             }
@@ -789,64 +792,65 @@ impl Relay {
     }
 
     /// One tick of the session's own clocks, then whatever it published.
-    fn tick_once(&self) -> Vec<Outbound> {
-        let (frames, events) = self.ticked();
+    ///
+    /// Returns whether the socket's queue took every frame.
+    fn tick_once(&self) -> bool {
+        let (queued, events) = self.ticked();
         self.emit(events);
-        frames.into_iter().map(Outbound::Binary).collect()
+        queued
     }
 
-    fn ticked(&self) -> (Vec<Vec<u8>>, Vec<RelayEvent>) {
+    fn ticked(&self) -> (bool, Vec<RelayEvent>) {
         let mut state = self.read();
         if state.destroyed || state.ending.is_some() {
-            return (Vec::new(), Vec::new());
+            return (true, Vec::new());
         }
         let clock = state.start.elapsed();
         state.session.tick(clock);
-        let frames = drain(&mut state);
+        let queued = Self::queue(&mut state, &self.outgoing);
         let events = report(&mut state);
-        (frames, events)
+        (queued, events)
     }
 
-    /// One sealed frame, as the relay delivered it.
-    fn deliver(&self, frame: &[u8]) -> Vec<Outbound> {
-        let (frames, events) = self.delivered(frame);
+    /// One sealed frame, as the relay delivered it. Returns whether the socket's queue took
+    /// every frame the delivery answered with.
+    fn deliver(&self, frame: &[u8]) -> bool {
+        let (queued, events) = self.delivered(frame);
         self.emit(events);
-        frames.into_iter().map(Outbound::Binary).collect()
+        queued
     }
 
-    fn delivered(&self, frame: &[u8]) -> (Vec<Vec<u8>>, Vec<RelayEvent>) {
+    fn delivered(&self, frame: &[u8]) -> (bool, Vec<RelayEvent>) {
         let mut state = self.read();
         let clock = state.start.elapsed();
         let outcome = state.session.deliver(clock, frame);
         // §13.5's content, and only content: a state, a holds set and a closing change no text.
         let content = matches!(outcome, Outcome::Applied { kind: 0 });
-        let frames = drain(&mut state);
+        let queued = Self::queue(&mut state, &self.outgoing);
         let mut events = report(&mut state);
         if content {
             events.push(RelayEvent::Text);
         }
-        (frames, events)
+        (queued, events)
     }
 
-    /// One text frame: the roster's events, a fault, or the room's end.
-    fn hear(&self, text: &str) -> Vec<Outbound> {
+    /// One text frame: the roster's events, a fault, or the room's end. Returns whether the
+    /// socket's queue took every frame the event answered with.
+    fn hear(&self, text: &str) -> bool {
         let Ok(message) = proto::ServerMessage::from_text(text) else {
-            return Vec::new();
+            return true;
         };
         if message.event.as_deref() == Some(event::SESSION_ERROR) {
             self.emit(vec![RelayEvent::Failed(self.note_fault(&message))]);
-            return Vec::new();
+            return true;
         }
-        let (frames, events) = self.heard(&message);
+        let (queued, events) = self.heard(&message);
         self.emit(events);
-        frames.into_iter().map(Outbound::Binary).collect()
+        queued
     }
 
     /// A server-authored frame, folded into the session, with what the two produced.
-    fn heard(
-        &self,
-        message: &proto::ServerMessage,
-    ) -> (Vec<Vec<u8>>, Vec<RelayEvent>) {
+    fn heard(&self, message: &proto::ServerMessage) -> (bool, Vec<RelayEvent>) {
         let mut state = self.read();
         let clock = state.start.elapsed();
         match message.event.as_deref() {
@@ -862,8 +866,31 @@ impl Relay {
             Some(event::ROOM_GONE) => state.end(RelayEnding::RoomGone),
             _ => {}
         }
-        let frames = drain(&mut state);
-        (frames, report(&mut state))
+        let queued = Self::queue(&mut state, &self.outgoing);
+        let events = report(&mut state);
+        (queued, events)
+    }
+
+    /// Hands a session's published frames to the socket's queue, while the caller still holds
+    /// the state lock they were published under.
+    ///
+    /// `CANONICAL.md` §6.1 numbers a frame under the key that signs it, and a receiver refuses
+    /// a `kind = 0`, `3` or `4` frame "at or below the mark" it has already advanced. The next
+    /// counter is taken under this lock, so the queue push has to happen under it too: a push
+    /// after the lock was released can be overtaken by another producer — the socket task, the
+    /// clock task, another caller — that took the lock in the gap, and the room then reads the
+    /// two frames with their counters the wrong way round and refuses the earlier one
+    /// `replayed_counter`.
+    ///
+    /// Returns whether the queue took every frame. A queue that is gone is a socket task that
+    /// has ended.
+    fn queue(
+        state: &mut RelayState,
+        outgoing: &mpsc::UnboundedSender<Outbound>,
+    ) -> bool {
+        drain(state)
+            .into_iter()
+            .all(|frame| outgoing.send(Outbound::Binary(frame)).is_ok())
     }
 
     /// One `session.error`: the server's own words, kept and reported, and never fatal.
@@ -1031,8 +1058,15 @@ fn peer_of(params: &serde_json::Value) -> Option<RelayPeer> {
 
 /// The server base of a URL, without the endpoint path. It is what a mint dials and what the
 /// invite is built from.
+///
+/// `PROTOCOL.md` §5.1: the fragment carries the room's keys and is never part of a request, so
+/// an address with one is not a base. A base is what every URL this connection builds is made
+/// from, and a fragment left in it would ride into each of them.
 fn session_base(url: &str) -> Option<String> {
     let (address, _) = url.split_once('?').unwrap_or((url, ""));
+    if address.contains('#') {
+        return None;
+    }
     let base = address
         .strip_suffix(proto::ENDPOINT_PATH)
         .unwrap_or(address);
@@ -1214,4 +1248,418 @@ fn mint_awareness_client_id() -> Result<u64, Error> {
 /// Reports a sealed-layer failure as this crate's own error.
 fn sealed(error: &SealedError) -> Error {
     Error::Yjs(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::error::Error as StdError;
+    use std::hint::spin_loop;
+    use std::num::NonZeroUsize;
+    use std::sync::{Arc, Mutex};
+    use std::thread::{
+        JoinHandle as ThreadHandle, available_parallelism, spawn,
+    };
+    use std::time::{Duration, Instant};
+
+    use futures_util::StreamExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
+    use tokio::time::sleep;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::Message;
+
+    use super::{
+        RelaySession, RelaySessionInfo, clock_period, lock, session_base, start,
+    };
+    use crate::host::{HostOptions, ListingSource};
+    use crate::peer::{PeerOptions, PeerSession};
+    use crate::sealed::{Envelope, KeyId, RoomKey, SessionKey};
+    use crate::session::KeepaliveConfig;
+
+    const ROOM: &str = "r-1";
+    const SEAT: &str = "p-self";
+    const PATH: &str = "notes.txt";
+    const HOST_SEED: [u8; 32] = [3; 32];
+    const OWN_SEED: [u8; 32] = [5; 32];
+
+    /// How long a test waits for a predicate of its own before it reports what it saw.
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// How long two editors edit one connection during the race below.
+    const WINDOW: Duration = Duration::from_millis(600);
+
+    /// The clocks these tests run the session on: a renewal short enough for the clock task to
+    /// move during a test, and a lease long enough not to lapse.
+    const fn keepalive() -> KeepaliveConfig {
+        KeepaliveConfig {
+            awareness_renew: Duration::from_millis(1),
+            awareness_expire: Duration::from_secs(30),
+        }
+    }
+
+    /// One frame as it arrived at the server end.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Arrived {
+        /// A `selvage/2` frame, as §6.1's clear prefix writes it: the key that signed it, its
+        /// kind, and the counter under that key.
+        Sealed {
+            key_id: KeyId,
+            kind: u64,
+            counter: u64,
+        },
+        /// A text frame — the session's own, such as a rename.
+        Text,
+    }
+
+    /// A relay over a loopback WebSocket, with this test as the server end.
+    ///
+    /// Nothing dials anywhere and no server is involved, so the relay's own wiring is the
+    /// subject rather than a room. The server end reads every frame the client sends, in the
+    /// order the socket delivers it, and records §6.1's clear prefix: the sealing covers none
+    /// of it, and an end holding no key still reads the order a sender numbered its frames in.
+    struct Fixture {
+        relay: Arc<RelaySession>,
+        arrived: Arc<Mutex<Vec<Arrived>>>,
+        close: Option<oneshot::Sender<()>>,
+        clock: Option<JoinHandle<()>>,
+    }
+
+    impl Fixture {
+        /// The frames that arrived so far, in order.
+        fn arrived(&self) -> Vec<Arrived> {
+            lock(&self.arrived).clone()
+        }
+
+        /// Ends the room's socket the way a server that goes away does.
+        fn end_the_socket(&mut self) {
+            let close = self.close.take();
+            let _ = close.map(|sender| sender.send(()));
+        }
+
+        /// Takes the clock task's handle, so a test can watch it end. Taking the handle does
+        /// not stop the task: a dropped handle leaves a task running.
+        fn take_clock(&mut self) -> Option<JoinHandle<()>> {
+            self.clock.take()
+        }
+    }
+
+    /// A seated relay over a loopback socket: a host session, seeded from constants, whose own
+    /// mint state commits its key — so a local edit is published rather than held back.
+    async fn fixture(
+        keepalive: KeepaliveConfig,
+    ) -> Result<Fixture, Box<dyn StdError>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (server, client) = tokio::try_join!(
+            async {
+                let (tcp, _) = listener.accept().await?;
+                let socket = tokio_tungstenite::accept_async(tcp).await?;
+                Ok::<_, Box<dyn StdError>>(socket)
+            },
+            async {
+                let url = format!("ws://{addr}/session");
+                let (socket, _) = tokio_tungstenite::connect_async(url).await?;
+                Ok::<_, Box<dyn StdError>>(socket)
+            },
+        )?;
+
+        let arrived = Arc::new(Mutex::new(Vec::new()));
+        let (close, closed) = oneshot::channel();
+        tokio::spawn(serving(server, Arc::clone(&arrived), closed));
+
+        let listing: ListingSource = Arc::new(Vec::new);
+        let session = PeerSession::new(&PeerOptions {
+            room_id: ROOM.to_string(),
+            room_key: RoomKey([7; 32]),
+            host_key: SessionKey::from_seed(HOST_SEED).public(),
+            renew: keepalive.awareness_renew,
+            expire: keepalive.awareness_expire,
+            seat: Some(SEAT.to_string()),
+            roster: BTreeSet::new(),
+            fixed_session_key: Some(OWN_SEED),
+            declared_role: None,
+            awareness_client_id: Some(7),
+            host: Some(HostOptions {
+                host_seed: HOST_SEED,
+                listing,
+                store: None,
+            }),
+        })?;
+        let info = RelaySessionInfo {
+            room_id: ROOM.to_string(),
+            token: Some("t-1".to_string()),
+            seat: SEAT.to_string(),
+            peers: Vec::new(),
+            capabilities: Vec::new(),
+            keepalive,
+            base_url: format!("ws://{addr}"),
+        };
+        let relay = start(client, session, info, None);
+        // `start` spawns the clock task first and the socket task after it: this end keeps the
+        // clock's handle and lets the socket's go, which leaves that task running.
+        let mut tasks = {
+            let mut held = lock(&relay.tasks);
+            held.drain(..).collect::<Vec<_>>()
+        };
+        let clock = tasks.drain(..1).next();
+        Ok(Fixture {
+            relay: Arc::new(relay),
+            arrived,
+            close: Some(close),
+            clock,
+        })
+    }
+
+    /// The server end: what the client sent, until the socket ends.
+    async fn serving(
+        mut socket: WebSocketStream<TcpStream>,
+        arrived: Arc<Mutex<Vec<Arrived>>>,
+        mut close: oneshot::Receiver<()>,
+    ) {
+        loop {
+            tokio::select! {
+                arriving = socket.next() => match arriving {
+                    Some(Ok(Message::Binary(frame))) => {
+                        if let Ok(envelope) = Envelope::parse(&frame) {
+                            lock(&arrived).push(Arrived::Sealed {
+                                key_id: envelope.key_id,
+                                kind: envelope.kind,
+                                counter: envelope.counter,
+                            });
+                        }
+                    }
+                    Some(Ok(Message::Text(_))) => lock(&arrived).push(Arrived::Text),
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => return,
+                },
+                _ = &mut close => {
+                    let _ = socket.close(None).await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Waits for a predicate of this test's own, with a deadline, and says whether it held. The
+    /// predicate is polled rather than slept on: what a test waits for is the effect.
+    async fn held_within(
+        deadline: Duration,
+        mut predicate: impl FnMut() -> bool,
+    ) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < deadline && !predicate() {
+            sleep(Duration::from_millis(2)).await;
+        }
+        predicate()
+    }
+
+    /// One editor's whole job: local inserts into one connection until its window closes.
+    fn edit_for(relay: &RelaySession, window: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < window {
+            let _ = relay.insert(PATH, 0, "x");
+        }
+    }
+
+    /// A thread that only burns its core, which is what puts a preemption inside the window the
+    /// race below needs.
+    fn burn_for(window: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < window {
+            spin_loop();
+        }
+    }
+
+    /// One editor on a thread of its own.
+    fn editor(relay: Arc<RelaySession>, window: Duration) -> ThreadHandle<()> {
+        spawn(move || edit_for(&relay, window))
+    }
+
+    /// One core burned by a thread of its own.
+    fn noisy(window: Duration) -> ThreadHandle<()> {
+        spawn(move || burn_for(window))
+    }
+
+    /// The editors: two connections' worth of local edits, each on its own thread.
+    fn editors(
+        relay: &Arc<RelaySession>,
+        count: usize,
+    ) -> Vec<ThreadHandle<()>> {
+        (0..count)
+            .map(|_| editor(Arc::clone(relay), WINDOW))
+            .collect()
+    }
+
+    /// One burnt core per core, which is what puts a preemption inside the window the race
+    /// below needs.
+    fn noise(count: usize) -> Vec<ThreadHandle<()>> {
+        (0..count).map(|_| noisy(WINDOW)).collect()
+    }
+
+    /// Joins the threads a test started, so a panic inside one is the test's failure and never
+    /// a green run.
+    fn joined(threads: Vec<ThreadHandle<()>>, what: &str) {
+        for thread in threads {
+            assert!(thread.join().is_ok(), "a {what} thread panicked");
+        }
+    }
+
+    /// The counters of the frames one key signed, in the order the socket delivered them.
+    fn counters_of(arrived: &[Arrived], key: KeyId) -> Vec<u64> {
+        arrived
+            .iter()
+            .filter_map(|frame| match frame {
+                Arrived::Sealed {
+                    key_id, counter, ..
+                } if *key_id == key => Some(*counter),
+                Arrived::Sealed { .. } | Arrived::Text => None,
+            })
+            .collect()
+    }
+
+    /// Whether a frame of this kind reached the server end.
+    fn sent_kind(arrived: &Mutex<Vec<Arrived>>, kind: u64) -> bool {
+        lock(arrived).iter().any(
+            |frame| matches!(frame, Arrived::Sealed { kind: seen, .. } if *seen == kind),
+        )
+    }
+
+    /// Whether one of the session's own text frames reached the server end.
+    fn sent_text(arrived: &Mutex<Vec<Arrived>>) -> bool {
+        lock(arrived)
+            .iter()
+            .any(|frame| matches!(frame, Arrived::Text))
+    }
+
+    /// Refuses the first counter that does not advance. The order the counters leave in is what
+    /// a receiver's mark is kept on (`CANONICAL.md` §6.1): a `kind = 0`, `3` or `4` frame at or
+    /// below the mark is refused whatever else is right about it.
+    fn the_counters_advance(counters: &[u64]) {
+        let mut previous = 0;
+        for (index, counter) in counters.iter().enumerate() {
+            assert!(
+                *counter > previous,
+                "frame {index} of {} carries counter {counter} after {previous}: a later frame \
+                 reached the socket first, and a peer refuses the earlier one as \
+                 `replayed_counter`",
+                counters.len()
+            );
+            previous = *counter;
+        }
+    }
+
+    /// M1: a frame's counter is assigned under the state lock, so the order the socket's queue
+    /// takes the frames in has to be that same order. Two tasks editing one connection
+    /// interleave inside that lock, and what leaves must be the order the session numbered the
+    /// frames in: a reordered pair costs the earlier edit until §13.6's re-sync repairs it.
+    ///
+    /// **This test is a race, and it is built to lose it.** The gap the defect lives in is
+    /// between releasing the lock and handing the frame over, and nothing but a preemption
+    /// widens it: the editors run on threads of their own and the test burns a core per core
+    /// while they do, because on a machine with a core to spare the publisher always reaches
+    /// its push first and the arrangement under test — the push after the lock — would pass.
+    /// What it measures is the wire order, which is what a peer's mark is kept on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_editors_frames_leave_in_the_order_they_were_numbered()
+    -> Result<(), Box<dyn StdError>> {
+        let mut fixture = fixture(keepalive()).await?;
+        fixture.relay.open(PATH)?;
+
+        joined(editors(&fixture.relay, 2), "editor");
+        joined(
+            noise(available_parallelism().map_or(4, NonZeroUsize::get)),
+            "noise",
+        );
+
+        // A text frame the session sends after the last edit is the sentinel that says the
+        // queue holds none of theirs any more: everything the editors published is already at
+        // this end, in the order the socket delivered it.
+        fixture.relay.rename("done")?;
+        let arrived = Arc::clone(&fixture.arrived);
+        assert!(
+            held_within(WAIT, || sent_text(&arrived)).await,
+            "the sentinel frame arrives"
+        );
+
+        let counters = counters_of(
+            &fixture.arrived(),
+            SessionKey::from_seed(OWN_SEED).public().id(),
+        );
+        assert!(
+            counters.len() > 100,
+            "the two editors published frames: {} arrived",
+            counters.len()
+        );
+        the_counters_advance(&counters);
+        fixture.end_the_socket();
+        Ok(())
+    }
+
+    /// m1: the clock task ends with the session it belongs to. A socket that closed or errored
+    /// ends the session as `room-gone` without destroying it, and a clock that watched only
+    /// `destroyed` would tick into an ended session for the rest of the process, holding the
+    /// relay, its state and its event channel alive while publishing nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_clock_task_ends_with_a_closed_socket()
+    -> Result<(), Box<dyn StdError>> {
+        let mut fixture = fixture(keepalive()).await?;
+        let clock =
+            fixture.take_clock().ok_or("the fixture has a clock task")?;
+        assert!(
+            !clock.is_finished(),
+            "the clock runs while the room's socket does"
+        );
+        fixture.end_the_socket();
+        assert!(
+            held_within(WAIT, || clock.is_finished()).await,
+            "the clock task is still running after the socket closed"
+        );
+        Ok(())
+    }
+
+    /// m4: `interval` panics on a zero period, and that period is either the room's advertised
+    /// keepalive — which `PROTOCOL.md` §8.2 lets a server write however it likes — or the
+    /// caller's own override, so it is floored before it is used. The assertion is that the
+    /// session keeps moving: a spawned panic is not a failed test, and a clock that died is a
+    /// session that never renews its holds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_zero_second_renewal_still_ticks() -> Result<(), Box<dyn StdError>>
+    {
+        let zero = KeepaliveConfig {
+            awareness_renew: Duration::ZERO,
+            awareness_expire: Duration::from_secs(30),
+        };
+        assert_eq!(
+            clock_period(&zero),
+            Duration::from_millis(1),
+            "a zero renewal is floored rather than handed to `interval`"
+        );
+        let fixture = fixture(zero).await?;
+        fixture.relay.open(PATH)?;
+        let arrived = Arc::clone(&fixture.arrived);
+        assert!(
+            held_within(WAIT, || sent_kind(&arrived, 3)).await,
+            "the clock task publishes the held set: {} frames arrived",
+            fixture.arrived().len()
+        );
+        Ok(())
+    }
+
+    /// §5.1: a base is what every URL this connection builds is made from, and the fragment is
+    /// never part of a request — so an address that carries one is not a base.
+    #[test]
+    fn a_base_with_a_fragment_is_refused() {
+        assert_eq!(
+            session_base("ws://h:8080/session?room=r-1"),
+            Some("ws://h:8080".to_string())
+        );
+        assert_eq!(
+            session_base("ws://h:8080/session#k=cd8&h=cd8"),
+            None,
+            "the fragment's keys never reach a request"
+        );
+        assert_eq!(session_base("ws://h:8080#k=cd8"), None);
+    }
 }
