@@ -14,6 +14,7 @@
 pub mod editor;
 mod engine;
 pub mod error;
+pub mod host;
 pub mod peer;
 pub mod presence;
 pub mod sealed;
@@ -29,6 +30,11 @@ pub use selvage_protocol::{Keepalive, PeerInfo, Role, WIRE_VERSION};
 pub use crate::editor::{EditorAdapter, EngineEvent, drive_editor};
 pub use crate::engine::{Command, EditOp};
 pub use crate::error::Error;
+pub use crate::host::{
+    HostOptions, HostPublication, HostProducer, HostReason, HostStore, ListingSource,
+    PersistedHost,
+};
+pub use crate::peer::{PeerInvite, PeerOptions, PeerSession};
 pub use crate::presence::{
     Anchor, AwarenessState, ItemId, Presence, Selection, SelectionOffsets,
 };

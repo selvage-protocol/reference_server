@@ -16,9 +16,11 @@
 //! own tests be about the rule rather than about how long a machine took.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::mem;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use yrs::block::ClientID;
 use yrs::sync::protocol::{DefaultProtocol, Protocol as YProtocol};
 use yrs::sync::{Awareness, Message as YMessage, SyncMessage};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
@@ -26,9 +28,10 @@ use yrs::{Doc, GetString, OffsetKind, Options, ReadTxn, Text, Transact};
 
 use selvage_protocol as proto;
 
+use crate::host::{HostOptions, HostProducer, HostReason};
 use crate::sealed::{
-    FrameKey, Guard, KeyId, Payload, PublicKey, Reader, Recipe, RoomKey,
-    SealedError, SessionKey, Verdict, fresh_nonce, seal,
+    Announcement, FrameKey, Guard, KeyId, Payload, PublicKey, Reader, Recipe,
+    RoomKey, SealedError, SessionKey, Verdict, fresh_nonce, seal,
 };
 
 /// An invite as `PROTOCOL.md` §5.1 writes one and §13.1's first step reads it.
@@ -52,6 +55,10 @@ pub struct PeerInvite {
 impl PeerInvite {
     /// Reads an invite link, or says which value is missing or malformed.
     ///
+    /// Both of `PROTOCOL.md` §5.1's forms are links this joins: the connection URL and the page
+    /// link, which names the same room, token and fragment over the scheme a browser speaks and
+    /// is resolved to its connection URL first ([`wire_invite`]).
+    ///
     /// # Errors
     ///
     /// Returns the client's own words for a link it cannot join with, which `PROTOCOL.md`
@@ -61,7 +68,7 @@ impl PeerInvite {
         let (address, fragment) = invite
             .split_once('#')
             .ok_or_else(|| MISSING_FRAGMENT.to_string())?;
-        let parsed = proto::parse_session_url(address).ok_or_else(|| {
+        let parsed = proto::parse_session_url(&wire_invite(address)).ok_or_else(|| {
             format!("{address:?} does not address the session endpoint")
         })?;
         let room = parsed
@@ -74,7 +81,7 @@ impl PeerInvite {
             .ok_or_else(|| "the invite carries no token".to_string())?;
         let (room_key, host_key) = fragment_keys(fragment)?;
         Ok(Self {
-            socket_url: address.to_string(),
+            socket_url: wire_invite(address),
             room,
             token,
             room_key,
@@ -83,9 +90,62 @@ impl PeerInvite {
     }
 }
 
+/// A link read back as the wire form of `PROTOCOL.md` §5.1, with any fragment left off.
+///
+/// The page form names the same room, token and fragment over the scheme a browser speaks
+/// (`https://host/page/?room=…&token=…`), and the connection URL is derived from it by reading
+/// the scheme back — `http://` as `ws://`, `https://` as `wss://` — and appending the session
+/// endpoint. A link that is already a connection URL, or one this cannot read as either form,
+/// is handed back unchanged: what refuses it is [`PeerInvite::parse`], which knows which part
+/// is missing.
+#[must_use]
+pub fn wire_invite(link: &str) -> String {
+    let (address, fragment) = match link.split_once('#') {
+        Some((address, fragment)) => (address, format!("#{fragment}")),
+        None => (link, String::new()),
+    };
+    let Some(mapped) = page_to_endpoint(address) else {
+        return link.to_string();
+    };
+    format!("{mapped}{fragment}")
+}
+
+/// The connection URL a page link names, or `None` when the address is not a page link.
+fn page_to_endpoint(address: &str) -> Option<String> {
+    let scheme = match address
+        .strip_prefix("http://")
+        .or_else(|| address.strip_prefix("https://"))
+    {
+        Some(rest) if address.starts_with("http://") => format!("ws://{rest}"),
+        Some(rest) => format!("wss://{rest}"),
+        None => return None,
+    };
+    let (before_query, query) = match scheme.split_once('?') {
+        Some((before, query)) => (before, Some(query)),
+        None => (scheme.as_str(), None),
+    };
+    let (authority, path) = match before_query.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (before_query, String::new()),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    let base = format!("{authority}{}", path.trim_end_matches('/'));
+    Some(query.map_or_else(
+        || format!("{base}{}", proto::ENDPOINT_PATH),
+        |rest| format!("{base}{}?{rest}", proto::ENDPOINT_PATH),
+    ))
+}
+
 /// What a link without a fragment is told, which is `PROTOCOL.md` §5.1's own sentence: the
 /// honest refusal asks for the whole link.
 const MISSING_FRAGMENT: &str = "the invite carries no fragment, so neither its room key nor its host key is here: ask for the whole link, `#` and all";
+
+/// What a session built to be a host is told when the handshake gave it no seat: §7.1's state
+/// labels its own connection's seat, and there is nothing to write without one.
+const HOST_NEEDS_SEAT: &str =
+    "a host session publishes its own seat, and the handshake gave it none";
 
 /// The two keys a fragment carries: `k` and `h`, each at most once, and an unknown parameter
 /// ignored as an unknown query parameter is.
@@ -157,6 +217,15 @@ pub struct PeerOptions {
     /// The role this client believes it has been given — `guest` or `viewer`, never `host` —
     /// declared in its announcement. A host **SHOULD** honour it (§7.1).
     pub declared_role: Option<String>,
+    /// The awareness client id the handshake announced, so that the states this connection
+    /// publishes and the seat the room attributes them to agree (§8.4). `None` mints one from
+    /// the replica, which is what a session with no handshake does.
+    pub awareness_client_id: Option<u64>,
+    /// The host's producer half (§7.1), which makes this session the room's authority rather
+    /// than one of its peers. The host key's private half lives here, so a session given one
+    /// can sign a state and a session without one cannot; the room's host publishes the state
+    /// that every peer's key and role come from, and a session with no state produces none.
+    pub host: Option<HostOptions>,
 }
 
 /// What a session did with one frame: the decision `PROTOCOL.md` §13.11 observes.
@@ -250,6 +319,15 @@ pub struct PeerSession {
     frame_key: FrameKey,
     session: SessionKey,
     declared_role: Option<String>,
+    /// The host's producer half, when this connection holds the host key (§7.1).
+    host: Option<HostProducer>,
+    /// The bytes of the last room state this connection **applied** (§7.1).
+    ///
+    /// §7.1 has a peer that holds a verified state re-send it, unchanged, when it sees a
+    /// `peer.joined`, so a joiner's state arrives while the host is away. The bytes are the
+    /// ones it received: only the host key signs a state, and a peer that re-sealed or
+    /// re-signed one would hand the room a frame every other peer refuses.
+    held_state_frame: Option<Vec<u8>>,
     counter: u64,
     renew: Duration,
     expire: Duration,
@@ -270,6 +348,10 @@ pub struct PeerSession {
     /// a seat the roster never knew from one that departed.
     departed: BTreeSet<String>,
     announced_at: Option<Duration>,
+    /// The local edits this client made while §13.1's step 4 held its content back, in the
+    /// order it made them: the deltas themselves, so that flushing them cannot carry a peer's
+    /// changes out under this connection's key.
+    unsent: Vec<Vec<u8>>,
     /// The clock of the first content frame this client refused since its last `SyncStep1`,
     /// which is §13.6's interval. `None` means there is nothing to re-sync about.
     resync_from: Option<Duration>,
@@ -304,7 +386,9 @@ impl PeerSession {
     /// # Errors
     ///
     /// Returns an error when the platform's CSPRNG cannot be read, which is the one thing
-    /// minting a session keypair needs.
+    /// minting a session keypair needs, and when a host session's first state cannot be sealed:
+    /// §7.1's mint state is what brings the room's listing into existence and commits this
+    /// connection's key, so a host that could not publish one is a host no peer can see.
     pub fn new(options: &PeerOptions) -> Result<Self, SealedError> {
         let session = match options.fixed_session_key {
             Some(seed) => SessionKey::from_seed(seed),
@@ -313,18 +397,37 @@ impl PeerSession {
         let reader =
             Reader::new(&options.room_id, options.room_key, options.host_key);
         let frame_key = reader.frame_key;
-        Ok(Self {
+        let own_key = session.public();
+        let host = match &options.host {
+            None => None,
+            Some(host_options) => Some(host_producer(
+                options,
+                frame_key,
+                host_options,
+                own_key,
+            )?),
+        };
+        let mut roster = options.roster.clone();
+        if let (Some(seat), true) = (options.seat.as_ref(), host.is_some()) {
+            // §9: a host is seated in the room it minted, whether or not the roster it was
+            // handed names it. Without this its own state's `host` entry labels a seat the
+            // session believes is absent, and §13.8's clock then ends its own session.
+            let _ = roster.insert(seat.clone());
+        }
+        let mut peer = Self {
             room_id: options.room_id.clone(),
             frame_key,
             session,
             declared_role: options.declared_role.clone(),
+            host,
+            held_state_frame: None,
             counter: 0,
             renew: options.renew,
             expire: options.expire,
             seat: options.seat.clone(),
-            roster: options.roster.clone(),
+            roster,
             reader,
-            awareness: Awareness::new(peer_doc()),
+            awareness: Awareness::new(peer_doc(options.awareness_client_id)),
             outbound: VecDeque::new(),
             held: BTreeSet::new(),
             holds_sent: Vec::new(),
@@ -332,6 +435,7 @@ impl PeerSession {
             leases: BTreeMap::new(),
             departed: BTreeSet::new(),
             announced_at: None,
+            unsent: Vec::new(),
             resync_from: None,
             handshaken_at: None,
             state_issued: None,
@@ -345,7 +449,18 @@ impl PeerSession {
             ending: None,
             mutation: None,
             fault: None,
-        })
+        };
+        if peer.host.is_some() {
+            // §13.1: a host's order is a peer's with one difference — it publishes a state at
+            // mint, so its own state may precede any it verifies. That state is also what
+            // commits its own connection's key, which is why a host has nothing to announce.
+            peer.publish_state(Duration::ZERO, HostReason::Mint);
+        }
+        let failed = peer.fault.take();
+        if let Some(fault) = failed {
+            return Err(SealedError::new(fault));
+        }
+        Ok(peer)
     }
 
     // --- what a caller reads --------------------------------------------------
@@ -366,6 +481,54 @@ impl PeerSession {
     #[must_use]
     pub const fn state_held(&self) -> bool {
         self.state_issued.is_some()
+    }
+
+    /// Whether this connection holds the host key, which is the whole of what being the host is
+    /// in this version (§7.1).
+    #[must_use]
+    pub const fn is_host(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// The awareness client id this connection announced, which is the one its replica speaks
+    /// under (§8.4): the id the room records for this seat, so a peer's caret is attributed to
+    /// the seat that published it.
+    #[must_use]
+    pub fn awareness_client_id(&self) -> u64 {
+        self.awareness.client_id().get()
+    }
+
+    /// The role the applied state gives this connection's own key (§13.4), or `None` while no
+    /// state commits it — the state is the only source of a role in this version.
+    #[must_use]
+    pub fn own_role(&self) -> Option<&str> {
+        self.role()
+    }
+
+    /// The seat the applied state's `host` entry labels, or `None` while no state names one
+    /// (§13.4: a client with none **MUST NOT** guess one).
+    #[must_use]
+    pub fn named_host_seat(&self) -> Option<&str> {
+        self.host_seat()
+    }
+
+    /// The roles the applied state assigns, by the seat each committed key is labelled.
+    #[must_use]
+    pub fn roles_by_seat(&self) -> BTreeMap<String, String> {
+        self.reader
+            .committed
+            .values()
+            .map(|peer| (peer.peer_id.clone(), peer.role.clone()))
+            .collect()
+    }
+
+    /// The edition of the last state this connection published, or `0` before it has published
+    /// one. This is §7.1's `issued` series, which a host that keeps hosting continues.
+    #[must_use]
+    pub fn published_issued(&self) -> u64 {
+        self.host
+            .as_ref()
+            .map_or(0, HostProducer::published_issued)
     }
 
     /// The edition of the state this client holds, or `None` before one is applied.
@@ -467,6 +630,21 @@ impl PeerSession {
         text.get_string(&doc.transact())
     }
 
+    /// The CRDT state vector, as `(client id, clock)` pairs: what a sync handshake exchanges,
+    /// and what two fully synced replicas agree on.
+    #[must_use]
+    pub fn state_vector(&self) -> Vec<(u64, u32)> {
+        let doc = self.awareness.doc();
+        let txn = doc.transact();
+        let mut entries: Vec<(u64, u32)> = txn
+            .state_vector()
+            .iter()
+            .map(|(client, clock)| (client.get(), *clock))
+            .collect();
+        entries.sort_unstable();
+        entries
+    }
+
     /// The paths this replica holds any text for: the documents that have arrived.
     #[must_use]
     pub fn documents(&self) -> Vec<String> {
@@ -500,6 +678,11 @@ impl PeerSession {
             return self.refuse(index, verdict.reason.as_deref());
         }
         let kind = verdict.kind.unwrap_or_default();
+        if matches!(verdict.payload, Some(Payload::RoomState(_))) {
+            // §7.1: what a peer re-sends when it sees a `peer.joined` is the bytes it received,
+            // and those are the ones that verified.
+            self.held_state_frame = Some(frame.to_vec());
+        }
         if self.ignores(&verdict) {
             self.reader.issued = issued;
             self.reader.ended = ended;
@@ -526,6 +709,7 @@ impl PeerSession {
         if self.window_passed(clock) {
             return;
         }
+        self.publish_state(clock, HostReason::Announcement);
         self.reannounce(clock);
         self.resync(clock);
         self.announce_holds(clock);
@@ -564,13 +748,51 @@ impl PeerSession {
     }
 }
 
+/// The host's producer half for a session handed the host key (§7.1).
+///
+/// §7.1's own entry labels this connection's seat, and a state whose `host` entry labels no seat
+/// of the roster leaves every peer with no identified host connection at all (§13.4), so a host
+/// session needs the seat the handshake gave it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the session's options, its frame key, the host's own and the key it signs with"
+)]
+fn host_producer(
+    options: &PeerOptions,
+    frame_key: FrameKey,
+    host_options: &HostOptions,
+    own_key: PublicKey,
+) -> Result<HostProducer, SealedError> {
+    let Some(seat) = options.seat.as_deref() else {
+        return Err(SealedError::new(HOST_NEEDS_SEAT));
+    };
+    HostProducer::new(
+        &options.room_id,
+        frame_key,
+        options.renew,
+        host_options,
+        seat,
+        own_key,
+    )
+}
+
 /// The session document §7 fixes: one `Y.Doc`, one `Y.Text` per document.
 ///
 /// A text offset is a UTF-16 code unit, which is what `yjs`, every editor's `offsetAt` and
 /// every peer on the wire use (`PROTOCOL.md` §8.1); `yrs` defaults to UTF-8 byte offsets.
-fn peer_doc() -> Doc {
+///
+/// `awareness_client_id` is the id the handshake announced (§8.4): y-protocols seeds one of its
+/// own, and a session that published under a second id would have every peer draw this client's
+/// caret under a stranger's. `ClientID` is a 53-bit value, which is the width every id on this
+/// wire is read in.
+fn peer_doc(awareness_client_id: Option<u64>) -> Doc {
+    const YJS_ID_BITS: u64 = 53;
+    let client_id = awareness_client_id.map_or_else(ClientID::random, |id| {
+        ClientID::new(id & ((1u64 << YJS_ID_BITS) - 1))
+    });
     Doc::with_options(Options {
         offset_kind: OffsetKind::Utf16,
+        client_id,
         ..Options::default()
     })
 }
@@ -636,7 +858,7 @@ impl PeerSession {
     }
 
     /// Folds an applied frame into the session: §13.3's state, §13.7's lease, §13.10's
-    /// closing, and the content a `kind = 0` frame carries.
+    /// closing, the announcement a host answers, and the content a `kind = 0` frame carries.
     fn fold(&mut self, clock: Duration, verdict: &Verdict) {
         match verdict.payload.as_ref() {
             Some(Payload::RoomState(state)) => {
@@ -645,13 +867,79 @@ impl PeerSession {
             Some(Payload::Closing(_)) => self.ending = Some(Ending::Closing),
             Some(Payload::Holds(_)) => self.renew_lease(clock, verdict.sender),
             Some(Payload::Content) => self.apply_content(&verdict.plaintext),
-            Some(Payload::Announcement(_)) | None => {}
+            Some(Payload::Announcement(announcement)) => {
+                self.hear_announcement(clock, announcement);
+            }
+            None => {}
         }
+    }
+
+    /// §7.1: a session-key announcement the receiver accepted.
+    ///
+    /// A peer that is not the host owes it nothing at all — the state is the only source of
+    /// the keys a receiver keeps, and an announcement is read for the host's sake (§13.3) — so
+    /// the host's answer is the whole of what this decision is.
+    fn hear_announcement(&mut self, clock: Duration, announcement: &Announcement) {
+        if self.host.is_none() {
+            return;
+        }
+        let Some(key) = PublicKey::parse(&announcement.key) else {
+            return;
+        };
+        let declared = announcement.role.as_deref();
+        if let Some(host) = self.host.as_mut() {
+            host.announcement(key, declared);
+        }
+        self.publish_state(clock, HostReason::Announcement);
+    }
+
+    /// The state §7.1 has this host publish now, if it is due: sealed by the host key, counted
+    /// as a publication, and folded into this session's own receiver.
+    ///
+    /// A host never receives the state it writes — the relay sends a frame to the room's
+    /// *other* connections — so the receiver is folded from the value rather than from the
+    /// bytes, and before anything that follows the frame (`after_state`) so that a `SyncStep1`
+    /// goes out only once a state commits this connection's key (§13.1's steps 4 and 6).
+    fn publish_state(&mut self, clock: Duration, reason: HostReason) {
+        let Some(host) = self.host.as_mut() else {
+            return;
+        };
+        let owed = host.publish(clock, reason);
+        if let Some(fault) = host.failure() {
+            let _ = self.fault.get_or_insert_with(|| fault.to_string());
+        }
+        let Some(publication) = owed else {
+            return;
+        };
+        self.outbound.push_back(publication.frame);
+        self.published = self.published.saturating_add(1);
+        let fresh = publication.state.as_ref().filter(|_| publication.fresh);
+        let Some(state) = fresh else {
+            return;
+        };
+        self.reader.apply_own(state);
+        self.after_state(clock, publication.issued);
+    }
+
+    /// One frame this connection did not author, put on the wire as the bytes it arrived as:
+    /// §7.1's re-send of a state the room holds, when a peer is seated. A frame at the edition
+    /// every peer already holds is refused `stale_issued` and changes nothing; the one this
+    /// re-send is for is the peer that holds none.
+    fn republish(&mut self, frame: &[u8]) {
+        if self.ending.is_some() {
+            return;
+        }
+        self.outbound.push_back(frame.to_vec());
+        self.published = self.published.saturating_add(1);
     }
 
     /// What §13.3, §13.1's step 6 and §13.7 owe an applied room state.
     fn after_state(&mut self, clock: Duration, issued: u64) {
         self.state_issued = Some(issued);
+        if let Some(host) = self.host.as_mut() {
+            // §7.1: a host that has verified a state keeps its own series above it.
+            host.verified_state(issued);
+        }
         self.refresh_host_away(clock, true);
         self.drop_departed_holds();
         // §13.1's steps 6 and 4: a state that commits this key is where the handshake belongs,
@@ -659,6 +947,7 @@ impl PeerSession {
         // wait a whole window for it.
         if self.commits_ours() {
             self.handshake_once(clock);
+            self.flush_held_back();
         } else {
             self.announce(clock);
         }
@@ -749,6 +1038,9 @@ impl PeerSession {
     /// seated, idle peer keep its holds.
     fn announce_holds(&mut self, clock: Duration) {
         if !self.may_publish() {
+            // A `viewer` keeps its edit in its own replica and never publishes it (§13.9);
+            // everyone else's is held back by §13.1's step 4 and sent once a state commits this
+            // key.
             return;
         }
         // A holder with nothing open and nothing yet said has no frame to send; one that has
@@ -954,17 +1246,76 @@ impl PeerSession {
 
 impl PeerSession {
     /// A seat has joined, from `peer.joined`.
-    pub fn seat_joined(&mut self, seat: &str) {
+    ///
+    /// §7.1 obliges a host to publish a state on it — which is how the joiner learns the
+    /// listing and the roles without asking — and asks any peer that holds a verified state to
+    /// re-send that state unchanged, so a joiner's state arrives while the host is away. §13.7
+    /// has a holder re-announce its holds on the same event.
+    pub fn seat_joined(&mut self, clock: Duration, seat: &str) {
+        if let Some(host) = self.host.as_mut() {
+            host.seat_joined(seat);
+        }
         let _ = self.departed.remove(seat);
         let _ = self.roster.insert(seat.to_string());
+        // §13.7: a hold is re-announced when a peer is seated, so a joiner learns the room's
+        // held set without asking for it.
+        self.holds_announced_at = None;
+        if self.host.is_some() {
+            self.publish_state(clock, HostReason::Roster);
+            return;
+        }
+        if let Some(frame) = self.held_state_frame.clone() {
+            self.republish(&frame);
+        }
     }
 
     /// A seat has left, from `peer.left`: §13.8's clock can arm on it and §13.7's holds go.
     pub fn seat_left(&mut self, clock: Duration, seat: &str) {
+        if let Some(host) = self.host.as_mut() {
+            host.seat_left(seat);
+        }
         let _ = self.roster.remove(seat);
         let _ = self.departed.insert(seat.to_string());
         self.drop_departed_holds();
         self.refresh_host_away(clock, false);
+        if self.host.is_some() {
+            self.publish_state(clock, HostReason::Roster);
+        }
+    }
+
+    /// The host's listing changed, from whatever watches its working tree (§7.1).
+    ///
+    /// A listing is replaced wholesale by every state, so this is the one thing a host's
+    /// adapter has to say about it: the state that follows names the whole tree as it now is,
+    /// and a shorter listing is a smaller working tree rather than a partial update (§13.3).
+    pub fn listing_changed(&mut self, clock: Duration) {
+        self.publish_state(clock, HostReason::Listing);
+    }
+
+    /// §7.1's closing: the host's statement that the room is over, above every state it
+    /// published.
+    ///
+    /// A host that publishes one stops publishing; every peer that already holds a verified
+    /// state below its `issued` applies it and ends, and §9's room dies when its last
+    /// connection ends. The session that published it ends with them, which is what §13.10
+    /// gives a receiver that applies one and what keeps a host from publishing content into a
+    /// room it has just declared over.
+    pub fn close_room(&mut self) -> bool {
+        let Some(host) = self.host.as_mut() else {
+            return false;
+        };
+        let closing = host.closing();
+        let failure = host.failure().map(ToString::to_string);
+        let Some(publication) = closing else {
+            let reason = failure
+                .unwrap_or_else(|| "the closing could not be sealed".to_string());
+            self.fault.get_or_insert(reason);
+            return false;
+        };
+        self.outbound.push_back(publication.frame);
+        self.published = self.published.saturating_add(1);
+        self.ending = Some(Ending::Closing);
+        true
     }
 
     /// Opens a path: this client offers it, and its whole held set changes (§13.7).
@@ -1022,14 +1373,50 @@ impl PeerSession {
         if update.is_empty() {
             return Ok(false);
         }
-        let allowed = self.may_publish() && self.role() != Some("viewer");
-        if !allowed {
+        if !self.may_publish() {
+            // §13.1's step 4 holds content back until a state commits this key, and a client
+            // that dropped what it held back would leave the room without that edit for good:
+            // §13.1's step 6 is a `SyncStep1`, which asks the room for what this replica lacks,
+            // and nothing asks the room for what it lacks. What is kept is this edit's own
+            // delta and not a diff over the document: another peer's content can have arrived
+            // in the meantime, and a client that re-sent it would publish under its own key
+            // changes it did not make.
+            self.hold_back(update);
             return Ok(false);
         }
+        if self.role() == Some("viewer") {
+            // §13.5 and §13.9: a `viewer`'s edit is its own and never the room's, so there is
+            // nothing to send later either.
+            return Ok(false);
+        }
+        self.send_update(update);
+        Ok(true)
+    }
+
+    /// Keeps one edit this connection may not publish yet (§13.1's step 4). §13.9's `viewer`
+    /// keeps its edit in its own replica and never publishes it, so nothing is kept for one.
+    fn hold_back(&mut self, update: Vec<u8>) {
+        if self.role() != Some("viewer") {
+            self.unsent.push(update);
+        }
+    }
+
+    fn send_update(&mut self, update: Vec<u8>) {
         let plaintext =
             encode_y_message(&YMessage::Sync(SyncMessage::Update(update)));
         self.publish(Published::Content, &plaintext);
-        Ok(true)
+    }
+
+    /// Publishes the edits this connection made before a state committed its key (§13.1's step
+    /// 4), in the order they were made.
+    fn flush_held_back(&mut self) {
+        let held: Vec<Vec<u8>> = mem::take(&mut self.unsent);
+        if held.is_empty() || self.role() == Some("viewer") {
+            return;
+        }
+        for update in held {
+            self.send_update(update);
+        }
     }
 }
 
@@ -1142,6 +1529,8 @@ mod tests {
             roster: roster.iter().map(|seat| (*seat).to_string()).collect(),
             fixed_session_key: Some([5; 32]),
             declared_role: None,
+            awareness_client_id: None,
+            host: None,
         };
         PeerSession::new(&options).unwrap()
     }
@@ -1367,6 +1756,32 @@ mod tests {
         session.tick(millis(2 + 301));
         session.tick(millis(2 + 302));
         assert!(session.take_outbound().is_empty(), "once per interval");
+    }
+
+    #[test]
+    fn an_edit_made_before_a_committing_state_goes_out_when_it_arrives() {
+        // §13.1's step 4 holds content back until a state commits this key, and a client that
+        // dropped what it held back would leave the room without that edit: nothing asks the
+        // room for what this replica lacks, only for what it has.
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        assert!(
+            !session.insert("README.md", 0, "held back").unwrap(),
+            "nothing may be published before a state commits this key"
+        );
+        assert_eq!(session.published(), 1, "the announcement, and no content");
+
+        let committing = state(&host(), 1, &[(&ours(), "guest", "p-self")]);
+        assert_eq!(
+            session.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        let out = session.take_outbound();
+        assert_eq!(out.len(), 2, "§13.1's step 6, then the held-back edit");
+        assert_eq!(session.handshake(), 1);
+        assert_eq!(session.published(), 2, "the edit is a publication");
+        assert_eq!(Envelope::parse(&out[1]).unwrap().kind, 0);
     }
 
     #[test]
@@ -1648,5 +2063,45 @@ mod tests {
 
         let no_host = invite(room_key(), "k=$k");
         assert!(PeerInvite::parse(&no_host).unwrap_err().contains("`h`"));
+    }
+
+    #[test]
+    fn the_page_link_is_the_same_room_token_and_fragment_over_the_browsers_scheme() {
+        // `PROTOCOL.md` §5.1's second form: the page the room's server serves, over the scheme
+        // a browser speaks, with the same host, port and path prefix and nothing else in it.
+        let room = encode_key(&room_key().0);
+        let host_key = host().public().encode();
+        let page =
+            format!("http://h:8080/?room={ROOM}&token=t-1#k={room}&h={host_key}");
+        let wire = format!("ws://h:8080/session?room={ROOM}&token=t-1");
+        let wire_with_fragment = format!("{wire}#k={room}&h={host_key}");
+        assert_eq!(
+            wire_invite(&page),
+            wire_with_fragment,
+            "the page reads back as the same wire invite, fragment and all"
+        );
+        let parsed = PeerInvite::parse(&page).unwrap();
+        assert_eq!(
+            parsed.socket_url, wire,
+            "and the address a socket is opened on carries no fragment"
+        );
+        assert_eq!(parsed.room, ROOM);
+        assert_eq!(parsed.token, "t-1");
+        assert_eq!(parsed.room_key, room_key());
+        assert_eq!(parsed.host_key, host().public());
+
+        // A path prefix survives the reading: the page is served under it and the endpoint is
+        // under it too.
+        let mounted = format!("https://h/page/?room={ROOM}&token=t-1#k={room}&h={host_key}");
+        assert_eq!(
+            PeerInvite::parse(&mounted).unwrap().socket_url,
+            format!("wss://h/page/session?room={ROOM}&token=t-1")
+        );
+
+        // A link that is already a connection URL is handed back exactly as it stands.
+        assert_eq!(wire_invite(&wire), wire);
+        assert!(PeerInvite::parse(&wire).unwrap_err().contains("fragment"));
+        // And one this cannot read as either form is not silently rewritten.
+        assert_eq!(wire_invite("wss://h/other?room=r"), "wss://h/other?room=r");
     }
 }
