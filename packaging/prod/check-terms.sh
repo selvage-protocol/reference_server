@@ -312,7 +312,7 @@ https://github.com/selvage-protocol/reference_server/blob/main/LICENSE-MIT
 https://github.com/selvage-protocol/reference_server/blob/main/LICENSE-APACHE
 https://github.com/selvage-protocol/reference_server/blob/main/crates/selvaged/LICENSE
 https://github.com/selvage-protocol/specification/blob/main/LICENSE
-https://selvage-protocol.vercel.app
+https://selvage.dontblameme.dev
 mailto:selvage@dontblameme.dev
 LINKS
 
