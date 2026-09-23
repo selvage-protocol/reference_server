@@ -224,6 +224,13 @@ impl HostProducer {
             standing: Standing::Live,
             faulted: None,
         };
+        // §7.1's own entry labels this connection's seat, and a state's `peers` carries only the
+        // keys of the seats the roster has: a host that never put its own seat there would drop
+        // every commitment it labelled with it — which is the label an announcement takes when
+        // no seat of the roster is free, its own being the last resort. The commitment is what
+        // §7.1 obliges and a peer cannot publish without (§13.1's step 4), so the seat goes in
+        // with the key rather than the label giving way later.
+        producer.seat(own_seat);
         if let Some(persisted) =
             producer.store.as_ref().and_then(|store| store.load())
             && persisted.host_seed == options.host_seed
@@ -463,7 +470,9 @@ impl HostProducer {
     /// to belong to a connection the roster no longer has. A key that arrives before its seat
     /// does leaves no other seat to replace, and the label is then the host's own, which §7.1
     /// permits by name (*its own included*) and which it obliges over withholding the
-    /// commitment.
+    /// commitment. That seat is the roster's from the start, so the commitment is carried
+    /// rather than dropped; the price is the one §7.1's *at most one key per seat* names, two
+    /// keys under this host's seat until the announcer's own seat is known.
     fn label(&self) -> String {
         let taken: BTreeSet<String> = self
             .seats
@@ -676,6 +685,11 @@ mod tests {
         SessionKey::from_seed([11; 32])
     }
 
+    /// A second peer's, for a state that follows the first one's announcement.
+    fn other_key() -> SessionKey {
+        SessionKey::from_seed([13; 32])
+    }
+
     /// The host key of the invite's fragment, derived from the seed a host is given.
     fn host_seed() -> [u8; 32] {
         [3; 32]
@@ -832,6 +846,64 @@ mod tests {
             host.published_issued(),
             0,
             "a seed that is not this host's starts the series at §7.1's `1`"
+        );
+    }
+
+    /// §7.1 obliges the commitment of every accepted announcement, and the state that carries
+    /// it is the only thing that lets that peer publish at all (§13.1's step 4): a commitment
+    /// the state leaves out is a peer that never joins. The label is the belief §7.1 calls it
+    /// and the commitment is what it obliges, so a key the host has accepted is in the state
+    /// whatever seat — its own included — the host had to label it with.
+    #[test]
+    fn an_announcement_accepted_before_its_seat_joins_is_still_committed() {
+        let mut host = producer(None);
+        let mint = host.publish(Duration::ZERO, HostReason::Mint).unwrap();
+
+        // The announcement arrives before the `peer.joined` that names its seat, so no seat of
+        // the roster is free and the label is the host's own.
+        host.announcement(peer_key().public(), None);
+        let answered =
+            host.publish(millis(500), HostReason::Announcement).unwrap();
+        assert!(answered.issued > mint.issued);
+        let state = state_of(&answered);
+        assert!(
+            state.peers.contains_key(&peer_key().public().encode()),
+            "the commitment is in the state that answers the announcement: {:?}",
+            state.peers.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            state.peers[&peer_key().public().encode()].role,
+            "guest",
+            "and carries the declaration the announcer's own key made"
+        );
+        assert_eq!(
+            state.peers[&peer_key().public().encode()].peer_id,
+            "p-self",
+            "the label is the host's own, the last seat §7.1 lets it fall back to"
+        );
+        assert_eq!(
+            host.roster().to_vec(),
+            ["p-self"],
+            "which is a seat the state keeps: the producer's roster holds its own"
+        );
+
+        // The seat joins afterwards, and the key already committed is in the state that
+        // follows too — a key the state had dropped would not come back with its seat.
+        host.seat_joined("p-guest");
+        host.announcement(other_key().public(), None);
+        let after = host
+            .publish(millis(1000), HostReason::Announcement)
+            .unwrap();
+        let state = state_of(&after);
+        assert!(
+            state.peers.contains_key(&peer_key().public().encode()),
+            "the key accepted before its seat joined is still committed: {:?}",
+            state.peers.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            state.peers[&other_key().public().encode()].peer_id,
+            "p-guest",
+            "the seat the roster gained is the one a later key is labelled with"
         );
     }
 
