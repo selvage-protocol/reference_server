@@ -1443,9 +1443,11 @@ impl PeerSession {
     }
 
     /// Keeps one edit this connection may not publish yet (§13.1's step 4). §13.9's `viewer`
-    /// keeps its edit in its own replica and never publishes it, so nothing is kept for one.
+    /// keeps its edit in its own replica and never publishes it, so nothing is kept for one,
+    /// and §13.10's ended session will publish nothing later either: keeping it would grow a
+    /// buffer nothing drains for as long as the session lives.
     fn hold_back(&mut self, update: Vec<u8>) {
-        if self.role() != Some("viewer") {
+        if self.role() != Some("viewer") && self.ending.is_none() {
             self.unsent.push(update);
         }
     }
@@ -1458,9 +1460,15 @@ impl PeerSession {
 
     /// Publishes the edits this connection made before a state committed its key (§13.1's step
     /// 4), in the order they were made.
+    ///
+    /// §13.10 reaches this path too: a state that arrives after the session ended would
+    /// otherwise flush the whole held set into a room this connection has left.
     fn flush_held_back(&mut self) {
         let held: Vec<Vec<u8>> = mem::take(&mut self.unsent);
-        if held.is_empty() || self.role() == Some("viewer") {
+        if held.is_empty()
+            || self.role() == Some("viewer")
+            || self.ending.is_some()
+        {
             return;
         }
         for update in held {
@@ -1565,6 +1573,24 @@ mod tests {
         let message =
             encode_y_message(&YMessage::Sync(SyncMessage::Update(update)));
         frame(signer, 0, counter, &message)
+    }
+
+    /// Whether a published frame carries document content: a `kind = 0` plaintext whose
+    /// y-protocols message is a sync `Update` rather than the `SyncStep1` of §13.1's step 6,
+    /// which shares the envelope's kind (`CANONICAL.md` §6.1).
+    fn carries_an_update(frame: &[u8]) -> bool {
+        let Ok(envelope) = Envelope::parse(frame) else {
+            return false;
+        };
+        if envelope.kind != 0 {
+            return false;
+        }
+        let Ok(plaintext) = opens(&room_key().frame_key(ROOM), ROOM, &envelope)
+        else {
+            return false;
+        };
+        plaintext.first() == Some(&0)
+            && read_varuint(&plaintext, 1).is_ok_and(|(tag, _)| tag == 2)
     }
 
     fn session(roster: &[&str]) -> PeerSession {
@@ -1887,6 +1913,11 @@ mod tests {
             !session.insert("README.md", 0, "after the closing").unwrap(),
             "an ended session publishes nothing"
         );
+        assert!(
+            session.unsent.is_empty(),
+            "and keeps nothing back: §13.10 publishes nothing later either, so a held set \
+             would only grow for as long as the session lives"
+        );
         assert!(session.take_outbound().is_empty());
         assert_eq!(session.published(), published);
         assert_eq!(
@@ -1894,6 +1925,48 @@ mod tests {
             "after the closing",
             "and its own replica still holds the edit"
         );
+
+        // The buffer stays empty however many edits follow, which is the whole of what an
+        // ended session does with one.
+        for _ in 0..64 {
+            assert!(!session.insert("README.md", 0, "x").unwrap());
+        }
+        assert!(session.unsent.is_empty());
+        assert!(session.take_outbound().is_empty());
+        assert_eq!(session.published(), published);
+    }
+
+    /// §13.10: an ended session publishes nothing, and the path that could still have done it
+    /// is the flush §13.1's step 4 owes a state that commits this connection's key. An edit held
+    /// back before the ending must not be published by a state arriving after it.
+    #[test]
+    fn a_state_after_the_ending_publishes_none_of_what_was_held_back() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+
+        // No state commits this key yet, so §13.1's step 4 holds the edit back.
+        assert!(!session.insert("README.md", 0, "held").unwrap());
+        assert_eq!(session.unsent.len(), 1, "the edit is held, not published");
+
+        // §13.10's no-state window ends the session while the edit is still held.
+        session.tick(millis(900));
+        assert_eq!(session.ending(), Some(Ending::NoState));
+
+        let committing = state(&host(), 1, &[(&ours(), "guest", "p-self")]);
+        assert_eq!(
+            session.deliver(millis(901), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        assert!(
+            !session
+                .take_outbound()
+                .iter()
+                .any(|frame| carries_an_update(frame)),
+            "the state that commits this key is the flush's own trigger, and the flush of an \
+             ended session is nothing"
+        );
+        assert!(session.unsent.is_empty());
     }
 
     #[test]
