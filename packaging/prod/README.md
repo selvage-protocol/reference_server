@@ -613,7 +613,11 @@ zone serves, `selvage-demo.dontblameme.dev`, because **Full (strict)** validates
 the origin's certificate against the name the visitor asked for: a certificate
 that does not name it is answered at the edge with Cloudflare's **526** and
 never reaches the front. A `*.dontblameme.dev` Origin Certificate covers this
-host, and every other subdomain of the zone, in one file.
+host, and every other single-label name on the zone, in one file — the landing
+page's `selvage.dontblameme.dev` among them. It covers *that* and no more: a
+wildcard matches one label, so a nested name such as `a.b.dontblameme.dev` is
+not covered by it, and a host serving one needs a certificate that names it,
+either its own or an entry on this certificate's SAN list.
 
 The owner placed it at `/etc/selvage/tls/origin.pem` and
 `/etc/selvage/tls/origin.key`, and the front reads both by path, so a
