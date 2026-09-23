@@ -416,6 +416,10 @@ pub struct PeerSession {
     applied: Vec<Applied>,
     dropped: Vec<Dropped>,
     ignored: Vec<u64>,
+    /// The frames refused because they were a second state at an edition this client already
+    /// holds (§13.3). The reason is `stale_issued` like any other stale state; this is the
+    /// local annotation that says which of the two it was.
+    conflicts: Vec<u64>,
     ending: Option<Ending>,
     mutation: Option<String>,
     /// The first thing that went wrong on the way *out* — a CSPRNG that would not read, an
@@ -491,6 +495,7 @@ impl PeerSession {
             applied: Vec::new(),
             dropped: Vec::new(),
             ignored: Vec::new(),
+            conflicts: Vec::new(),
             ending: None,
             mutation: None,
             fault: None,
@@ -619,6 +624,16 @@ impl PeerSession {
         &self.ignored
     }
 
+    /// The frames refused as a second publication at an edition this client already holds
+    /// (§13.3), by the index they were handed as. They are in `dropped` too, with the reason
+    /// `stale_issued`: §13.3 keeps the reason and asks for the divergence to be visible beside
+    /// it, because two receivers can hold different listings at one edition and nothing on the
+    /// wire says which of the two is the host's latest.
+    #[must_use]
+    pub fn conflicts(&self) -> &[u64] {
+        &self.conflicts
+    }
+
     /// Why the session ended, if it has.
     #[must_use]
     pub const fn ending(&self) -> Option<Ending> {
@@ -718,7 +733,7 @@ impl PeerSession {
         let verdict = self.reader.read(frame);
         if !verdict.ok {
             self.note_refusal(clock, &verdict);
-            return self.refuse(index, verdict.reason.as_deref());
+            return self.refuse(index, &verdict);
         }
         let kind = verdict.kind.unwrap_or_default();
         if matches!(verdict.payload, Some(Payload::RoomState(_))) {
@@ -882,10 +897,19 @@ impl PeerSession {
     }
 
     /// One refused frame: §13.2's local report, which is never sent anywhere.
-    fn refuse(&mut self, frame: u64, reason: Option<&str>) -> Outcome {
+    fn refuse(&mut self, frame: u64, verdict: &Verdict) -> Outcome {
+        // §13.3: the reason stays `stale_issued` for a second state at one edition and for an
+        // older one alike, and this index is the local annotation beside it that says which of
+        // the two the frame was.
+        if verdict.conflict {
+            self.conflicts.push(frame);
+        }
         // Every refusal carries the step that refused it; one without a reason would be a bug
         // in the byte layer and not a decision to report.
-        let named = reason.unwrap_or("bad_envelope").to_string();
+        let named = verdict
+            .reason
+            .clone()
+            .unwrap_or_else(|| "bad_envelope".to_string());
         self.dropped.push(Dropped {
             frame,
             reason: named.clone(),
@@ -1781,6 +1805,29 @@ mod tests {
         );
         assert_eq!(session.applied().len(), 1);
         assert_eq!(session.dropped().len(), 1);
+        // m2: §13.3's `SHOULD` — the second state at one edition is the divergence, and a
+        // state *below* the mark is an ordinary stale state. The reason is the same for both.
+        assert_eq!(session.conflicts(), [1]);
+    }
+
+    #[test]
+    fn a_state_below_the_mark_is_stale_and_not_a_conflict() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let first = state(&host(), 5, &[(&ours(), "guest", "p-self")]);
+        let old = state(&host(), 4, &[(&peer(), "guest", "p-other")]);
+        let _ = session.deliver(millis(1), &first);
+        assert_eq!(
+            session.deliver(millis(2), &old),
+            Outcome::Dropped {
+                reason: "stale_issued".to_string()
+            }
+        );
+        assert_eq!(session.dropped().len(), 1, "still refused, still named");
+        assert!(
+            session.conflicts().is_empty(),
+            "an edition below the mark is not two publications at one edition"
+        );
     }
 
     #[test]

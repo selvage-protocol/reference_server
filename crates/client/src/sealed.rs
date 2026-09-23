@@ -540,6 +540,13 @@ pub enum Payload {
 }
 
 /// What a receiver did with one frame: accepted it, or refused it and why.
+///
+/// The two flags answer two questions the reason does not: whether the frame was accepted, and
+/// whether the refusal was the equal-`issued` one §13.3 asks a client to tell apart.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "accepted, and refused at the mark: two questions the reason alone does not answer"
+)]
 #[derive(Debug, Clone)]
 pub struct Verdict {
     pub ok: bool,
@@ -550,6 +557,11 @@ pub struct Verdict {
     pub counter: Option<u64>,
     pub plaintext: Vec<u8>,
     pub payload: Option<Payload>,
+    /// §13.3's equal-`issued` refusal, which the reason does not distinguish: the frame was a
+    /// room state at exactly the edition this receiver holds, so two states were published at
+    /// one `issued` and this is the second. The reason stays `stale_issued` and this is the
+    /// local annotation beside it, which is what the `SHOULD` asks a client to be able to say.
+    pub conflict: bool,
 }
 
 impl Verdict {
@@ -562,6 +574,7 @@ impl Verdict {
             counter: envelope.map(|e| e.counter),
             plaintext: Vec::new(),
             payload: None,
+            conflict: false,
         }
     }
 }
@@ -756,6 +769,7 @@ impl Reader {
             counter: Some(envelope.counter),
             plaintext,
             payload: Some(Payload::Announcement(announcement)),
+            conflict: false,
         }
     }
 
@@ -814,7 +828,13 @@ impl Reader {
             && issued <= self.issued
             && !self.mutations.contains(Guard::Issued)
         {
-            return Verdict::refused("stale_issued", Some(envelope));
+            let mut verdict = Verdict::refused("stale_issued", Some(envelope));
+            // §13.3: two connections of one host can publish states at one edition, and a
+            // second state at the mark is that divergence rather than an old state. A closing
+            // at the mark is not: it is one frame of one series, refused like any other.
+            verdict.conflict = issued == self.issued
+                && matches!(payload, Some(Payload::RoomState(_)));
+            return verdict;
         }
         // Step 10: a committed `viewer` may not send document content.
         if envelope.kind == 0
@@ -871,6 +891,7 @@ impl Reader {
             counter: Some(envelope.counter),
             plaintext,
             payload,
+            conflict: false,
         }
     }
 

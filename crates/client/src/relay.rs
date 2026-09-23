@@ -463,6 +463,14 @@ impl RelaySession {
         self.read().ending
     }
 
+    /// The frames refused as a second state at an edition this client already holds (§13.3),
+    /// by the index the socket handed them as. They are in the session's dropped frames too,
+    /// with the reason `stale_issued`; this is the local annotation beside it.
+    #[must_use]
+    pub fn conflicts(&self) -> Vec<u64> {
+        self.read().session.conflicts().to_vec()
+    }
+
     /// The sentence for that ending, where the version has one.
     #[must_use]
     pub fn ending_sentence(&self) -> Option<&'static str> {
