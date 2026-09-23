@@ -91,7 +91,7 @@ usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]
                 [--max-connections N] [--max-rooms N] [--max-peers-per-room N]
                 [--max-documents-per-room N] [--outbound-queue-bytes N]
                 [--max-envelope-bytes N] [--inbound-bytes-per-sec N]
-                [--inbound-burst-bytes N] [--serve-version-2]
+                [--inbound-burst-bytes N] [--serve-version-1-only]
 ```
 
 | Flag | What it does |
@@ -99,7 +99,7 @@ usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]
 | `--listen ADDR` | bind `ADDR` (default `127.0.0.1:8080`) |
 | `--room-grace-ms MS` | how long a room survives its host disconnecting, in milliseconds (default `30000`, printed as 30s) |
 | `--serve-page DIR` | serve the browser page from `DIR` on the same origin as `/session` and `/meta` |
-| `--serve-version-2` | seat `selvage/2` as well as `selvage/1`, so `/meta` advertises both. Off by default: every published client speaks `selvage/1`. A room is pinned to the version its minting connection spoke, and a connection speaking the other version is refused `unsupported_version` (close `4005`) |
+| `--serve-version-1-only` | seat `selvage/1` alone. Every version is seated by default, so `/meta` advertises both and a `selvage/2` connection is seated; this narrows the server to the version-1 corpus's own shape, where a `selvage/2` hello is refused `unsupported_version` (close `4005`). A room is pinned to the version its minting connection spoke either way |
 | `--max-connections N` | connections held at once, counted past the request head (default `1024`) |
 | `--max-rooms N` | rooms held at once; past it a room is not minted (default `1024`) |
 | `--max-peers-per-room N` | peers one room seats at once (default `128`) |
@@ -275,16 +275,18 @@ awareness payload, and the relay between peers is opaque to both. A peer's role 
 or `guest`, the invite token is the permission, and the room is removed after the grace
 period if its host does not reclaim it. There are no accounts and no file access.
 
-### `selvage/2`, while both versions are served
+### `selvage/2`, seated beside `selvage/1`
 
-`--serve-version-2` lets one process seat both wire versions, which is the transitional
-shape: the published clients speak `selvage/1`, and `selvage/2` is what the revision's
-clients will speak. A room is pinned to the version its **minting connection** spoke — a
-version-1 room expects the server to hold the document set and a version-2 one requires
-that it does not, so one room cannot serve both — and a connection that speaks the other
-version is refused `unsupported_version` with close **4005** before it is seated
-(`PROTOCOL.md` §10). Nothing else changes for a version-1 client: the same methods, the
-same events, the same refusals, and the same `/meta` body when the flag is off.
+One process seats both wire versions by default: the published clients speak `selvage/1`,
+and `selvage/2` is what the revision's clients speak, so `/meta` advertises both and a room
+serves whichever version its connections speak. A room is pinned to the version its
+**minting connection** spoke — a version-1 room expects the server to hold the document set
+and a version-2 one requires that it does not, so one room cannot serve both — and a
+connection that speaks the other version is refused `unsupported_version` with close
+**4005** before it is seated (`PROTOCOL.md` §10). `--serve-version-1-only` narrows the
+process to `selvage/1` alone, which is the shape the specification's version-1 corpus pins
+and what a client that has to be shown the refusal is pointed at. Nothing else changes for
+a version-1 client: the same methods, the same events, the same refusals.
 
 A version-2 room is smaller than a version-1 one. The server records membership — a
 `peer_id`, a display name and an awareness client id per connection — and it holds no
@@ -319,8 +321,7 @@ link whose fragment carries `k` and `h` resolves to a sealed invite through
 one stays `selvage/1`. A fragment that is present but is not both keys is refused where the
 link is read — `ConnectOptions::read_invite_url` is that reading, and its error says which
 value is wrong — rather than dialled as the other version, whose socket URL would carry the
-fragment. `crates/harness/tests/relay_selvaged.rs` is that pair against a real
-`selvaged --serve-version-2`.
+fragment. `crates/harness/tests/relay_selvaged.rs` is that pair against a real `selvaged`.
 
 Two suites hold that layer. `crates/harness/tests/peer_vectors.rs` replays the corpus's
 nineteen **frame** vectors against the sealed layer, and `crates/harness/tests/decisions.rs`
@@ -349,9 +350,9 @@ where the runnable transcript and the vector replay live.
 ## GET /meta
 
 `GET /meta` answers a JSON body with the server string (`selvaged/<version>`, the same one
-`--version` prints), the wire versions it speaks (`selvage/1`, or both versions with
-`--serve-version-2`), the roles it seats (`host`, `guest`), its capabilities, and the
-keepalive and room-grace values it is configured with.
+`--version` prints), the wire versions it speaks (both `selvage/1` and `selvage/2`, or
+`selvage/1` alone with `--serve-version-1-only`), the roles it seats (`host`, `guest`), its
+capabilities, and the keepalive and room-grace values it is configured with.
 
 ## Serving the page
 
