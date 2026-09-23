@@ -240,11 +240,14 @@ pub struct RelaySession {
 impl RelaySession {
     /// Mints a room; this connection is its host by holding the host key's private half.
     ///
+    /// `GET /meta` is read first (§2) and a server that names no version at major 2 this client
+    /// can speak is refused locally, before a socket is opened.
+    ///
     /// # Errors
     ///
     /// Returns [`Error`] when the socket cannot be opened, the server refuses the session, the
-    /// handshake does not finish inside [`HANDSHAKE_TIMEOUT`], or §7.1's first state cannot be
-    /// sealed from the invite's two keys.
+    /// handshake does not finish inside [`HANDSHAKE_TIMEOUT`], §2's version gate refuses the
+    /// server, or §7.1's first state cannot be sealed from the invite's two keys.
     pub async fn host(options: RelayHostOptions) -> Result<Self, Error> {
         let base = session_base(&options.base_url).ok_or_else(|| {
             Error::Invite(format!(
