@@ -62,6 +62,19 @@ const EVENT_BACKLOG: usize = 64;
 /// process, and past this bound the socket is ended like any other dropped one.
 pub const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
+/// What this client says it speaks in every `selvage/2` hello, which is the whole of what it
+/// advertises (`PROTOCOL.md` §10).
+///
+/// `awareness` is deliberately not here. §10 defines the name as "the peer publishes
+/// presence", and this session publishes none: it takes an awareness frame in and applies it
+/// (`crate::peer::PeerSession::deliver`), and publishes no state of its own, renews none and
+/// forgets none (§8.2's `MUST`s). An advertisement is a claim a peer may size its UI on, so
+/// the honest list is the one capability this client does speak — §7's document sync. Adding
+/// the name back owes §8's producer half: publish a state, renew it every
+/// `keepalive.awareness_renew_ms`, forget a remote state not renewed inside
+/// `keepalive.awareness_expire_ms`, and republish on a `peer.joined` (§8.3's step 2).
+pub const CLIENT_CAPABILITIES_V2: &[&str] = &["y-protocols/1"];
+
 /// A peer as `selvage/2` records it: `PROTOCOL.md` §6.1's `PeerInfo` without `role`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayPeer {
@@ -1142,7 +1155,7 @@ fn hello(
 ) -> String {
     let params = proto::HelloParamsV2 {
         awareness_client_id: Some(awareness_client_id),
-        capabilities: proto::CAPABILITIES_V2
+        capabilities: CLIENT_CAPABILITIES_V2
             .iter()
             .map(ToString::to_string)
             .collect(),
@@ -1369,7 +1382,7 @@ mod tests {
 
     use super::{
         RelayHostOptions, RelayJoinOptions, RelaySession, RelaySessionInfo,
-        clock_period, lock, session_base, start,
+        clock_period, hello, lock, session_base, start,
     };
     use crate::host::{HostOptions, ListingSource};
     use crate::peer::{PeerOptions, PeerSession};
@@ -1961,6 +1974,28 @@ mod tests {
             "the fragment's keys never reach a request"
         );
         assert_eq!(session_base("ws://h:8080#k=cd8"), None);
+    }
+
+    /// M1: an advertised capability is a claim a peer may act on, and §10 defines `awareness`
+    /// as "the peer publishes presence". This session publishes none — no state of its own, no
+    /// renewal, no expiry — so the hello carries the one name it does speak.
+    #[test]
+    fn the_version_two_hello_advertises_only_what_this_client_speaks() {
+        let client = "selvage-test/0.1.0".to_string();
+        let text = hello("Ada", Some(&client), 7);
+        let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(frame["v"], "selvage/2");
+        assert_eq!(frame["method"], "session.hello");
+        assert_eq!(
+            frame["params"]["capabilities"],
+            serde_json::json!(["y-protocols/1"]),
+            "§7's document sync is spoken here and §8's presence is not"
+        );
+        assert_eq!(
+            frame["params"]["awareness_client_id"],
+            serde_json::json!(7),
+            "the id is claimed in both versions and is an identity in neither (§8.4)"
+        );
     }
 
     /// The two keys a `PROTOCOL.md` §5.1 fragment carries, as a host mints them.

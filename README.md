@@ -412,9 +412,11 @@ integration. `PROTOCOL.md` §12 lists every decision the design record leaves op
 observables and no editor surface, and the bridge that turns one into the other is not written
 here. `SyncEngine` is still the version-1 engine and stays where it is; a version-2 link is
 joined with `RelaySession` instead. Awareness is applied and not published — and not read
-back either — so a version-2 session shows no cursor and `select` is not something a driver
-can use. A dropped socket ends its session: `§9.1`'s return is unwired, as it is in the shared
-engine whose relay runs no resume either.
+back either — so a version-2 session shows no cursor, `select` is not something a driver can
+use, and the version-2 hello advertises `y-protocols/1` alone: §10 defines `awareness` as a
+statement that the peer publishes presence, so a client that advertises it while publishing
+none has told its peers to wait on cursors that never come. A dropped socket ends its session:
+`§9.1`'s return is unwired, as it is in the shared engine whose relay runs no resume either.
 
 ## Licence
 
