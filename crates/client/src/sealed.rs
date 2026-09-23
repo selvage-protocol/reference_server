@@ -874,6 +874,15 @@ impl Reader {
         }
     }
 
+    /// Folds a state this connection **published** into its own receiver (§7.1).
+    ///
+    /// The relay never hands a sender its own frame back, so a host that only read its peers'
+    /// frames would hold no listing, no committed key and no `issued` — it would offer nothing
+    /// to a peer and refuse the content of everything it committed itself.
+    pub fn apply_own(&mut self, state: &RoomState) {
+        self.apply_state(state);
+    }
+
     fn apply_state(&mut self, state: &RoomState) {
         // `PROTOCOL.md` §13.3: a state replaces the receiver's keys and roles for the
         // whole room, and a key it does not name is uncommitted from that moment.

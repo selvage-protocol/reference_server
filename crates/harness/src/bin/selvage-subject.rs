@@ -185,6 +185,11 @@ fn join(shared: &Shared, command: &Value) -> Result<Next, String> {
             }
         },
         declared_role: optional_text(command, "role"),
+        // The corpus's decision layer drives a session and not a connection: there is no
+        // handshake here to announce an awareness id, and a host's producer half needs a seat
+        // this subject does not hold, so both are the session's own.
+        awareness_client_id: None,
+        host: None,
     };
     let mut peer =
         PeerSession::new(&options).map_err(|error| error.to_string())?;
