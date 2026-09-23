@@ -257,7 +257,7 @@ buildx; a pull request's checks are where they run.
 |---|---|
 | `crates/protocol` | `selvage/1` session envelope, method/event/error vocabulary, invite URLs. No I/O. |
 | `crates/selvaged` | the server: rooms, membership, the open-document set, payload-opaque relay, `GET /meta` |
-| `crates/client` | the sync engine (one `Y.Doc` per session, one `Y.Text` per document, y-protocols, awareness), the `EditorAdapter` seam, and `selvage/2`'s peer session (`peer.rs`) over the sealed frame (`sealed.rs`) |
+| `crates/client` | the sync engine (one `Y.Doc` per session, one `Y.Text` per document, y-protocols, awareness), the `EditorAdapter` seam, and `selvage/2`: the sealed frame (`sealed.rs`), the peer session (`peer.rs`), the host's producer half (`host.rs`) and the relay that puts a session on a socket (`relay.rs`) |
 | `crates/harness` | one server plus N clients, driven programmatically; also a runnable transcript, the vector replay over `vectors/`, and `selvage-subject`, the client the peer corpus's decision layer drives |
 | `vectors/` | the wire vectors, vendored from the specification; `scripts/sync-vectors.sh` refreshes them |
 
@@ -307,6 +307,17 @@ before and after a state commits the connection's key, attribution by the key th
 the holds and their lease, and the two windows that end a session. It holds no socket: a
 frame goes in, the decisions come out, and every clock is a value the caller passes in, which
 is what lets the corpus drive it.
+
+Around it are the two halves it was written to be handed. `host.rs` is §7.1's producer — the
+room state's listing, roles and `issued` series, and the `HostStore` a host that means to keep
+hosting keeps its key and its series in — and `relay.rs` is the connection: it opens the
+WebSocket, says `session.hello` at `selvage/2`, seats the session from
+`room.created`/`room.joined`, hands every binary frame to it and every frame it produced to the
+socket, and runs its clocks on a timer of its own. §5.1's two invite forms are one reading: a
+link whose fragment carries `k` and `h` resolves to a sealed invite through
+`ConnectOptions::from_invite_url` and is joined with `relay::RelaySession`, and a link without
+one stays `selvage/1`. `crates/harness/tests/relay_selvaged.rs` is that pair against a real
+`selvaged --serve-version-2`.
 
 Two suites hold that layer. `crates/harness/tests/peer_vectors.rs` replays the corpus's
 nineteen **frame** vectors against the sealed layer, and `crates/harness/tests/decisions.rs`
@@ -392,15 +403,14 @@ outside the Cargo workspace, so `flake.nix` hands the directory in explicitly.
 No persistence, no accounts, no file access, no read-only guests, no E2EE, no editor
 integration. `PROTOCOL.md` §12 lists every decision the design record leaves open.
 
-`crates/client` speaks `selvage/2` as a **peer session** and not yet as a connected client:
-`peer::PeerSession` implements `PROTOCOL.md` §13 for a connection another layer feeds frames
-over, which is what the corpus's decision layer drives, and the socket, the handshake and the
-editor adapter for a version-2 connection are not wired to it. `SyncEngine` is still the
-version-1 engine, and no client here hosts or joins a version-2 room over a socket yet. What
-`PROTOCOL.md` §13 leaves to the host's own half — publishing a state at mint, on every
-`peer.joined` and on every announcement it accepts — is §7.1's producer rule and is
-unimplemented: `PeerSession` holds the room state a receiver needs and does not author one.
-Awareness is applied and not published, so a version-2 session shows no cursor.
+`crates/client` hosts and joins a version-2 room over a socket (`relay.rs`, over `peer.rs` and
+`host.rs`), but no **editor adapter** drives one: the relay exposes the session's own
+observables and no editor surface, and the bridge that turns one into the other is not written
+here. `SyncEngine` is still the version-1 engine and stays where it is; a version-2 link is
+joined with `RelaySession` instead. Awareness is applied and not published — and not read
+back either — so a version-2 session shows no cursor and `select` is not something a driver
+can use. A dropped socket ends its session: `§9.1`'s return is unwired, as it is in the shared
+engine whose relay runs no resume either.
 
 ## Licence
 
