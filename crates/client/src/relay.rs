@@ -255,7 +255,7 @@ impl RelaySession {
                 link_address(&options.base_url)
             ))
         })?;
-        refuse_a_version_this_client_cannot_speak(&base).await?;
+        refuse_a_version_this_client_cannot_speak_at(&base).await?;
         let room_key = match options.room_key {
             Some(key) => key,
             None => random_room_key()?,
@@ -323,7 +323,7 @@ impl RelaySession {
         let invite =
             PeerInvite::parse(&options.invite).map_err(Error::Invite)?;
         if let Some(base) = session_base(&invite.socket_url) {
-            refuse_a_version_this_client_cannot_speak(&base).await?;
+            refuse_a_version_this_client_cannot_speak_at(&base).await?;
         }
         let awareness_client_id = mint_awareness_client_id()?;
         let dial = dial(
@@ -1146,12 +1146,15 @@ fn peer_of(params: &serde_json::Value) -> Option<RelayPeer> {
 }
 
 /// The server base of a URL, without the endpoint path. It is what a mint dials and what the
-/// invite is built from.
+/// invite is built from, and it is the address §2/§10's refusal names — a caller that has a link
+/// and no session ([`refuse_a_version_this_client_cannot_speak`], driven by the corpus's
+/// subject) reads the base off the invite with this rather than re-deriving it.
 ///
 /// `PROTOCOL.md` §5.1: the fragment carries the room's keys and is never part of a request, so
 /// an address with one is not a base. A base is what every URL this connection builds is made
 /// from, and a fragment left in it would ride into each of them.
-fn session_base(url: &str) -> Option<String> {
+#[must_use]
+pub fn session_base(url: &str) -> Option<String> {
     let (address, _) = url.split_once('?').unwrap_or((url, ""));
     if address.contains('#') {
         return None;
@@ -1310,23 +1313,44 @@ fn refuse_tls(url: &str) -> Result<(), Error> {
 ///
 /// A `/meta` that could not be read is not that answer: §2 leaves the decision to the
 /// handshake, which refuses an unreadable server in its own words.
-async fn refuse_a_version_this_client_cannot_speak(
+async fn refuse_a_version_this_client_cannot_speak_at(
     base: &str,
 ) -> Result<(), Error> {
     let Some(meta) = read_meta(base).await else {
         return Ok(());
     };
-    if meta
-        .wire_versions
+    refuse_a_version_this_client_cannot_speak(base, &meta.wire_versions)
+}
+
+/// The same rule decided from the body rather than read.
+///
+/// One home for the decision, with two callers:
+/// [`refuse_a_version_this_client_cannot_speak_at`] in front of it with the `GET /meta` it made,
+/// and a caller that was handed the body and opens no socket —
+/// `crates/harness/src/bin/selvage-subject.rs`, which the peer corpus's decision layer drives —
+/// with one it already has. `wire_versions` is §2's own member and nothing else of the body is
+/// read: §10 decides by major alone, so any spelling at major 2 is a version this client can
+/// speak.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] carrying `code::UNSUPPORTED_VERSION` when nothing in the list is
+/// at major 2, in the client's own words: the caller must not connect, and `base` is the address
+/// those words name.
+pub fn refuse_a_version_this_client_cannot_speak(
+    base: &str,
+    wire_versions: &[String],
+) -> Result<(), Error> {
+    if wire_versions
         .iter()
         .any(|version| proto::version_of(version) == Some(proto::Version::V2))
     {
         return Ok(());
     }
-    let listed = if meta.wire_versions.is_empty() {
+    let listed = if wire_versions.is_empty() {
         "no wire version".to_string()
     } else {
-        meta.wire_versions.join(", ")
+        wire_versions.join(", ")
     };
     Err(Error::Protocol {
         code: code::UNSUPPORTED_VERSION.to_string(),
@@ -1397,7 +1421,8 @@ mod tests {
 
     use super::{
         RelayHostOptions, RelayJoinOptions, RelaySession, RelaySessionInfo,
-        clock_period, hello, lock, session_base, start,
+        clock_period, hello, lock, refuse_a_version_this_client_cannot_speak,
+        session_base, start,
     };
     use crate::host::{HostOptions, ListingSource};
     use crate::peer::{PeerOptions, PeerSession};
@@ -2059,6 +2084,48 @@ mod tests {
             frame["params"]["awareness_client_id"],
             serde_json::json!(7),
             "the id is claimed in both versions and is an identity in neither (§8.4)"
+        );
+    }
+
+    /// §2/§10's no-fallback rule, decided from the body: what it refuses, and what it does not.
+    ///
+    /// The socket path calls this with the `/meta` it read, and the peer corpus's subject calls it
+    /// with the body a vector handed it (`crates/harness/src/bin/selvage-subject.rs`), so the rule
+    /// is one function with two callers and this is where its two answers are pinned.
+    #[test]
+    fn a_body_at_major_one_alone_is_refused_and_one_at_major_two_is_not() {
+        let base = "ws://h:8080";
+        let refused = refuse_a_version_this_client_cannot_speak(
+            base,
+            &["selvage/1".to_string()],
+        )
+        .expect_err("a body that seats no version at major 2 is refused");
+        let said = refused.to_string();
+        assert!(said.contains(base), "the refusal names the address: {said}");
+        assert!(
+            said.contains("selvage/2"),
+            "and the version this client would need: {said}"
+        );
+        assert!(
+            said.contains("selvage/1"),
+            "and what the server advertised instead: {said}"
+        );
+
+        for offered in ["selvage/2", "selvage/2.1"] {
+            assert!(
+                refuse_a_version_this_client_cannot_speak(
+                    base,
+                    &[offered.to_string()],
+                )
+                .is_ok(),
+                "§10 decides by major alone, so {offered} seats this client"
+            );
+        }
+        let empty = refuse_a_version_this_client_cannot_speak(base, &[])
+            .expect_err("an empty list seats nothing");
+        assert!(
+            empty.to_string().contains("no wire version"),
+            "a list with nothing in it says so rather than reading as an advertisement: {empty}"
         );
     }
 
