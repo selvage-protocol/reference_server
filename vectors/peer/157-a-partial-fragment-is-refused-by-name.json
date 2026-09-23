@@ -1,0 +1,62 @@
+{
+  "id": "157",
+  "title": "A fragment that names one of §5.1's two keys and not the other is refused locally, by name of the missing one",
+  "spec": "PROTOCOL.md#51-room-and-token-in-the-connection-url",
+  "notes": "The rule: a client that would speak `selvage/2` on this join MUST refuse an invite whose `k` or `h` is missing, locally and before it opens a socket, and the refusal names the key it is about (§5.1). This vector pins that refusal and its naming, with both directions of the fault: `k` alone is refused for the missing `h`, and `h` alone for the missing `k`. The subject is handed the link and answers the `join` itself, in its own words, because a refusal with no socket on it has no frame to report in; `expectRefusal` asserts the naming and not the sentence, since §5.1 leaves the sentence to the client. The two refused legs are also the evidence that neither seated anything: a subject left in a session after one would refuse the next `start` for that reason instead. The third leg is the control — the whole fragment, which must join — because the other way to pass a corpus of refusals is to refuse everything, and the two refusals above differ only in which key they must name. The failure this prevents is a client that treats a half-copied fragment as a version-1 join: it dials, the server seats it in the clear, and the room's contents are readable by the server the keys exist to keep out of them.",
+  "layer": "peer",
+  "kind": "decision",
+  "fixture": "fixture/keys.json",
+  "catches": "accept-partial-fragment",
+  "scenario": {
+    "keepalive": {
+      "awareness_expire_ms": 900,
+      "awareness_renew_ms": 300,
+      "ping_interval_ms": 30000,
+      "room_grace_ms": 30000
+    }
+  },
+  "steps": [
+    {
+      "op": "start",
+      "conn": "peer",
+      "key": "guest-1",
+      "invite": "/session?room=$room&token=$token#k=$room_key"
+    },
+    {
+      "op": "expectRefusal",
+      "conn": "peer",
+      "names": ["`h`"]
+    },
+    {
+      "op": "start",
+      "conn": "peer",
+      "key": "guest-1",
+      "invite": "/session?room=$room&token=$token#h=$host_key"
+    },
+    {
+      "op": "expectRefusal",
+      "conn": "peer",
+      "names": ["`k`"]
+    },
+    {
+      "op": "start",
+      "conn": "peer",
+      "key": "guest-1",
+      "invite": "/session?room=$room&token=$token#k=$room_key&h=$host_key"
+    },
+    {
+      "op": "expectSubject",
+      "conn": "peer",
+      "applied": [],
+      "dropped": [],
+      "frames": 0,
+      "ended": false
+    },
+    {
+      "op": "stop",
+      "conn": "peer"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}
