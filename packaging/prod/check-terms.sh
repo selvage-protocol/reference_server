@@ -282,6 +282,7 @@ MIT
 Apache-2.0
 FSL-1.1-MIT
 CC-BY-4.0
+selvage@dontblameme.dev
 CLAIMS
 
 # The links a reader of this page wants, by target. A dead one is worse than
@@ -301,6 +302,7 @@ https://github.com/selvage-protocol/reference_server/blob/main/LICENSE-APACHE
 https://github.com/selvage-protocol/reference_server/blob/main/crates/selvaged/LICENSE
 https://github.com/selvage-protocol/specification/blob/main/LICENSE
 https://selvage-protocol.vercel.app
+mailto:selvage@dontblameme.dev
 LINKS
 
 say "the banner, as substituted into the page's own bytes"
