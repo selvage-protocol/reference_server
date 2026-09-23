@@ -17,6 +17,7 @@ pub mod error;
 pub mod host;
 pub mod peer;
 pub mod presence;
+pub mod relay;
 pub mod sealed;
 pub mod session;
 
@@ -27,6 +28,9 @@ use tokio::time::timeout;
 
 pub use selvage_protocol::{Keepalive, PeerInfo, Role, WIRE_VERSION};
 
+/// What a caller is told when a `selvage/2` invite is handed to the version-1 engine.
+pub const SEALED_INVITE: &str = "this link is a `selvage/2` invite: its fragment carries the room key and the host key, which this engine cannot hold — join it with `RelaySession` instead";
+
 pub use crate::editor::{EditorAdapter, EngineEvent, drive_editor};
 pub use crate::engine::{Command, EditOp};
 pub use crate::error::Error;
@@ -35,6 +39,10 @@ pub use crate::host::{
     PersistedHost,
 };
 pub use crate::peer::{PeerInvite, PeerOptions, PeerSession};
+pub use crate::relay::{
+    RelayEnding, RelayEvent, RelayHostOptions, RelayJoinOptions, RelayPeer,
+    RelaySession, RelaySessionInfo,
+};
 pub use crate::presence::{
     Anchor, AwarenessState, ItemId, Presence, Selection, SelectionOffsets,
 };
@@ -66,6 +74,14 @@ impl SyncEngine {
     /// Returns [`Error`] when the socket cannot be opened, the server refuses the
     /// session, or the handshake does not finish within ten seconds.
     pub async fn connect(options: ConnectOptions) -> Result<Self, Error> {
+        // A `selvage/2` invite carries the room's key and the host's in its fragment, and this
+        // engine is the version-1 one: it has no way to seal a frame and no place to put either
+        // key, so connecting it to such a link would drop them and hand the room a peer that
+        // cannot read a byte of it. The link is refused where it is read rather than at the
+        // server, which would answer `unsupported_version` for a reason that is not this one.
+        if options.sealed_invite.is_some() {
+            return Err(Error::Version(SEALED_INVITE.to_string()));
+        }
         // `PROTOCOL.md` §9.1: the room's grace is what a reconnect has to span, and the
         // handshake reply has no member to carry it. Read best-effort, bounded on its own
         // so the ten seconds below stay the handshake's, and only when a retry would use

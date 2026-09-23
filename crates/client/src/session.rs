@@ -5,6 +5,7 @@ use std::time::Duration;
 use selvage_protocol as proto;
 
 use crate::Role;
+use crate::peer::{PeerInvite, wire_invite};
 use crate::presence::AwarenessState;
 
 /// The awareness clock this client runs: renew every `awareness_renew`, forget a remote
@@ -193,6 +194,13 @@ pub struct ConnectOptions {
     /// Overrides the awareness clock the server advertises. `None` — the default — uses the
     /// server's values, so both sides of the session measure awareness the same way.
     pub keepalive: Option<KeepaliveConfig>,
+    /// The invite's fragment, read as `PROTOCOL.md` §5.1's two keys and the address it names.
+    ///
+    /// It is `Some` exactly when the link carried a fragment with both values, which is what
+    /// makes the link a `selvage/2` one: this engine cannot seal a frame, so
+    /// [`SyncEngine::connect`](crate::SyncEngine::connect) refuses options that carry these and
+    /// [`RelaySession`](crate::relay::RelaySession) is what joins one.
+    pub sealed_invite: Option<PeerInvite>,
     /// How a dropped connection is retried. `enabled` turns reconnection off; the
     /// fields override the defaults. An unset `max_attempts` is not a default of five:
     /// it is sized from the grace the room reports, so the retry spans the window the
@@ -233,19 +241,35 @@ impl ConnectOptions {
     /// Connects using an invite URL exactly as `invite_url` produced it: the link
     /// carries the server, the room and the token, so pasting it is enough.
     ///
-    /// Returns `None` when the URL does not address the session endpoint or does not
+    /// Both of `PROTOCOL.md` §5.1's forms are read — the connection URL and the page link —
+    /// and a fragment is read rather than dropped: a link that carries §5.1's two keys sets
+    /// [`ConnectOptions::sealed_invite`], which is how a caller learns it is holding a
+    /// `selvage/2` invite. The version itself is the fragment's presence and nothing else, so
+    /// a link without one stays a `selvage/1` connection.
+    ///
+    /// Returns `None` when the URL does not address a session endpoint or does not
     /// carry both a room and a token.
     #[must_use]
     pub fn from_invite_url(
         url: &str,
         display_name: impl Into<String>,
     ) -> Option<Self> {
-        let parsed = proto::parse_session_url(url)?;
+        let wire = wire_invite(url);
+        let parsed = proto::parse_session_url(&wire)?;
         let mut options = Self::new(parsed.base, display_name);
         options.room = parsed.join.room;
         options.token = parsed.join.token;
         options.role = Some(Role::Guest);
-        (options.room.is_some() && options.token.is_some()).then_some(options)
+        if options.room.is_none() || options.token.is_none() {
+            return None;
+        }
+        if url.contains('#') {
+            // A fragment that is not `§5.1`'s two keys is a local refusal here, as the absence
+            // of one is at a join: a caller is told what the link is missing rather than
+            // handed a session that will fail to read every frame of the room.
+            options.sealed_invite = PeerInvite::parse(url).ok();
+        }
+        Some(options)
     }
 
     fn new(
@@ -264,6 +288,7 @@ impl ConnectOptions {
                 env!("CARGO_PKG_VERSION")
             )),
             keepalive: None,
+            sealed_invite: None,
             reconnect: ReconnectPolicy::default(),
             initial_awareness: AwarenessState::default(),
         }
@@ -325,7 +350,49 @@ impl ConnectOptions {
 mod tests {
     use std::time::Duration;
 
-    use super::ReconnectPolicy;
+    use super::{ConnectOptions, ReconnectPolicy};
+    use crate::Role;
+    use crate::sealed::{RoomKey, SessionKey, encode_key};
+
+    /// The keys and the address a `selvage/2` invite carries, as a host mints them.
+    fn sealed_link() -> String {
+        format!(
+            "ws://h:8080/session?room=r-1&token=t-1#k={}&h={}",
+            encode_key(&RoomKey([7; 32]).0),
+            SessionKey::from_seed([3; 32]).public().encode()
+        )
+    }
+
+    /// §5.1: the fragment's two keys are what make a link a `selvage/2` one, so a link without
+    /// one stays the version-1 connection the engine speaks.
+    #[test]
+    fn the_fragment_decides_the_version_and_a_link_without_one_stays_version_one() {
+        let plain = ConnectOptions::from_invite_url(
+            "ws://h:8080/session?room=r-1&token=t-1",
+            "Ada",
+        )
+        .unwrap();
+        assert!(plain.sealed_invite.is_none());
+        assert_eq!(plain.base_url, "ws://h:8080");
+        assert_eq!(plain.room.as_deref(), Some("r-1"));
+        assert_eq!(plain.token.as_deref(), Some("t-1"));
+        assert_eq!(plain.role, Some(Role::Guest));
+
+        let sealed = ConnectOptions::from_invite_url(&sealed_link(), "Ada").unwrap();
+        let invite = sealed.sealed_invite.unwrap();
+        assert_eq!(invite.room, "r-1");
+        assert_eq!(invite.token, "t-1");
+        assert_eq!(invite.room_key, RoomKey([7; 32]));
+        assert_eq!(invite.host_key, SessionKey::from_seed([3; 32]).public());
+        assert!(!invite.socket_url.contains('#'));
+
+        // The page form is the same link over the scheme a browser speaks, and it resolves to
+        // the same room, token and two keys.
+        let page = sealed_link().replace("ws://h:8080/session?", "http://h:8080/?");
+        let from_page = ConnectOptions::from_invite_url(&page, "Ada").unwrap();
+        assert_eq!(from_page.base_url, "ws://h:8080");
+        assert_eq!(from_page.sealed_invite, Some(invite));
+    }
 
     fn fast() -> ReconnectPolicy {
         ReconnectPolicy {

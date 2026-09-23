@@ -21,6 +21,8 @@ pub enum Error {
     Closed,
     /// The session could not be started: the given string is not a connection URL.
     Invite(String),
+    /// The link names the other wire version, which this engine does not speak.
+    Version(String),
     /// The sync engine could not apply an operation.
     Yjs(String),
 }
@@ -34,6 +36,7 @@ impl fmt::Display for Error {
             Self::Protocol { code, message } => write!(f, "{code}: {message}"),
             Self::Closed => write!(f, "the session is closed"),
             Self::Invite(url) => write!(f, "not a Selvage invite URL: {url}"),
+            Self::Version(message) => write!(f, "{message}"),
             Self::Yjs(message) => write!(f, "sync: {message}"),
         }
     }
