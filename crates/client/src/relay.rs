@@ -1277,7 +1277,7 @@ mod tests {
     use futures_util::SinkExt;
     use futures_util::StreamExt;
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
     use tokio::task::JoinHandle;
     use tokio::time::sleep;
     use tokio_tungstenite::WebSocketStream;
@@ -1289,7 +1289,9 @@ mod tests {
     };
     use crate::host::{HostOptions, ListingSource};
     use crate::peer::{PeerOptions, PeerSession};
-    use crate::sealed::{Envelope, KeyId, RoomKey, SessionKey, encode_key};
+    use crate::sealed::{
+        Envelope, KeyId, Recipe, RoomKey, SessionKey, encode_key, seal,
+    };
     use crate::session::KeepaliveConfig;
 
     const ROOM: &str = "r-1";
@@ -1333,9 +1335,12 @@ mod tests {
     /// subject rather than a room. The server end reads every frame the client sends, in the
     /// order the socket delivers it, and records §6.1's clear prefix: the sealing covers none
     /// of it, and an end holding no key still reads the order a sender numbered its frames in.
+    /// It sends too, through [`Fixture::feed`], which is how a test reaches the socket task's
+    /// own inbound paths.
     struct Fixture {
         relay: Arc<RelaySession>,
         arrived: Arc<Mutex<Vec<Arrived>>>,
+        feed: mpsc::UnboundedSender<Message>,
         close: Option<oneshot::Sender<()>>,
         clock: Option<JoinHandle<()>>,
     }
@@ -1344,6 +1349,13 @@ mod tests {
         /// The frames that arrived so far, in order.
         fn arrived(&self) -> Vec<Arrived> {
             lock(&self.arrived).clone()
+        }
+
+        /// Puts one frame on the wire to the client, as the room's server would. The socket
+        /// task reads it through `deliver` or `hear` and publishes whatever §13 owes it, which
+        /// is the path a fixture that only ever listened cannot exercise.
+        fn feed(&self, frame: Message) -> bool {
+            self.feed.send(frame).is_ok()
         }
 
         /// Ends the room's socket the way a server that goes away does.
@@ -1359,10 +1371,32 @@ mod tests {
         }
     }
 
-    /// A seated relay over a loopback socket: a host session, seeded from constants, whose own
-    /// mint state commits its key — so a local edit is published rather than held back.
-    async fn fixture(
+    /// The session a fixture seats: the room, the two keys and this connection's own key, all
+    /// from constants. `host` is `None` for a guest, whose key no state commits until one
+    /// arrives — so §13.1's step 4 holds everything it edits back.
+    fn options(
         keepalive: KeepaliveConfig,
+        host: Option<HostOptions>,
+    ) -> PeerOptions {
+        PeerOptions {
+            room_id: ROOM.to_string(),
+            room_key: RoomKey([7; 32]),
+            host_key: SessionKey::from_seed(HOST_SEED).public(),
+            renew: keepalive.awareness_renew,
+            expire: keepalive.awareness_expire,
+            seat: Some(SEAT.to_string()),
+            roster: BTreeSet::new(),
+            fixed_session_key: Some(OWN_SEED),
+            declared_role: None,
+            awareness_client_id: Some(7),
+            host,
+        }
+    }
+
+    /// A seated relay over a loopback socket, whatever session is on it.
+    async fn seated(
+        keepalive: KeepaliveConfig,
+        options: &PeerOptions,
     ) -> Result<Fixture, Box<dyn StdError>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
@@ -1381,26 +1415,10 @@ mod tests {
 
         let arrived = Arc::new(Mutex::new(Vec::new()));
         let (close, closed) = oneshot::channel();
-        tokio::spawn(serving(server, Arc::clone(&arrived), closed));
+        let (feed, sent) = mpsc::unbounded_channel();
+        tokio::spawn(serving(server, Arc::clone(&arrived), closed, sent));
 
-        let listing: ListingSource = Arc::new(Vec::new);
-        let session = PeerSession::new(&PeerOptions {
-            room_id: ROOM.to_string(),
-            room_key: RoomKey([7; 32]),
-            host_key: SessionKey::from_seed(HOST_SEED).public(),
-            renew: keepalive.awareness_renew,
-            expire: keepalive.awareness_expire,
-            seat: Some(SEAT.to_string()),
-            roster: BTreeSet::new(),
-            fixed_session_key: Some(OWN_SEED),
-            declared_role: None,
-            awareness_client_id: Some(7),
-            host: Some(HostOptions {
-                host_seed: HOST_SEED,
-                listing,
-                store: None,
-            }),
-        })?;
+        let session = PeerSession::new(options)?;
         let info = RelaySessionInfo {
             room_id: ROOM.to_string(),
             token: Some("t-1".to_string()),
@@ -1421,20 +1439,50 @@ mod tests {
         Ok(Fixture {
             relay: Arc::new(relay),
             arrived,
+            feed,
             close: Some(close),
             clock,
         })
     }
 
-    /// The server end: what the client sent, until the socket ends.
+    /// A seated relay over a loopback socket: a host session, seeded from constants, whose own
+    /// mint state commits its key — so a local edit is published rather than held back.
+    async fn fixture(
+        keepalive: KeepaliveConfig,
+    ) -> Result<Fixture, Box<dyn StdError>> {
+        let listing: ListingSource = Arc::new(Vec::new);
+        let host = HostOptions {
+            host_seed: HOST_SEED,
+            listing,
+            store: None,
+        };
+        seated(keepalive, &options(keepalive, Some(host))).await
+    }
+
+    /// The same socket with a guest on it: no host half, and no state has committed its key, so
+    /// §13.1's step 4 holds back every edit until one does.
+    async fn guest_fixture(
+        keepalive: KeepaliveConfig,
+    ) -> Result<Fixture, Box<dyn StdError>> {
+        seated(keepalive, &options(keepalive, None)).await
+    }
+
+    /// The server end: what the client sent, until the socket ends, and what this end puts on
+    /// the wire back to it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the socket, its own two ends and the frames this test feeds in are what a server end is"
+    )]
     async fn serving(
-        mut socket: WebSocketStream<TcpStream>,
+        socket: WebSocketStream<TcpStream>,
         arrived: Arc<Mutex<Vec<Arrived>>>,
         mut close: oneshot::Receiver<()>,
+        mut sending: mpsc::UnboundedReceiver<Message>,
     ) {
+        let (mut sink, mut stream) = socket.split();
         loop {
             tokio::select! {
-                arriving = socket.next() => match arriving {
+                arriving = stream.next() => match arriving {
                     Some(Ok(Message::Binary(frame))) => {
                         if let Ok(envelope) = Envelope::parse(&frame) {
                             lock(&arrived).push(Arrived::Sealed {
@@ -1448,8 +1496,14 @@ mod tests {
                     Some(Ok(_)) => {}
                     Some(Err(_)) | None => return,
                 },
+                outgoing = sending.recv() => {
+                    let Some(frame) = outgoing else { return };
+                    if sink.send(frame).await.is_err() {
+                        return;
+                    }
+                }
                 _ = &mut close => {
-                    let _ = socket.close(None).await;
+                    let _ = sink.close().await;
                     return;
                 }
             }
@@ -1575,6 +1629,13 @@ mod tests {
     /// while they do, because on a machine with a core to spare the publisher always reaches
     /// its push first and the arrangement under test — the push after the lock — would pass.
     /// What it measures is the wire order, which is what a peer's mark is kept on.
+    ///
+    /// That load is the whole reproduction, and what it buys is worth stating: with the push
+    /// moved back to after the lock this test passed every run on a quiet host (0 red of 10)
+    /// and failed every run with one spinner per core added (10 of 10), and a failing run
+    /// carried 60–105 inversions in 5,500–7,000 frames, of which the first is the one reported.
+    /// The producers here are two callers and the clock; the socket task's own path is the test
+    /// below.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_editors_frames_leave_in_the_order_they_were_numbered()
     -> Result<(), Box<dyn StdError>> {
@@ -1604,6 +1665,128 @@ mod tests {
         assert!(
             counters.len() > 100,
             "the two editors published frames: {} arrived",
+            counters.len()
+        );
+        the_counters_advance(&counters);
+        fixture.end_the_socket();
+        Ok(())
+    }
+
+    /// How many edits a guest makes before the state that commits its key arrives. §13.1's step
+    /// 4 flushes every one of them as a single report, and a report this size is what makes the
+    /// race below decidable: the window a wrong arrangement leaves is the push loop the report
+    /// is handed over in, and one frame makes that window a function call wide.
+    const HELD_EDITS: usize = 8_000;
+
+    /// One frame this end seals itself, as the session's own `sealed_frame` does: the room's
+    /// frame key, the kind, a counter under the key that signs it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "what a test seals with: the kind, the counter, the signer and the plaintext"
+    )]
+    fn sealed(
+        kind: u64,
+        counter: u64,
+        signer: &SessionKey,
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        let frame_key = RoomKey([7; 32]).frame_key(ROOM);
+        let recipe = Recipe {
+            room_id: ROOM,
+            frame_key: &frame_key,
+            kind,
+            epoch: 0,
+            counter,
+            nonce: [9; 12],
+            signer,
+        };
+        seal(&recipe, plaintext).expect("the frame seals").bytes()
+    }
+
+    /// A host-signed state that commits this connection's own key: §7.1's mint state, which is
+    /// what takes a guest out of §13.1's step 4 and makes it publish everything it held back.
+    fn committing_state() -> Vec<u8> {
+        let mut peers = serde_json::Map::new();
+        peers.insert(
+            SessionKey::from_seed(OWN_SEED).public().encode(),
+            serde_json::json!({"peer_id": SEAT, "role": "guest"}),
+        );
+        let payload = serde_json::json!({
+            "issued": 1,
+            "listing": [PATH],
+            "peers": peers,
+        });
+        sealed(
+            1,
+            1,
+            &SessionKey::from_seed(HOST_SEED),
+            &serde_json::to_vec(&payload).expect("a state encodes"),
+        )
+    }
+
+    /// `count` edits a guest makes before a state commits its key, every one of them held back
+    /// by §13.1's step 4 rather than published.
+    fn hold_edits(
+        relay: &RelaySession,
+        count: usize,
+    ) -> Result<(), Box<dyn StdError>> {
+        for _ in 0..count {
+            let _ = relay.insert(PATH, 0, "x")?;
+        }
+        Ok(())
+    }
+
+    /// M1, the socket task's half: a report `deliver` publishes is handed to the socket under
+    /// the guard that numbered its frames, exactly as a caller's own edit is.
+    ///
+    /// The report is a guest's whole held-back set. §13.1's step 4 keeps every edit made before
+    /// a state commits this connection's key, and the state that commits it puts all of them on
+    /// the wire in one report — published from the socket task's own `delivered`, which is the
+    /// side of the lock that a fixture whose server end only ever listens cannot reach. The
+    /// editors above race each other; this races an editor against that report, and the
+    /// property is the same: a frame the report numbered must not arrive behind one the editor
+    /// numbered later.
+    ///
+    /// **The race is the same race, with a wider window.** Reverting `delivered` alone — the
+    /// report drained under the guard and handed over after it — leaves the editors' test above
+    /// green and turns this one red on a quiet host: fifteen failing runs in fifteen, the
+    /// failure the first counter inversion, which lands between frame 3,400 and frame 10,700 of
+    /// runs of 9,700–14,900. The window is the loop the report's frames leave in, thousands of
+    /// pushes wide, where a report of one frame leaves a window a function call wide and the
+    /// machine's mood decides it: at half this report, that revert was caught in 8 runs of 10.
+    /// With the fix it is green, ten runs in ten.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reports_frames_are_handed_over_under_the_lock_that_numbered_them()
+    -> Result<(), Box<dyn StdError>> {
+        let mut fixture = guest_fixture(keepalive()).await?;
+        fixture.relay.open(PATH)?;
+        // §13.1's step 4, ahead of the state: none of these is published yet.
+        hold_edits(&fixture.relay, HELD_EDITS)?;
+
+        // An editor of its own, editing through the lock while the report is handed over.
+        let editor = editor(Arc::clone(&fixture.relay), WINDOW);
+        assert!(
+            fixture.feed(Message::binary(committing_state())),
+            "the committing state reaches the client's socket"
+        );
+        joined(vec![editor], "editor");
+
+        // The same sentinel as above: a text frame the session sends after the last edit says
+        // the queue holds none of theirs any more.
+        fixture.relay.rename("done")?;
+        let arrived = Arc::clone(&fixture.arrived);
+        assert!(
+            held_within(WAIT, || sent_text(&arrived)).await,
+            "the sentinel frame arrives"
+        );
+
+        let counters = counters_of(
+            &fixture.arrived(),
+            SessionKey::from_seed(OWN_SEED).public().id(),
+        );
+        assert!(
+            counters.len() > HELD_EDITS,
+            "the held set and the editor both published: {} arrived",
             counters.len()
         );
         the_counters_advance(&counters);
