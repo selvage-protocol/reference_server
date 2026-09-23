@@ -1005,8 +1005,11 @@ impl PeerSession {
     }
 
     /// Whether §13.1's step 4 lets this client publish anything but its announcement.
+    ///
+    /// §13.10: a session that has ended publishes nothing, whichever ending reached it, so
+    /// the ending is checked here rather than at each caller.
     fn may_publish(&self) -> bool {
-        self.state_held() && self.commits_ours()
+        self.ending.is_none() && self.state_held() && self.commits_ours()
     }
 
     /// §13.1's step 4: the session-key announcement, `kind = 4`, signed by the key it names.
@@ -1816,6 +1819,38 @@ mod tests {
         assert_eq!(session.published(), 2);
         let envelope = Envelope::parse(&out[0]).unwrap();
         assert_eq!(envelope.kind, 0);
+    }
+
+    /// §13.10: a session that has ended publishes nothing, whichever ending reached it. A
+    /// guest whose ending is the host's closing keeps a later edit in its own replica and
+    /// sends none of it.
+    #[test]
+    fn an_ended_session_publishes_no_edit() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let state = state(&host(), 1, &[(&ours(), "guest", "p-self")]);
+        assert_eq!(
+            session.deliver(millis(1), &state),
+            Outcome::Applied { kind: 1 }
+        );
+        assert_eq!(
+            session.deliver(millis(2), &closing(&host(), 2)),
+            Outcome::Applied { kind: 2 }
+        );
+        assert_eq!(session.ending(), Some(Ending::Closing));
+        let _ = session.take_outbound();
+        let published = session.published();
+        assert!(
+            !session.insert("README.md", 0, "after the closing").unwrap(),
+            "an ended session publishes nothing"
+        );
+        assert!(session.take_outbound().is_empty());
+        assert_eq!(session.published(), published);
+        assert_eq!(
+            session.text("README.md"),
+            "after the closing",
+            "and its own replica still holds the edit"
+        );
     }
 
     #[test]
