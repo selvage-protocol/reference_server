@@ -22,6 +22,11 @@ exclude = [
   # demo's box. It answers only while that is running, and it is never a link
   # anything can check from a checkout.
   "^https?://127\\.0\\.0\\.1[:/]",
+  # `h` is the placeholder host a client test builds its links from
+  # (`ws://h:8080/session?room=r-1`), read back as the page form over the scheme a
+  # browser speaks. No such host exists to answer, and `ws://` is already
+  # unsupported rather than checked.
+  "^https?://h[:/]",
   # The Pi demo's **server** origin, where 404 is the right answer: that
   # deployment is two-origin, so its page is `http://100.64.0.3/` (200) and only
   # `/meta` and `/session` exist on `:8080`. The URL is in
