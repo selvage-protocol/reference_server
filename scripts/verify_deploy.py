@@ -47,7 +47,7 @@ from typing import NamedTuple
 
 SSH_TARGET = "deployci@selvage-protocol-prod"
 ORIGIN_URL = "https://127.0.0.1"
-PUBLIC_URL = "https://selvage.dontblameme.dev"
+PUBLIC_URL = "https://selvage-demo.dontblameme.dev"
 
 # Long enough for a front that a deploy has just recreated to answer again, and
 # short enough that a step which cannot pass says so instead of looking hung.

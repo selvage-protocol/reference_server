@@ -1,4 +1,4 @@
-# The public demo at `selvage.dontblameme.dev`, and nothing else.
+# The public demo at `selvage-demo.dontblameme.dev`, and nothing else.
 #
 # Three containers on one origin, on an Azure `Standard_B2ats_v2`: 2 vCPU,
 # 892 MiB of RAM and no swap. The front terminates TLS for the Cloudflare

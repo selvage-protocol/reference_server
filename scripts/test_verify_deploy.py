@@ -375,7 +375,7 @@ class TheSubprocessTest(unittest.TestCase):
     def test_a_missing_curl_is_a_read_that_fails_rather_than_a_traceback(self):
         with tempfile.TemporaryDirectory() as empty:
             with mock.patch.dict(os.environ, {"PATH": empty}):
-                reading = verify.read_public("https://selvage.dontblameme.dev")
+                reading = verify.read_public("https://selvage-demo.dontblameme.dev")
             self.assertEqual(reading.status, "")
             self.assertIn("could not be run", reading.error)
 
@@ -393,7 +393,7 @@ class TheSubprocessTest(unittest.TestCase):
                 "printf '403'\n",
             )
             with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}:{os.environ['PATH']}"}):
-                reading = verify.read_public("https://selvage.dontblameme.dev")
+                reading = verify.read_public("https://selvage-demo.dontblameme.dev")
             self.assertEqual(reading.status, "403")
             verdict, detail = verify.classify_public(reading, "0.2.1")
             self.assertEqual(verdict, verify.CHALLENGE)
@@ -413,7 +413,7 @@ class TheSubprocessTest(unittest.TestCase):
                 "printf '200'\nexit 28\n",
             )
             with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}:{os.environ['PATH']}"}):
-                reading = verify.read_public("https://selvage.dontblameme.dev")
+                reading = verify.read_public("https://selvage-demo.dontblameme.dev")
             self.assertIn("exited 28", reading.error)
             verdict, _ = verify.classify_public(reading, "0.2.1")
             self.assertEqual(verdict, verify.UNREADABLE)

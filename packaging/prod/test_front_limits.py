@@ -204,7 +204,7 @@ def source_conn(port, source, timeout=15):
 
 
 def get_response(conn, path):
-    conn.request("GET", path, headers={"Host": "selvage.dontblameme.dev", "User-Agent": "front-limits"})
+    conn.request("GET", path, headers={"Host": "selvage-demo.dontblameme.dev", "User-Agent": "front-limits"})
     response = conn.getresponse()
     headers = {name.lower(): value for name, value in response.getheaders()}
     response.read()

@@ -1,6 +1,6 @@
 # The public demo's shape
 
-The exact files that run `selvage.dontblameme.dev`, tracked here so the
+The exact files that run `selvage-demo.dontblameme.dev`, tracked here so the
 deployment's shape is a reviewable artefact in a repository. `pi-demo/` beside
 this directory is the same idea for the Pi.
 
@@ -37,7 +37,7 @@ One origin serves everything, one port is published, and the split is by path:
 
 ```text
               browser
-                 |  https://selvage.dontblameme.dev/...
+                 |  https://selvage-demo.dontblameme.dev/...
                  v
           Cloudflare  (proxied DNS, Full (strict), redirect at the edge)
                  |  TCP 443, from Cloudflare's published ranges only
@@ -254,13 +254,13 @@ has ever set it: no file under `packaging/prod/` carries an `add_header` at all.
 What a visitor receives for this host is Cloudflare's, added at the zone:
 
 ```console
-$ curl -sS -o /dev/null -D - https://selvage.dontblameme.dev/ | grep -i strict-transport
+$ curl -sS -o /dev/null -D - https://selvage-demo.dontblameme.dev/ | grep -i strict-transport
 strict-transport-security: max-age=0; includeSubDomains; preload
 ```
 
 That field is the edge's and not the origin's, and the response that shows it
 does not settle the question — both layers answer on this hostname. Two others
-do. `https://selvage.dontblameme.dev/cdn-cgi/trace` is answered by Cloudflare
+do. `https://selvage-demo.dontblameme.dev/cdn-cgi/trace` is answered by Cloudflare
 and never reaches an origin, and it carries the same field; so does the zone's
 apex, where `dontblameme.dev` answers a `301` to another site from the edge.
 The value is Cloudflare's HSTS setting with a max-age of `0`, which is that
@@ -436,7 +436,7 @@ older front is that directory at an older commit and the same `up -d`.
 
 ## Cloudflare answers a datacenter client with a challenge
 
-`curl https://selvage.dontblameme.dev/meta` from a GitHub runner, and from this
+`curl https://selvage-demo.dontblameme.dev/meta` from a GitHub runner, and from this
 box, is refused at the edge:
 
 ```console
@@ -595,10 +595,18 @@ not which build that page is.
 
 ## Certificate
 
-The certificate is a Cloudflare Origin Certificate for
-`selvage.dontblameme.dev`, valid to 2041. The owner placed it at
-`/etc/selvage/tls/origin.pem` and `/etc/selvage/tls/origin.key` and the front
-reads both by path, so a replacement is a file copy and `docker compose restart proxy` — never a rebuild.
+The certificate is a Cloudflare **Origin Certificate**, and the front presents it
+to Cloudflare on every connection to this listener. It has to cover the host the
+zone serves, `selvage-demo.dontblameme.dev`, because **Full (strict)** validates
+the origin's certificate against the name the visitor asked for: a certificate
+that does not name it is answered at the edge with Cloudflare's **526** and
+never reaches the front. A `*.dontblameme.dev` Origin Certificate covers this
+host, and every other subdomain of the zone, in one file.
+
+The owner placed it at `/etc/selvage/tls/origin.pem` and
+`/etc/selvage/tls/origin.key`, and the front reads both by path, so a
+replacement is a file copy and `docker compose restart proxy` — never a
+rebuild.
 
 The key is mode **640**, owned `root` and group **101** on the host, which is the
 group uid 101 is in inside the front's image. The front is the only thing that

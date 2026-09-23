@@ -1,6 +1,6 @@
 name: deploy-prod
 
-# The button that redeploys the public demo, `selvage.dontblameme.dev`.
+# The button that redeploys the public demo, `selvage-demo.dontblameme.dev`.
 #
 # One job, behind the `prod` environment, which is what makes this safe to have
 # at all: the environment's required reviewer is the approval, and the
