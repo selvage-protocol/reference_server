@@ -687,7 +687,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "selvage-client"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "ed25519-dalek",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "selvage-harness"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "futures-util",
  "selvage-client",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "selvage-protocol"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "selvaged"
-version = "0.2.1"
+version = "0.4.0"
 dependencies = [
  "futures-util",
  "rand",

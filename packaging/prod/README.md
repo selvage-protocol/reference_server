@@ -408,7 +408,7 @@ git archive <sha> packaging/prod | ssh selvage@selvage-protocol-prod 'sudo tar -
 and this is the public origin.
 
 ```sh
-scripts/image-digest.py ghcr.io/selvage-protocol/selvaged:0.2.0
+scripts/image-digest.py ghcr.io/selvage-protocol/selvaged:0.2.1
 ```
 
 That is the same anonymous pull flow `assert-multiarch-layers.py` uses
@@ -416,7 +416,7 @@ That is the same anonymous pull flow `assert-multiarch-layers.py` uses
 one line of it a deploy needs is:
 
 ```sh
-repo=selvage-protocol/selvaged; tag=0.2.0
+repo=selvage-protocol/selvaged; tag=0.2.1
 tok=$(curl -s "https://ghcr.io/token?scope=repository:$repo:pull&service=ghcr.io" \
       | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
 curl -sI -H "Authorization: Bearer $tok" \
@@ -495,8 +495,8 @@ cannot fail it).
 
 ```sh
 gh workflow run deploy-prod.yml --ref main -f server_version=0.2.1
-gh workflow run deploy-prod.yml --ref main -f web_version=0.1.1
-gh workflow run deploy-prod.yml --ref main -f server_version=0.3.0 -f web_version=0.2.0
+gh workflow run deploy-prod.yml --ref main -f web_version=0.3.1
+gh workflow run deploy-prod.yml --ref main -f server_version=0.2.1 -f web_version=0.3.1
 ```
 
 An input it is not given means **leave that service exactly as it is**, so a page
