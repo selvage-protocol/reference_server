@@ -508,10 +508,15 @@ fn peer_left_frame(version: proto::Version, peer_id: &str) -> Option<Outbound> {
     )
 }
 
-/// The `host.detached` a host's departure is announced with.
-fn host_detached_frame(grace_ms: u64) -> Option<Outbound> {
+/// The `host.detached` a host's departure is announced with, in the version of the peer that
+/// left: a frame's `v` is the connection's and not the server's, so a version-2 room's
+/// `host.detached` stamped with the other version is one the clients it is meant for refuse.
+fn host_detached_frame(
+    version: proto::Version,
+    grace_ms: u64,
+) -> Option<Outbound> {
     event_frame(
-        proto::Version::V1,
+        version,
         event::HOST_DETACHED,
         serde_json::json!({ "grace_ms": grace_ms }),
     )
@@ -580,7 +585,7 @@ async fn eject_into(
     // before `host.detached`, like a clean leave in `remove_peer`.
     if removed.was_host {
         let grace = grace_ms(&shared.config);
-        if let Some(gone) = host_detached_frame(grace) {
+        if let Some(gone) = host_detached_frame(removed.version, grace) {
             pending.push((None, gone));
         }
         reap_later(shared.clone(), room_id.to_string(), removed.generation);
@@ -617,7 +622,13 @@ async fn remove_peer(shared: &Shared, room_id: &str, peer_id: &str) {
     .await;
     if removed.was_host {
         let grace = grace_ms(&shared.config);
-        deliver(shared, room_id, None, host_detached_frame(grace)).await;
+        deliver(
+            shared,
+            room_id,
+            None,
+            host_detached_frame(removed.version, grace),
+        )
+        .await;
         reap_later(shared.clone(), room_id.to_string(), removed.generation);
     } else if removed.version == proto::Version::V2 && removed.empty {
         reap_later_empty(
@@ -1428,6 +1439,24 @@ mod tests {
     /// A server holding one registry, for a test that drives seating directly.
     fn serving(config: ServerConfig) -> Shared {
         Shared::new(config, Arc::new(Mutex::new(Registry::default())))
+    }
+
+    /// n1: an event frame carries the version of the connection it is addressed to, and
+    /// `host.detached` is one. `Room::host` is set only for a version-1 room, so a version-2
+    /// room cannot reach this today — which is why the stamp is pinned here rather than left as
+    /// a hardcoded version for the next reader to inherit.
+    #[test]
+    fn a_host_detached_frame_carries_the_version_of_the_peer_that_left() {
+        let frame =
+            host_detached_frame(proto::Version::V2, 30_000).expect("a frame");
+        let Outbound::Text(text) = frame else {
+            panic!("an event is a text frame");
+        };
+        let body: serde_json::Value =
+            serde_json::from_str(&text).expect("its own JSON");
+        assert_eq!(body["v"], "selvage/2");
+        assert_eq!(body["event"], event::HOST_DETACHED);
+        assert_eq!(body["params"]["grace_ms"], 30_000);
     }
 
     /// A mint whose `room.created` the queue will not take is taken back: the room is
