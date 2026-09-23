@@ -335,6 +335,16 @@ class TheSubprocessTest(unittest.TestCase):
         for foreign in ("0.2.1", "server_version", "SERVER_VERSION", "@VERSION@"):
             self.assertNotIn(foreign, command)
 
+    def test_the_remote_command_names_the_host_the_front_answers(self):
+        """The front is the server for the demo's name and closes the connection
+        for any other, so a loopback read that named only `127.0.0.1` would come
+        back with nothing rather than with the origin, and the deploy would go
+        red for a reason that is not the box's."""
+        command = verify.remote_read("https://127.0.0.1")
+        self.assertIn(f"-H 'Host: {verify.DEMO_HOST}'", command)
+        self.assertEqual(command.count(f"Host: {verify.DEMO_HOST}"), 2, "both the page and /meta carry it")
+        self.assertIn(f"https://{verify.DEMO_HOST}", verify.PUBLIC_URL)
+
     def test_the_url_reaches_the_remote_shell_as_data(self):
         with tempfile.TemporaryDirectory() as workdir:
             bin_dir = Path(workdir) / "bin"

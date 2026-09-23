@@ -100,6 +100,17 @@ if [ -z "$terms_root" ]; then
     exit 2
 fi
 
+# The one name the front's block is the server for, read out of the configuration
+# for the same reason the root is: every request below has to carry it. A request
+# for any other Host is closed rather than served (that guard is in the block
+# above and `test_front_limits.py` measures it in both directions), so a harness
+# with the wrong name here would fail every claim for the wrong reason.
+demo_host=$(sed -n 's/^[[:space:]]*server_name \([^;[:space:]]*\);$/\1/p' "$default_conf")
+if [ -z "$demo_host" ]; then
+    printf 'no server_name in %s: the harness has no Host to ask for\n' "$default_conf" >&2
+    exit 2
+fi
+
 sed \
     -e "s#^pid /dev/shm/nginx.pid;#pid $work/nginx.pid;#" \
     -e "s#^error_log /dev/stderr crit;#error_log $work/error.log crit;#" \
@@ -189,7 +200,7 @@ stub_pid=$!
 "$ngx" -c "$work/nginx.conf" -p "$work/prefix" -e "$work/error.log"
 
 deadline=$((SECONDS + 15))
-until curl -sS -o /dev/null --max-time 2 "http://127.0.0.1:$listen_port/terms"; do
+until curl -sS -o /dev/null --max-time 2 -H "Host: $demo_host" "http://127.0.0.1:$listen_port/terms"; do
     if [ "$SECONDS" -ge "$deadline" ]; then
         bad 'the front did not answer /terms within 15s'
         printf '  front log:\n'
@@ -204,7 +215,7 @@ ok "the front is listening on 127.0.0.1:$listen_port"
 
 say "the terms page, as served"
 
-fetch() { curl -sS --max-time 5 -o "$2" -w '%{http_code} %{content_type}' "$1"; }
+fetch() { curl -sS --max-time 5 -H "Host: $demo_host" -o "$2" -w '%{http_code} %{content_type}' "$1"; }
 
 answer=$(fetch "http://127.0.0.1:$listen_port/terms" "$work/served-terms.html")
 code=${answer%% *}
@@ -332,6 +343,25 @@ if grep -q 'GET /termsomething' "$work/page.log"; then
     ok 'a sibling path reaches the page container, not the terms file'
 else
     bad '/termsomething did not reach the page container'
+fi
+
+say "the name the front is the server for"
+
+# The front's block is the only one on its port, so nginx would otherwise make it
+# the default and answer any name that resolves here. `selvage.dontblameme.dev`
+# is the project's landing page, served somewhere else entirely, and a request
+# naming it must not reach the demo's locations. `444` is a closed connection
+# with no response, which curl reports as `000` and a non-zero status.
+#
+# The positive half of the pair is every fetch above: they all name `$demo_host`,
+# read out of the configuration, and none of them could bring a body through if
+# that were not the name the front is the server for.
+answer=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+    -H 'Host: selvage.dontblameme.dev' "http://127.0.0.1:$listen_port/terms" 2>/dev/null || true)
+if [ "$answer" = 000 ]; then
+    ok 'a request naming another host is closed rather than served'
+else
+    bad "a request naming another host answered $answer: the front answers a name it is not the server for"
 fi
 
 say "result"

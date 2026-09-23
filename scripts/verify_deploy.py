@@ -4,10 +4,11 @@
 Two reads, and only one of them decides the run's colour.
 
 * **The origin**, over the Tailscale SSH path the deploy itself used, through the
-  front on the box's own loopback: `https://127.0.0.1/meta` and the page at `/`.
-  That is the honest source — it is what is running, with no edge between the
-  reader and it — so it **fails the run** when the version asked for is not the
-  version served, and when the page stops answering 200.
+  front on the box's own loopback: `https://127.0.0.1/meta` and the page at `/`,
+  both naming the demo's own `Host`. That is the honest source — it is what is
+  running, with no edge between the reader and it — so it **fails the run** when
+  the version asked for is not the version served, and when the page stops
+  answering 200.
 * **The public origin**, over Cloudflare, from this runner. It is read in three
   shapes and only one of them decides the run's colour:
 
@@ -28,7 +29,10 @@ Two reads, and only one of them decides the run's colour.
 The origin read needs `-k`: the certificate is the Cloudflare Origin CA pair
 issued for the public name, which is in no trust store and does not match
 `127.0.0.1` in any case. The front is reached directly, not through the edge, and
-nothing from the dispatch reaches the remote shell.
+nothing from the dispatch reaches the remote shell. It also needs the `Host`
+header, because the front is the server for `selvage-demo.dontblameme.dev` and
+closes the connection for any other name: a loopback address is where the front
+is, not a name it answers.
 
     scripts/verify_deploy.py --expect-version 0.2.1
     scripts/verify_deploy.py                      # a page-only deploy: /meta is read, not compared
@@ -47,7 +51,13 @@ from typing import NamedTuple
 
 SSH_TARGET = "deployci@selvage-protocol-prod"
 ORIGIN_URL = "https://127.0.0.1"
-PUBLIC_URL = "https://selvage-demo.dontblameme.dev"
+# The name the deployment's front is the server for, and the one it answers; a
+# request naming any other Host is closed rather than served. Both reads carry it:
+# the public one in the URL, and the origin read — which dials the box's own
+# loopback, with no edge in the way — as an explicit `Host`, because an address is
+# not a name and `127.0.0.1` is not one the front serves.
+DEMO_HOST = "selvage-demo.dontblameme.dev"
+PUBLIC_URL = f"https://{DEMO_HOST}"
 
 # Long enough for a front that a deploy has just recreated to answer again, and
 # short enough that a step which cannot pass says so instead of looking hung.
@@ -65,8 +75,8 @@ META_MARKER = "origin-meta:"
 # version nor anything else out of the dispatch is in here: it is a comparison on
 # this side and never a word in a remote shell.
 REMOTE_READ = """\
-printf 'origin-page:%s\\n' "$(curl -sk -o /dev/null -w '%{http_code}' --max-time @MAX@ @URL@/)"
-printf 'origin-meta:%s\\n' "$(curl -sk --max-time @MAX@ @URL@/meta | tr -d '\\n')"
+printf 'origin-page:%s\\n' "$(curl -sk -o /dev/null -w '%{http_code}' --max-time @MAX@ -H 'Host: @HOST@' @URL@/)"
+printf 'origin-meta:%s\\n' "$(curl -sk --max-time @MAX@ -H 'Host: @HOST@' @URL@/meta | tr -d '\\n')"
 """
 
 CHALLENGE = "challenge"
@@ -218,9 +228,14 @@ def remote_read(origin_url: str) -> str:
 
     The SSH client hands this string to the remote user's shell, so a
     `--origin-url` carrying shell syntax has to arrive as data rather than as
-    syntax. The seconds placeholder is a number this module owns.
+    syntax. The seconds placeholder is a number this module owns, and the Host is
+    the name above, quoted the same way.
     """
-    return REMOTE_READ.replace("@MAX@", str(CURL_MAX_SECONDS)).replace("@URL@", shlex.quote(origin_url))
+    return (
+        REMOTE_READ.replace("@MAX@", str(CURL_MAX_SECONDS))
+        .replace("@HOST@", shlex.quote(DEMO_HOST))
+        .replace("@URL@", shlex.quote(origin_url))
+    )
 
 
 def read_origin(ssh_target: str, origin_url: str) -> Origin:
