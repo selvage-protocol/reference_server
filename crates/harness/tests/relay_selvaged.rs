@@ -11,6 +11,10 @@ use std::error::Error as StdError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio::time::timeout;
+
 use selvage_client::host::{HostStore, PersistedHost};
 use selvage_client::relay::{
     RelayEnding, RelayHostOptions, RelayJoinOptions, RelaySession,
@@ -169,7 +173,17 @@ async fn a_version_two_host_mints_and_a_guest_joins_by_the_wire_link()
     assert_eq!(host.session_info().room_id, guest.session_info().room_id);
     assert!(host.is_host());
     assert!(!guest.is_host());
-    assert_eq!(guest.applied_role().as_deref(), Some("guest"));
+    // The listing and this connection's role do not necessarily arrive in one state: a host
+    // publishes its own state on its clock too, and one that does not yet commit this guest
+    // carries the listing and no seat for it. The role is what the state §7.1 owes
+    // `peer.joined` gives, so it is waited for rather than read off the listing's arrival.
+    let role = wait_for_described(
+        "the guest to learn its role",
+        || async { format!("{:?}", guest.applied_role()) },
+        || async { guest.applied_role() },
+    )
+    .await;
+    assert_eq!(role, "guest");
 
     // §13.4: the guest's seat reaches the host as a `peer.joined`, and the role it is drawn
     // with is the one the applied state gives that seat rather than anything the event claimed.
@@ -347,13 +361,20 @@ async fn the_hosts_closing_ends_the_guest() -> Result<(), Failure> {
 }
 
 /// A link with no fragment carries neither of §5.1's two keys, and a join is refused before a
-/// socket exists rather than handed a room it cannot read.
+/// socket exists — measured, not inferred from the refusal's wording: the address the link
+/// names is a listener this test owns, and it fails the test if any connection arrives.
 #[tokio::test]
 async fn a_fragment_less_link_is_refused_before_a_socket_is_opened()
 -> Result<(), Failure> {
-    let server = Harness::start_with(transitional()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (heard, mut arrival) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let _ = heard.send(listener.accept().await.is_ok());
+    });
+
     let joined = RelaySession::join(RelayJoinOptions {
-        invite: format!("{}/session?room=r-1&token=t-1", server.ws_base()),
+        invite: format!("ws://{addr}/session?room=r-1&token=t-1"),
         display_name: "Bob".to_string(),
         declared_role: None,
         client: None,
@@ -364,6 +385,13 @@ async fn a_fragment_less_link_is_refused_before_a_socket_is_opened()
     assert!(
         error.to_string().contains("fragment"),
         "the refusal asks for the whole link: {error}"
+    );
+    assert!(
+        !matches!(
+            timeout(Duration::from_millis(250), arrival.recv()).await,
+            Ok(Some(true))
+        ),
+        "a socket was opened for a link that names no keys"
     );
     Ok(())
 }
