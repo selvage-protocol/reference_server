@@ -1,6 +1,6 @@
 # The public demo's shape
 
-The exact files that run `selvage.dontblameme.dev`, tracked here so the
+The exact files that run `selvage-demo.dontblameme.dev`, tracked here so the
 deployment's shape is a reviewable artefact in a repository. `pi-demo/` beside
 this directory is the same idea for the Pi.
 
@@ -29,7 +29,7 @@ those facts; this directory owns the files, and the two must agree.
 | `proxy/conf.d/cloudflare-ips.conf` | baked into that image | Cloudflare's published ranges, for `real_ip` |
 | `proxy/www/terms.html` | baked into that image at `/usr/share/selvage/www/` | The terms of this instance, which is the page `/terms` answers with |
 | `check-terms.sh` | nowhere; run where it is | The notice read back out of the bytes the front serves, without Docker |
-| `test_front_limits.py` | nowhere; run where it is | That the front refuses a source, and that one metered endpoint cannot spend another's budget |
+| `test_front_limits.py` | nowhere; run where it is | That the front serves one name, refuses a source, and that one metered endpoint cannot spend another's budget |
 
 ## The shape
 
@@ -37,7 +37,7 @@ One origin serves everything, one port is published, and the split is by path:
 
 ```text
               browser
-                 |  https://selvage.dontblameme.dev/...
+                 |  https://selvage-demo.dontblameme.dev/...
                  v
           Cloudflare  (proxied DNS, Full (strict), redirect at the edge)
                  |  TCP 443, from Cloudflare's published ranges only
@@ -172,6 +172,16 @@ idle deadline and a rate limit in front of the server, and requires that a
 deployment not log request URLs. The split is the one `ai_notes` settled when the
 capacity flags landed:
 
+- **One name, and only one.** The front's block is the only server on its port, so
+  nginx makes it the default and would answer *any* name that resolves to this
+  origin — `selvage.dontblameme.dev` is the project's landing page and is served
+  somewhere else entirely. A request whose `Host` is not the name that block is
+  the server for is closed with `444` — no response at all — rather than given the
+  demo's page or its socket. The name is written once, in the block's
+  `server_name`, and the guard compares the request against it; the NSG above
+  means no such request arrives from outside Cloudflare today, which makes this
+  depth rather than the only lock.
+
 - **Per-source caps at the front.** `selvaged` has no per-source view at all.
   `limit_conn` allows one source 32 connections to the page, 8 concurrent
   `/session` sockets and 4 concurrent `/meta` reads; `limit_req` allows 5 `/session`
@@ -254,13 +264,13 @@ has ever set it: no file under `packaging/prod/` carries an `add_header` at all.
 What a visitor receives for this host is Cloudflare's, added at the zone:
 
 ```console
-$ curl -sS -o /dev/null -D - https://selvage.dontblameme.dev/ | grep -i strict-transport
+$ curl -sS -o /dev/null -D - https://selvage-demo.dontblameme.dev/ | grep -i strict-transport
 strict-transport-security: max-age=0; includeSubDomains; preload
 ```
 
 That field is the edge's and not the origin's, and the response that shows it
 does not settle the question — both layers answer on this hostname. Two others
-do. `https://selvage.dontblameme.dev/cdn-cgi/trace` is answered by Cloudflare
+do. `https://selvage-demo.dontblameme.dev/cdn-cgi/trace` is answered by Cloudflare
 and never reaches an origin, and it carries the same field; so does the zone's
 apex, where `dontblameme.dev` answers a `301` to another site from the edge.
 The value is Cloudflare's HSTS setting with a max-age of `0`, which is that
@@ -436,7 +446,7 @@ older front is that directory at an older commit and the same `up -d`.
 
 ## Cloudflare answers a datacenter client with a challenge
 
-`curl https://selvage.dontblameme.dev/meta` from a GitHub runner, and from this
+`curl https://selvage-demo.dontblameme.dev/meta` from a GitHub runner, and from this
 box, is refused at the edge:
 
 ```console
@@ -450,8 +460,8 @@ It is a **managed challenge**, a zone-level Cloudflare setting aimed at
 automated traffic, and a programmatic client cannot pass it: there is no
 browser to run the challenge's script and no `cf_clearance` cookie to carry.
 What triggers it here is the *address*, not the request — the two reads that
-answer are the box's own front (`curl -sk https://127.0.0.1/meta`, 200 with the
-right body) and the same public read from a residential host (200). The origin
+answer are the box's own front (`curl -sk -H 'Host: selvage-demo.dontblameme.dev' https://127.0.0.1/meta`, 200 with the right body) and the same public read from a
+residential host (200). The origin
 and the front are healthy; the edge is the layer saying no.
 
 **What that means:** nothing on a datacenter address can read this deployment's
@@ -475,7 +485,9 @@ this, and the next reader should not spend a cycle finding that out again.
 `.github/workflows/deploy-prod.yml` in `reference_server`: a manual dispatch that
 joins the tailnet, hands this box one request over Tailscale SSH and then asserts,
 over that same SSH path, that the origin is serving the version it deployed —
-`https://127.0.0.1/meta` through the front, and the page answering 200. The
+`https://127.0.0.1/meta` through the front, naming the demo's own `Host` because a
+loopback address is where the front is and not a name it answers, and the page
+answering 200. The
 public URL is read too: a challenge, an unreadable read or any other answer that
 is not a version is a report, and a 200 reporting a version other than the one
 the dispatch named fails the run (the challenge above is why the first three
@@ -595,10 +607,22 @@ not which build that page is.
 
 ## Certificate
 
-The certificate is a Cloudflare Origin Certificate for
-`selvage.dontblameme.dev`, valid to 2041. The owner placed it at
-`/etc/selvage/tls/origin.pem` and `/etc/selvage/tls/origin.key` and the front
-reads both by path, so a replacement is a file copy and `docker compose restart proxy` — never a rebuild.
+The certificate is a Cloudflare **Origin Certificate**, and the front presents it
+to Cloudflare on every connection to this listener. It has to cover the host the
+zone serves, `selvage-demo.dontblameme.dev`, because **Full (strict)** validates
+the origin's certificate against the name the visitor asked for: a certificate
+that does not name it is answered at the edge with Cloudflare's **526** and
+never reaches the front. A `*.dontblameme.dev` Origin Certificate covers this
+host, and every other single-label name on the zone, in one file — the landing
+page's `selvage.dontblameme.dev` among them. It covers *that* and no more: a
+wildcard matches one label, so a nested name such as `a.b.dontblameme.dev` is
+not covered by it, and a host serving one needs a certificate that names it,
+either its own or an entry on this certificate's SAN list.
+
+The owner placed it at `/etc/selvage/tls/origin.pem` and
+`/etc/selvage/tls/origin.key`, and the front reads both by path, so a
+replacement is a file copy and `docker compose restart proxy` — never a
+rebuild.
 
 The key is mode **640**, owned `root` and group **101** on the host, which is the
 group uid 101 is in inside the front's image. The front is the only thing that
@@ -623,15 +647,19 @@ visitor and nothing about TLS, the certificate or the upstreams, which is what
 the box proof below is for.
 
 `test_front_limits.py` is the same harness pointed at the limits, and runs in CI
-as the `prod-front` check. It asserts what a configuration file cannot: that
-`/session` is refused with a real `429` past its burst, that six concurrent
-`/meta` reads are refused past `permeta`'s four, and that a source which has just
-spent `/meta` is still served on `/session`. Each client is a loopback address of
-its own, because the zones are keyed on `$binary_remote_addr`, so none of the
-claims waits for a rate to refill. The last claim carries its own control inside
-the test: the same run against a copy whose `/meta` names the session request
-zone has to fail it, and a control that passed would mean the test could not see
-the defect it exists for.
+as the `prod-front` check. It asserts what a configuration file cannot: that a
+request naming a Host the front is not the server for is closed rather than
+answered, that `/session` is refused with a real `429` past its burst, that six
+concurrent `/meta` reads are refused past `permeta`'s four, and that a source
+which has just spent `/meta` is still served on `/session`. Each client is a
+loopback address of its own, because the zones are keyed on
+`$binary_remote_addr`, so none of the claims waits for a rate to refill, and every
+request carries the name the front answers, read out of the configuration under
+test rather than repeated in the harness. Each claim that is a negative carries
+its own control in the same test — a copy with the host guard removed, a copy
+whose `/meta` names the session request zone, a copy with an HSTS field added —
+and a control that passed would mean the test could not see the defect it exists
+for.
 
 The front's TLS path, its routing and its log policy are proved without starting
 this deployment, against throwaway backends on a high port, rather than assumed

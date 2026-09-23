@@ -1,6 +1,6 @@
 name: deploy-prod
 
-# The button that redeploys the public demo, `selvage.dontblameme.dev`.
+# The button that redeploys the public demo, `selvage-demo.dontblameme.dev`.
 #
 # One job, behind the `prod` environment, which is what makes this safe to have
 # at all: the environment's required reviewer is the approval, and the
@@ -171,8 +171,10 @@ jobs:
       # A deploy that goes green because `docker compose` exited zero is a deploy
       # nobody checked, so this asserts what is actually serving: the origin, read
       # on the box through the front over the SSH path step 5 already opened —
-      # `https://127.0.0.1/meta` and the page — and the run fails unless it reports
-      # the version this dispatch asked for.
+      # `https://127.0.0.1/meta` and the page, both naming the demo's own `Host`,
+      # because the front is the server for that name and closes the connection
+      # for any other one — and the run fails unless it reports the version this
+      # dispatch asked for.
       #
       # The *public* URL is read in three shapes, and only one of them decides the
       # run. Cloudflare serves a managed challenge to a programmatic client on a
