@@ -134,11 +134,10 @@ enum Peer {
 impl Peer {
     /// Reads the link, settles which wire version it names, and joins.
     async fn join(options: &Options) -> Result<Self, Failure> {
-        let connect = ConnectOptions::from_invite_url(
+        let connect = ConnectOptions::read_invite_url(
             &options.invite,
             options.name.as_str(),
-        )
-        .ok_or("--invite is not a session URL this client can join with")?;
+        )?;
         let sealed = connect.sealed_invite.is_some();
         let version = choose(options, sealed)?;
         match version {

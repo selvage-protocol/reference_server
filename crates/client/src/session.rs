@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use selvage_protocol as proto;
 
+use crate::Error;
 use crate::Role;
 use crate::peer::{PeerInvite, wire_invite};
 use crate::presence::AwarenessState;
@@ -247,29 +248,59 @@ impl ConnectOptions {
     /// `selvage/2` invite. The version itself is the fragment's presence and nothing else, so
     /// a link without one stays a `selvage/1` connection.
     ///
-    /// Returns `None` when the URL does not address a session endpoint or does not
-    /// carry both a room and a token.
+    /// Returns `None` when the URL does not address a session endpoint, does not carry both a
+    /// room and a token, or carries a fragment that is not §5.1's two keys. The last of those
+    /// is §5.1's local refusal and not a link dialled without its keys;
+    /// [`ConnectOptions::read_invite_url`] is this reading with the reason it refused.
     #[must_use]
     pub fn from_invite_url(
         url: &str,
         display_name: impl Into<String>,
     ) -> Option<Self> {
-        let wire = wire_invite(url);
-        let parsed = proto::parse_session_url(&wire)?;
+        Self::read_invite_url(url, display_name).ok()
+    }
+
+    /// Reads an invite link, or says in the client's own words what the link is missing.
+    ///
+    /// This is the same reading [`ConnectOptions::from_invite_url`] performs, with the
+    /// sentence a refusal carries rather than a bare `None`. The fragment is stripped before
+    /// anything reads the query, so neither the room nor the token these options carry is
+    /// any part of it, and it is not put back into the socket URL either.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Invite`] when the link does not address a session endpoint or does
+    /// not carry both a room and a token, and [`Error::InvalidInvite`] when the link carries
+    /// a fragment that is not §5.1's room key and host key.
+    pub fn read_invite_url(
+        url: &str,
+        display_name: impl Into<String>,
+    ) -> Result<Self, Error> {
+        // §5.1: the fragment is the one part of a link a user agent never puts in a request,
+        // so it is split off here, before anything reads the query. A reader that handed the
+        // whole link on would find the fragment's first `&` and glue `k` onto `token`, and
+        // the room key would leave in the socket URL the server is dialled on.
+        let address = url
+            .split_once('#')
+            .map_or(url, |(address, _fragment)| address);
+        let parsed = proto::parse_session_url(&wire_invite(address))
+            .ok_or_else(|| Error::Invite(url.to_string()))?;
+        let (Some(room), Some(token)) = (parsed.join.room, parsed.join.token)
+        else {
+            return Err(Error::Invite(url.to_string()));
+        };
         let mut options = Self::new(parsed.base, display_name);
-        options.room = parsed.join.room;
-        options.token = parsed.join.token;
+        options.room = Some(room);
+        options.token = Some(token);
         options.role = Some(Role::Guest);
-        if options.room.is_none() || options.token.is_none() {
-            return None;
-        }
         if url.contains('#') {
-            // A fragment that is not `§5.1`'s two keys is a local refusal here, as the absence
-            // of one is at a join: a caller is told what the link is missing rather than
-            // handed a session that will fail to read every frame of the room.
-            options.sealed_invite = PeerInvite::parse(url).ok();
+            // §5.1: the presence of a fragment is the version, and a fragment that is present
+            // but is not both keys is refused here rather than dialled as `selvage/1` — which
+            // would drop the keys and put the room key in the token above on the wire.
+            options.sealed_invite =
+                Some(PeerInvite::parse(url).map_err(Error::InvalidInvite)?);
         }
-        Some(options)
+        Ok(options)
     }
 
     fn new(
@@ -351,6 +382,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{ConnectOptions, ReconnectPolicy};
+    use crate::Error;
     use crate::Role;
     use crate::sealed::{RoomKey, SessionKey, encode_key};
 
@@ -364,7 +396,9 @@ mod tests {
     }
 
     /// §5.1: the fragment's two keys are what make a link a `selvage/2` one, so a link without
-    /// one stays the version-1 connection the engine speaks.
+    /// one stays the version-1 connection the engine speaks. The fragment is read as the
+    /// fragment on every path, so neither `room` nor `token` — the two values the socket URL
+    /// is built from — carries any part of it.
     #[test]
     fn the_fragment_decides_the_version_and_a_link_without_one_stays_version_one()
      {
@@ -381,7 +415,12 @@ mod tests {
 
         let sealed =
             ConnectOptions::from_invite_url(&sealed_link(), "Ada").unwrap();
-        let invite = sealed.sealed_invite.unwrap();
+        let invite = sealed
+            .sealed_invite
+            .clone()
+            .expect("the fragment names both keys");
+        assert_eq!(sealed.room.as_deref(), Some("r-1"));
+        assert_eq!(sealed.token.as_deref(), Some("t-1"));
         assert_eq!(invite.room, "r-1");
         assert_eq!(invite.token, "t-1");
         assert_eq!(invite.room_key, RoomKey([7; 32]));
@@ -394,7 +433,54 @@ mod tests {
             sealed_link().replace("ws://h:8080/session?", "http://h:8080/?");
         let from_page = ConnectOptions::from_invite_url(&page, "Ada").unwrap();
         assert_eq!(from_page.base_url, "ws://h:8080");
+        assert_eq!(from_page.room.as_deref(), Some("r-1"));
+        assert_eq!(from_page.token.as_deref(), Some("t-1"));
         assert_eq!(from_page.sealed_invite, Some(invite));
+    }
+
+    /// §5.1: a client "MUST refuse an invite whose fragment is absent, whose `k` or `h` is
+    /// missing, or whose `k` or `h` is not a 32-byte value — locally, and before it opens a
+    /// socket". A link whose fragment is present but is not the two keys is refused with the
+    /// value named, and never read as `selvage/1` — whose token would put the fragment in the
+    /// socket URL the server is dialled on.
+    #[test]
+    fn a_fragment_that_is_not_two_keys_is_refused_by_name() {
+        let link = sealed_link();
+        let (address, fragment) =
+            link.split_once('#').expect("the link carries a fragment");
+        // A chat client loses the last character of `h` and leaves `k` whole, which is the
+        // shape that used to leave the room key in `token`.
+        let short = fragment
+            .get(..fragment.len().saturating_sub(1))
+            .unwrap_or(fragment);
+        let truncated = format!("{address}#{short}");
+
+        assert!(
+            ConnectOptions::from_invite_url(&truncated, "Ada").is_none(),
+            "a present-but-malformed fragment is refused, not dialled as version 1"
+        );
+        let refused =
+            ConnectOptions::read_invite_url(&truncated, "Ada").unwrap_err();
+        assert!(
+            matches!(&refused, Error::InvalidInvite(reason) if reason.contains("`h`")),
+            "the refusal names the value that is wrong: {refused}"
+        );
+
+        // A fragment that names no room key is refused by that name too.
+        let no_room_key = format!(
+            "{address}#h={}",
+            SessionKey::from_seed([3; 32]).public().encode()
+        );
+        let refused =
+            ConnectOptions::read_invite_url(&no_room_key, "Ada").unwrap_err();
+        assert!(
+            matches!(&refused, Error::InvalidInvite(reason) if reason.contains("`k`")),
+            "the refusal names the value that is missing: {refused}"
+        );
+        assert!(ConnectOptions::from_invite_url(&no_room_key, "Ada").is_none());
+
+        // The whole link is still read, keys and all.
+        assert!(ConnectOptions::from_invite_url(&link, "Ada").is_some());
     }
 
     fn fast() -> ReconnectPolicy {

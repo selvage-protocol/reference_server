@@ -316,7 +316,10 @@ WebSocket, says `session.hello` at `selvage/2`, seats the session from
 socket, and runs its clocks on a timer of its own. §5.1's two invite forms are one reading: a
 link whose fragment carries `k` and `h` resolves to a sealed invite through
 `ConnectOptions::from_invite_url` and is joined with `relay::RelaySession`, and a link without
-one stays `selvage/1`. `crates/harness/tests/relay_selvaged.rs` is that pair against a real
+one stays `selvage/1`. A fragment that is present but is not both keys is refused where the
+link is read — `ConnectOptions::read_invite_url` is that reading, and its error says which
+value is wrong — rather than dialled as the other version, whose socket URL would carry the
+fragment. `crates/harness/tests/relay_selvaged.rs` is that pair against a real
 `selvaged --serve-version-2`.
 
 Two suites hold that layer. `crates/harness/tests/peer_vectors.rs` replays the corpus's

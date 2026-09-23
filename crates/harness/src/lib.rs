@@ -292,14 +292,16 @@ impl Harness {
     /// # Errors
     ///
     /// Returns [`Error::Invite`] when the URL is not a connection URL this client can
-    /// use, and whatever [`SyncEngine::connect`] returns when the server refuses.
+    /// use, [`Error::InvalidInvite`] when it carries a fragment that is not §5.1's room key
+    /// and host key — which is refused here, before a socket is opened — and whatever
+    /// [`SyncEngine::connect`] returns when the server refuses.
     pub async fn join_url(
         &self,
         invite_url: &str,
         display_name: &str,
     ) -> Result<SyncEngine, Error> {
-        let options = ConnectOptions::from_invite_url(invite_url, display_name)
-            .ok_or_else(|| Error::Invite(invite_url.to_string()))?;
+        let options =
+            ConnectOptions::read_invite_url(invite_url, display_name)?;
         SyncEngine::connect(options).await
     }
 
