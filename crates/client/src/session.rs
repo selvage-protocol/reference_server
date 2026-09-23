@@ -6,7 +6,7 @@ use selvage_protocol as proto;
 
 use crate::Error;
 use crate::Role;
-use crate::peer::{PeerInvite, wire_invite};
+use crate::peer::{PeerInvite, wire_address};
 use crate::presence::AwarenessState;
 
 /// The awareness clock this client runs: renew every `awareness_renew`, forget a remote
@@ -283,7 +283,7 @@ impl ConnectOptions {
         let address = url
             .split_once('#')
             .map_or(url, |(address, _fragment)| address);
-        let parsed = proto::parse_session_url(&wire_invite(address))
+        let parsed = proto::parse_session_url(&wire_address(address))
             .ok_or_else(|| Error::Invite(url.to_string()))?;
         let (Some(room), Some(token)) = (parsed.join.room, parsed.join.token)
         else {

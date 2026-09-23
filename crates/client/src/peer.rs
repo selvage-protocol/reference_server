@@ -57,7 +57,7 @@ impl PeerInvite {
     ///
     /// Both of `PROTOCOL.md` §5.1's forms are links this joins: the connection URL and the page
     /// link, which names the same room, token and fragment over the scheme a browser speaks and
-    /// is resolved to its connection URL first ([`wire_invite`]).
+    /// is resolved to its connection address first ([`wire_address`]).
     ///
     /// # Errors
     ///
@@ -68,7 +68,7 @@ impl PeerInvite {
         let (address, fragment) = invite
             .split_once('#')
             .ok_or_else(|| MISSING_FRAGMENT.to_string())?;
-        let parsed = proto::parse_session_url(&wire_invite(address))
+        let parsed = proto::parse_session_url(&wire_address(address))
             .ok_or_else(|| {
                 format!("{address:?} does not address the session endpoint")
             })?;
@@ -82,7 +82,7 @@ impl PeerInvite {
             .ok_or_else(|| "the invite carries no token".to_string())?;
         let (room_key, host_key) = fragment_keys(fragment)?;
         Ok(Self {
-            socket_url: wire_invite(address),
+            socket_url: wire_address(address),
             room,
             token,
             room_key,
@@ -91,24 +91,26 @@ impl PeerInvite {
     }
 }
 
-/// A link read back as the wire form of `PROTOCOL.md` §5.1, with any fragment left off.
+/// The connection address a `PROTOCOL.md` §5.1 invite names, with any fragment left off.
 ///
 /// The page form names the same room, token and fragment over the scheme a browser speaks
-/// (`https://host/page/?room=…&token=…`), and the connection URL is derived from it by reading
-/// the scheme back — `http://` as `ws://`, `https://` as `wss://` — and appending the session
-/// endpoint. A link that is already a connection URL, or one this cannot read as either form,
-/// is handed back unchanged: what refuses it is [`PeerInvite::parse`], which knows which part
-/// is missing.
+/// (`https://h/page/?room=…&token=…`), and the connection address is derived from it by
+/// reading the scheme back — `http://` as `ws://`, `https://` as `wss://` — and appending the
+/// session endpoint. A link that is already a connection URL, or one this cannot read as
+/// either form, is handed back as its address: what refuses it is [`PeerInvite::parse`], which
+/// knows which part is missing.
+///
+/// §5.1's two keys live in the fragment and a user agent never puts one in a request, so
+/// nothing here keeps it — the returned address is one a socket may be dialled on, and a caller
+/// that put the fragment back would put the room key in that request. A reader that needs the
+/// keys splits the fragment off the link itself, which is what [`PeerInvite::parse`] does; this
+/// function is the address half of that reading and nothing more.
 #[must_use]
-pub fn wire_invite(link: &str) -> String {
-    let (address, fragment) = match link.split_once('#') {
-        Some((address, fragment)) => (address, format!("#{fragment}")),
-        None => (link, String::new()),
-    };
-    let Some(mapped) = page_to_endpoint(address) else {
-        return link.to_string();
-    };
-    format!("{mapped}{fragment}")
+pub fn wire_address(link: &str) -> String {
+    let address = link
+        .split_once('#')
+        .map_or(link, |(address, _fragment)| address);
+    page_to_endpoint(address).unwrap_or_else(|| address.to_string())
 }
 
 /// The connection URL a page link names, or `None` when the address is not a page link.
@@ -2114,11 +2116,31 @@ mod tests {
             "http://h:8080/?room={ROOM}&token=t-1#k={room}&h={host_key}"
         );
         let wire = format!("ws://h:8080/session?room={ROOM}&token=t-1");
-        let wire_with_fragment = format!("{wire}#k={room}&h={host_key}");
         assert_eq!(
-            wire_invite(&page),
-            wire_with_fragment,
-            "the page reads back as the same wire invite, fragment and all"
+            wire_address(&page),
+            wire,
+            "the page reads back as the same connection address, fragment left off"
+        );
+        // §5.1: the fragment is the one part a request never carries, so the address is the
+        // whole of what `wire_address` hands back however it is called. This is the door the
+        // pre-fix reading came through: re-appending the fragment here and handing the result
+        // to `parse_session_url` glued `k` onto `token` and put the room key in the URL a
+        // socket is dialled on.
+        let door = wire_address(&page);
+        assert!(
+            !door.contains('#')
+                && !door.contains(&room)
+                && !door.contains(&host_key),
+            "no key byte and no fragment survives the address reading: {door}"
+        );
+        assert_eq!(
+            proto::parse_session_url(&door)
+                .unwrap()
+                .join
+                .token
+                .as_deref(),
+            Some("t-1"),
+            "the token stays the query's own, nothing glued onto it"
         );
         let parsed = PeerInvite::parse(&page).unwrap();
         assert_eq!(
@@ -2141,9 +2163,12 @@ mod tests {
         );
 
         // A link that is already a connection URL is handed back exactly as it stands.
-        assert_eq!(wire_invite(&wire), wire);
+        assert_eq!(wire_address(&wire), wire);
         assert!(PeerInvite::parse(&wire).unwrap_err().contains("fragment"));
         // And one this cannot read as either form is not silently rewritten.
-        assert_eq!(wire_invite("wss://h/other?room=r"), "wss://h/other?room=r");
+        assert_eq!(
+            wire_address("wss://h/other?room=r"),
+            "wss://h/other?room=r"
+        );
     }
 }
