@@ -21,7 +21,10 @@ use selvage_client::relay::{
 };
 use selvage_client::sealed::{RoomKey, SessionKey, encode_key};
 use selvage_client::session::KeepaliveConfig;
-use selvage_harness::{Harness, ServerConfig, wait_for, wait_for_described};
+use selvage_harness::{
+    Harness, ServerConfig, wait_for, wait_for_described,
+    wait_for_described_within,
+};
 
 /// Anything this test can fail with.
 type Failure = Box<dyn StdError>;
@@ -29,6 +32,11 @@ type Failure = Box<dyn StdError>;
 const PATH: &str = "notes.txt";
 const OTHER: &str = "src/main.rs";
 const SEED: &str = "a room two relays share\n";
+
+/// The guest's own windows are the client keepalive's: §13.8's host-away ending arrives
+/// `awareness_expire` after the host's seat left. A wait that means to report which ending it
+/// was has to outlast it rather than time out on it.
+const HOST_AWAY_WINDOW: Duration = Duration::from_secs(15);
 
 /// A transitional server: it seats `selvage/2` as well as `selvage/1`.
 fn transitional() -> ServerConfig {
@@ -356,6 +364,41 @@ async fn the_hosts_closing_ends_the_guest() -> Result<(), Failure> {
     assert_eq!(host.ending(), Some(RelayEnding::Closing));
 
     host.disconnect();
+    guest.disconnect();
+    Ok(())
+}
+
+/// §7.1's closing, with the disconnect in the same breath: the closing frame is what the socket
+/// task has queued when the caller ends the session, and the guest still ends `Closing`. Losing
+/// it leaves the guest to §13.8's host-away window, which is a different ending and a slower
+/// one.
+#[tokio::test]
+async fn a_host_that_closes_and_disconnects_at_once_still_ends_the_guest()
+-> Result<(), Failure> {
+    let server = Harness::start_with(transitional()).await;
+    let listing = Listing::of(&[PATH]);
+    let host = host_of(&server, &listing, None).await?;
+    let invite = host.invite().ok_or("the host is handed a link")?;
+    let guest = guest_of(&invite, "Bob").await?;
+    // The guest holds a verified state, so the closing applies rather than being ignored.
+    let _ = wait_for("the guest to hold the listing", || async {
+        listing_of(&guest)
+    })
+    .await;
+
+    assert!(host.close_room()?, "the host publishes a closing");
+    host.disconnect();
+
+    let ended = wait_for_described_within(
+        HOST_AWAY_WINDOW,
+        "the guest to hear the closing",
+        || async { format!("{:?}", guest.ending()) },
+        || async { guest.ending() },
+    )
+    .await;
+    assert_eq!(ended, RelayEnding::Closing);
+    assert_eq!(guest.ending_sentence(), Some("the room closed"));
+
     guest.disconnect();
     Ok(())
 }

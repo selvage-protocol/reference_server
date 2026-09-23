@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
+use tokio::runtime::Handle;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, timeout};
@@ -53,6 +54,12 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How many events a subscriber that has not read yet is kept.
 const EVENT_BACKLOG: usize = 64;
+
+/// How long [`RelaySession::disconnect`] leaves the socket task to send what the session had
+/// already published — §7.1's closing among it — before the socket is dropped. A peer that has
+/// stopped reading must not hold the task, its relay and its state alive for the life of the
+/// process, and past this bound the socket is ended like any other dropped one.
+pub const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 /// A peer as `selvage/2` records it: `PROTOCOL.md` §6.1's `PeerInfo` without `role`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,7 +213,14 @@ struct Relay {
 /// way a timer left behind does anywhere else: ending a session is the caller's to say.
 pub struct RelaySession {
     relay: Arc<Relay>,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// The session's clock task. It is aborted by [`RelaySession::disconnect`]: a session that
+    /// has ended publishes nothing, and a timer still moving one would hold the relay alive for
+    /// nothing.
+    clock: Mutex<Option<JoinHandle<()>>>,
+    /// The socket task, which owns every frame the session published and has not sent. It is
+    /// left to drain to its `Close` and return rather than aborted, because §7.1's closing is
+    /// one of those frames; [`RelaySession::disconnect`] bounds that drain.
+    socket: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl RelaySession {
@@ -567,17 +581,34 @@ impl RelaySession {
         self.moving(|state| Ok(state.session.close_room()))
     }
 
-    /// Ends the session: the socket closed, the clock stopped, the session released.
+    /// Ends the session: the clock stopped, what the session had already published still sent,
+    /// and the socket closed.
+    ///
+    /// What is queued ahead of the `Close` is the caller's to have on the wire — §7.1's closing
+    /// is one such frame, so a `close_room` and a disconnect in one breath still ends the room
+    /// rather than leaving it to §13.8's host-away window. The socket task therefore drains to
+    /// the `Close` instead of being aborted where it stands, bounded by [`CLOSE_GRACE`].
     pub fn disconnect(&self) {
         {
             let mut state = self.read();
             state.destroyed = true;
         }
-        let _ = self.relay.outgoing.send(Outbound::Close);
-        let mut tasks = lock(&self.tasks);
-        for task in tasks.drain(..) {
-            task.abort();
+        // The clock first, so nothing the session publishes joins the queue behind the close.
+        if let Some(clock) = lock(&self.clock).take() {
+            clock.abort();
         }
+        let _ = self.relay.outgoing.send(Outbound::Close);
+        let Some(socket) = lock(&self.socket).take() else {
+            return;
+        };
+        // The socket task is left to send what is queued ahead of the `Close` and to return on
+        // it. A peer that has stopped reading cannot hold it: outside a runtime there is no
+        // timer to bound the drain with, so the socket is ended the way a dropped one is.
+        let Ok(runtime) = Handle::try_current() else {
+            socket.abort();
+            return;
+        };
+        runtime.spawn(end_within_the_close_grace(socket));
     }
 
     // --- the two paths every mutation takes -------------------------------------
@@ -669,7 +700,8 @@ fn start(
         tokio::spawn(socket_loop(sink, stream, Arc::clone(&relay), incoming));
     let me = RelaySession {
         relay,
-        tasks: Mutex::new(vec![clock_task, socket_task]),
+        clock: Mutex::new(Some(clock_task)),
+        socket: Mutex::new(Some(socket_task)),
     };
     let _ = me.relay.events.send(RelayEvent::Seated);
     // §13.1's step 4: a guest's announcement belongs at the join, and a host's first state is
@@ -752,6 +784,15 @@ async fn socket_loop(
                 }
             }
         }
+    }
+}
+
+/// Waits for a socket task to finish the drain [`RelaySession::disconnect`] left it, and ends
+/// it past [`CLOSE_GRACE`]: a peer that has stopped reading must not keep the task, its relay
+/// and its state alive for the life of the process.
+async fn end_within_the_close_grace(mut socket: JoinHandle<()>) {
+    if timeout(CLOSE_GRACE, &mut socket).await.is_err() {
+        socket.abort();
     }
 }
 
@@ -1429,13 +1470,10 @@ mod tests {
             base_url: format!("ws://{addr}"),
         };
         let relay = start(client, session, info, None);
-        // `start` spawns the clock task first and the socket task after it: this end keeps the
-        // clock's handle and lets the socket's go, which leaves that task running.
-        let mut tasks = {
-            let mut held = lock(&relay.tasks);
-            held.drain(..).collect::<Vec<_>>()
-        };
-        let clock = tasks.drain(..1).next();
+        // This end takes the clock's handle, so a test can watch it end. Taking the handle does
+        // not stop the task, and the socket's stays where it is: `disconnect` is a relay test's
+        // subject too, and it reads both.
+        let clock = lock(&relay.clock).take();
         Ok(Fixture {
             relay: Arc::new(relay),
             arrived,
@@ -1812,6 +1850,28 @@ mod tests {
         assert!(
             held_within(WAIT, || clock.is_finished()).await,
             "the clock task is still running after the socket closed"
+        );
+        Ok(())
+    }
+
+    /// §7.1's closing is a frame the socket task owns like any other the session published: a
+    /// host that publishes one and disconnects in the same breath still ends the room. Aborting
+    /// the task where it stands loses everything queued ahead of the close, which is what the
+    /// closing is — and the room is then left to §13.8's host-away window instead.
+    #[tokio::test]
+    async fn a_disconnect_sends_what_the_session_published_before_it()
+    -> Result<(), Box<dyn StdError>> {
+        let fixture = fixture(keepalive()).await?;
+        assert!(fixture.relay.close_room()?, "the host publishes a closing");
+        // No await between the two: the closing is in the socket's queue and nothing has moved
+        // it when the caller asks for the disconnect.
+        fixture.relay.disconnect();
+
+        let arrived = Arc::clone(&fixture.arrived);
+        assert!(
+            held_within(WAIT, || sent_kind(&arrived, 2)).await,
+            "the closing left before the socket closed: {:?} arrived",
+            fixture.arrived()
         );
         Ok(())
     }
