@@ -542,6 +542,13 @@ mod tests {
                 )),
             "a key the options hold was printed: {printed}"
         );
+        // A `Debug` that printed a key in the encoding §5.1's fragment carries it in is a key
+        // printed, and neither `Debug` spelling above is that string: the value itself is the
+        // needle that reaches it.
+        assert!(
+            !printed.contains(&keys.0) && !printed.contains(&keys.1),
+            "the encoded form of a key the options hold was printed: {printed}"
+        );
     }
 
     fn fast() -> ReconnectPolicy {
