@@ -1421,6 +1421,17 @@ impl PeerSession {
         self.announce_holds(clock);
     }
 
+    /// Holds this one path and nothing else, announced once (§13.7).
+    ///
+    /// A holds message carries the whole set and no delta, so a caller replacing the set with
+    /// one path cannot say so with [`Self::release`] and [`Self::open`]: each announces the
+    /// change it makes, and the room would see an empty set between them.
+    pub fn hold_only(&mut self, clock: Duration, path: &str) {
+        self.held.clear();
+        let _ = self.held.insert(path.to_string());
+        self.announce_holds(clock);
+    }
+
     /// A local edit, published as the delta it produced and never as the whole document.
     ///
     /// Returns whether anything went out: §13.5 and §13.9 have a `viewer` keep its edit and
@@ -2221,6 +2232,19 @@ mod tests {
             opens(&room_key().frame_key(ROOM), ROOM, &envelope).unwrap();
         let payload: Value = serde_json::from_slice(&plaintext).unwrap();
         assert_eq!(payload["holds"], json!([] as [&str; 0]));
+
+        // The whole set replaced by one path is one message: `release` and `open` would put an
+        // empty set on the wire between them, which is a release no caller asked for.
+        session.open(millis(6), "README.md");
+        let _ = session.take_outbound();
+        session.hold_only(millis(7), "src/main.rs");
+        let out = session.take_outbound();
+        assert_eq!(out.len(), 1, "a set replaced in one step is one message");
+        let envelope = Envelope::parse(&out[0]).unwrap();
+        let plaintext =
+            opens(&room_key().frame_key(ROOM), ROOM, &envelope).unwrap();
+        let payload: Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(payload["holds"], json!(["src/main.rs"]));
     }
 
     /// §13.7's two "at once" moments, which the tick alone does not honour: the state that

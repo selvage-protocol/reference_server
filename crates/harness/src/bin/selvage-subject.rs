@@ -247,8 +247,7 @@ fn announce(shared: &Shared, command: &Value) -> Result<Next, String> {
     let path = text(command, "path")?.to_string();
     with_session(shared, |running| {
         let clock = running.clock();
-        running.peer.release(clock);
-        running.peer.open(clock, &path);
+        running.peer.hold_only(clock, &path);
         running.peer.tick(clock);
         running_report(running)
     })
