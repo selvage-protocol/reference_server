@@ -891,6 +891,11 @@ impl Reader {
     /// accepted again. Every other frame of that key is refused `uncommitted_key` whatever mark
     /// stands against it. That is the trade §13.3 states rather than a defect.
     fn cap_marks(&mut self) {
+        // The uncommitted count cannot exceed the number of marks there are, so below the cap
+        // nothing can be evicted and the set and the scan below are what the count would cost.
+        if self.marks.len() <= UNCOMMITTED_MARKS {
+            return;
+        }
         let committed: BTreeSet<KeyId> =
             self.committed.values().map(|peer| peer.key.id()).collect();
         let uncommitted = self
