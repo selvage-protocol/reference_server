@@ -12,7 +12,10 @@ pub enum Error {
     Io(io::Error),
     Wire(WireError),
     Json(JsonError),
-    /// The server refused the session; `code` is one of `selvage_protocol::code`.
+    /// The session was refused; `code` is one of `selvage_protocol::code`. The server refusing
+    /// the handshake and this client's own `/meta` version gate (`PROTOCOL.md` §2, §10) are the
+    /// two ways here, and both carry `unsupported_version` for that refusal: the `message` is
+    /// whose words it is.
     Protocol {
         code: String,
         message: String,

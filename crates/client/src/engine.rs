@@ -199,12 +199,20 @@ pub async fn connect(
 /// is "the room reported nothing to size against", which is the same as a `/meta` that
 /// never answered, carried a body this client cannot read, or was not a `200`.
 pub async fn advertised_grace(base_url: &str) -> Option<Duration> {
+    let meta = read_meta(base_url).await?;
+    Some(Duration::from_millis(meta.keepalive.room_grace_ms))
+}
+
+/// `GET /meta`, read best-effort and bounded (`PROTOCOL.md` §2). `None` is "the room reported
+/// nothing": a read that did not answer, was not a `200`, or carried a body this client cannot
+/// read. A caller that decided something on a `None` would be deciding on the absence of a
+/// frame, and §2 says a `/meta` that could not be read is not an answer.
+pub async fn read_meta(base_url: &str) -> Option<proto::Meta> {
     let (authority, path) = meta_target(base_url)?;
     let body = timeout(META_TIMEOUT, http_get(&authority, &path))
         .await
         .ok()??;
-    let meta: proto::Meta = serde_json::from_str(&body).ok()?;
-    Some(Duration::from_millis(meta.keepalive.room_grace_ms))
+    serde_json::from_str(&body).ok()
 }
 
 /// The `host:port` and request path a `GET /meta` has to use, taken from the base URL

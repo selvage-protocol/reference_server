@@ -32,9 +32,10 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
 
 use selvage_protocol as proto;
-use selvage_protocol::{event, method};
+use selvage_protocol::{code, event, method};
 
 use crate::Error;
+use crate::engine::read_meta;
 use crate::host::{HostOptions, HostStore, ListingSource};
 use crate::peer::{Ending, Outcome, PeerInvite, PeerOptions, PeerSession};
 use crate::sealed::{
@@ -238,6 +239,7 @@ impl RelaySession {
                 link_address(&options.base_url)
             ))
         })?;
+        refuse_a_version_this_client_cannot_speak(&base).await?;
         let room_key = match options.room_key {
             Some(key) => key,
             None => random_room_key()?,
@@ -293,14 +295,20 @@ impl RelaySession {
 
     /// Joins the room an invite names; the fragment is read here and never reaches the socket.
     ///
+    /// `GET /meta` is read first (§2), as it is by [`RelaySession::host`].
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Invite`] when the link is not one this client can join with — including
     /// a link with no fragment, which carries neither of §5.1's two keys — and [`Error`] when
-    /// the socket cannot be opened or the server refuses the session.
+    /// §2's version gate refuses the server, the socket cannot be opened, or the server refuses
+    /// the session.
     pub async fn join(options: RelayJoinOptions) -> Result<Self, Error> {
         let invite =
             PeerInvite::parse(&options.invite).map_err(Error::Invite)?;
+        if let Some(base) = session_base(&invite.socket_url) {
+            refuse_a_version_this_client_cannot_speak(&base).await?;
+        }
         let awareness_client_id = mint_awareness_client_id()?;
         let dial = dial(
             &invite.socket_url,
@@ -1267,6 +1275,40 @@ fn refuse_tls(url: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// `PROTOCOL.md` §2's and §10's local stop: a reachable `/meta` that names no version at major
+/// 2 this client can speak is a refusal **before a socket is opened**, in this client's own
+/// words, and never a fall back to `selvage/1` — a version-2 peer and a version-1 peer cannot
+/// share a room, so a capability would only be a silent downgrade.
+///
+/// A `/meta` that could not be read is not that answer: §2 leaves the decision to the
+/// handshake, which refuses an unreadable server in its own words.
+async fn refuse_a_version_this_client_cannot_speak(
+    base: &str,
+) -> Result<(), Error> {
+    let Some(meta) = read_meta(base).await else {
+        return Ok(());
+    };
+    if meta
+        .wire_versions
+        .iter()
+        .any(|version| proto::version_of(version) == Some(proto::Version::V2))
+    {
+        return Ok(());
+    }
+    let listed = if meta.wire_versions.is_empty() {
+        "no wire version".to_string()
+    } else {
+        meta.wire_versions.join(", ")
+    };
+    Err(Error::Protocol {
+        code: code::UNSUPPORTED_VERSION.to_string(),
+        message: format!(
+            "{base} advertises {listed}: this client needs {WIRE_VERSION_V2} and does not \
+             fall back to an earlier version"
+        ),
+    })
+}
+
 /// A room key from the platform's CSPRNG (`CANONICAL.md` §6.1).
 fn random_room_key() -> Result<RoomKey, Error> {
     let mut bytes = [0u8; 32];
@@ -1317,10 +1359,11 @@ mod tests {
 
     use futures_util::SinkExt;
     use futures_util::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{mpsc, oneshot};
     use tokio::task::JoinHandle;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -1942,8 +1985,10 @@ mod tests {
         );
     }
 
-    /// A server that completes the handshake and seats the connection in another room: the
-    /// one reply that makes `RelaySession::join` disagree with the address it dialled.
+    /// A server that answers `GET /meta` and then completes the handshake and seats the
+    /// connection in another room: the one reply that makes `RelaySession::join` disagree with
+    /// the address it dialled. `PROTOCOL.md` §2 has a client read `/meta` before it dials, so a
+    /// fixture that seats a client serves that read first.
     #[expect(
         clippy::excessive_nesting,
         reason = "a task's handshake is one place: the listener, the accept and the reply belong together"
@@ -1955,35 +2000,98 @@ mod tests {
         let addr = listener.local_addr()?;
         let seated = room.to_string();
         tokio::spawn(async move {
-            let Ok((tcp, _)) = listener.accept().await else {
-                return;
-            };
-            let Ok(mut socket) = tokio_tungstenite::accept_async(tcp).await
-            else {
-                return;
-            };
-            // The client's hello, then the seating reply.
-            let _ = socket.next().await;
-            let reply = serde_json::json!({
-                "v": "selvage/2",
-                "event": "room.joined",
-                "params": {
-                    "room_id": seated,
-                    "self": {"peer_id": "p-2", "display_name": "Bob"},
-                    "peers": [],
-                    "capabilities": [],
-                    "keepalive": {
-                        "awareness_renew_ms": 15000,
-                        "awareness_expire_ms": 30000,
-                        "ping_interval_ms": 30000,
-                    },
-                },
-            });
-            let _ = socket.send(Message::text(reply.to_string())).await;
-            // Hold the socket open so the dial reads the reply before any close.
-            let _ = socket.next().await;
+            while let Ok((tcp, _)) = listener.accept().await {
+                // Peeked and not read: the WebSocket handshake that follows a `/meta` read is
+                // read by `accept_async`, which needs those bytes still in the socket.
+                let asks_for_meta = request_line(&tcp)
+                    .await
+                    .is_some_and(|line| line.starts_with("GET /meta"));
+                if !asks_for_meta {
+                    let Ok(mut socket) =
+                        tokio_tungstenite::accept_async(tcp).await
+                    else {
+                        continue;
+                    };
+                    // The client's hello, then the seating reply.
+                    let _ = socket.next().await;
+                    let reply = serde_json::json!({
+                        "v": "selvage/2",
+                        "event": "room.joined",
+                        "params": {
+                            "room_id": seated,
+                            "self": {"peer_id": "p-2", "display_name": "Bob"},
+                            "peers": [],
+                            "capabilities": [],
+                            "keepalive": {
+                                "awareness_renew_ms": 15000,
+                                "awareness_expire_ms": 30000,
+                                "ping_interval_ms": 30000,
+                            },
+                        },
+                    });
+                    let _ = socket.send(Message::text(reply.to_string())).await;
+                    // Hold the socket open so the dial reads the reply before any close.
+                    let _ = socket.next().await;
+                    return;
+                }
+                let mut tcp = tcp;
+                // Consumed before the answer: a socket closed with bytes still unread in it is
+                // reset rather than ended, and this client reads to the end of the body.
+                let _ = drain_request(&mut tcp).await;
+                let body = br#"{"capabilities":["y-protocols/1","awareness"],"server":"selvage-test/0.1.0","wire_versions":["selvage/1","selvage/2"]}"#;
+                let answer = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = tcp.write_all(answer.as_bytes()).await;
+                let _ = tcp.write_all(body).await;
+            }
         });
         Ok(format!("ws://{addr}"))
+    }
+
+    /// The first line of a request, peeked and never consumed, so that the handshake behind it
+    /// can still be read. `None` for a connection that says nothing.
+    async fn request_line(tcp: &TcpStream) -> Option<String> {
+        let mut head = [0u8; 64];
+        let mut read = timeout(WAIT, tcp.peek(&mut head)).await.ok()?.ok()?;
+        while read > 0 && line_end(head.get(..read)?).is_none() {
+            read = timeout(WAIT, tcp.peek(&mut head)).await.ok()?.ok()?;
+        }
+        let arrived = head.get(..read)?;
+        String::from_utf8(arrived.get(..line_end(arrived)?)?.to_vec()).ok()
+    }
+
+    /// Where the first line of one request ends, or `None` while it has not arrived whole.
+    fn line_end(head: &[u8]) -> Option<usize> {
+        head.windows(2).position(|pair| pair == b"\r\n")
+    }
+
+    /// Reads one connection's request to its end, leaving nothing in the socket for the close
+    /// after the answer to turn into a reset.
+    async fn drain_request(tcp: &mut TcpStream) -> Option<()> {
+        let mut request: Vec<u8> = Vec::new();
+        let mut whole = false;
+        while !whole {
+            whole = read_a_chunk(tcp, &mut request).await?;
+        }
+        Some(())
+    }
+
+    /// One chunk of a request, appended, and whether the headers are now whole.
+    async fn read_a_chunk(
+        tcp: &mut TcpStream,
+        request: &mut Vec<u8>,
+    ) -> Option<bool> {
+        let mut chunk = [0u8; 64];
+        let read = timeout(WAIT, tcp.read(&mut chunk)).await.ok()?.ok()?;
+        request.extend_from_slice(chunk.get(..read)?);
+        Some(read == 0 || header_end(request).is_some())
+    }
+
+    /// Where one request's headers end, or `None` while they have not arrived whole.
+    fn header_end(request: &[u8]) -> Option<usize> {
+        request.windows(4).position(|four| four == b"\r\n\r\n")
     }
 
     /// R1: a refusal names the address, never the link. §5.1 forbids the fragment leaving a
