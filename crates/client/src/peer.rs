@@ -998,6 +998,11 @@ impl PeerSession {
         } else {
             self.announce(clock);
         }
+        // §13.7: a holder's *first* holds message waits for the state that commits its key, so
+        // one that was open when that state landed announces here rather than a renewal late.
+        // Nothing goes out for a session that holds nothing and has said nothing, and nothing
+        // goes out until the key is committed — that test is `announce_holds`' own.
+        self.announce_holds(clock);
     }
 
     /// §13.2 and §13.3: a `kind = 0` plaintext, applied to the session document and answered.
@@ -1308,8 +1313,10 @@ impl PeerSession {
         let _ = self.departed.remove(seat);
         let _ = self.roster.insert(seat.to_string());
         // §13.7: a hold is re-announced when a peer is seated, so a joiner learns the room's
-        // held set without asking for it.
+        // held set without asking for it — on the event itself rather than at the next renewal,
+        // which is a whole window the joiner would spend holding nothing from this peer.
         self.holds_announced_at = None;
+        self.announce_holds(clock);
         if self.host.is_some() {
             self.publish_state(clock, HostReason::Roster);
             return;
@@ -1368,14 +1375,23 @@ impl PeerSession {
     }
 
     /// Opens a path: this client offers it, and its whole held set changes (§13.7).
-    pub fn open(&mut self, path: &str) {
+    ///
+    /// The change is announced here rather than left to the caller's next tick: §13.7 asks a
+    /// holder to re-announce at once when its set changes, and the tick's period is the room's
+    /// own `awareness_renew_ms` — fifteen seconds at the reference defaults, which is not
+    /// "at once". Nothing goes out while §13.1's step 4 withholds everything but the
+    /// announcement, and nothing goes out for a set that did not change.
+    pub fn open(&mut self, clock: Duration, path: &str) {
         let _ = self.held.insert(path.to_string());
+        self.announce_holds(clock);
     }
 
     /// Releases every path. §13.7 asks for the empty set rather than for silence, so the room
-    /// learns in one hop instead of waiting out a lease.
-    pub fn release(&mut self) {
+    /// learns in one hop instead of waiting out a lease — and it learns it here, for the reason
+    /// [`Self::open`] gives.
+    pub fn release(&mut self, clock: Duration) {
         self.held.clear();
+        self.announce_holds(clock);
     }
 
     /// A local edit, published as the delta it produced and never as the whole document.
@@ -2120,9 +2136,9 @@ mod tests {
         let _ = session.deliver(millis(1), &state);
         let _ = session.take_outbound();
 
-        session.open("README.md");
-        session.open("src/main.rs");
-        session.tick(millis(2));
+        // §13.7: a set that changed goes out with the change, and not at the next renewal —
+        // no `tick` between the two, so nothing else can have published it.
+        session.open(millis(2), "README.md");
         let out = session.take_outbound();
         assert_eq!(out.len(), 1, "a changed set goes out at once");
         let envelope = Envelope::parse(&out[0]).unwrap();
@@ -2130,18 +2146,75 @@ mod tests {
         let plaintext =
             opens(&room_key().frame_key(ROOM), ROOM, &envelope).unwrap();
         let payload: Value = serde_json::from_slice(&plaintext).unwrap();
-        assert_eq!(payload["holds"], json!(["README.md", "src/main.rs"]));
+        assert_eq!(payload["holds"], json!(["README.md"]));
 
-        session.release();
-        session.tick(millis(3));
+        // The whole set and no delta, so the second open carries both paths.
+        session.open(millis(3), "src/main.rs");
         let out = session.take_outbound();
         assert_eq!(out.len(), 1);
+        let envelope = Envelope::parse(&out[0]).unwrap();
+        let plaintext =
+            opens(&room_key().frame_key(ROOM), ROOM, &envelope).unwrap();
+        let payload: Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(payload["holds"], json!(["README.md", "src/main.rs"]));
+
+        // Opening a path that is already held changes nothing, so nothing is published.
+        session.open(millis(4), "README.md");
+        assert!(session.take_outbound().is_empty());
+
+        session.release(millis(5));
+        let out = session.take_outbound();
+        assert_eq!(out.len(), 1, "the empty set is a change like any other");
         assert_eq!(session.held().len(), 0);
         let envelope = Envelope::parse(&out[0]).unwrap();
         let plaintext =
             opens(&room_key().frame_key(ROOM), ROOM, &envelope).unwrap();
         let payload: Value = serde_json::from_slice(&plaintext).unwrap();
         assert_eq!(payload["holds"], json!([] as [&str; 0]));
+    }
+
+    /// §13.7's two "at once" moments, which the tick alone does not honour: the state that
+    /// commits this key is where a holder's *first* holds message belongs, and a `peer.joined`
+    /// is where a joiner learns the room's holds.
+    #[test]
+    fn a_first_holds_message_and_a_joiner_are_answered_on_the_event() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        session.open(millis(1), "README.md");
+        assert!(
+            session.take_outbound().is_empty(),
+            "§13.1's step 4 withholds it until a state commits this key"
+        );
+
+        let committing = state(&host(), 1, &[(&ours(), "guest", "p-self")]);
+        let _ = session.deliver(millis(2), &committing);
+        let out = session.take_outbound();
+        let kinds: Vec<u64> = out
+            .iter()
+            .map(|frame| Envelope::parse(frame).unwrap().kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [0, 3],
+            "§13.1's step 6 handshake, then the first holds message: no tick between them"
+        );
+        assert_eq!(session.handshake(), 1);
+        assert_eq!(
+            session.published(),
+            2,
+            "the announcement and the holds message; the handshake is counted apart"
+        );
+
+        // A seat is seated: the room's holds go out with the event, and the state this client
+        // already holds is re-sent behind them (§7.1).
+        session.seat_joined(millis(3), "p-other");
+        let out = session.take_outbound();
+        let kinds: Vec<u64> = out
+            .iter()
+            .map(|frame| Envelope::parse(frame).unwrap().kind)
+            .collect();
+        assert_eq!(kinds, [3, 1], "the holds, then the state the room holds");
     }
 
     #[test]

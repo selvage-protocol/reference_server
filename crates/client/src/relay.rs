@@ -502,27 +502,31 @@ impl RelaySession {
     // --- what the caller hands in ----------------------------------------------
 
     /// §13.1's join order: a hold is taken once a state commits this connection's key, and the
-    /// whole set goes out when it changes rather than at the next renewal (§13.7).
+    /// whole set goes out when it changes rather than at the next renewal (§13.7) — the change
+    /// is announced on this call, and the clock it is stamped with is this connection's own.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Closed`] when the connection has ended.
     pub fn open(&self, path: &str) -> Result<(), Error> {
         self.moving(|state| {
-            state.session.open(path);
+            let clock = state.start.elapsed();
+            state.session.open(clock, path);
             Ok(())
         })
     }
 
     /// Releases every path. §13.7 asks for the empty set rather than for silence, so the room
-    /// learns in one hop instead of waiting out a lease.
+    /// learns in one hop instead of waiting out a lease — and, like [`Self::open`], on this
+    /// call rather than at the next renewal.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Closed`] when the connection has ended.
     pub fn release(&self) -> Result<(), Error> {
         self.moving(|state| {
-            state.session.release();
+            let clock = state.start.elapsed();
+            state.session.release(clock);
             Ok(())
         })
     }
@@ -1683,9 +1687,17 @@ mod tests {
 
     /// Whether a frame of this kind reached the server end.
     fn sent_kind(arrived: &Mutex<Vec<Arrived>>, kind: u64) -> bool {
-        lock(arrived).iter().any(
-            |frame| matches!(frame, Arrived::Sealed { kind: seen, .. } if *seen == kind),
-        )
+        sent_kinds(arrived, kind) > 0
+    }
+
+    /// How many frames of one kind reached the server end.
+    fn sent_kinds(arrived: &Mutex<Vec<Arrived>>, kind: u64) -> usize {
+        lock(arrived)
+            .iter()
+            .filter(|frame| {
+                matches!(frame, Arrived::Sealed { kind: seen, .. } if *seen == kind)
+            })
+            .count()
     }
 
     /// Whether one of the session's own text frames reached the server end.
@@ -1956,6 +1968,47 @@ mod tests {
             held_within(WAIT, || sent_kind(&arrived, 3)).await,
             "the clock task publishes the held set: {} frames arrived",
             fixture.arrived().len()
+        );
+        Ok(())
+    }
+
+    /// m3: §13.7 asks a holder to re-announce *at once* when its held set changes, and the
+    /// session's tick is the room's own `awareness_renew_ms` — fifteen seconds at the reference
+    /// defaults. The renewal here is a minute, so a holds frame that reaches the server end
+    /// inside [`WAIT`] of the call is the change and not the clock task.
+    #[tokio::test]
+    async fn a_changed_held_set_leaves_without_waiting_for_the_renewal()
+    -> Result<(), Box<dyn StdError>> {
+        let slow = KeepaliveConfig {
+            awareness_renew: Duration::from_secs(60),
+            awareness_expire: Duration::from_secs(120),
+        };
+        let fixture = fixture(slow).await?;
+        let arrived = Arc::clone(&fixture.arrived);
+        assert_eq!(
+            sent_kinds(&arrived, 3),
+            0,
+            "a holder with nothing open and nothing said sends no holds message"
+        );
+
+        fixture.relay.open(PATH)?;
+        assert!(
+            held_within(WAIT, || sent_kinds(&arrived, 3) == 1).await,
+            "the changed set left on the call: {:?} arrived",
+            fixture.arrived()
+        );
+
+        // The release is the same obligation in the other direction: the empty set, and not
+        // silence.
+        fixture.relay.release()?;
+        assert!(
+            held_within(WAIT, || sent_kinds(&arrived, 3) == 2).await,
+            "the empty set left on the call: {:?} arrived",
+            fixture.arrived()
+        );
+        assert!(
+            fixture.relay.held_paths().is_empty(),
+            "the release is the whole set"
         );
         Ok(())
     }

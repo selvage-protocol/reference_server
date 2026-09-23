@@ -191,12 +191,14 @@ fn join(shared: &Shared, command: &Value) -> Result<Next, String> {
         awareness_client_id: None,
         host: None,
     };
+    let start = Instant::now();
     let mut peer =
         PeerSession::new(&options).map_err(|error| error.to_string())?;
     if let Some(path) = optional_text(command, "path") {
-        peer.open(&path);
+        // §13.7's change is announced where it happens; before a state commits this key
+        // nothing is published either way (§13.1's step 4).
+        peer.open(start.elapsed(), &path);
     }
-    let start = Instant::now();
     let mut running = Running { peer, start };
     let clock = running.clock();
     running.peer.tick(clock);
@@ -244,9 +246,9 @@ fn insert(shared: &Shared, command: &Value) -> Result<Next, String> {
 fn announce(shared: &Shared, command: &Value) -> Result<Next, String> {
     let path = text(command, "path")?.to_string();
     with_session(shared, |running| {
-        running.peer.release();
-        running.peer.open(&path);
         let clock = running.clock();
+        running.peer.release(clock);
+        running.peer.open(clock, &path);
         running.peer.tick(clock);
         running_report(running)
     })
