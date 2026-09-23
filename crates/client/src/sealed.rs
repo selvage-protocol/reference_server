@@ -22,6 +22,10 @@ use sha2::{Digest, Sha256};
 
 use serde::Deserialize;
 use serde_json::Value;
+use yrs::sync::{
+    Message as YMessage, MessageReader, SyncMessage as YSyncMessage,
+};
+use yrs::updates::decoder::DecoderV1;
 
 /// The five kinds this version defines, in the order `CANONICAL.md` §6.1 gives them.
 pub const KINDS: [u64; 5] = [0, 1, 2, 3, 4];
@@ -971,12 +975,34 @@ const fn payload_issued(payload: Option<&Payload>) -> Option<u64> {
 }
 
 /// Document content is a `kind = 0` plaintext carrying a `SyncStep2` or an `Update`
-/// (`PROTOCOL.md` §13.5): message type 0, sync sub-type 1 or 2.
+/// (`PROTOCOL.md` §13.5): a sync message of sub-type 1 or 2, **anywhere** in the stream.
+///
+/// The whole stream, and not its first message: this check is what refuses a `viewer`'s
+/// edits, and the receiver that applies a frame reads every message it holds, so a frame
+/// whose first message is a `SyncStep1` and whose second is an `Update` would otherwise pass
+/// and have its content applied. The walk is that receiver's own decoder — `yrs`'s message
+/// reader, which is what the session applies a `kind = 0` plaintext with — so the two cannot
+/// disagree about where one message ends and the next begins. A hand-rolled walk does not
+/// keep that agreement: `yrs` reads `Auth` as a status varint and a reason only when the
+/// status is `PERMISSION_DENIED`, where a length-prefixed-buffer read loses alignment and can
+/// hide an `Update` behind an auth message.
 fn is_content(plaintext: &[u8]) -> bool {
-    if plaintext.first() != Some(&0) {
-        return false;
+    let mut decoder = DecoderV1::from(plaintext);
+    let mut content = false;
+    for message in MessageReader::new(&mut decoder) {
+        match message {
+            Ok(YMessage::Sync(
+                YSyncMessage::SyncStep2(_) | YSyncMessage::Update(_),
+            )) => {
+                content = true;
+            }
+            Ok(_) => {}
+            // The applier stops at a stream this decoder cannot read, and so does the
+            // walk; what it has already seen is what the frame carries.
+            Err(_) => break,
+        }
     }
-    matches!(read_varuint(plaintext, 1), Ok((1 | 2, _)))
+    content
 }
 
 /// The key a `peers` member or an announcement's `key` must be, or `None`.
@@ -1069,11 +1095,17 @@ const fn base64_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// A path `PROTOCOL.md` §5 refuses is dropped at the receiver, never refused: §13.3 and
-/// §13.7 leave it out of a listing and a hold set and apply the rest.
+/// §13.3's and §13.7's bound on one path, in the bytes a listing carries it as.
+pub const MAX_PATH_BYTES: usize = 4096;
+
+/// A path `PROTOCOL.md` §5 refuses, or one over §13.3's 4096-byte bound, is dropped at the
+/// receiver, never refused: §13.3 and §13.7 leave it out of a listing and a hold set and
+/// apply the rest.
 #[must_use]
 pub fn usable_path(path: &str) -> bool {
-    !path.is_empty() && !path.chars().any(char::is_control)
+    !path.is_empty()
+        && !path.chars().any(char::is_control)
+        && path.len() <= MAX_PATH_BYTES
 }
 
 #[cfg(test)]
@@ -1274,5 +1306,144 @@ mod tests {
         .bytes();
         let verdict = reader.read(&frame);
         assert_eq!(verdict.reason.as_deref(), Some("unauthorised_content"));
+    }
+
+    #[test]
+    fn a_viewers_content_behind_a_leading_request_is_refused() {
+        let key = room_key();
+        let frame_key = key.frame_key("R7f3a2c19");
+        let viewer = SessionKey::from_seed([11u8; 32]);
+        let public = viewer.public();
+        let mut reader = Reader::new("R7f3a2c19", key, PublicKey([1u8; 32]));
+        reader.committed.insert(
+            public.encode(),
+            Committed {
+                key: public,
+                role: "viewer".to_string(),
+                peer_id: "p-1".to_string(),
+            },
+        );
+        // A SyncStep1 first (type 0, sub-type 0, a one-byte empty state vector) and an Update
+        // second (type 0, sub-type 2, an empty update): the content is not the frame's first
+        // message, and §6.1's step 10 reads the whole stream.
+        let plaintext = [0u8, 0, 1, 0, 0, 2, 0];
+        let frame = seal(
+            &Recipe {
+                room_id: "R7f3a2c19",
+                frame_key: &frame_key,
+                kind: 0,
+                epoch: 0,
+                counter: 1,
+                nonce: [6u8; 12],
+                signer: &viewer,
+            },
+            &plaintext,
+        )
+        .unwrap()
+        .bytes();
+        let verdict = reader.read(&frame);
+        assert_eq!(verdict.reason.as_deref(), Some("unauthorised_content"));
+    }
+
+    #[test]
+    fn a_viewers_content_behind_an_auth_message_is_refused() {
+        let key = room_key();
+        let frame_key = key.frame_key("R7f3a2c19");
+        let viewer = SessionKey::from_seed([11u8; 32]);
+        let public = viewer.public();
+        let mut reader = Reader::new("R7f3a2c19", key, PublicKey([1u8; 32]));
+        reader.committed.insert(
+            public.encode(),
+            Committed {
+                key: public,
+                role: "viewer".to_string(),
+                peer_id: "p-1".to_string(),
+            },
+        );
+        // An Auth message first (`yrs` reads it as a status varint, `PERMISSION_GRANTED`), then
+        // a sync Update: a walk that reads Auth as a length-prefixed buffer loses alignment
+        // and can miss the Update behind it.
+        let plaintext = [2u8, 1, 0, 2, 0];
+        let frame = seal(
+            &Recipe {
+                room_id: "R7f3a2c19",
+                frame_key: &frame_key,
+                kind: 0,
+                epoch: 0,
+                counter: 1,
+                nonce: [6u8; 12],
+                signer: &viewer,
+            },
+            &plaintext,
+        )
+        .unwrap()
+        .bytes();
+        let verdict = reader.read(&frame);
+        assert_eq!(verdict.reason.as_deref(), Some("unauthorised_content"));
+    }
+
+    #[test]
+    fn a_path_over_the_bound_is_dropped_from_a_listing_and_a_hold_set() {
+        let key = room_key();
+        let frame_key = key.frame_key("R7f3a2c19");
+        let host = SessionKey::from_seed([3u8; 32]);
+        let guest = SessionKey::from_seed([9u8; 32]);
+        let public = guest.public();
+        let mut reader = Reader::new("R7f3a2c19", key, host.public());
+        // 4096 bytes is kept and 4097 is dropped: the bound is over it, not at it.
+        let at_bound = "b".repeat(MAX_PATH_BYTES);
+        let over = "a".repeat(MAX_PATH_BYTES + 1);
+        assert!(usable_path(&at_bound));
+        assert!(!usable_path(&over));
+        let peers: serde_json::Map<String, Value> = [(
+            public.encode(),
+            serde_json::json!({"peer_id": "p-1", "role": "guest"}),
+        )]
+        .into_iter()
+        .collect();
+        let listing = serde_json::json!({
+            "issued": 1,
+            "listing": [at_bound.as_str(), over.as_str()],
+            "peers": peers,
+        })
+        .to_string();
+        let frame = seal(
+            &Recipe {
+                room_id: "R7f3a2c19",
+                frame_key: &frame_key,
+                kind: 1,
+                epoch: 0,
+                counter: 1,
+                nonce: [5u8; 12],
+                signer: &host,
+            },
+            listing.as_bytes(),
+        )
+        .unwrap()
+        .bytes();
+        let verdict = reader.read(&frame);
+        assert!(verdict.ok, "{:?}", verdict.reason);
+        assert_eq!(reader.listing, vec![at_bound.clone()]);
+
+        let holds =
+            serde_json::json!({"holds": [at_bound.as_str(), over.as_str()]})
+                .to_string();
+        let frame = seal(
+            &Recipe {
+                room_id: "R7f3a2c19",
+                frame_key: &frame_key,
+                kind: 3,
+                epoch: 0,
+                counter: 1,
+                nonce: [6u8; 12],
+                signer: &guest,
+            },
+            holds.as_bytes(),
+        )
+        .unwrap()
+        .bytes();
+        let verdict = reader.read(&frame);
+        assert!(verdict.ok, "{:?}", verdict.reason);
+        assert_eq!(reader.holds[&public.id()], vec![at_bound]);
     }
 }

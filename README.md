@@ -309,7 +309,7 @@ frame goes in, the decisions come out, and every clock is a value the caller pas
 is what lets the corpus drive it.
 
 Two suites hold that layer. `crates/harness/tests/peer_vectors.rs` replays the corpus's
-seventeen **frame** vectors against the sealed layer, and `crates/harness/tests/decisions.rs`
+nineteen **frame** vectors against the sealed layer, and `crates/harness/tests/decisions.rs`
 drives its six **decision** vectors against the client through `selvage-subject`, the binary
 that speaks the corpus's subject protocol
 (`cargo run -p selvage-harness --bin selvage-subject`). The specification's own runner can
