@@ -68,21 +68,29 @@ struct Options {
 }
 
 fn options() -> Result<Options, Failure> {
+    options_of(env::args().skip(1))
+}
+
+/// The command line, read from any sequence of arguments so that a test can hand it one.
+fn options_of(args: impl Iterator<Item = String>) -> Result<Options, Failure> {
     let mut invite = None;
     let mut path = None;
     let mut name = None;
     let mut version = None;
-    let mut args = env::args().skip(1);
+    let mut args = args;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--invite" => invite = args.next(),
             "--path" => path = args.next(),
             "--name" => name = args.next(),
             "--version" => {
-                version = args
-                    .next()
-                    .map(|value| parse_version(&value))
-                    .transpose()?;
+                // A flag with no value is an error like an unknown one: dropping it would
+                // leave the version to the link and overrule it silently, which is the one
+                // thing this reading is here to avoid.
+                let value = args.next().ok_or(
+                    "--version needs a value: `1` (or `selvage/1`) or `2` (or `selvage/2`)",
+                )?;
+                version = Some(parse_version(&value)?);
             }
             other => {
                 return Err(format!("unknown argument {other:?}").into());
@@ -413,4 +421,48 @@ async fn vector_of(engine: &SyncEngine) -> Result<Vec<(u64, u32)>, Failure> {
 /// `stdout` is line-buffered, so a reply is on the wire as soon as it is printed.
 fn emit(value: &Value) {
     println!("{value}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WireVersion, options_of};
+
+    /// Every flag the driver needs, in one place.
+    fn base() -> Vec<String> {
+        [
+            "--invite",
+            "ws://127.0.0.1:9/session?room=r-1&token=t-1",
+            "--path",
+            "notes.txt",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    /// `--version` at the end of a line names no value, and a flag that named none used to be
+    /// dropped and leave the version to the link: the silent overrule this reading exists to
+    /// avoid.
+    #[test]
+    fn a_version_flag_without_a_value_is_refused() {
+        let mut args = base();
+        args.push("--version".to_string());
+        let Err(refused) = options_of(args.into_iter()) else {
+            panic!("a bare --version is an error");
+        };
+        assert!(
+            refused.to_string().contains("--version"),
+            "the error names the flag: {refused}"
+        );
+    }
+
+    /// The flag with a value settles the version, and the link is what settles one otherwise.
+    #[test]
+    fn a_version_flag_with_a_value_is_read() {
+        let mut args = base();
+        args.extend(["--version", "2"].map(String::from));
+        let read = options_of(args.into_iter()).expect("the flag is read");
+        assert_eq!(read.version, Some(WireVersion::Two));
+        let read = options_of(base().into_iter()).expect("the link decides");
+        assert_eq!(read.version, None);
+    }
 }
