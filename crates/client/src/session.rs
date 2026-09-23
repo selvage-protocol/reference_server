@@ -284,10 +284,10 @@ impl ConnectOptions {
             .split_once('#')
             .map_or(url, |(address, _fragment)| address);
         let parsed = proto::parse_session_url(&wire_address(address))
-            .ok_or_else(|| Error::Invite(url.to_string()))?;
+            .ok_or_else(|| Error::Invite(address.to_string()))?;
         let (Some(room), Some(token)) = (parsed.join.room, parsed.join.token)
         else {
-            return Err(Error::Invite(url.to_string()));
+            return Err(Error::Invite(address.to_string()));
         };
         let mut options = Self::new(parsed.base, display_name);
         options.room = Some(room);
@@ -481,6 +481,67 @@ mod tests {
 
         // The whole link is still read, keys and all.
         assert!(ConnectOptions::from_invite_url(&link, "Ada").is_some());
+    }
+
+    /// §5.1: a client "MUST NOT log" the invite's fragment, and `read_invite_url` is the
+    /// path a pasted link takes. A link it refuses is named by its address — the fragment-free
+    /// part — so neither key and no `#` reaches the sentence a caller prints.
+    #[test]
+    fn a_refused_link_is_named_by_its_address_and_never_by_its_fragment() {
+        let link = sealed_link();
+        let (address, fragment) =
+            link.split_once('#').expect("the link has a fragment");
+        let keys = (
+            encode_key(&RoomKey([7; 32]).0),
+            SessionKey::from_seed([3; 32]).public().encode(),
+        );
+        let names_no_key = |text: &str| {
+            assert!(!text.contains('#'), "the fragment survived into: {text}");
+            assert!(
+                !text.contains(&keys.0),
+                "the room key survived into: {text}"
+            );
+            assert!(
+                !text.contains(&keys.1),
+                "the host key survived into: {text}"
+            );
+        };
+
+        // An ordinary truncated paste: the query lost its token, and the fragment is whole.
+        let no_token = format!("ws://h:8080/session?room=r-1#{fragment}");
+        let refused =
+            ConnectOptions::read_invite_url(&no_token, "Ada").unwrap_err();
+        assert!(matches!(&refused, Error::Invite(_)));
+        names_no_key(&refused.to_string());
+
+        // The token twice: the query is not one this reads, and the fragment is still whole.
+        let twice = format!("{address}&token=t-2#{fragment}");
+        let refused =
+            ConnectOptions::read_invite_url(&twice, "Ada").unwrap_err();
+        assert!(matches!(&refused, Error::Invite(_)));
+        names_no_key(&refused.to_string());
+
+        // And an address that is not a session endpoint at all.
+        let elsewhere =
+            format!("ws://h:8080/other?room=r-1&token=t-1#{fragment}");
+        let refused =
+            ConnectOptions::read_invite_url(&elsewhere, "Ada").unwrap_err();
+        assert!(matches!(&refused, Error::Invite(_)));
+        names_no_key(&refused.to_string());
+
+        // §5.1 reaches the options a caller holds too: `ConnectOptions`' derived `Debug`
+        // delegates to the invite's, so neither key is printed there either.
+        let options = ConnectOptions::from_invite_url(&link, "Ada")
+            .expect("the whole link is read");
+        let printed = format!("{options:?}");
+        assert!(
+            !printed.contains(&format!("{:?}", RoomKey([7; 32])))
+                && !printed.contains(&format!(
+                    "{:?}",
+                    SessionKey::from_seed([3; 32]).public()
+                )),
+            "a key the options hold was printed: {printed}"
+        );
     }
 
     fn fast() -> ReconnectPolicy {

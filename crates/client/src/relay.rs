@@ -221,7 +221,7 @@ impl RelaySession {
         let base = session_base(&options.base_url).ok_or_else(|| {
             Error::Invite(format!(
                 "not a session address: {}",
-                options.base_url
+                link_address(&options.base_url)
             ))
         })?;
         let room_key = match options.room_key {
@@ -303,7 +303,9 @@ impl RelaySession {
             // The link names the room it joins, and a reply that seats this connection
             // somewhere else means the two readings disagreed about the address the join was
             // sent to. A session that continued would read every frame of the wrong room.
-            return Err(Error::Invite(options.invite));
+            // The refusal names the address, which carries no fragment: §5.1 keeps the two
+            // keys out of every message a client produces.
+            return Err(Error::Invite(invite.socket_url));
         }
         let session = PeerSession::new(&PeerOptions {
             room_id: invite.room,
@@ -1044,6 +1046,16 @@ fn seats_of(peers: &[RelayPeer]) -> BTreeSet<String> {
     peers.iter().map(|peer| peer.peer_id.clone()).collect()
 }
 
+/// The part of a link `PROTOCOL.md` §5.1 lets out: everything before its first `#`.
+///
+/// The fragment carries the room key and the host key, and §5.1 says a client MUST NOT log
+/// them, so no message or error here names a whole link — a refusal names the address, which
+/// is what the sentence is about anyway.
+fn link_address(link: &str) -> &str {
+    link.split_once('#')
+        .map_or(link, |(address, _fragment)| address)
+}
+
 /// One `PeerInfo` from a `peer.joined`'s params, which wraps its record under `peer`.
 fn peer_of(params: &serde_json::Value) -> Option<RelayPeer> {
     let record = params.get("peer").unwrap_or(params);
@@ -1163,8 +1175,8 @@ async fn seating(
         }
         let Some(body) = frame.params else { continue };
         let read: proto::SessionParamsV2 = serde_json::from_value(body)?;
-        let base =
-            session_base(url).ok_or_else(|| Error::Invite(url.to_string()))?;
+        let base = session_base(url)
+            .ok_or_else(|| Error::Invite(link_address(url).to_string()))?;
         let advertised = KeepaliveConfig::from(read.keepalive);
         return Ok(Dialled {
             socket,
@@ -1262,6 +1274,7 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    use futures_util::SinkExt;
     use futures_util::StreamExt;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
@@ -1271,11 +1284,12 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{
-        RelaySession, RelaySessionInfo, clock_period, lock, session_base, start,
+        RelayHostOptions, RelayJoinOptions, RelaySession, RelaySessionInfo,
+        clock_period, lock, session_base, start,
     };
     use crate::host::{HostOptions, ListingSource};
     use crate::peer::{PeerOptions, PeerSession};
-    use crate::sealed::{Envelope, KeyId, RoomKey, SessionKey};
+    use crate::sealed::{Envelope, KeyId, RoomKey, SessionKey, encode_key};
     use crate::session::KeepaliveConfig;
 
     const ROOM: &str = "r-1";
@@ -1661,5 +1675,120 @@ mod tests {
             "the fragment's keys never reach a request"
         );
         assert_eq!(session_base("ws://h:8080#k=cd8"), None);
+    }
+
+    /// The two keys a `PROTOCOL.md` §5.1 fragment carries, as a host mints them.
+    fn sealed_keys() -> (String, String) {
+        (
+            encode_key(&RoomKey([7; 32]).0),
+            SessionKey::from_seed([3; 32]).public().encode(),
+        )
+    }
+
+    /// §5.1: a client "MUST NOT log" the invite's fragment, so no refusal may name a whole
+    /// link — not the fragment, and not either key it carries.
+    fn names_no_key(text: &str, keys: &(String, String)) {
+        assert!(!text.contains('#'), "the fragment survived into: {text}");
+        assert!(
+            !text.contains(&keys.0),
+            "the room key survived into: {text}"
+        );
+        assert!(
+            !text.contains(&keys.1),
+            "the host key survived into: {text}"
+        );
+    }
+
+    /// A server that completes the handshake and seats the connection in another room: the
+    /// one reply that makes `RelaySession::join` disagree with the address it dialled.
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "a task's handshake is one place: the listener, the accept and the reply belong together"
+    )]
+    async fn seating_elsewhere(
+        room: &str,
+    ) -> Result<String, Box<dyn StdError>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let seated = room.to_string();
+        tokio::spawn(async move {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut socket) = tokio_tungstenite::accept_async(tcp).await
+            else {
+                return;
+            };
+            // The client's hello, then the seating reply.
+            let _ = socket.next().await;
+            let reply = serde_json::json!({
+                "v": "selvage/2",
+                "event": "room.joined",
+                "params": {
+                    "room_id": seated,
+                    "self": {"peer_id": "p-2", "display_name": "Bob"},
+                    "peers": [],
+                    "capabilities": [],
+                    "keepalive": {
+                        "awareness_renew_ms": 15000,
+                        "awareness_expire_ms": 30000,
+                        "ping_interval_ms": 30000,
+                    },
+                },
+            });
+            let _ = socket.send(Message::text(reply.to_string())).await;
+            // Hold the socket open so the dial reads the reply before any close.
+            let _ = socket.next().await;
+        });
+        Ok(format!("ws://{addr}"))
+    }
+
+    /// R1: a refusal names the address, never the link. §5.1 forbids the fragment leaving a
+    /// client, and these are the two refusals a caller reaches with an ordinary paste — a base
+    /// that carries a whole link, and a server that seats the connection somewhere else.
+    #[tokio::test]
+    async fn a_refusal_names_the_address_and_never_the_two_keys()
+    -> Result<(), Box<dyn StdError>> {
+        let keys = sealed_keys();
+        let listing: ListingSource = Arc::new(Vec::new);
+
+        // A base that is a whole link with the fragment in its address: `session_base` refuses
+        // it, and the refusal must not repeat what it refused. (A fragment after a `?` is
+        // stripped with the query before this point, which is why the shape below carries
+        // none.)
+        let minted = RelaySession::host(RelayHostOptions {
+            base_url: format!("ws://h:8080/session#k={}&h={}", keys.0, keys.1),
+            display_name: "Ada".to_string(),
+            listing,
+            room_key: None,
+            host_seed: None,
+            store: None,
+            client: None,
+            keepalive: Some(keepalive()),
+        })
+        .await;
+        let refused =
+            minted.err().ok_or("a base with a fragment is refused")?;
+        names_no_key(&refused.to_string(), &keys);
+
+        let base = seating_elsewhere("r-OTHER").await?;
+        let joined = RelaySession::join(RelayJoinOptions {
+            invite: format!(
+                "{base}/session?room=r-1&token=t-1#k={}&h={}",
+                keys.0, keys.1
+            ),
+            display_name: "Bob".to_string(),
+            declared_role: None,
+            client: None,
+            keepalive: Some(keepalive()),
+        })
+        .await;
+        let refused = joined.err().ok_or("another room is refused")?;
+        assert!(
+            refused.to_string().contains("r-1"),
+            "the refusal names the address the link gave: {refused}"
+        );
+        names_no_key(&refused.to_string(), &keys);
+        Ok(())
     }
 }

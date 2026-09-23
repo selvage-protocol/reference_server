@@ -16,6 +16,7 @@
 //! own tests be about the rule rather than about how long a machine took.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use std::mem;
 use std::time::Duration;
 
@@ -42,7 +43,7 @@ use crate::sealed::{
 /// the fragment stripped. Both keys are required, and their absence is a local refusal before
 /// a socket is opened: without both, a client can neither read a frame nor verify one, so
 /// there is no fallback and no plaintext mode.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PeerInvite {
     /// The connection URL, without the fragment. Nothing here puts the fragment back.
     pub socket_url: String,
@@ -50,6 +51,22 @@ pub struct PeerInvite {
     pub token: String,
     pub room_key: RoomKey,
     pub host_key: PublicKey,
+}
+
+/// §5.1's two keys are not printed. A derived `Debug` would put the room key and the host key
+/// in whatever log an invite — or the [`crate::ConnectOptions`] holding one — is written to,
+/// which is the one thing the fragment exists to prevent. Their ids are in every frame's clear
+/// prefix already (`CANONICAL.md` §6.1), so those stand in for them.
+impl fmt::Debug for PeerInvite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerInvite")
+            .field("socket_url", &self.socket_url)
+            .field("room", &self.room)
+            .field("token", &self.token)
+            .field("room_key", &"<redacted>")
+            .field("host_key", &self.host_key.id().hex())
+            .finish()
+    }
 }
 
 impl PeerInvite {
@@ -193,7 +210,7 @@ fn set_once<T>(
 
 /// What a session is opened with: the invite's two keys, the session's clock, and the seats
 /// the server has shown.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PeerOptions {
     pub room_id: String,
     pub room_key: RoomKey,
@@ -233,6 +250,30 @@ pub struct PeerOptions {
     /// can sign a state and a session without one cannot; the room's host publishes the state
     /// that every peer's key and role come from, and a session with no state produces none.
     pub host: Option<HostOptions>,
+}
+
+/// The same rule as [`PeerInvite`]'s: the room key, the host key and the two private seeds are
+/// not printed. A session's options are built from an invite, and §5.1 forbids what they carry
+/// from reaching a log as much as it forbids it reaching a request.
+impl fmt::Debug for PeerOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerOptions")
+            .field("room_id", &self.room_id)
+            .field("room_key", &"<redacted>")
+            .field("host_key", &self.host_key.id().hex())
+            .field("renew", &self.renew)
+            .field("expire", &self.expire)
+            .field("seat", &self.seat)
+            .field("roster", &self.roster)
+            .field(
+                "fixed_session_key",
+                &self.fixed_session_key.map(|_| "<redacted>"),
+            )
+            .field("declared_role", &self.declared_role)
+            .field("awareness_client_id", &self.awareness_client_id)
+            .field("host", &self.host.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// What a session did with one frame: the decision `PROTOCOL.md` §13.11 observes.
@@ -2103,6 +2144,45 @@ mod tests {
 
         let no_host = invite(room_key(), "k=$k");
         assert!(PeerInvite::parse(&no_host).unwrap_err().contains("`h`"));
+    }
+
+    /// §5.1: the fragment's two keys are read to be used, never repeated. A `Debug` that
+    /// printed them would put both in whatever log an invite — or the options a session is
+    /// built from — is written to, which is the one thing the fragment exists to prevent.
+    #[test]
+    fn the_invites_keys_are_not_printed_by_debug() {
+        let room_key = room_key();
+        let host_key = host().public();
+        let parsed = PeerInvite::parse(&invite(room_key, "k=$k&h=$h")).unwrap();
+        let printed = format!("{parsed:?}");
+        assert!(
+            !printed.contains(&format!("{room_key:?}")),
+            "the room key was printed: {printed}"
+        );
+        assert!(
+            !printed.contains(&format!("{host_key:?}")),
+            "the host key was printed: {printed}"
+        );
+
+        let options = PeerOptions {
+            room_id: ROOM.to_string(),
+            room_key,
+            host_key,
+            renew: Duration::from_millis(300),
+            expire: Duration::from_millis(900),
+            seat: Some("p-self".to_string()),
+            roster: BTreeSet::new(),
+            fixed_session_key: Some([5; 32]),
+            declared_role: None,
+            awareness_client_id: None,
+            host: None,
+        };
+        let printed = format!("{options:?}");
+        assert!(
+            !printed.contains(&format!("{room_key:?}"))
+                && !printed.contains(&format!("{host_key:?}")),
+            "a key the options hold was printed: {printed}"
+        );
     }
 
     #[test]
