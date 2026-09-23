@@ -1338,16 +1338,19 @@ impl PeerSession {
         let _ = self.roster.insert(seat.to_string());
         // §13.7: a hold is re-announced when a peer is seated, so a joiner learns the room's
         // held set without asking for it — on the event itself rather than at the next renewal,
-        // which is a whole window the joiner would spend holding nothing from this peer.
+        // which is a whole window the joiner would spend holding nothing from this peer. The
+        // state goes first: a holds message resolves against the keys the applied state commits
+        // (§13.4), so a joiner that has applied no state yet refuses it `uncommitted_key`.
         self.holds_announced_at = None;
-        self.announce_holds(clock);
         if self.host.is_some() {
             self.publish_state(clock, HostReason::Roster);
+            self.announce_holds(clock);
             return;
         }
         if let Some(frame) = self.held_state_frame.clone() {
             self.republish(&frame);
         }
+        self.announce_holds(clock);
     }
 
     /// A seat has left, from `peer.left`: §13.8's clock can arm on it and §13.7's holds go.
@@ -2253,15 +2256,16 @@ mod tests {
             "the announcement and the holds message; the handshake is counted apart"
         );
 
-        // A seat is seated: the room's holds go out with the event, and the state this client
-        // already holds is re-sent behind them (§7.1).
+        // A seat is seated: the state that will commit the joiner's key goes out with the event,
+        // and the room's holds behind it — a holds message resolves against the keys the applied
+        // state commits (§13.4), so one that arrives before the state is refused.
         session.seat_joined(millis(3), "p-other");
         let out = session.take_outbound();
         let kinds: Vec<u64> = out
             .iter()
             .map(|frame| Envelope::parse(frame).unwrap().kind)
             .collect();
-        assert_eq!(kinds, [3, 1], "the holds, then the state the room holds");
+        assert_eq!(kinds, [1, 3], "the state the room holds, then the holds");
     }
 
     #[test]
