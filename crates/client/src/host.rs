@@ -412,7 +412,7 @@ impl HostProducer {
         }
         let issued = self.next_issued();
         let frame = self.seal_state(issued, &listing, &peers)?;
-        self.commit_series(issued);
+        self.commit_series(issued, Some(clock));
         let state = RoomState {
             issued,
             listing,
@@ -448,7 +448,7 @@ impl HostProducer {
         let issued = self.next_issued();
         let plaintext = canonical(&json!({"closing": true, "issued": issued}));
         let frame = self.seal(2, &plaintext)?;
-        self.commit_series(issued);
+        self.commit_series(issued, None);
         self.standing = Standing::Closed;
         Some(HostPublication {
             frame,
@@ -463,9 +463,12 @@ impl HostProducer {
         self.issued.max(self.verified).saturating_add(1)
     }
 
-    fn commit_series(&mut self, issued: u64) {
+    /// `clock` is the publication's own, and a save records it: the renewal-window batching in
+    /// [`Self::flush_frames`] measures from the last write of any kind. A closing has no clock of
+    /// its own and keeps the last one, which is harmless because nothing is published after it.
+    fn commit_series(&mut self, issued: u64, clock: Option<Duration>) {
         self.issued = issued;
-        self.save(self.saved_at);
+        self.save(clock.or(self.saved_at));
     }
 
     fn save(&mut self, clock: Option<Duration>) {

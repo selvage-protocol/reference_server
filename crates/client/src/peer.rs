@@ -2498,20 +2498,77 @@ mod tests {
         let mut session = budgeted(FRAME_BUDGET, Some(stored_host(&store)));
         session.tick(Duration::ZERO);
         let _ = session.take_outbound();
-        session.tick(millis(1));
+        // The mint state's own write opened the window at 0, so the count it could not yet carry
+        // is written on the first tick a window later.
+        session.tick(millis(300));
         let first = store.load().map(|saved| saved.frames).unwrap_or_default();
         assert!(
             first > 0,
             "the frames the host sealed are written on the tick"
         );
-        let _ = session.deliver(millis(2), &holds(&peer(), 1, &["README.md"]));
-        session.tick(millis(400));
+        let _ =
+            session.deliver(millis(301), &holds(&peer(), 1, &["README.md"]));
+        session.tick(millis(600));
         let saved = store.load().unwrap();
         assert!(
             saved.frames > first,
             "a delivered frame is in the next write"
         );
         assert!(saved.issued > 0, "written beside `issued`");
+    }
+
+    #[derive(Default)]
+    struct Counted {
+        saved: Saved,
+        saves: Mutex<u32>,
+    }
+
+    impl HostStore for Counted {
+        fn load(&self) -> Option<PersistedHost> {
+            self.saved.load()
+        }
+
+        fn save(&self, persisted: PersistedHost) {
+            let mut saves = self.saves.lock().unwrap();
+            *saves = saves.saturating_add(1);
+            self.saved.save(persisted);
+        }
+    }
+
+    #[test]
+    fn a_state_published_after_a_flush_counts_as_a_write_for_the_renewal_window()
+     {
+        let store = Arc::new(Counted::default());
+        let listing: ListingSource = Arc::new(|| vec!["README.md".to_string()]);
+        let options = HostOptions {
+            host_seed: [3; 32],
+            listing,
+            store: Some(Arc::clone(&store) as Arc<dyn HostStore>),
+        };
+        let mut session = budgeted(FRAME_BUDGET, Some(options));
+        session.tick(Duration::ZERO);
+        session.tick(millis(300));
+        // An announcement commits a key, so the host publishes a fresh state, and that write
+        // carries the count at its own clock: a frame that moves the count right after it waits
+        // for the next window rather than being written on the next tick.
+        session.seat_joined(millis(600), "p-alice");
+        let named = json!({ "key": peer().public().encode() }).to_string();
+        let _ = session
+            .deliver(millis(600), &frame(&peer(), 4, 1, named.as_bytes()));
+        let after_state = *store.saves.lock().unwrap();
+        let _ = session.deliver(millis(601), &[1, 2, 3]);
+        session.tick(millis(602));
+        assert_eq!(
+            *store.saves.lock().unwrap(),
+            after_state,
+            "no write inside the window"
+        );
+        session.tick(millis(900));
+        assert_eq!(
+            *store.saves.lock().unwrap(),
+            after_state.saturating_add(1),
+            "one once it has passed"
+        );
     }
 
     #[test]
