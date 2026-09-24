@@ -1444,6 +1444,9 @@ impl PeerSession {
             return false;
         };
         self.count_frame();
+        if let Some(host) = self.host.as_mut() {
+            host.save_frames();
+        }
         self.outbound.push_back(publication.frame);
         self.published = self.published.saturating_add(1);
         self.ending = Some(Ending::Closing);
@@ -1469,8 +1472,14 @@ impl PeerSession {
         if let Some(publication) =
             self.host.as_mut().and_then(HostProducer::closing)
         {
+            self.count_frame();
             self.outbound.push_back(publication.frame);
             self.published = self.published.saturating_add(1);
+        }
+        // The session ends here, so the count is written now rather than on a tick that will not
+        // come.
+        if let Some(host) = self.host.as_mut() {
+            host.save_frames();
         }
         self.ending = Some(Ending::FrameBudget);
         true
@@ -1609,7 +1618,9 @@ impl PeerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{HostStore, ListingSource, PersistedHost};
+    use crate::host::{
+        ABSENCE_CHARGE, HostStore, ListingSource, PersistedHost,
+    };
     use crate::sealed::{Envelope, RoomKey, encode_key, opens, read_varuint};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -2480,9 +2491,13 @@ mod tests {
         store.save(PersistedHost {
             host_seed: [3; 32],
             issued: 5,
-            frames: 10,
+            frames: Some(10),
         });
-        let mut session = budgeted(11, Some(stored_host(&store)));
+        // A reload is a return, so the saved count is continued with the absence charge on it.
+        let mut session = budgeted(
+            ABSENCE_CHARGE.saturating_add(11),
+            Some(stored_host(&store)),
+        );
         session.tick(Duration::ZERO);
         session.tick(millis(1));
         assert_eq!(
@@ -2501,7 +2516,10 @@ mod tests {
         // The mint state's own write opened the window at 0, so the count it could not yet carry
         // is written on the first tick a window later.
         session.tick(millis(300));
-        let first = store.load().map(|saved| saved.frames).unwrap_or_default();
+        let first = store
+            .load()
+            .and_then(|saved| saved.frames)
+            .unwrap_or_default();
         assert!(
             first > 0,
             "the frames the host sealed are written on the tick"
@@ -2511,10 +2529,46 @@ mod tests {
         session.tick(millis(600));
         let saved = store.load().unwrap();
         assert!(
-            saved.frames > first,
+            saved.frames.unwrap_or_default() > first,
             "a delivered frame is in the next write"
         );
         assert!(saved.issued > 0, "written beside `issued`");
+    }
+
+    #[test]
+    fn a_host_record_without_a_count_reads_as_a_spent_budget() {
+        // `CANONICAL.md` §6.1: a record written before the count existed cannot say what the
+        // room has sealed, so the host closes the room at its first tick rather than continue it.
+        let store = Arc::new(Saved::default());
+        store.save(PersistedHost {
+            host_seed: [3; 32],
+            issued: 3,
+            frames: None,
+        });
+        let mut session = budgeted(FRAME_BUDGET, Some(stored_host(&store)));
+        session.tick(Duration::ZERO);
+        let kinds: Vec<u64> = session
+            .take_outbound()
+            .iter()
+            .map(|frame| Envelope::parse(frame).unwrap().kind)
+            .collect();
+        assert_eq!(kinds, [2], "the closing, and nothing sealed before it");
+        assert_eq!(session.ending(), Some(Ending::FrameBudget));
+        assert_eq!(store.load().map(|saved| saved.issued), Some(4));
+    }
+
+    #[test]
+    fn a_host_that_closes_its_room_saves_the_count_with_the_closing_in_it() {
+        let store = Arc::new(Saved::default());
+        let mut session = budgeted(FRAME_BUDGET, Some(stored_host(&store)));
+        session.tick(Duration::ZERO);
+        let sealed = u64::try_from(session.take_outbound().len()).unwrap();
+        assert!(session.close_room());
+        assert_eq!(
+            store.load().and_then(|saved| saved.frames),
+            Some(sealed.saturating_add(1)),
+            "a reload continues from the frame that ended the room"
+        );
     }
 
     #[derive(Default)]

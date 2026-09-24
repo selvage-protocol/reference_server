@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
+use crate::peer::FRAME_BUDGET;
+
 use crate::sealed::{
     FrameKey, PeerEntry, PublicKey, Recipe, RoomState, SealedError, SessionKey,
     fresh_nonce, seal, usable_path,
@@ -39,6 +41,18 @@ pub const MAX_LISTING_PATHS: usize = 100_000;
 /// §13.3's third bound: the path bytes one listing may carry.
 pub const MAX_LISTING_BYTES: usize = 4 * 1024 * 1024;
 
+/// `CANONICAL.md` §6.1's absence charge: what every return of the host costs its count, a fixed
+/// ceiling on the frames one absence can hide. 1024 returns spend the frame budget on charges
+/// alone. This client has no in-process reconnect, so its one return is a reload from its store.
+pub const ABSENCE_CHARGE: u64 = 1 << 21;
+
+/// The count a reload continues from (`CANONICAL.md` §6.1): the saved one with the absence charge
+/// on it, since a reload is a return, or the spent budget for a record written before the count
+/// existed.
+fn resumed_frames(saved: Option<u64>) -> u64 {
+    saved.map_or(FRAME_BUDGET, |frames| frames.saturating_add(ABSENCE_CHARGE))
+}
+
 /// What §7.1 has a host keep together: the host key, its `issued` beside it, and the room's
 /// frame count (`CANONICAL.md` §6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,8 +62,9 @@ pub struct PersistedHost {
     /// The highest `issued` this host has published.
     pub issued: u64,
     /// The room's frame count as this host has kept it since the mint (`CANONICAL.md` §6.1's
-    /// frame budget). A store written before the count existed reads it as `0`.
-    pub frames: u64,
+    /// frame budget). `None` is a record written before the count existed, which cannot say what
+    /// the room has sealed and so reads as a spent budget.
+    pub frames: Option<u64>,
 }
 
 /// Where a host keeps what makes it the host after a reload (§7.1, §9.1).
@@ -248,8 +263,11 @@ impl HostProducer {
             && persisted.host_seed == options.host_seed
         {
             producer.issued = persisted.issued;
-            producer.frames = persisted.frames;
-            producer.saved_frames = persisted.frames;
+            // `CANONICAL.md` §6.1: a reload is a return, so it costs the absence charge; a record
+            // with no count cannot say what the room has sealed, so it reads as a spent budget and
+            // the room closes at the first tick.
+            producer.frames = resumed_frames(persisted.frames);
+            producer.saved_frames = persisted.frames.unwrap_or(u64::MAX);
         }
         Ok(producer)
     }
@@ -282,6 +300,14 @@ impl HostProducer {
     /// The session's count as it moves, kept here so every save writes it beside `issued`.
     pub const fn count_frames(&mut self, count: u64) {
         self.frames = count;
+    }
+
+    /// Writes the count now, whatever the window: a session that is ending has no later tick to
+    /// leave it to, and a reload must continue from the frame that ended it.
+    pub fn save_frames(&mut self) {
+        if self.frames != self.saved_frames {
+            self.save(self.saved_at);
+        }
     }
 
     /// `CANONICAL.md` §6.1: the count is written at least once every `awareness_renew_ms` while
@@ -478,7 +504,7 @@ impl HostProducer {
         store.save(PersistedHost {
             host_seed: self.host_seed,
             issued: self.issued,
-            frames: self.frames,
+            frames: Some(self.frames),
         });
         self.saved_frames = self.frames;
         self.saved_at = clock;
@@ -893,7 +919,7 @@ mod tests {
         store.save(PersistedHost {
             host_seed: [9; 32],
             issued: 42,
-            frames: 7,
+            frames: Some(7),
         });
         let host = producer(Some(store));
         assert_eq!(
