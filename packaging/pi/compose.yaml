@@ -20,8 +20,9 @@
 name: selvage-pi-demo
 
 services:
-  # The session server, at the address the desktop clients already dial
-  # (`ws://100.64.0.3:8080`), so their default survives this shape.
+  # The session server, at the address the native deployment had
+  # (`ws://100.64.0.3:8080`). The clients' default server is the public demo, so
+  # a session here is reached by naming this address.
   selvaged:
     image: ${SELVAGED_IMAGE:?set SELVAGED_IMAGE in .env to the published image, by digest}
     # The image's own command adds `--serve-page /page`, and the page baked into

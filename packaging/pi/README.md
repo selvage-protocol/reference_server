@@ -39,10 +39,10 @@ server each listen where a guest can reach them directly.
         +--------------------------------------------------+
 ```
 
-The ports are the shape the desktop clients already assume: both default to
-`ws://100.64.0.3:8080` for the server, so the session server kept the address the
-native deployment had. The page is the published `selvage-web` image rather than
-the page baked into the server image, which is why `selvaged` runs without
+The ports are the shape the native deployment had: the session server kept its address,
+`ws://100.64.0.3:8080`. The desktop clients' default server is the public demo, so a client
+reaches this instance by naming this address. The page is the published `selvage-web` image
+rather than the page baked into the server image, which is why `selvaged` runs without
 `--serve-page` here — a visitor's page and the server are one release each.
 
 Both containers run read-only, with every capability dropped and no process able
