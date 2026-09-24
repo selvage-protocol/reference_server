@@ -330,16 +330,20 @@ fragment. `crates/harness/tests/relay_selvaged.rs` is that pair against a real `
 
 Two suites hold that layer. `crates/harness/tests/peer_vectors.rs` replays the corpus's
 nineteen **frame** vectors against the sealed layer, and `crates/harness/tests/decisions.rs`
-drives its six **decision** vectors against the client through `selvage-subject`, the binary
+drives its eight **decision** vectors against the client through `selvage-subject`, the binary
 that speaks the corpus's subject protocol
-(`cargo run -p selvage-harness --bin selvage-subject`). The specification's own runner can
+(`cargo run -p selvage-harness --bin selvage-subject`). Six of the eight are about what a client
+did with a frame it was handed; the other two are about the decisions a link carries before any
+frame at all — §5.1's half-copied fragment and §2/§10's version-1-only server — which the
+subject answers as a refusal in its own words, decided by the client library's own rules rather
+than by a copy of them. The specification's own runner can
 drive the same binary:
 
 ```
 python3 runner/run_peer.py --subject <checkout>/reference_server/target/debug/selvage-subject
 ```
 
-All six decision vectors pass, and each goes red under the guard it declares it catches: the
+All eight decision vectors pass, and each goes red under the guard it declares it catches: the
 same suite removes the one guard a vector names and shows the vector fail, so a rule vector
 cannot pass by asserting nothing.
 
