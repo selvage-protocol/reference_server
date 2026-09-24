@@ -17,7 +17,7 @@
     {
       "op": "expect",
       "conn": "binary",
-      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expectClose",
@@ -32,12 +32,12 @@
     {
       "op": "send",
       "conn": "chatty",
-      "text": "{\"id\":1,\"method\":\"doc.open\",\"params\":{\"path\":\"src/main.rs\"},\"v\":\"selvage/1\"}"
+      "text": "{\"id\":1,\"method\":\"session.rename\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "chatty",
-      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"hello_required\",\"message\":\"$_\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"hello_required\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expectClose",
@@ -45,6 +45,6 @@
       "code": 4000
     }
   ],
-  "selvage": "selvage/1",
+  "selvage": "selvage/2",
   "canonical": "SJ-C/1"
 }

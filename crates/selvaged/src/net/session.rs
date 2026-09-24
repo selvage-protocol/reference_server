@@ -11,11 +11,11 @@ use tokio_tungstenite::tungstenite::Error as WireError;
 use tokio_tungstenite::tungstenite::Message;
 
 use selvage_protocol as proto;
-use selvage_protocol::{Keepalive, close, code, event, method};
+use selvage_protocol::{Keepalive, code, event, method};
 
 use crate::ServerConfig;
 use crate::room::{
-    Claim, NewRoom, Outbound, Peer, Queue, Registry, Room, SeatError, send_all,
+    Claim, NewRoom, Outbound, Peer, Queue, Registry, SeatError, send_all,
 };
 use crate::{mint_room_id, mint_token};
 
@@ -28,40 +28,6 @@ use crate::budget::InboundBudget;
 /// Why a connection was not seated: the error code and the message to send back.
 type Refusal = (&'static str, String);
 
-/// The longest grant this server will carry, in paths. A listing is bounded as policy and not
-/// as a peer's contract (`PROTOCOL.md` §2.1, §5): the transport already refuses a frame over
-/// its own bound, so this is the backstop against a pathologically wide listing that a host
-/// should have bounded itself (§5). It sits well above the file count of any working tree a
-/// host should be sharing — a checkout that reaches it is one whose build output or dependency
-/// tree was not excluded.
-pub const MAX_GRANT_PATHS: usize = 100_000;
-
-/// The longest single path in a grant, in bytes. The server does not resolve or normalise
-/// paths, so this is the only thing it can say about one; POSIX's own `PATH_MAX` is 4096 bytes
-/// for a whole path, and a workspace-relative one is shorter than that (`PROTOCOL.md` §5).
-pub const MAX_GRANT_PATH_BYTES: usize = 4096;
-
-/// The most path bytes a grant carries in total. The count and the per-path length cap
-/// the shape; this caps the bytes: `100_000` paths of 4096 bytes would otherwise be
-/// ~400 MiB of room state, re-serialized on every publish and delivered whole to every
-/// late joiner. What a late joiner can be sent is bounded by what could be published.
-///
-/// Its unit is the path, not the frame. JSON writes a `"` or a `\` as two bytes, so a
-/// listing written in either is up to twice this on the wire, and the `doc.grant` that
-/// carries it has to fit the envelope bound besides — the room state this caps and the
-/// frames that carry it are different sizes, and the smaller bound is the one a given
-/// listing meets.
-///
-/// 4 MiB clears measured real use with headroom: a 25,000-path working-tree listing is
-/// 893,750 path bytes, and 100,000 typical paths are 3,575,000 bytes, both publishing
-/// whole; a contaminated tree (123,883 files, ~11.9 MiB of path bytes with build
-/// outputs included — a shell count of a working area, not a shape the tests seed) is
-/// refused, which is the documented policy — the host excludes what it should not be
-/// sharing (`PROTOCOL.md` §5). Shapes measured in
-/// `crates/harness/tests/bounds.rs`, clearance pinned in
-/// `crates/harness/tests/session.rs`.
-pub const MAX_GRANT_BYTES: usize = 4 * 1024 * 1024;
-
 /// Capacity refusals are this server's policy, not the protocol's (`PROTOCOL.md` §2.1,
 /// §11): an implementation that needs a code of its own names it in the `x.` namespace
 /// rather than inventing a bare name a later version may want. Neither code is in the
@@ -69,11 +35,6 @@ pub const MAX_GRANT_BYTES: usize = 4 * 1024 * 1024;
 /// then stops — the tolerable shape for a full server.
 const SERVER_FULL: &str = "x.server_full";
 const ROOM_FULL: &str = "x.room_full";
-
-/// The longest path a `doc.open` or `doc.close` carries, in bytes: the grant's bound,
-/// applied to the other path ingestion. A megabyte path was accepted, stored in the
-/// room's set and broadcast whole before this bound; §5 allows the same length in both.
-pub const MAX_DOC_PATH_BYTES: usize = 4096;
 
 /// One request off the wire: the id to answer and the params to interpret.
 struct Request {
@@ -95,36 +56,23 @@ pub struct Applicant {
 /// The result of the handshake.
 pub struct Hello {
     params: proto::HelloParams,
-    /// The wire version this connection speaks. It pins the room when it mints one, and
-    /// decides the shape of the reply and the method surface.
-    version: proto::Version,
-    /// A connection without a room in the URL is minting one.
-    claims_host: bool,
 }
 
-/// What seating a newcomer produces: the reply for its own connection, and the peer
-/// record the room is told about when a host reclaims it — `None` for a mint and
-/// for a guest join, which announce nothing beyond `peer.joined`. Plain data only: the
-/// reply is serialized by the caller while it still holds the registry lock, because the
-/// order of the newcomer's first frames is part of what seating decides (see `seat`).
-/// What seating a newcomer produces: the reply's event name and params, the wire version
-/// of the room it is seated in, whether the room was minted, and the peer record the room
-/// is told about when a host reclaims it — `None` for a mint and for a guest join, which
-/// announce nothing beyond `peer.joined`.
+/// What seating a newcomer produces: the reply's event name and params, whether the
+/// room was minted, and the room id. Plain data only: the reply is serialized by the
+/// caller while it still holds the registry lock, because the order of the newcomer's
+/// first frames is part of what seating decides (see `seat`).
 struct Placement {
     event: &'static str,
     body: Value,
     room_id: String,
     minted: bool,
-    version: proto::Version,
-    attached: Option<proto::PeerInfo>,
 }
 
 /// Everything that decides where a newcomer is seated.
 struct Seating<'a> {
     applicant: &'a Applicant,
     config: &'a ServerConfig,
-    role: proto::Role,
     info: &'a proto::PeerInfo,
     /// `None` means "mint a new room".
     room_id: Option<&'a str>,
@@ -137,13 +85,8 @@ struct Seating<'a> {
 ///
 /// Returns the refusal to send back when the first frame is not a compatible
 /// `session.hello`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a handshake names its transport, what the URL claimed, the server's limits and the budget the frames are charged to"
-)]
 pub async fn handshake(
     stream: &mut SessionStream,
-    claims_host: bool,
     config: &ServerConfig,
     budget: &mut InboundBudget,
 ) -> Result<Hello, Refusal> {
@@ -170,25 +113,16 @@ pub async fn handshake(
     if msg.id.is_none() {
         return Err((code::BAD_MESSAGE, "a request needs an id".to_string()));
     }
-    // The wire version before the method, as on a seated connection and as §11 orders the
-    // checks: a first frame that is both a non-hello method and an incompatible version
-    // was answered `hello_required`, which tells the client the wrong thing about why it
-    // was refused. The envelope and the id are judged first, the method after the version.
-    // The version is judged before the method's params and by §10's compatibility rule:
-    // a version this server does not seat is refused before seating and the room is
-    // untouched, which for a `--serve-version-1-only` server includes `selvage/2`.
-    let version = match proto::version_of(&msg.v) {
-        Some(proto::Version::V1) => proto::Version::V1,
-        Some(proto::Version::V2) if !config.serve_version_1_only => {
-            proto::Version::V2
-        }
-        _ => {
-            return Err((
-                code::UNSUPPORTED_VERSION,
-                format!("unsupported wire version {}", msg.v),
-            ));
-        }
-    };
+    // The version before the method, as on a seated connection and as §11 orders the
+    // checks: a first frame that is both a non-hello method and another version was
+    // answered `hello_required`, which tells the client the wrong thing about why it was
+    // refused. The envelope and the id are judged first, the method after the version.
+    if !proto::speaks(&msg.v) {
+        return Err((
+            code::BAD_MESSAGE,
+            format!("a frame this server cannot read names {}", msg.v),
+        ));
+    }
     if msg.method != method::SESSION_HELLO {
         return Err((
             code::HELLO_REQUIRED,
@@ -199,36 +133,15 @@ pub async fn handshake(
             ),
         ));
     }
-    let mut params = match version {
-        proto::Version::V1 => {
-            serde_json::from_value::<proto::HelloParams>(msg.params)
-                .map_err(|e| envelope_refusal("bad session.hello params", &e))?
-        }
-        proto::Version::V2 => {
-            let read: proto::HelloParamsV2 = serde_json::from_value(msg.params)
-                .map_err(|e| {
-                    envelope_refusal("bad session.hello params", &e)
-                })?;
-            proto::HelloParams {
-                awareness_client_id: read.awareness_client_id,
-                capabilities: read.capabilities,
-                client: read.client,
-                display_name: read.display_name,
-                role: None,
-            }
-        }
-    };
+    let mut params: proto::HelloParams = serde_json::from_value(msg.params)
+        .map_err(|e| envelope_refusal("bad session.hello params", &e))?;
     validate_name(&mut params.display_name)?;
-    Ok(Hello {
-        params,
-        version,
-        claims_host,
-    })
+    Ok(Hello { params })
 }
 
-/// The one place a display name is judged, for both versions and both the handshake and
-/// a rename (`PROTOCOL.md` §5): non-blank, no control character, at most 32 UTF-16 code
-/// units, judged on the received value before the trim.
+/// The one place a display name is judged, for both the handshake and a rename
+/// (`PROTOCOL.md` §5): non-blank, no control character, at most 32 UTF-16 code units,
+/// judged on the received value before the trim.
 fn validate_name(display_name: &mut String) -> Result<(), Refusal> {
     if proto::has_control_characters(display_name) {
         return Err((
@@ -336,51 +249,10 @@ fn refusal_for(error: SeatError, room_id: &str) -> Refusal {
         SeatError::TokenMismatch => {
             (code::TOKEN_INVALID, "invalid room token".to_string())
         }
-        SeatError::HostPresent => (
-            code::HOST_PRESENT,
-            "the room already has a host".to_string(),
-        ),
         SeatError::RoomFull => {
             (ROOM_FULL, "the room seats no more peers".to_string())
         }
-        // A room is pinned to the version its minting connection spoke, so a connection
-        // speaking the other one names a room that is not its own. §10 refuses a version
-        // mismatch `unsupported_version`, before seating.
-        SeatError::VersionMismatch => (
-            code::UNSUPPORTED_VERSION,
-            format!("room {room_id} is another wire version"),
-        ),
     }
-}
-
-/// The result of a document method: the room's open-document set after the change.
-fn doc_set(documents: &[String]) -> Value {
-    serde_json::json!({ "documents": documents })
-}
-
-/// The `path` of a `doc.open` or `doc.close` request. The two params are the same shape
-/// (§5) — a path and nothing else — so one type reads either and the rule that a path is
-/// non-blank and carries no control character lives here for both. Params that do not
-/// parse and a path that is empty, all whitespace or control-bearing are all `bad_params`.
-fn document_path(raw: Value) -> Result<String, Refusal> {
-    let params = serde_json::from_value::<proto::DocOpenParams>(raw)
-        .map_err(|e| (code::BAD_PARAMS, e.to_string()))?;
-    if params.path.trim().is_empty() {
-        return Err((code::BAD_PARAMS, "path is required".to_string()));
-    }
-    if proto::has_control_characters(&params.path) {
-        return Err((
-            code::BAD_PARAMS,
-            "path contains control characters".to_string(),
-        ));
-    }
-    if params.path.len() > MAX_DOC_PATH_BYTES {
-        return Err((
-            code::BAD_PARAMS,
-            format!("a document path is at most {MAX_DOC_PATH_BYTES} bytes"),
-        ));
-    }
-    Ok(params.path)
 }
 
 /// The `display_name` of a `session.rename` request, which carries the handshake's bound
@@ -394,61 +266,11 @@ fn rename_name(raw: Value) -> Result<String, Refusal> {
     Ok(params.display_name)
 }
 
-/// The `paths` of a `doc.grant` request (`PROTOCOL.md` §5): the host's whole listing, in the
-/// order it wrote it. The shape is a path's (`document_path`), an empty array is a listing
-/// that grants nothing and not a fault, and the listing is rejected `bad_params` with the
-/// connection open when it is over this server's bounds. The order is never touched: the
-/// server carries what it was given and does not sort, deduplicate or normalise it.
-fn grant_paths(raw: Value) -> Result<Vec<String>, Refusal> {
-    let params = serde_json::from_value::<proto::GrantParams>(raw)
-        .map_err(|e| (code::BAD_PARAMS, e.to_string()))?;
-    if params.paths.len() > MAX_GRANT_PATHS {
-        return Err((
-            code::BAD_PARAMS,
-            format!("a grant is at most {MAX_GRANT_PATHS} paths"),
-        ));
-    }
-    for path in &params.paths {
-        if path.trim().is_empty() {
-            return Err((
-                code::BAD_PARAMS,
-                "a grant path is required".to_string(),
-            ));
-        }
-        if proto::has_control_characters(path) {
-            return Err((
-                code::BAD_PARAMS,
-                "a grant path contains control characters".to_string(),
-            ));
-        }
-        if path.len() > MAX_GRANT_PATH_BYTES {
-            return Err((
-                code::BAD_PARAMS,
-                format!("a grant path is at most {MAX_GRANT_PATH_BYTES} bytes"),
-            ));
-        }
-    }
-    let total: usize = params.paths.iter().map(String::len).sum();
-    if total > MAX_GRANT_BYTES {
-        return Err((
-            code::BAD_PARAMS,
-            format!("a grant is at most {MAX_GRANT_BYTES} path bytes in total"),
-        ));
-    }
-    Ok(params.paths)
-}
-
 /// A peer taken out of the room under the lock: what its announcements need after it.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "whether it was the host and whether the room is now empty are two different questions"
-)]
 struct DetachedPeer {
     peer_id: String,
-    was_host: bool,
     generation: u64,
-    version: proto::Version,
-    /// The room holds nobody after this leave, which is what arms `selvage/2`'s grace.
+    /// The room holds nobody after this leave, which is what arms the room's grace.
     empty: bool,
     /// Dropping this ends the connection's task. A removed peer is gone either way;
     /// ending its task is what closes its socket.
@@ -467,9 +289,7 @@ fn detach_locked(
     let poison = registry.take_task(peer_id);
     Some(DetachedPeer {
         peer_id: peer_id.to_string(),
-        was_host: detach.was_host,
         generation: detach.generation,
-        version: detach.version,
         empty: detach.empty,
         poison,
     })
@@ -500,26 +320,8 @@ fn unseat(
 }
 
 /// The `peer.left` a departure is announced with.
-fn peer_left_frame(version: proto::Version, peer_id: &str) -> Option<Outbound> {
-    event_frame(
-        version,
-        event::PEER_LEFT,
-        serde_json::json!({ "peer_id": peer_id }),
-    )
-}
-
-/// The `host.detached` a host's departure is announced with, in the version of the peer that
-/// left: a frame's `v` is the connection's and not the server's, so a version-2 room's
-/// `host.detached` stamped with the other version is one the clients it is meant for refuse.
-fn host_detached_frame(
-    version: proto::Version,
-    grace_ms: u64,
-) -> Option<Outbound> {
-    event_frame(
-        version,
-        event::HOST_DETACHED,
-        serde_json::json!({ "grace_ms": grace_ms }),
-    )
+fn peer_left_frame(peer_id: &str) -> Option<Outbound> {
+    event_frame(event::PEER_LEFT, serde_json::json!({ "peer_id": peer_id }))
 }
 
 /// The room grace period in whole milliseconds, as `host.detached` carries it and as
@@ -581,22 +383,14 @@ async fn eject_into(
     let Some(removed) = detached else {
         return;
     };
-    // Queued host-first: `deliver` drains LIFO, so the room hears `peer.left`
-    // before `host.detached`, like a clean leave in `remove_peer`.
-    if removed.was_host {
-        let grace = grace_ms(&shared.config);
-        if let Some(gone) = host_detached_frame(removed.version, grace) {
-            pending.push((None, gone));
-        }
-        reap_later(shared.clone(), room_id.to_string(), removed.generation);
-    } else if removed.version == proto::Version::V2 && removed.empty {
+    if removed.empty {
         reap_later_empty(
             shared.clone(),
             room_id.to_string(),
             removed.generation,
         );
     }
-    if let Some(left) = peer_left_frame(removed.version, &removed.peer_id) {
+    if let Some(left) = peer_left_frame(&removed.peer_id) {
         pending.push((None, left));
     }
     drop(removed.poison);
@@ -613,24 +407,8 @@ async fn remove_peer(shared: &Shared, room_id: &str, peer_id: &str) {
     let Some(removed) = detached else {
         return;
     };
-    deliver(
-        shared,
-        room_id,
-        None,
-        peer_left_frame(removed.version, &removed.peer_id),
-    )
-    .await;
-    if removed.was_host {
-        let grace = grace_ms(&shared.config);
-        deliver(
-            shared,
-            room_id,
-            None,
-            host_detached_frame(removed.version, grace),
-        )
-        .await;
-        reap_later(shared.clone(), room_id.to_string(), removed.generation);
-    } else if removed.version == proto::Version::V2 && removed.empty {
+    deliver(shared, room_id, None, peer_left_frame(&removed.peer_id)).await;
+    if removed.empty {
         reap_later_empty(
             shared.clone(),
             room_id.to_string(),
@@ -640,152 +418,66 @@ async fn remove_peer(shared: &Shared, room_id: &str, peer_id: &str) {
     drop(removed.poison);
 }
 
-/// The capabilities a version's server advertises (`PROTOCOL.md` §2, §10).
-fn capabilities_for(version: proto::Version) -> Vec<String> {
-    let names = match version {
-        proto::Version::V1 => proto::CAPABILITIES,
-        proto::Version::V2 => proto::CAPABILITIES_V2,
-    };
-    names.iter().map(ToString::to_string).collect()
-}
-
 /// What a handshake reply takes from the room, snapshotted under the registry lock.
 struct RoomView {
     capabilities: Vec<String>,
     keepalive: Keepalive,
-    documents: Vec<String>,
 }
 
-/// The params of `room.created`/`room.joined` for a version, serialized.
-///
-/// `selvage/2`'s shape has no `documents` and its `PeerInfo` has no `role`
-/// (`PROTOCOL.md` §6.1): what the server holds in a version-2 room is membership, so the
-/// params carry membership and nothing else.
+/// The params of `room.created`/`room.joined`, serialized. `PROTOCOL.md` §6.1's shape:
+/// membership and nothing else — no document set, no listing, no role.
 #[expect(
     clippy::too_many_arguments,
-    reason = "a reply names its version, its room, its token, its own seat and the room it is seated into"
+    reason = "a reply names its room, its token, its own seat, the room it is seated into and its clocks"
 )]
 fn reply_body(
-    version: proto::Version,
     room_id: String,
     token: Option<String>,
     self_info: &proto::PeerInfo,
     peers: Vec<proto::PeerInfo>,
     view: RoomView,
 ) -> Result<Value, Refusal> {
-    let params = match version {
-        proto::Version::V1 => serde_json::to_value(proto::SessionParams {
-            room_id,
-            token,
-            self_peer: self_info.clone(),
-            peers,
-            documents: view.documents,
-            capabilities: view.capabilities,
-            keepalive: view.keepalive,
-        }),
-        proto::Version::V2 => serde_json::to_value(proto::SessionParamsV2 {
-            room_id,
-            token,
-            self_peer: peer_info_v2(self_info),
-            peers: peers.iter().map(peer_info_v2).collect(),
-            capabilities: view.capabilities,
-            keepalive: view.keepalive,
-        }),
-    };
-    params.map_err(|error| bad_body(&error))
+    serde_json::to_value(proto::SessionParams {
+        room_id,
+        token,
+        self_peer: self_info.clone(),
+        peers,
+        capabilities: view.capabilities,
+        keepalive: view.keepalive,
+    })
+    .map_err(|error| bad_body(&error))
 }
 
-/// The `peer.joined` announcement for a seat, in the version's `PeerInfo` shape.
-fn peer_joined_frame(
-    version: proto::Version,
-    peer: &proto::PeerInfo,
-) -> Option<Outbound> {
-    let params = match version {
-        proto::Version::V1 => serde_json::json!({ "peer": peer }),
-        proto::Version::V2 => serde_json::json!({ "peer": peer_info_v2(peer) }),
-    };
-    event_frame(version, event::PEER_JOINED, params)
-}
-
-/// `selvage/2`'s record of a seat: its `PeerInfo` without `role` (`PROTOCOL.md` §6.1).
-fn peer_info_v2(peer: &proto::PeerInfo) -> proto::PeerInfoV2 {
-    proto::PeerInfoV2 {
-        awareness_client_id: peer.awareness_client_id,
-        display_name: peer.display_name.clone(),
-        peer_id: peer.peer_id.clone(),
-    }
-}
-
-/// `selvage/1`'s grant as the room holds it, or `None` when there is none to hand back.
-fn join_grant_of(room: Option<&Room>) -> Option<Vec<String>> {
-    let held = room?;
-    (!held.grant().is_empty()).then(|| held.grant().to_vec())
-}
-
-/// The `doc.granted` a connection seated into a room receives right after its `room.joined`,
-/// or `None` when the room has no grant (`PROTOCOL.md` §6.3). It is a snapshot rather than a
-/// delta — the room already holds the listing — and a freshly minted room's grant is always
-/// empty, so a mint produces no frame. The paths arrive cloned from under the registry
-/// lock; serializing them here keeps megabytes of JSON out of the critical section.
-fn join_grant(grant: Option<&[String]>) -> Option<Outbound> {
-    let paths = grant?;
-    if paths.is_empty() {
-        return None;
-    }
-    event_frame(
-        proto::Version::V1,
-        event::DOC_GRANTED,
-        serde_json::json!({ "paths": paths }),
-    )
+/// The `peer.joined` announcement for a seat.
+fn peer_joined_frame(peer: &proto::PeerInfo) -> Option<Outbound> {
+    event_frame(event::PEER_JOINED, serde_json::json!({ "peer": peer }))
 }
 
 impl Applicant {
-    /// The role this connection is seated as. A connection that arrives without a room
-    /// mints that room, so it is its host whatever `session.hello` claims: honouring a
-    /// claimed `guest` would create a room with no host, whose real host would then be
-    /// refused it.
-    fn role(&self) -> proto::Role {
-        // `selvage/2` seats nobody as anything (`PROTOCOL.md` §1.2): there is no claim to
-        // make and no server-side host, so every connection is a guest to the server.
-        if self.hello.version == proto::Version::V2 {
-            return proto::Role::Guest;
-        }
-        if self.hello.claims_host {
-            return proto::Role::Host;
-        }
-        self.hello.params.role.unwrap_or(proto::Role::Guest)
-    }
-
-    fn info(&self, role: proto::Role) -> proto::PeerInfo {
+    fn info(&self) -> proto::PeerInfo {
         proto::PeerInfo {
             peer_id: self.peer_id.clone(),
             display_name: self.hello.params.display_name.clone(),
-            role,
             awareness_client_id: self.hello.params.awareness_client_id,
         }
     }
 
     /// Mints a room or admits this connection to an existing one, then queues the
-    /// handshake response. The seating, the reply and the join-time grant are one step
-    /// under the registry lock: a publication that takes the lock after this seating takes
-    /// it after the snapshot has been queued, which is what makes every publication after
-    /// the snapshot follow it on the joining connection (`PROTOCOL.md` §6.3); one that took
-    /// the lock before this seating is already in the snapshot. Serializing the reply and
-    /// the listing under the lock is what that costs — once per join — against a joiner
-    /// left holding a grant the room has already replaced. The announcements exclude the
-    /// newcomer, so the reply is still this connection's first frame.
+    /// handshake response. The seating and the reply are one step under the registry
+    /// lock: a publication that takes the lock after this seating takes it after the
+    /// snapshot has been queued, which is what makes every publication after the
+    /// snapshot follow it on the joining connection (`PROTOCOL.md` §6.3); one that took
+    /// the lock before this seating is already in the snapshot. The announcements
+    /// exclude the newcomer, so the reply is still this connection's first frame.
     ///
     /// # Errors
     ///
-    /// Returns the refusal to send back when the room is unknown, the token is wrong,
-    /// or the host role is taken.
+    /// Returns the refusal to send back when the room is unknown or the token is wrong.
     pub async fn seat(self, shared: &Shared) -> Result<Session, Refusal> {
-        let role = self.role();
-        let info = self.info(role);
+        let info = self.info();
         let seating = Seating {
             applicant: &self,
             config: &shared.config,
-            role,
             info: &info,
             room_id: self.join.room.as_deref(),
             peer: Peer::new(info.clone(), self.queue.clone()),
@@ -796,38 +488,23 @@ impl Applicant {
             body,
             room_id,
             minted,
-            version,
-            attached: attached_peer,
         } = seating.place(&mut guard)?;
         guard.set_task(&self.peer_id, self.poison);
-        // A grant is `selvage/1`'s: a version-2 room holds no listing for the server to
-        // hand back, so there is no join-time `doc.granted` to send.
-        let granted = (version == proto::Version::V1)
-            .then(|| join_grant_of(guard.room(&room_id)))
-            .flatten();
         let joined_peer = (!minted).then(|| info.clone());
         let peer_id = self.peer_id.clone();
         let queue = self.queue.clone();
 
-        // A joining connection learns the room's grant straight after its `room.joined`, so
-        // it needs no round trip and `room.joined` needs no fifth member. Both go out under
-        // the lock: see this method's comment.
-        //
-        // These are the frames that seat this connection, and they are the ones it cannot
-        // be told about later: a queue that will not take one of them has seated nothing.
-        // Handing back a live session anyway is a client waiting for a handshake that is
-        // already lost, holding a seat and — for a mint — a room, so the placement is
-        // taken back and the connection refused instead. `--outbound-queue-bytes` cannot be
-        // set below the largest frame this server generates
-        // (`ServerConfig::smallest_queue_bytes`), so a deployment does not reach this by
-        // flag; it is the backstop for a configuration built past that.
-        let seated = event_frame(version, event_name, body)
+        // The reply is the frame that seats this connection, and it is one the
+        // connection cannot be told about later: a queue that will not take it has
+        // seated nothing. Handing back a live session anyway is a client waiting for a
+        // handshake that is already lost, holding a seat and — for a mint — a room, so
+        // the placement is taken back and the connection refused instead.
+        // `--outbound-queue-bytes` cannot be set below the largest frame this server
+        // generates (`ServerConfig::smallest_queue_bytes`), so a deployment does not
+        // reach this by flag; it is the backstop for a configuration built past that.
+        let seated = event_frame(event_name, body)
             .is_some_and(|frame| self.queue.try_queue(frame));
-        let announced_grant = granted.as_deref().is_none_or(|paths| {
-            join_grant(Some(paths))
-                .is_none_or(|frame| self.queue.try_queue(frame))
-        });
-        if !seated || !announced_grant {
+        if !seated {
             let poison = unseat(&mut guard, minted, &room_id, &peer_id);
             drop(guard);
             drop(poison);
@@ -844,21 +521,11 @@ impl Applicant {
         drop(guard);
 
         // Late arrivals must be announced to the peers already in the room.
-        let joined =
-            joined_peer.and_then(|peer| peer_joined_frame(version, &peer));
-        let attached = attached_peer.and_then(|peer| {
-            event_frame(
-                version,
-                event::HOST_ATTACHED,
-                serde_json::json!({ "peer": peer }),
-            )
-        });
-        deliver(shared, &room_id, Some(&peer_id), attached).await;
+        let joined = joined_peer.and_then(|peer| peer_joined_frame(&peer));
         deliver(shared, &room_id, Some(&peer_id), joined).await;
         Ok(Session {
             peer_id,
             room_id,
-            version,
             queue,
             poisoned: AtomicBool::new(false),
         })
@@ -870,16 +537,14 @@ fn bad_body(error: &serde_json::Error) -> Refusal {
 }
 
 impl Seating<'_> {
-    /// Seats the newcomer: its reply, and the reclaim frame for the room if any.
+    /// Seats the newcomer: its reply.
     fn mint(self, registry: &mut Registry) -> Result<Placement, Refusal> {
         let token = mint_token();
-        let version = self.applicant.hello.version;
         let room_id = registry
             .create(
                 NewRoom {
                     id: mint_room_id(),
                     token: token.clone(),
-                    version,
                     keepalive: self.config.keepalive,
                 },
                 self.peer,
@@ -895,15 +560,13 @@ impl Seating<'_> {
                 )
             })?;
         let body = reply_body(
-            version,
             room_id.clone(),
             Some(token),
             self.info,
             Vec::new(),
             RoomView {
-                capabilities: capabilities_for(version),
+                capabilities: capabilities(),
                 keepalive: self.config.keepalive,
-                documents: Vec::new(),
             },
         )?;
         Ok(Placement {
@@ -911,8 +574,6 @@ impl Seating<'_> {
             body,
             room_id,
             minted: true,
-            version,
-            attached: None,
         })
     }
 
@@ -921,16 +582,11 @@ impl Seating<'_> {
         registry: &mut Registry,
         room_id: &str,
     ) -> Result<Placement, Refusal> {
-        let version = self.applicant.hello.version;
-        let host_was_present =
-            registry.room(room_id).is_some_and(Room::host_present);
         registry
             .admit(
                 Claim {
                     room_id,
                     token: self.applicant.join.token.as_deref(),
-                    role: self.role,
-                    version,
                 },
                 self.peer,
                 self.config.max_peers_per_room,
@@ -943,32 +599,21 @@ impl Seating<'_> {
                         self.config.max_peers_per_room
                     ),
                 ),
-                SeatError::Unknown
-                | SeatError::TokenMismatch
-                | SeatError::HostPresent
-                | SeatError::VersionMismatch => refusal_for(error, room_id),
+                SeatError::Unknown | SeatError::TokenMismatch => {
+                    refusal_for(error, room_id)
+                }
             })?;
-        // `host.attached` is a host reclaiming the room (§6, §9.1): a guest joining
-        // while the room is between hosts is a `peer.joined` and nothing more, and a
-        // `selvage/2` room has no host for the server to know about.
-        let attached = if !host_was_present && self.role == proto::Role::Host {
-            Some(self.info.clone())
-        } else {
-            None
-        };
         let room = registry
             .room(room_id)
             .ok_or_else(|| (code::ROOM_GONE, "the room is gone".to_string()))?;
         let body = reply_body(
-            version,
             room.id.clone(),
             None,
             self.info,
             room.peers_except(&self.applicant.peer_id),
             RoomView {
-                capabilities: capabilities_for(version),
+                capabilities: capabilities(),
                 keepalive: room.keepalive,
-                documents: room.documents().to_vec(),
             },
         )?;
         Ok(Placement {
@@ -976,8 +621,6 @@ impl Seating<'_> {
             body,
             room_id: room.id.clone(),
             minted: false,
-            version,
-            attached,
         })
     }
 
@@ -989,13 +632,18 @@ impl Seating<'_> {
     }
 }
 
+/// The capabilities a server of this version advertises (`PROTOCOL.md` §2).
+fn capabilities() -> Vec<String> {
+    proto::CAPABILITIES
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
 /// A seated connection: its identity and the queue its frames leave through.
 pub struct Session {
     peer_id: String,
     room_id: String,
-    /// The room's wire version, which every frame this session authors carries and which
-    /// decides the method surface (`PROTOCOL.md` §4, §5).
-    version: proto::Version,
     queue: Queue,
     /// Set when a reply found the queue full: the peer stopped reading. `handle_text`
     /// ends the session on the same frame the reply was dropped on.
@@ -1068,104 +716,35 @@ impl Session {
             self.alert(code::BAD_MESSAGE, "a request needs an id");
             return;
         };
-        // §10: the version is checked on every later request against the room's, so a
-        // `selvage/2` room refuses a version-1 request and the other way round.
-        if !self.version.accepts(&msg.v) {
-            self.expire(id, &msg.v);
+        // §10: the version is checked on every request. A frame naming another version is a
+        // frame this server cannot read, which is `bad_message` like any other, and the
+        // connection stays open: a peer that sent one frame can send a readable one next.
+        if !proto::speaks(&msg.v) {
+            self.alert(
+                code::BAD_MESSAGE,
+                format!("a frame this server cannot read names {}", msg.v),
+            );
             return;
         }
         let proto::ClientMessage { method, params, .. } = msg;
         let request = Request { id, params };
-        // `PROTOCOL.md` §5: `session.hello` and `session.rename` are `selvage/2`'s whole
-        // method surface. The three `doc.*` rows are `selvage/1`'s, so a version-2
-        // connection that sends one gets the answer any unknown method gets.
-        match (self.version, method.as_str()) {
-            (_, method::SESSION_RENAME) => self.rename(request, shared).await,
-            (_, method::SESSION_HELLO) => {
+        // `PROTOCOL.md` §5: `session.hello` and `session.rename` are the whole method
+        // surface. Anything else is the answer any unknown method gets.
+        match method.as_str() {
+            method::SESSION_RENAME => self.rename(request, shared).await,
+            method::SESSION_HELLO => {
                 self.reply(&proto::ServerMessage::error(
                     id,
                     code::ALREADY_SEATED,
                     "this connection already completed the handshake",
                 ));
             }
-            (proto::Version::V1, method::DOC_OPEN) => {
-                self.open_document(request, shared).await;
-            }
-            (proto::Version::V1, method::DOC_CLOSE) => {
-                self.close_document(request, shared).await;
-            }
-            (proto::Version::V1, method::DOC_GRANT) => {
-                self.grant(request, shared).await;
-            }
-            (_, other) => self.reply(&proto::ServerMessage::error(
+            other => self.reply(&proto::ServerMessage::error(
                 id,
                 code::UNKNOWN_METHOD,
                 format!("no such method: {other}"),
             )),
         }
-    }
-
-    /// `doc.open`: declares a path open for this peer and announces the room's set.
-    async fn open_document(&self, request: Request, shared: &Shared) {
-        let path = match document_path(request.params) {
-            Ok(path) => path,
-            Err((code, message)) => {
-                return self.reply(&proto::ServerMessage::error(
-                    request.id, code, message,
-                ));
-            }
-        };
-        let Some(documents) = self.hold(shared, &path).await else {
-            return self.reply(&proto::ServerMessage::error(
-                request.id,
-                ROOM_FULL,
-                format!(
-                    "the room holds at most {} open documents",
-                    shared.config.max_documents_per_room
-                ),
-            ));
-        };
-        self.reply(&proto::ServerMessage::response(
-            request.id,
-            doc_set(&documents),
-        ));
-        let announced = serde_json::json!({
-            "peer_id": self.peer_id,
-            "path": path,
-            "documents": documents,
-        });
-        self.announce_documents(
-            shared,
-            event_frame(proto::Version::V1, event::DOC_OPENED, announced),
-        )
-        .await;
-    }
-
-    /// `doc.close`: releases this peer's hold on a path and announces the room's set.
-    async fn close_document(&self, request: Request, shared: &Shared) {
-        let path = match document_path(request.params) {
-            Ok(path) => path,
-            Err((code, message)) => {
-                return self.reply(&proto::ServerMessage::error(
-                    request.id, code, message,
-                ));
-            }
-        };
-        let documents = self.release(shared, &path).await;
-        self.reply(&proto::ServerMessage::response(
-            request.id,
-            doc_set(&documents),
-        ));
-        let announced = serde_json::json!({
-            "peer_id": self.peer_id,
-            "path": path,
-            "documents": documents,
-        });
-        self.announce_documents(
-            shared,
-            event_frame(proto::Version::V1, event::DOC_CLOSED, announced),
-        )
-        .await;
     }
 
     /// `session.rename` (`PROTOCOL.md` §5): changes this connection's own display name and
@@ -1182,8 +761,8 @@ impl Session {
             }
         };
         let renamed = self.set_display_name(shared, &display_name).await;
-        // The response is queued before the event, as a `doc.open` result precedes its
-        // `doc.opened`: both leave on this connection's channel, so the bytes keep order.
+        // The response is queued before the event: both leave on this connection's
+        // channel, so the bytes keep order.
         self.reply(&proto::ServerMessage::response(
             request.id,
             serde_json::json!({}),
@@ -1197,11 +776,8 @@ impl Session {
             "display_name": peer.display_name,
             "peer_id": peer.peer_id,
         });
-        self.announce_documents(
-            shared,
-            event_frame(self.version, event::PEER_RENAMED, announced),
-        )
-        .await;
+        self.announce(shared, event_frame(event::PEER_RENAMED, announced))
+            .await;
     }
 
     /// Records this peer's new name, returning the record as it now reads. `None` when the
@@ -1216,105 +792,13 @@ impl Session {
         room.rename_peer(&self.peer_id, display_name)
     }
 
-    /// `doc.grant` (`PROTOCOL.md` §5): replaces the room's grant with the host's listing and
-    /// tells the whole room, the host included. Only the connection the server holds as the
-    /// room's host may publish one; §11 has no code for "not permitted", so anyone else is
-    /// refused `bad_params`, which is the code a malformed request gets. A malformed or
-    /// over-long listing is refused the same way and changes nothing.
-    async fn grant(&self, request: Request, shared: &Shared) {
-        let paths = match grant_paths(request.params) {
-            Ok(paths) => paths,
-            Err((code, message)) => {
-                return self.reply(&proto::ServerMessage::error(
-                    request.id, code, message,
-                ));
-            }
-        };
-        if !self.store_grant(shared, paths.clone()).await {
-            return self.reply(&proto::ServerMessage::error(
-                request.id,
-                code::BAD_PARAMS,
-                "only the room's host may publish the grant".to_string(),
-            ));
-        }
-        // The response is queued before the event, as a `doc.open` result precedes its
-        // `doc.opened`: both leave on this connection's channel, so the bytes keep order.
-        self.reply(&proto::ServerMessage::response(
-            request.id,
-            serde_json::json!({}),
-        ));
-        let announced = serde_json::json!({ "paths": paths });
-        self.announce_documents(
-            shared,
-            event_frame(proto::Version::V1, event::DOC_GRANTED, announced),
-        )
-        .await;
-    }
-
-    /// Stores the room's new grant if this connection is its host, returning whether it was
-    /// stored. `false` means the room is gone or this connection is not its host, and then
-    /// nothing was written.
-    async fn store_grant(&self, shared: &Shared, paths: Vec<String>) -> bool {
-        let mut guard = shared.registry.lock().await;
-        let Some(room) = guard.room_mut(&self.room_id) else {
-            return false;
-        };
-        if !room.is_host(&self.peer_id) {
-            return false;
-        }
-        room.set_grant(paths);
-        true
-    }
-
-    /// Records this peer's hold on a path, returning the room's set afterwards — or
-    /// `None` when the set is at its cap and the path is not in it.
-    async fn hold(&self, shared: &Shared, path: &str) -> Option<Vec<String>> {
-        let mut guard = shared.registry.lock().await;
-        let Some(room) = guard.room_mut(&self.room_id) else {
-            return Some(Vec::new());
-        };
-        room.open_document(
-            &self.peer_id,
-            path,
-            shared.config.max_documents_per_room,
-        )
-        .map(|_| room.documents().to_vec())
-    }
-
-    /// Releases this peer's hold on a path, returning the room's set afterwards.
-    async fn release(&self, shared: &Shared, path: &str) -> Vec<String> {
-        let mut guard = shared.registry.lock().await;
-        let Some(room) = guard.room_mut(&self.room_id) else {
-            return Vec::new();
-        };
-        room.close_document(&self.peer_id, path);
-        room.documents().to_vec()
-    }
-
-    /// Tells a connection its wire version is not this server's, then closes it. When
-    /// even the close cannot be queued the session is already over: the poison the
-    /// reply left ends it on the same frame at the end of `handle_text`.
-    fn expire(&self, id: u64, version: &str) {
-        self.reply(&proto::ServerMessage::error(
-            id,
-            code::UNSUPPORTED_VERSION,
-            format!("unsupported wire version {version}"),
-        ));
-        let _ = self.queue.try_queue(Outbound::Close(
-            close::UNSUPPORTED_VERSION,
-            "version".to_string(),
-        ));
-    }
-
     /// Queues a response or an error for the connection. A full queue means the peer
     /// stopped reading: the frame is dropped and the session is marked. `handle_text`
     /// ends a marked session on this same frame, whichever path marked it. The
     /// room is told `peer.left`; nothing unsent is kept for the peer, and no reply is
     /// presented as delivered that was not queued.
     fn reply(&self, msg: &proto::ServerMessage) {
-        let Some(frame) =
-            super::frame_of(&msg.clone().for_version(self.version))
-        else {
+        let Some(frame) = super::frame_of(msg) else {
             return;
         };
         if !self.queue.try_queue(frame) {
@@ -1331,25 +815,19 @@ impl Session {
         self.reply(&msg);
     }
 
-    /// Sends a room-wide event to every peer, the one that made the change included: the
-    /// open-document set is the room's, so everyone has to hold the same view of it, and a
+    /// Sends a room-wide event to every peer, the one that made the change included: a
     /// rename is announced to the mover as well as to the rest.
-    async fn announce_documents(
-        &self,
-        shared: &Shared,
-        frame: Option<Outbound>,
-    ) {
+    async fn announce(&self, shared: &Shared, frame: Option<Outbound>) {
         deliver(shared, &self.room_id, None, frame).await;
     }
 
-    /// Detaches this connection, tells the room, and arms the room's grace period if
-    /// the host just left.
+    /// Detaches this connection, tells the room and arms the room's grace period.
     pub async fn leave(&self, shared: &Shared) {
         remove_peer(shared, &self.room_id, &self.peer_id).await;
     }
 }
 
-/// Waits out `room_grace_ms`, then destroys a `selvage/2` room that still holds nobody.
+/// Waits out `room_grace_ms`, then destroys a room that still holds nobody.
 ///
 /// The deadline can only be reached with no connection seated, so the destruction has no
 /// recipient (`PROTOCOL.md` §6, §9): no `room.gone` is sent, the id is gone for good, and
@@ -1365,65 +843,27 @@ fn reap_later_empty(shared: Shared, room_id: String, generation: u64) {
     });
 }
 
-/// Waits out the host grace period, then destroys the room if the host stayed away.
-fn reap_later(shared: Shared, room_id: String, generation: u64) {
-    tokio::spawn(async move {
-        sleep(shared.config.room_grace).await;
-        let mut guard = shared.registry.lock().await;
-        let peers = guard.reap_if_host_absent(&room_id, generation);
-        for peer in &peers {
-            drop(guard.take_task(&peer.info.peer_id));
-        }
-        drop(guard);
-        tell_room_gone(&room_id, peers);
-    });
-}
-
-/// Tells the peers left behind that the room is gone, then closes their connections.
-/// A queue that will not take even the close is not kept for the peer: its task was
-/// already ended, and the socket goes with it.
-fn tell_room_gone(room_id: &str, peers: Vec<Peer>) {
-    let frame = event_frame(
-        proto::Version::V1,
-        event::ROOM_GONE,
-        serde_json::json!({ "room_id": room_id, "reason": "host did not return" }),
-    );
-    for peer in peers {
-        if let Some(out) = frame.clone() {
-            let _ = peer.send(out);
-        }
-        let _ = peer
-            .send(Outbound::Close(close::ROOM_GONE, "room gone".to_string()));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
-    use std::thread;
     use std::time::Duration;
-    use tokio::runtime::Handle;
-    use tokio::sync::mpsc;
-
-    use selvage_protocol::{Keepalive, PeerInfo, Role};
     use tokio::sync::Mutex;
+
+    use selvage_protocol::{Keepalive, PeerInfo};
 
     use super::*;
     use crate::room::{MAX_QUEUE_BYTES, MAX_QUEUE_FRAMES, peer_channel};
 
     /// A `session.hello` as the handshake would have produced it.
-    fn hello(name: &str, claims_host: bool) -> Hello {
+    fn hello(name: &str) -> Hello {
         Hello {
             params: proto::HelloParams {
                 awareness_client_id: None,
                 capabilities: Vec::new(),
                 client: None,
                 display_name: name.to_string(),
-                role: None,
             },
-            version: proto::Version::V1,
-            claims_host,
         }
     }
 
@@ -1441,22 +881,30 @@ mod tests {
         Shared::new(config, Arc::new(Mutex::new(Registry::default())))
     }
 
-    /// n1: an event frame carries the version of the connection it is addressed to, and
-    /// `host.detached` is one. `Room::host` is set only for a version-1 room, so a version-2
-    /// room cannot reach this today — which is why the stamp is pinned here rather than left as
-    /// a hardcoded version for the next reader to inherit.
-    #[test]
-    fn a_host_detached_frame_carries_the_version_of_the_peer_that_left() {
-        let frame =
-            host_detached_frame(proto::Version::V2, 30_000).expect("a frame");
-        let Outbound::Text(text) = frame else {
-            panic!("an event is a text frame");
-        };
-        let body: serde_json::Value =
-            serde_json::from_str(&text).expect("its own JSON");
-        assert_eq!(body["v"], "selvage/2");
-        assert_eq!(body["event"], event::HOST_DETACHED);
-        assert_eq!(body["params"]["grace_ms"], 30_000);
+    /// A room whose membership is wide enough that a joining connection's `room.joined`
+    /// does not fit a small queue. The peers are seated under the lock, so nothing is
+    /// delivered while the room grows.
+    async fn crowded_room(shared: &Shared) {
+        let (host, _host_rx) = peer_channel(
+            PeerInfo {
+                peer_id: "p-ada".to_string(),
+                display_name: "p".repeat(300),
+                awareness_client_id: None,
+            },
+            MAX_QUEUE_BYTES,
+        );
+        let mut guard = shared.registry.lock().await;
+        guard
+            .create(
+                NewRoom {
+                    id: "r-1".to_string(),
+                    token: "t".to_string(),
+                    keepalive: Keepalive::default(),
+                },
+                host,
+                1,
+            )
+            .expect("the room is minted");
     }
 
     /// A mint whose `room.created` the queue will not take is taken back: the room is
@@ -1474,7 +922,7 @@ mod tests {
         let applicant = Applicant {
             peer_id: "p-ada".to_string(),
             join: proto::parse_join_query("").expect("a mint's query parses"),
-            hello: hello("Ada", true),
+            hello: hello("Ada"),
             queue,
             poison,
         };
@@ -1486,7 +934,6 @@ mod tests {
             PeerInfo {
                 peer_id: "p-ada".to_string(),
                 display_name: "Ada".to_string(),
-                role: Role::Host,
                 awareness_client_id: None,
             },
             MAX_QUEUE_BYTES,
@@ -1498,7 +945,6 @@ mod tests {
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
-                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     host,
@@ -1509,40 +955,6 @@ mod tests {
         );
     }
 
-    /// A room whose open-document set is wide enough that a joining connection's
-    /// `room.joined` does not fit its queue. The set is opened under the lock, so nothing
-    /// is delivered while it grows.
-    async fn wide_room(shared: &Shared) {
-        let (host, _host_rx) = peer_channel(
-            PeerInfo {
-                peer_id: "p-ada".to_string(),
-                display_name: "Ada".to_string(),
-                role: Role::Host,
-                awareness_client_id: None,
-            },
-            MAX_QUEUE_BYTES,
-        );
-        let mut guard = shared.registry.lock().await;
-        guard
-            .create(
-                NewRoom {
-                    id: "r-1".to_string(),
-                    token: "t".to_string(),
-                    version: proto::Version::V1,
-                    keepalive: Keepalive::default(),
-                },
-                host,
-                1,
-            )
-            .expect("the room is minted");
-        let room = guard.room_mut("r-1").expect("the room is minted");
-        for n in 0..40 {
-            let path = format!("d{n:02}{}", "p".repeat(300));
-            room.open_document("p-ada", &path, 1024)
-                .expect("the set takes the path");
-        }
-    }
-
     /// A join whose `room.joined` the queue will not take takes no seat either: the room
     /// keeps the peers it had, and nothing of the newcomer's is left registered.
     #[tokio::test]
@@ -1551,7 +963,7 @@ mod tests {
             max_queue_bytes: 4096,
             ..ServerConfig::default()
         });
-        wide_room(&shared).await;
+        crowded_room(&shared).await;
 
         let (queue, _leftovers) = Queue::channel(64);
         let (poison, _poisoned) = oneshot::channel();
@@ -1559,7 +971,7 @@ mod tests {
             peer_id: "p-bob".to_string(),
             join: proto::parse_join_query("room=r-1&token=t")
                 .expect("the join query parses"),
-            hello: hello("Bob", false),
+            hello: hello("Bob"),
             queue,
             poison,
         };
@@ -1593,7 +1005,6 @@ mod tests {
             PeerInfo {
                 peer_id: "p-host".to_string(),
                 display_name: "Ada".to_string(),
-                role: Role::Host,
                 awareness_client_id: None,
             },
             MAX_QUEUE_BYTES,
@@ -1604,7 +1015,6 @@ mod tests {
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
-                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     host,
@@ -1617,7 +1027,6 @@ mod tests {
             PeerInfo {
                 peer_id: "p-slow".to_string(),
                 display_name: "Bob".to_string(),
-                role: Role::Guest,
                 awareness_client_id: None,
             },
             MAX_QUEUE_BYTES,
@@ -1628,8 +1037,6 @@ mod tests {
                 Claim {
                     room_id: "r-1",
                     token: Some("t"),
-                    role: Role::Guest,
-                    version: proto::Version::V1,
                 },
                 guest,
                 usize::MAX,
@@ -1649,7 +1056,6 @@ mod tests {
         let session = Session {
             peer_id: "p-slow".to_string(),
             room_id: "r-1".to_string(),
-            version: proto::Version::V1,
             queue,
             poisoned: AtomicBool::new(false),
         };
@@ -1661,209 +1067,5 @@ mod tests {
             "the slow peer is detached"
         );
         assert!(room.peers.contains_key("p-host"), "the host is undisturbed");
-    }
-
-    /// A server holding one room whose grant is `listing`, plus the peer record a newcomer
-    /// to it will be seated with and the queue that peer's frames arrive on.
-    fn room_with_a_grant(
-        listing: Vec<String>,
-    ) -> (Shared, Peer, mpsc::Receiver<Outbound>) {
-        let mut registry = Registry::default();
-        let (host, _host_rx) = peer_channel(
-            PeerInfo {
-                peer_id: "p-host".to_string(),
-                display_name: "Ada".to_string(),
-                role: Role::Host,
-                awareness_client_id: None,
-            },
-            MAX_QUEUE_BYTES,
-        );
-        assert!(
-            registry
-                .create(
-                    NewRoom {
-                        id: "r-1".to_string(),
-                        token: "t".to_string(),
-                        version: proto::Version::V1,
-                        keepalive: Keepalive::default(),
-                    },
-                    host,
-                    usize::MAX,
-                )
-                .is_some()
-        );
-        registry
-            .room_mut("r-1")
-            .expect("the room is minted")
-            .set_grant(listing);
-        let (newcomer, frames) = peer_channel(
-            PeerInfo {
-                peer_id: "p-new".to_string(),
-                display_name: "Zoe".to_string(),
-                role: Role::Guest,
-                awareness_client_id: None,
-            },
-            MAX_QUEUE_BYTES,
-        );
-        let shared = Shared::new(
-            ServerConfig::default(),
-            Arc::new(Mutex::new(registry)),
-        );
-        (shared, newcomer, frames)
-    }
-
-    /// The newcomer of [`room_with_a_grant`], asking to join room `r-1` with its token.
-    fn guest_applicant(newcomer: &Peer) -> Applicant {
-        let (poison, _poison_rx) = oneshot::channel();
-        Applicant {
-            peer_id: "p-new".to_string(),
-            join: proto::JoinQuery {
-                room: Some("r-1".to_string()),
-                token: Some("t".to_string()),
-            },
-            hello: Hello {
-                params: proto::HelloParams {
-                    awareness_client_id: None,
-                    capabilities: Vec::new(),
-                    client: None,
-                    display_name: "Zoe".to_string(),
-                    role: None,
-                },
-                version: proto::Version::V1,
-                claims_host: false,
-            },
-            queue: newcomer.queue.clone(),
-            poison,
-        }
-    }
-
-    /// The event a queued frame carries: `None` for a frame that is not a text envelope.
-    fn as_event(frame: Outbound) -> Option<(String, Value)> {
-        let Outbound::Text(text) = frame else {
-            return None;
-        };
-        let msg: proto::ServerMessage =
-            serde_json::from_str(&text).expect("a server frame");
-        Some((
-            msg.event.unwrap_or_default(),
-            msg.params.unwrap_or_default(),
-        ))
-    }
-
-    /// Every event the newcomer's queue holds, in the order it holds them, until it has
-    /// been quiet for a moment.
-    async fn announced(
-        frames: &mut mpsc::Receiver<Outbound>,
-    ) -> Vec<(String, Value)> {
-        let mut seen: Vec<(String, Value)> = Vec::new();
-        while let Ok(Some(frame)) =
-            timeout(Duration::from_millis(200), frames.recv()).await
-        {
-            seen.extend(as_event(frame));
-        }
-        seen
-    }
-
-    /// Seats `applicant` on the server it was built for: what the connection task does with
-    /// it.
-    async fn seat(
-        applicant: Applicant,
-        shared: Shared,
-    ) -> Result<Session, Refusal> {
-        applicant.seat(&shared).await
-    }
-
-    /// Starts [`publish_blocking`] on a thread of its own, which is the point of it: a
-    /// woken worker queue is not the same interleaving as a thread already waiting.
-    fn publish_in_background(
-        shared: Shared,
-        handle: Handle,
-        listing: Vec<String>,
-    ) -> thread::JoinHandle<()> {
-        thread::spawn(move || publish_blocking(&shared, &handle, &listing))
-    }
-
-    /// Publishes `listing` as room `r-1`'s grant and announces it: the two steps
-    /// `Session::grant` takes, without a connection to answer. It blocks on the registry
-    /// lock, so a caller can make it a waiter behind a seating.
-    fn publish_blocking(shared: &Shared, handle: &Handle, listed: &[String]) {
-        {
-            let mut guard = shared.registry.blocking_lock();
-            guard
-                .room_mut("r-1")
-                .expect("the room survives")
-                .set_grant(listed.to_vec());
-        }
-        handle.block_on(deliver(
-            shared,
-            "r-1",
-            None,
-            event_frame(
-                proto::Version::V1,
-                event::DOC_GRANTED,
-                serde_json::json!({ "paths": listed }),
-            ),
-        ));
-    }
-
-    /// The join-time `doc.granted` is the snapshot taken under the seating lock, and a
-    /// publication that takes that lock afterwards is queued after it (`PROTOCOL.md` §6.3).
-    /// The seat is held at the lock here with a publication queued behind it, and the
-    /// snapshot's own listing is wide enough that serializing it is a window a publisher
-    /// could otherwise enqueue inside: the newcomer's frames must still read reply,
-    /// snapshot, republish — never a snapshot queued after the listing that replaced it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_publication_cannot_overtake_the_join_snapshot() {
-        let wide: Vec<String> =
-            (0..60_000).map(|n| format!("src/file{n:05}.rs")).collect();
-        let listed = vec!["README.md".to_string()];
-        let (shared, newcomer, mut frames) = room_with_a_grant(wide.clone());
-        let applicant = guest_applicant(&newcomer);
-
-        // Holding the lock makes both waiters, the seat first: the publication waits on the
-        // same lock from a thread of its own, so it is woken the moment the seating releases
-        // it rather than whenever a worker gets round to it. That is what makes the
-        // interleaving a property of the code instead of one of this machine.
-        let guard = shared.registry.lock().await;
-        let seat_shared = shared.clone();
-        let seating = tokio::spawn(seat(applicant, seat_shared));
-        sleep(Duration::from_millis(20)).await;
-        let publish_shared = shared.clone();
-        let publishing = publish_in_background(
-            publish_shared,
-            Handle::current(),
-            listed.clone(),
-        );
-        sleep(Duration::from_millis(20)).await;
-        drop(guard);
-        seating
-            .await
-            .expect("the seat task runs")
-            .expect("the guest is seated");
-        publishing.join().expect("the publishing thread runs");
-
-        let seen = announced(&mut frames).await;
-        let names: Vec<&str> =
-            seen.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(
-            names.first().copied(),
-            Some(event::ROOM_JOINED),
-            "the reply is the newcomer's first frame: {names:?}"
-        );
-        let grants: Vec<Value> = seen
-            .iter()
-            .filter(|(name, _)| name == event::DOC_GRANTED)
-            .map(|(_, params)| params["paths"].clone())
-            .collect();
-        assert_eq!(
-            grants.first(),
-            Some(&serde_json::json!(wide)),
-            "the join snapshot is the listing the room held: {names:?}"
-        );
-        assert_eq!(
-            grants.last(),
-            Some(&serde_json::json!(listed)),
-            "the publication follows the snapshot instead of overtaking it: {names:?}"
-        );
     }
 }

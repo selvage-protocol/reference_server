@@ -1,7 +1,7 @@
 {
   "id": "102",
   "title": "A frame with one bit flipped inside its GCM tag is refused `bad_signature`",
-  "spec": "CANONICAL.md#61-sealed-frames-selvage2",
+  "spec": "CANONICAL.md#61-sealed-frames",
   "notes": "`bad_signature` and not `bad_tag`, and that is measured rather than chosen: the signature input covers the counter, the nonce and the ciphertext, so a corrupted tag is a corrupted signature and the AEAD's own failure is unreachable as a distinct report — which is why `bad_tag` is not in the vocabulary at all. The frame refused here is the one step 5 would not stop: it carries counter 2 under `guest-1`, above the mark of 1 the previous frame left. The last two steps are the half that matters: the same counter arrives again untampered and is applied, because a frame a receiver refuses never moves a mark (`CANONICAL.md` §6.1).",
   "layer": "peer",
   "kind": "frame",

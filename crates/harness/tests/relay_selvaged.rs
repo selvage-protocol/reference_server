@@ -1,4 +1,4 @@
-//! The `selvage/2` relay against a real `selvaged` on its defaults, which seat both versions:
+//! The `selvage/2` relay against a real `selvaged` on its defaults, which seats one version:
 //! two relays, one room, a host and a guest, exchanging an edit through a server that never
 //! sees a file name or a byte of either replica.
 //!
@@ -11,8 +11,7 @@ use std::error::Error as StdError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -26,88 +25,6 @@ use selvage_harness::{
     Harness, ServerConfig, wait_for, wait_for_described,
     wait_for_described_within,
 };
-
-/// One `GET /meta` body as a server that seats no version-2 client advertises one
-/// (`PROTOCOL.md` §2): the capability names the published `selvage/1` server writes, with
-/// `wire_versions` naming the one version it can seat. `roles` and `keepalive` are the members
-/// this fixture leaves out, and both are optional.
-const VERSION_ONE_META: &[u8] = br#"{"capabilities":["y-protocols/1","awareness","open-document-set","host-reclaim"],"server":"selvaged/0.2.1","wire_versions":["selvage/1"]}"#;
-
-/// The request line of one connection, which is all this end needs to tell a `/meta` read from
-/// a WebSocket handshake — both begin with `GET`. The whole request is consumed, because a
-/// socket closed with bytes still unread in it is reset rather than ended, and the client
-/// reading the answer would see the reset instead of the body.
-async fn request_line(socket: &mut TcpStream) -> Option<String> {
-    let mut request: Vec<u8> = Vec::new();
-    let mut whole = false;
-    while !whole {
-        whole = read_a_chunk(socket, &mut request).await?;
-    }
-    let headers =
-        request.get(..header_end(&request).unwrap_or(request.len()))?;
-    String::from_utf8(headers.get(..line_end(headers)?)?.to_vec()).ok()
-}
-
-/// One chunk of a request, appended, and whether the headers are now whole.
-async fn read_a_chunk(
-    socket: &mut TcpStream,
-    request: &mut Vec<u8>,
-) -> Option<bool> {
-    let mut chunk = [0u8; 64];
-    let read = timeout(READ_BOUND, socket.read(&mut chunk))
-        .await
-        .ok()?
-        .ok()?;
-    request.extend_from_slice(chunk.get(..read)?);
-    Some(read == 0 || header_end(request).is_some())
-}
-
-/// Where one request's headers end, or `None` while they have not arrived whole.
-fn header_end(request: &[u8]) -> Option<usize> {
-    request.windows(4).position(|four| four == b"\r\n\r\n")
-}
-
-/// Where the first line of one request ends, or `None` while it has not arrived whole.
-fn line_end(head: &[u8]) -> Option<usize> {
-    head.windows(2).position(|pair| pair == b"\r\n")
-}
-
-/// Serves [`VERSION_ONE_META`] to one `GET /meta`, as a server that cannot seat this client
-/// does, and closes.
-async fn serve_the_version_one_meta(
-    socket: &mut TcpStream,
-) -> Result<(), Failure> {
-    let head = format!(
-        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        VERSION_ONE_META.len()
-    );
-    socket.write_all(head.as_bytes()).await?;
-    socket.write_all(VERSION_ONE_META).await?;
-    Ok(())
-}
-
-/// Answers every `/meta` read, and reports the first connection that is not one: a client that
-/// dialled a server which cannot seat it, which is the failure this fixture measures.
-async fn serve_until_a_dial(
-    listener: TcpListener,
-    heard: mpsc::UnboundedSender<()>,
-) {
-    while let Ok((mut tcp, _)) = listener.accept().await {
-        let meta = request_line(&mut tcp)
-            .await
-            .is_some_and(|line| line.starts_with("GET /meta"));
-        if !meta {
-            let _ = heard.send(());
-            return;
-        }
-        if serve_the_version_one_meta(&mut tcp).await.is_err() {
-            return;
-        }
-    }
-}
-
-/// A bound on one read of the fake server, so a client that says nothing cannot hold the test.
-const READ_BOUND: Duration = Duration::from_secs(5);
 
 /// Anything this test can fail with.
 type Failure = Box<dyn StdError>;
@@ -510,62 +427,6 @@ async fn a_fragment_less_link_is_refused_before_a_socket_is_opened()
             Ok(Some(true))
         ),
         "a socket was opened for a link that names no keys"
-    );
-    Ok(())
-}
-
-/// §2's local stop, measured rather than inferred from the refusal's wording. The address the
-/// link names is a listener this test owns: it answers `GET /meta` the way a server that seats
-/// no version-2 client does, and it reports a connection that arrives after that read. A client
-/// that dialled anyway would be seated or refused by the wire; this one must not dial at all.
-#[tokio::test]
-async fn a_server_that_speaks_only_the_other_version_is_refused_before_a_socket()
--> Result<(), Failure> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let (heard, mut arrival) = mpsc::unbounded_channel();
-    tokio::spawn(serve_until_a_dial(listener, heard));
-
-    let keys = (
-        encode_key(&RoomKey([7; 32]).0),
-        SessionKey::from_seed([3; 32]).public().encode(),
-    );
-    let joined = RelaySession::join(RelayJoinOptions {
-        invite: format!(
-            "ws://{addr}/session?room=r-1&token=t-1#k={}&h={}",
-            keys.0, keys.1
-        ),
-        display_name: "Bob".to_string(),
-        declared_role: None,
-        client: None,
-        keepalive: Some(keepalive()),
-    })
-    .await;
-    let error = joined
-        .err()
-        .ok_or("a server that advertises no version-2 is refused")?;
-    assert!(
-        error.to_string().contains("selvage/2"),
-        "the refusal names the version this client needs: {error}"
-    );
-    assert!(
-        error.to_string().contains(&addr.to_string()),
-        "and the server it would need it from: {error}"
-    );
-    assert!(
-        matches!(
-            &error,
-            selvage_client::Error::Protocol { code, .. }
-                if code == "unsupported_version"
-        ),
-        "§10's local stop is an `unsupported_version` refusal: {error}"
-    );
-    assert!(
-        !matches!(
-            timeout(Duration::from_millis(250), arrival.recv()).await,
-            Ok(Some(()))
-        ),
-        "a socket was opened for a server that cannot seat this client"
     );
     Ok(())
 }

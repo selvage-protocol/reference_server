@@ -1,8 +1,8 @@
 {
   "id": "002",
-  "title": "A connection without a room mints one, and is its host whatever it claims",
+  "title": "A connection with no room mints one, and two of them mint two rooms",
   "spec": "PROTOCOL.md#51-room-and-token-in-the-connection-url",
-  "notes": "Minting is hosting: the second connection claims `role: \"guest\"` and is seated as host anyway, because a room with no host would refuse its real host with `host_present`. The reply to `session.hello` is an event, never a response, and `token` appears here and nowhere else.",
+  "notes": "The reply to `session.hello` is an event, never a response, and `token` appears here and nowhere else. A connection whose URL names no room mints one and is marked as the room's host inside the state the peers verify, not by the server; the second connection mints a room of its own rather than joining the first.",
   "steps": [
     {
       "op": "open",
@@ -12,12 +12,12 @@
     {
       "op": "send",
       "conn": "host",
-      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"awareness_client_id\":77,\"capabilities\":[\"y-protocols/1\"],\"client\":\"probe/1\",\"display_name\":\"Ada\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"awareness_client_id\":77,\"capabilities\":[\"y-protocols/1\"],\"client\":\"probe/1\",\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "host",
-      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"awareness_client_id\":77,\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},\"token\":\"$token\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"awareness_client_id\":77,\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "open",
@@ -27,14 +27,14 @@
     {
       "op": "send",
       "conn": "claimant",
-      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Mint\",\"role\":\"guest\"},\"v\":\"selvage/1\"}"
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Mint\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "claimant",
-      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$_\",\"self\":{\"display_name\":\"Mint\",\"peer_id\":\"$_\",\"role\":\"host\"},\"token\":\"$_\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$_\",\"self\":{\"display_name\":\"Mint\",\"peer_id\":\"$_\"},\"token\":\"$_\"},\"v\":\"selvage/2\"}"
     }
   ],
-  "selvage": "selvage/1",
+  "selvage": "selvage/2",
   "canonical": "SJ-C/1"
 }

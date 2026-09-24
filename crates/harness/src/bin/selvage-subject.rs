@@ -18,14 +18,11 @@
 //! observable one, so `join` must say `"offline": true` and this refuses a session that
 //! expected a connection it does not make.
 //!
-//! **A link is decided about before any frame, and the two rules are the client's own.** §5.1's
-//! fragment and §2/§10's version rule are refusals a client makes locally, with no socket and no
-//! frame to report them in, so `join` answers them itself — the protocol's `{"ok": false,
-//! "error": …}` — and seats nothing. Both are the client library's rules and not copies of them:
-//! §5.1's is [`PeerInvite::parse`] and §2/§10's is
-//! [`selvage_client::relay::refuse_a_version_this_client_cannot_speak`], which the socket path
-//! calls with the body it read and this calls with the body the vector handed it, because this
-//! layer opens no socket.
+//! **A link is decided about before any frame.** §5.1's fragment rule is a refusal a client
+//! makes locally, with no socket and no frame to report it in, so `join` answers it itself —
+//! the protocol's `{"ok": false, "error": …}` — and seats nothing. It is the client library's
+//! rule and not a copy of it: §5.1's is [`PeerInvite::parse`], which `RelaySession::join`
+//! also calls, because this layer opens no socket.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
@@ -35,59 +32,23 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use selvage_client::WIRE_VERSION;
-use selvage_client::peer::{
-    Ending, PeerInvite, PeerOptions, PeerSession, wire_address,
-};
-use selvage_client::relay::{
-    WIRE_VERSION_V2, refuse_a_version_this_client_cannot_speak, session_base,
-};
-use selvage_client::session::Invite;
-use selvage_protocol::parse_session_url;
+use selvage_client::peer::{Ending, PeerInvite, PeerOptions, PeerSession};
+use selvage_client::sealed::encode_key;
 use serde_json::{Map, Value, json};
 
 /// How often the session's clocks are run while the caller is not asking for anything.
 const TICK: Duration = Duration::from_millis(10);
 
-/// The guards of `PROTOCOL.md` §13.11's table that sit on the **link** rather than in a session,
-/// under the names `specification/runner/subject.py` gives them, and the two names each of the
-/// corpus's link vectors declares in its `catches`. A caller removes one **before** the `join`
-/// that reads its link, because a client reads its link before any session exists; every other
-/// name of the table is a session's guard and is handed to that session.
+/// The guards of `PROTOCOL.md` §13.11's table that sit on the **link** rather than in a
+/// session, under the name `specification/runner/subject.py` gives it. A caller removes it
+/// **before** the `join` that reads its link, because a client reads its link before any
+/// session exists; every other name of the table is a session's guard and is handed to that
+/// session.
 const ACCEPT_PARTIAL_FRAGMENT: &str = "accept-partial-fragment";
-const FALL_BACK_TO_VERSION_1: &str = "fall-back-to-version-1";
-
-/// What a decision the sealed wire owns is told when this subject is seated on the clear one.
-/// The room is named because the seat holds it and because a reader of a failed vector wants to
-/// know which room the client was seated in when the decision it asked for turned out to belong
-/// to the other wire.
-fn clear_seat(room: &str) -> String {
-    format!(
-        "this seat is a `selvage/1` session of room {room:?}: the decision layer's frames are \
-         §13's sealed ones, which this subject does not drive"
-    )
-}
-
-/// What the subject is seated in.
-///
-/// A link that speaks the sealed wire seats [`Seat::Sealed`], which is the session the whole
-/// decision layer is about. A link this client has pinned to `selvage/1` — §2's own member, the
-/// deliberate choice to host a room the server can read — is a version-1 join: its invite carries
-/// the room and the token and none of §5.1's keys, and [`Invite`] is that engine's join input.
-/// Nothing here drives that wire, so the seat holds the join input and refuses every frame by
-/// name rather than applying it to a session that could not read it.
-///
-/// The session is boxed because the two variants are a session and two strings: a subject holds
-/// one seat for its whole life, so the difference is a size nothing moves around and not a reason
-/// to put a session on the heap.
-enum Seat {
-    Sealed(Box<PeerSession>),
-    Clear(Invite),
-}
 
 /// A running subject: one seat and the zero of the clock it reads.
 struct Running {
-    seat: Seat,
+    peer: PeerSession,
     start: Instant,
 }
 
@@ -96,19 +57,11 @@ impl Running {
     fn clock(&self) -> Duration {
         self.start.elapsed()
     }
-
-    /// The sealed session, or the refusal that names what this seat is instead.
-    fn sealed(&mut self) -> Result<&mut PeerSession, String> {
-        match &mut self.seat {
-            Seat::Sealed(peer) => Ok(peer),
-            Seat::Clear(invite) => Err(clear_seat(&invite.room)),
-        }
-    }
 }
 
-/// The subject: the session, or nothing before a `join`, and the guard this run removed from the
-/// link — which is this subject's own state, because it is removed before there is a session to
-/// hold it.
+/// The subject: the session, or nothing before a `join`, and the guard this run removed from
+/// the link — which is this subject's own state, because it is removed before there is a
+/// session to hold it.
 struct State {
     removed_on_the_link: Option<String>,
     running: Option<Running>,
@@ -145,9 +98,9 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             // A command this side cannot take is answered and not fatal, so a caller sees
-            // which one failed instead of a subject that vanished. A link this client refuses
-            // arrives here too: `PROTOCOL.md` §5.1's fragment and §2/§10's version rule are
-            // decisions, and this is the channel they are reported in.
+            // which one failed instead of a subject that vanished. A link this client
+            // refuses arrives here too: §5.1's fragment rule is a decision, and this is the
+            // channel it is reported in.
             Err(error) => json!({"ok": false, "error": error}),
         };
         if emit(&reply).is_err() {
@@ -189,17 +142,14 @@ fn spawn_ticker(shared: &Shared) {
 }
 
 /// One tick of the session, on the clock this client runs from its seat. There is nothing to
-/// tick before a `join`, which is the `None` arm, and nothing to tick on a clear seat: the
-/// clocks §13.7 and §13.8 name are the sealed wire's.
+/// tick before a `join`, which is the `None` arm.
 fn tick(shared: &Shared) {
     let mut state = lock(shared);
     let Some(running) = state.running.as_mut() else {
         return;
     };
     let clock = running.clock();
-    if let Seat::Sealed(peer) = &mut running.seat {
-        peer.tick(clock);
-    }
+    running.peer.tick(clock);
 }
 
 /// The lock, with a poisoned one treated as held: nothing here leaves shared state half
@@ -240,9 +190,9 @@ fn dispatch(shared: &Shared, command: &Value) -> Result<Next, String> {
 
 /// Seats a session from a link, or refuses the link in this client's own words.
 ///
-/// The refusal is `PROTOCOL.md` §5.1's fragment and §2/§10's version rule, both decided before a
-/// socket; `Err` is how they are answered, and a subject left unseated by one is free to be
-/// handed another link, which is what lets a vector carry a refusal and its control leg.
+/// The refusal is `PROTOCOL.md` §5.1's fragment, decided before a socket; `Err` is how it is
+/// answered, and a subject left unseated by one is free to be handed another link, which is
+/// what lets a vector carry a refusal and its control leg.
 fn join(shared: &Shared, command: &Value) -> Result<Next, String> {
     if command.get("offline") != Some(&Value::Bool(true)) {
         return Err(
@@ -257,93 +207,46 @@ fn join(shared: &Shared, command: &Value) -> Result<Next, String> {
     }
 
     let start = Instant::now();
-    let mut seat =
-        seat_of(command, keepalive, state.removed_on_the_link.as_deref())?;
-    if let Seat::Sealed(peer) = &mut seat
-        && let Some(path) = optional_text(command, "path")
-    {
+    let invite = invite_of(command, state.removed_on_the_link.as_deref())?;
+    let mut peer = sealed_peer(command, keepalive, &invite)?;
+    if let Some(path) = optional_text(command, "path") {
         // §13.7's change is announced where it happens; before a state commits this key
         // nothing is published either way (§13.1's step 4).
         peer.open(start.elapsed(), &path);
     }
-    let mut running = Running { seat, start };
+    let mut running = Running { peer, start };
     let clock = running.clock();
-    if let Seat::Sealed(peer) = &mut running.seat {
-        peer.tick(clock);
-    }
+    running.peer.tick(clock);
     state.running = Some(running);
     state_report(&state).map(Next::Report)
 }
 
-/// The seat this link is joined with, or the client's own words for a link it refuses.
+/// The link this command joins with, or the client's own words for a link it refuses.
 ///
-/// The order is the client's own ([`selvage_client::relay::RelaySession::join`]): the link is
-/// read first — §5.1's fragment, which names both keys or is refused, naming the one that is
-/// missing — and §2/§10's version rule is decided against the body `GET /meta` answered, which
-/// this layer is handed as a member because it opens no socket.
-///
-/// `removed` is the guard on the link this run removed, if any, and each of the two is the wrong
-/// implementation one of the corpus's vectors is about. Both are seated on the clear wire, which
-/// is what those wrong clients do: the one that reads a half-copied fragment as a version-1 join
-/// dials and is seated in the clear, and the one that falls back from a server whose `/meta` seats
-/// no version at major 2 speaks the clear wire's version instead of refusing.
-fn seat_of(
+/// `removed` is the guard on the link this run removed, if any: a client that reads a
+/// half-copied fragment as a join is the wrong implementation vector `157` is about.
+fn invite_of(
     command: &Value,
-    keepalive: &Value,
     removed: Option<&str>,
-) -> Result<Seat, String> {
+) -> Result<PeerInvite, String> {
     let link = text(command, "invite")?;
-    let pin = optional_text(command, "pin");
-    if let Some(pinned) = pin.as_deref()
-        && pinned != WIRE_VERSION
-        && pinned != WIRE_VERSION_V2
-    {
-        return Err(format!(
-            "`pin` is one of the two wire versions, not {pinned:?}"
-        ));
-    }
-    // §2's pin: the version this client has deliberately chosen to speak. Pinned to `selvage/1`
-    // it is a version-1 join — §5.1 reads the fragment rule as the rule of "the client that would
-    // speak `selvage/2` on this join, and not one that cannot speak it or is pinned to
-    // `selvage/1`" — and §2/§10's no-fallback rule is not its rule either: §10 addresses it to
-    // the client whose version is `selvage/2`.
-    if pin.as_deref() == Some(WIRE_VERSION) {
-        return Ok(Seat::Clear(clear_invite(link)?));
-    }
-    let sealed = match PeerInvite::parse(link) {
-        Ok(invite) => Some(invite),
+    match PeerInvite::parse(link) {
+        Ok(invite) => Ok(invite),
         Err(refusal) => {
             if removed == Some(ACCEPT_PARTIAL_FRAGMENT) && half_a_fragment(link)
             {
-                None
+                // The guard was removed, so the wrong client seats: §5.1's two keys are
+                // read from wherever they happen to be, and a link naming one of them
+                // seats a session that will fail to verify every frame.
+                PeerInvite::parse(&whole_fragment(link))
             } else {
-                return Err(refusal);
+                Err(refusal)
             }
         }
-    };
-    let Some(invite) = sealed else {
-        return Ok(Seat::Clear(clear_invite(link)?));
-    };
-    if let Some(versions) = wire_versions(command)? {
-        if removed == Some(FALL_BACK_TO_VERSION_1) {
-            return Ok(Seat::Clear(clear_invite(link)?));
-        }
-        // The address the refusal names is the server base and not the link: an invite's
-        // fragment is §5.1's and never part of a request, and the sentence the client says is
-        // the one `RelaySession::join` says, because it is the same function. Its rendering is
-        // the error's own — `unsupported_version`, then the words — which is the reason §2 says
-        // a client refuses with.
-        let base = session_base(&invite.socket_url)
-            .unwrap_or_else(|| invite.socket_url.clone());
-        refuse_a_version_this_client_cannot_speak(&base, &versions)
-            .map_err(|error| error.to_string())?;
     }
-    Ok(Seat::Sealed(Box::new(sealed_peer(
-        command, keepalive, &invite,
-    )?)))
 }
 
-/// The session a sealed link seats: §5.1's two keys, the session's clock, and the seat and roster
+/// The session a link seats: §5.1's two keys, the session's clock, and the seat and roster
 /// the relay would have carried.
 fn sealed_peer(
     command: &Value,
@@ -375,26 +278,6 @@ fn sealed_peer(
     PeerSession::new(&options).map_err(|error| error.to_string())
 }
 
-/// The version-1 join a link names: the room and the token, and none of §5.1's fragment.
-///
-/// [`Invite`] is the clear engine's join input — "what a guest needs to join" — and a licence to
-/// speak the sealed wire is not part of it. A link that names no room or no token is refused with
-/// the same words `PeerInvite::parse` refuses those with, because it is the same link being read.
-fn clear_invite(link: &str) -> Result<Invite, String> {
-    let parsed = parse_session_url(&wire_address(link)).ok_or_else(|| {
-        format!("{link:?} does not address the session endpoint")
-    })?;
-    let room = parsed
-        .join
-        .room
-        .ok_or_else(|| "the invite names no room".to_string())?;
-    let token = parsed
-        .join
-        .token
-        .ok_or_else(|| "the invite carries no token".to_string())?;
-    Ok(Invite::new(room, token))
-}
-
 /// Whether a link's fragment names one of §5.1's two keys and not the other.
 ///
 /// Read off the link and not off a refusal message: what refuses the link is the client's own
@@ -411,32 +294,29 @@ fn half_a_fragment(link: &str) -> bool {
     names.contains("k") != names.contains("h")
 }
 
-/// The `wire_versions` of the body `GET /meta` answered, or `None` when the vector handed none.
+/// A link's fragment with both of §5.1's keys present, for the one guard a run removes.
 ///
-/// `PROTOCOL.md` §2: a `/meta` that could not be read is not an answer about versions and is not
-/// what a client refuses on, so an absent body decides nothing. Only this member of the body is
-/// read, which is what §10 decides by.
-fn wire_versions(command: &Value) -> Result<Option<Vec<String>>, String> {
-    let Some(meta) = command.get("meta") else {
-        return Ok(None);
+/// A wrong client that ignores the half-copy rule seats anyway. What it seats with cannot be a
+/// real second key — this layer holds no other — so the missing one is a placeholder: the
+/// vector that removes this guard asserts that the leg seated at all, and a session opened
+/// with a key that verifies nothing is exactly the shape the rule exists to prevent.
+fn whole_fragment(link: &str) -> String {
+    let Some((address, fragment)) = link.split_once('#') else {
+        return link.to_string();
     };
-    if meta.is_null() {
-        return Ok(None);
+    let mut parts: Vec<String> =
+        fragment.split('&').map(str::to_string).collect();
+    let names: BTreeSet<&str> = fragment
+        .split('&')
+        .map(|pair| pair.split_once('=').map_or(pair, |(name, _)| name))
+        .collect();
+    let placeholder = encode_key(&[0u8; 32]);
+    for name in ["k", "h"] {
+        if !names.contains(name) {
+            parts.push(format!("{name}={placeholder}"));
+        }
     }
-    let listed = meta
-        .get("wire_versions")
-        .and_then(Value::as_array)
-        .ok_or("`meta.wire_versions` is the list the server advertises")?;
-    let mut versions = Vec::with_capacity(listed.len());
-    for version in listed {
-        versions.push(
-            version
-                .as_str()
-                .ok_or("`meta.wire_versions` is a list of version names")?
-                .to_string(),
-        );
-    }
-    Ok(Some(versions))
+    format!("{address}#{}", parts.join("&"))
 }
 
 /// The session's clock, which every `join` has to carry: it arrives on `room.created` in a real
@@ -453,9 +333,8 @@ fn deliver(shared: &Shared, command: &Value) -> Result<Next, String> {
     with_session(shared, |state| {
         let running = session(state)?;
         let clock = running.clock();
-        let peer = running.sealed()?;
-        let _ = peer.deliver(clock, &raw);
-        peer.tick(clock);
+        let _ = running.peer.deliver(clock, &raw);
+        running.peer.tick(clock);
         state_report(state)
     })
     .map(Next::Report)
@@ -470,10 +349,11 @@ fn insert(shared: &Shared, command: &Value) -> Result<Next, String> {
     with_session(shared, |state| {
         let running = session(state)?;
         let clock = running.clock();
-        let peer = running.sealed()?;
-        peer.insert(&path, index, &chunk)
+        running
+            .peer
+            .insert(&path, index, &chunk)
             .map_err(|error| error.to_string())?;
-        peer.tick(clock);
+        running.peer.tick(clock);
         state_report(state)
     })
     .map(Next::Report)
@@ -485,9 +365,8 @@ fn announce(shared: &Shared, command: &Value) -> Result<Next, String> {
     with_session(shared, |state| {
         let running = session(state)?;
         let clock = running.clock();
-        let peer = running.sealed()?;
-        peer.hold_only(clock, &path);
-        peer.tick(clock);
+        running.peer.hold_only(clock, &path);
+        running.peer.tick(clock);
         state_report(state)
     })
     .map(Next::Report)
@@ -502,17 +381,18 @@ fn announce(shared: &Shared, command: &Value) -> Result<Next, String> {
 fn mutate(shared: &Shared, command: &Value) -> Result<Next, String> {
     let name = text(command, "name")?.to_string();
     let mut state = lock(shared);
-    if name == ACCEPT_PARTIAL_FRAGMENT || name == FALL_BACK_TO_VERSION_1 {
+    if name == ACCEPT_PARTIAL_FRAGMENT {
         state.removed_on_the_link = Some(name);
         return state_report(&state).map(Next::Report);
     }
     let running = state.running.as_mut().ok_or("no session: `join` first")?;
     running
-        .sealed()?
+        .peer
         .mutate(&name)
         .map_err(|error| error.to_string())?;
     state_report(&state).map(Next::Report)
 }
+
 /// The caller's liveness probe asks before it seats anything, and a client with no session
 /// holds nothing: that is the empty report and not a refusal.
 fn report(shared: &Shared) -> Result<Next, String> {
@@ -530,21 +410,20 @@ fn session(state: &mut State) -> Result<&mut Running, String> {
 
 /// What the subject says about itself: `PROTOCOL.md` §13.11's observables and nothing else.
 ///
-/// A clear seat holds nothing and is handed nothing — this layer does not drive that wire — so
-/// its report is the empty one. The guard a link carried is this subject's own state and is
-/// reported whichever seat is in it, because a link guard is removed before any session exists.
+/// The guard a link carried is this subject's own state and is reported whichever session is in
+/// it, because a link guard is removed before any session exists.
 fn state_report(state: &State) -> Result<Value, String> {
-    let report = match state.running.as_ref().map(|running| &running.seat) {
-        None | Some(Seat::Clear(_)) => Report::empty(),
-        Some(Seat::Sealed(peer)) => {
+    let report = match state.running.as_ref() {
+        None => Report::empty(),
+        Some(running) => {
             // A frame this session could not produce would leave it looking like a client with
             // nothing to say, which is the one thing a subject must never do quietly.
-            if let Some(fault) = peer.fault() {
+            if let Some(fault) = running.peer.fault() {
                 return Err(format!(
                     "this session could not publish a frame: {fault}"
                 ));
             }
-            Report::of(peer)
+            Report::of(&running.peer)
         }
     };
     Ok(report

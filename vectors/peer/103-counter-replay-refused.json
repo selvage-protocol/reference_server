@@ -1,7 +1,7 @@
 {
   "id": "103",
   "title": "A frame at or below the mark its sender has already reached is refused `replayed_counter`",
-  "spec": "CANONICAL.md#61-sealed-frames-selvage2",
+  "spec": "CANONICAL.md#61-sealed-frames",
   "notes": "There is no window around the mark: the transport is ordered, so a counter that does not advance is a replay. The replica shows why the verdict is the only observable here — yjs integrates an item once, so applying this replay would change nothing and a client without the window is indistinguishable from one with it by replica state alone. `expectDoc` after the refusal asserts the consequence the other way round: nothing was applied, and the replica still holds what the second frame made it.",
   "layer": "peer",
   "kind": "frame",

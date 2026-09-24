@@ -2,7 +2,7 @@
   "id": "010",
   "title": "An awareness exchange: relayed verbatim, and attributed through the session layer",
   "spec": "PROTOCOL.md#84-attributing-a-cursor-to-a-person",
-  "notes": "Awareness is peer to peer and the server relays it uninspected, so the first frame is asserted as exact bytes and the rest are decoded with the reference decoder: message type 1, one client, one clock, and the state the peer published. The state's shape (`path` plus `selection`) is this implementation's, and each selection endpoint is a CRDT anchor, never an offset (§8.1). Three anchor shapes appear on purpose, because a receiver has to accept all three: the yjs shape, which names the scope and the element together (`{\"tname\":…,\"item\":…}`), the element alone (`{\"item\":…}`), which is what the reference client publishes for a caret inside a root type, and the scope alone (`{\"tname\":…,\"assoc\":0}`), which is the only encoding that exists for a position with no element to name — a caret at the end of a text, or anywhere in an empty one. A receiver that insisted on one of the three would show no cursor whatever for a peer on the other library, which is the silent cross-implementation failure §8.1 exists to prevent. Because no index reaches the wire, this vector fixes no offset unit — a receiver recomputes the index against its own replica. Identity is not in the state: `awareness_client_id` on `PeerInfo` is what joins a cursor to a display name.",
+  "notes": "Awareness is y-protocols and opaque to the server. The test is the whole path: two connections, the ids they claimed in `session.hello`, the bytes in both directions, and the attribution an adapter does from `PeerInfo.awareness_client_id` and the client id inside the awareness update. The last step pins the other half of a departure: the room is told `peer.left`, and nothing else about the connection that ended.",
   "steps": [
     {
       "op": "open",
@@ -12,12 +12,12 @@
     {
       "op": "send",
       "conn": "host",
-      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"awareness_client_id\":5,\"display_name\":\"Ada\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"awareness_client_id\":5,\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "host",
-      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"awareness_client_id\":5,\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},\"token\":\"$token\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"awareness_client_id\":5,\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "open",
@@ -27,17 +27,17 @@
     {
       "op": "send",
       "conn": "guest",
-      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"awareness_client_id\":9,\"display_name\":\"Bob\",\"role\":\"guest\"},\"v\":\"selvage/1\"}"
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"awareness_client_id\":9,\"display_name\":\"Bob\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "guest",
-      "text": "{\"event\":\"room.joined\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[{\"awareness_client_id\":5,\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"}],\"room_id\":\"$room\",\"self\":{\"awareness_client_id\":9,\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"room.joined\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[{\"awareness_client_id\":5,\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"}],\"room_id\":\"$room\",\"self\":{\"awareness_client_id\":9,\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\"}},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "host",
-      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"awareness_client_id\":9,\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\",\"role\":\"guest\"}},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"awareness_client_id\":9,\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\"}},\"v\":\"selvage/2\"}"
     },
     {
       "op": "sendBinary",
@@ -124,14 +124,9 @@
     {
       "op": "expect",
       "conn": "guest",
-      "text": "{\"event\":\"peer.left\",\"params\":{\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
-    },
-    {
-      "op": "expect",
-      "conn": "guest",
-      "text": "{\"event\":\"host.detached\",\"params\":{\"grace_ms\":30000},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"peer.left\",\"params\":{\"peer_id\":\"$host_peer\"},\"v\":\"selvage/2\"}"
     }
   ],
-  "selvage": "selvage/1",
+  "selvage": "selvage/2",
   "canonical": "SJ-C/1"
 }

@@ -39,7 +39,28 @@ export NIX_BUILD_CORES=${NIX_BUILD_CORES:-2}
 
 say() { printf '\n=== %s ===\n' "$*"; }
 
+# What a `nix build` here reads is the tracked tree at its working-tree content: a file that is
+# new and untracked is invisible to it, while a modified or deleted tracked file is read as it
+# stands. Either way the run is not the run CI would do — CI checks out the committed ref — so
+# the jobs that build refuse when the tree differs from HEAD, and say so. Commit, not just
+# stage: staged-but-uncommitted is visible to the local build and absent from CI. One thing
+# this guard is for, and it happened: an untracked test file that would have run the wire suite
+# was invisible to the build, which reported a green run of a smaller suite. The steps that run
+# in the dev shell (`cargo deny`, `actionlint`, `typos`) and the `container` job read the
+# working tree directly, so they carry no guard.
+inputs_clean() {
+  local dirty
+  dirty=$(git status --porcelain)
+  if [[ -n $dirty ]]; then
+    printf 'refusing: the tree differs from HEAD, so this is not the run CI would do.\n' >&2
+    printf 'commit, or stash, then re-run:\n' >&2
+    printf '%s\n' "$dirty" >&2
+    return 1
+  fi
+}
+
 job_checks() {
+  inputs_clean
   say "checks: format"
   nix build .#checks.x86_64-linux.fmt --no-link --print-build-logs
   say "checks: clippy"
@@ -87,6 +108,7 @@ job_checks() {
 }
 
 job_nightly() {
+  inputs_clean
   say "nightly: coverage"
   nix build .#checks.x86_64-linux.tarpaulin --no-link --print-build-logs
   say "nightly: cargo-deny"
@@ -101,6 +123,7 @@ job_lint() {
 }
 
 job_image() {
+  inputs_clean
   say "image: nix-built image smoke without publishing"
   scripts/image-smoke.sh
 }

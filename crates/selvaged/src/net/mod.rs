@@ -1,8 +1,8 @@
 //! Listener, `GET /meta`, the WebSocket upgrade and the per-connection task.
 //!
 //! The server is session-aware and payload-opaque: it parses the JSON session envelope,
-//! owns rooms, membership and the open-document set, but never decodes a document or
-//! awareness payload — binary frames are routed to the rest of the room untouched.
+//! owns rooms and membership, but never decodes a document or awareness payload — binary
+//! frames are routed to the rest of the room untouched.
 
 use std::fmt::Write as _;
 use std::io;
@@ -38,8 +38,6 @@ use crate::{ServerConfig, random_hex};
 
 mod session;
 
-pub use session::{MAX_DOC_PATH_BYTES, MAX_GRANT_BYTES};
-
 use session::{Applicant, Session, grace_ms, handshake};
 
 const MAX_HEAD_BYTES: usize = 16 * 1024;
@@ -72,7 +70,7 @@ const MAX_CLOSE_REASON: usize = 123;
 
 /// The standard WebSocket code for "try again later": what a peer hears when this
 /// connection cannot be served right now — the server is full, or this connection has
-/// sent past its inbound budget. The 4xxx range is `selvage/1`'s own (`PROTOCOL.md`
+/// sent past its inbound budget. The 4xxx range is the protocol's own (`PROTOCOL.md`
 /// §11); this one is IANA's, which is why it is named here rather than in the protocol
 /// crate.
 const TRY_AGAIN_LATER: u16 = 1013;
@@ -164,8 +162,9 @@ impl Drop for Slot {
 
 /// Accepts one connection with Nagle's algorithm off.
 ///
-/// A reply and the event that follows it are two small writes back to back — `doc.open`'s
-/// result and its `doc.opened` — and so is a burst of relayed frames. Nagle holds the second
+/// A reply and the event that follows it are two small writes back to back — a
+/// `session.rename` result and its `peer.renamed` — and so is a burst of relayed frames.
+/// Nagle holds the second
 /// write until the first is acknowledged: latency the protocol earns nothing for, since its
 /// frames are whole messages that cannot usefully coalesce. Loopback acknowledges too quickly
 /// for it to show; a wide-area link does not.
@@ -314,10 +313,8 @@ impl Shared {
                     .await;
             }
         };
-        let claims_host = join.room.is_none();
         let greeted =
-            handshake(&mut wire.stream, claims_host, &self.config, &mut budget)
-                .await;
+            handshake(&mut wire.stream, &self.config, &mut budget).await;
         let seated = match greeted {
             Ok(hello) => {
                 let (poison_tx, poison_rx) = oneshot::channel();
@@ -425,11 +422,11 @@ async fn join_writer(writer: &mut JoinHandle<()>) {
 /// libraries do it as they read), so a peer that has not answered two successive pings by
 /// the time the third is due is not idle, it is gone — a roaming client whose socket died
 /// without its TCP end noticing, or a hung relay. Leaving it seated is what strands a room:
-/// the connection stays the room's host, no grace period is ever armed, and the host that
-/// comes back is refused `host_present` while every guest waits for a `host.detached` that
-/// cannot come. Ending it is what any dropped socket does: `peer.left`, `host.detached`,
-/// the grace period. At the reference `ping_interval` of 30 s a peer has two intervals —
-/// 60 s of complete silence — before anything happens to it.
+/// the connection stays in it, so no grace period is ever armed and the room outlives
+/// everyone the peers can still see. Ending it is what any dropped socket does:
+/// `peer.left`, and the room's grace period when it was the last one. At the reference
+/// `ping_interval` of 30 s a peer has two intervals — 60 s of complete silence — before
+/// anything happens to it.
 const MAX_MISSED_PINGS: u32 = 2;
 
 /// A seated session plus the plumbing that keeps it alive.
@@ -599,14 +596,9 @@ fn frame_of(msg: &proto::ServerMessage) -> Option<Outbound> {
     msg.to_text().ok().map(Outbound::Text)
 }
 
-/// Builds an event frame ready to write, carrying the wire version of the room it is
-/// addressed to (`PROTOCOL.md` §4): a `selvage/2` connection is answered in `selvage/2`.
-pub fn event_frame(
-    version: proto::Version,
-    name: &str,
-    params: Value,
-) -> Option<Outbound> {
-    frame_of(&proto::ServerMessage::event(name, params).for_version(version))
+/// Builds an event frame ready to write.
+pub fn event_frame(name: &str, params: Value) -> Option<Outbound> {
+    frame_of(&proto::ServerMessage::event(name, params))
 }
 
 fn frame_of_outbound(out: Outbound) -> Message {
@@ -819,15 +811,12 @@ async fn respond_plain(
             }
         };
     }
-    // Canonical (`CANONICAL.md`), so that the negotiation body has the same bytes for
-    // every implementation. The grace is this server's configured value: it is the one
-    // number a client needs before it has a session, since `host.detached` never reaches
-    // the host whose budget has to fit inside it.
-    let versions = config.wire_versions();
-    let meta = serde_json::to_string(&proto::Meta::for_versions(
+    // Canonical (`CANONICAL.md`), so that the body has the same bytes for every
+    // implementation. The grace is this server's configured value: it is the one number
+    // a client needs before it has a session, to size a reconnect's budget.
+    let meta = serde_json::to_string(&proto::Meta::reference(
         config.keepalive,
         grace_ms(config),
-        &versions,
     ))
     .map_err(io::Error::other)?;
     respond_status(tcp, Status::Ok, &meta, &head.method).await

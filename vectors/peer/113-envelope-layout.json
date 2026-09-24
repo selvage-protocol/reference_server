@@ -1,7 +1,7 @@
 {
   "id": "113",
   "title": "A frame with bytes left over past its signature, or short inside one, is `bad_envelope`",
-  "spec": "CANONICAL.md#61-sealed-frames-selvage2",
+  "spec": "CANONICAL.md#61-sealed-frames",
   "notes": "The three fixed-width fields are fixed and the envelope is exactly one envelope: nothing precedes it and nothing follows it. The first leg is the one that matters — the trailing byte is not in the signature input, so a lenient reader that parses the prefix and drops the rest accepts a frame that is not this layout at all. The second leg is a frame that runs out inside its signature, which no lenient parse can rescue.",
   "layer": "peer",
   "kind": "frame",

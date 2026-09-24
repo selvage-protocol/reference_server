@@ -3,7 +3,7 @@
   "title": "A text frame that is not one JSON object is `bad_message`",
   "spec": "PROTOCOL.md#4-session-envelope",
   "notes": "Every text frame is one JSON object, and a frame that is not one is refused `bad_message` — the code the frame's shape earns, whatever it would have said. Before seating that is a refusal: `session.error` and close 4000. Once seated the same fault is an event and the connection stays open, which the request after it shows. The truncated frame is not JSON at all and the array is JSON of the wrong shape; both are one case for the receiver, so both are pinned. `error.message` carries the parser's own words, which is why it is matched as `$_`.",
-  "selvage": "selvage/1",
+  "selvage": "selvage/2",
   "canonical": "SJ-C/1",
   "steps": [
     {
@@ -21,7 +21,7 @@
     {
       "op": "expect",
       "conn": "truncated",
-      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expectClose",
@@ -42,7 +42,7 @@
     {
       "op": "expect",
       "conn": "array",
-      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expectClose",
@@ -57,12 +57,12 @@
     {
       "op": "send",
       "conn": "host",
-      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "host",
-      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},\"token\":\"$token\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "send",
@@ -73,22 +73,22 @@
     {
       "op": "expect",
       "conn": "host",
-      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "send",
       "conn": "host",
-      "text": "{\"id\":2,\"method\":\"doc.open\",\"params\":{\"path\":\"src/main.rs\"},\"v\":\"selvage/1\"}"
+      "text": "{\"id\":2,\"method\":\"session.rename\",\"params\":{\"display_name\":\"Ada Lovelace\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "host",
-      "text": "{\"id\":2,\"result\":{\"documents\":[\"src/main.rs\"]},\"v\":\"selvage/1\"}"
+      "text": "{\"id\":2,\"result\":{},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "host",
-      "text": "{\"event\":\"doc.opened\",\"params\":{\"documents\":[\"src/main.rs\"],\"path\":\"src/main.rs\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"peer.renamed\",\"params\":{\"display_name\":\"Ada Lovelace\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/2\"}"
     }
   ]
 }

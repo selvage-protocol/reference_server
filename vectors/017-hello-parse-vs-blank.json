@@ -1,7 +1,7 @@
 {
   "id": "017",
   "title": "A `session.hello` with no `display_name` is `bad_message`; a blank one is `bad_params`",
-  "spec": "PROTOCOL.md#session-hello--the-handshake",
+  "spec": "PROTOCOL.md#sessionhello--the-handshake",
   "notes": "The distinction is parse failure against semantic failure, and both are reachable before the handshake completes, where every fault closes the connection. Params with no `display_name` cannot be read as a hello at all; params that carry a blank one read fine and are refused as a value. Neither mints a room, and a well-formed hello afterwards seats normally.",
   "steps": [
     {
@@ -13,12 +13,12 @@
       "op": "send",
       "conn": "unreadable",
       "refused": true,
-      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{},\"v\":\"selvage/1\"}"
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "unreadable",
-      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expectClose",
@@ -34,12 +34,12 @@
       "op": "send",
       "conn": "blank",
       "refused": true,
-      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"  \"},\"v\":\"selvage/1\"}"
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"  \"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "blank",
-      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_params\",\"message\":\"$_\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_params\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expectClose",
@@ -54,14 +54,14 @@
     {
       "op": "send",
       "conn": "host",
-      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "host",
-      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},\"token\":\"$token\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
     }
   ],
-  "selvage": "selvage/1",
+  "selvage": "selvage/2",
   "canonical": "SJ-C/1"
 }

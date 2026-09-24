@@ -2,7 +2,7 @@
   "id": "016",
   "title": "A request with no `id` is `bad_message`: refused at the handshake, an event once seated",
   "spec": "PROTOCOL.md#41-request-client--server",
-  "notes": "The id is the only correlation the wire has, so a request without one is not a request. During the handshake that is fatal like every other handshake fault — `session.error` then close 4000 — and once seated it is an event and the connection stays open, which the follow-up request shows. The frame is otherwise well formed: what is missing is the member the reply would need.",
+  "notes": "The envelope is judged before the method: a first frame with no `id` is refused whatever it names, and the refusal at the handshake is a `session.error` event and close 4000. On a seated connection the same fault is announced the same way and the connection stays open, which the rename at the end shows.",
   "steps": [
     {
       "op": "open",
@@ -13,12 +13,12 @@
       "op": "send",
       "conn": "nameless",
       "refused": true,
-      "text": "{\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/1\"}"
+      "text": "{\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "nameless",
-      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expectClose",
@@ -33,40 +33,25 @@
     {
       "op": "send",
       "conn": "host",
-      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\",\"role\":\"host\"},\"v\":\"selvage/1\"}"
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "host",
-      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\",\"open-document-set\",\"host-reclaim\"],\"documents\":[],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\",\"role\":\"host\"},\"token\":\"$token\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "send",
       "conn": "host",
       "refused": true,
-      "text": "{\"method\":\"doc.open\",\"params\":{\"path\":\"src/main.rs\"},\"v\":\"selvage/1\"}"
+      "text": "{\"method\":\"session.rename\",\"params\":{\"display_name\":\"Ada L\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "host",
-      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/1\"}"
-    },
-    {
-      "op": "send",
-      "conn": "host",
-      "text": "{\"id\":2,\"method\":\"doc.open\",\"params\":{\"path\":\"src/main.rs\"},\"v\":\"selvage/1\"}"
-    },
-    {
-      "op": "expect",
-      "conn": "host",
-      "text": "{\"id\":2,\"result\":{\"documents\":[\"src/main.rs\"]},\"v\":\"selvage/1\"}"
-    },
-    {
-      "op": "expect",
-      "conn": "host",
-      "text": "{\"event\":\"doc.opened\",\"params\":{\"documents\":[\"src/main.rs\"],\"path\":\"src/main.rs\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/1\"}"
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
     }
   ],
-  "selvage": "selvage/1",
+  "selvage": "selvage/2",
   "canonical": "SJ-C/1"
 }

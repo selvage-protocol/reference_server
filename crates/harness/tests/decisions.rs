@@ -1,12 +1,12 @@
 //! The peer corpus's decision layer, replayed against this client's `selvage/2` session.
 //!
-//! `specification/vectors/peer/151…158.json` are the eight vectors that are about what a client
+//! `specification/vectors/peer/151…157.json` are the seven vectors that are about what a client
 //! decided. Six of them (`151…156`) are about what it *did* with a frame it received — what it
 //! applied, what it dropped and why, what it published, whether it ended — and none of that is on
-//! a socket. The other two (`157`, `158`) are about the two decisions a link carries **before a
-//! socket**: `PROTOCOL.md` §5.1's half-copied fragment and §2/§10's version-1-only server. A
-//! client that holds either rule refuses the link locally, in its own words, so the step that
-//! asserts one is `expectRefusal` and the words are the subject's own.
+//! a socket. The other (`157`) is about a decision a link carries **before a socket**:
+//! `PROTOCOL.md` §5.1's half-copied fragment. A client that holds the rule refuses the link
+//! locally, in its own words, so the step that asserts it is `expectRefusal` and the words are the
+//! subject's own.
 //!
 //! The specification drives them through `specification/runner/subject.py` and
 //! `runner/run_peer.py --subject`; this drives the same files through the same subject binary,
@@ -14,11 +14,9 @@
 //! corpus is evidence in this repository's own suite and not only wherever the specification's
 //! runner is pointed by hand.
 //!
-//! A `start` hands the subject the link and, because this layer opens no socket, the two things
-//! §2 and §10 read before one: what `GET /meta` answered (`meta`) and the version this client's
-//! own setting pins it to (`pin`). A guard that sits on the **link** is removed *before* the
-//! `join` that reads its link, which is where a client reads it; every other guard is removed
-//! after the join, once there is a session to hold it.
+//! A `start` hands the subject the link, because this layer opens no socket. A guard that sits
+//! on the **link** is removed *before* the `join` that reads its link, which is where a client
+//! reads it; every other guard is removed after the join, once there is a session to hold it.
 //!
 //! The runner in Python seals each recipe and hands the bytes over; so does this, with
 //! `sealed::seal`, and both check the bytes against the `hex` the vector carries for the
@@ -214,12 +212,11 @@ fn decision_vector(path: &Path) -> Result<Option<Value>, String> {
 // --- the subject, as a child process --------------------------------------------
 
 /// The guards of `PROTOCOL.md` §13.11's table that a caller has to remove **before** the `join`
-/// that reads its link, under the names `specification/runner/subject.py` gives them
-/// (`LINK_MUTATIONS`): §5.1's fragment and §2/§10's version rule are decided about the link
-/// itself, so a subject asked for one after it was seated could not have refused the link
-/// anyway. Every other name is a session's guard and is removed once there is a session.
-const LINK_MUTATIONS: [&str; 2] =
-    ["accept-partial-fragment", "fall-back-to-version-1"];
+/// that reads its link, under the name `specification/runner/subject.py` gives it
+/// (`LINK_MUTATIONS`): §5.1's fragment rule is decided about the link itself, so a subject asked
+/// for it after it was seated could not have refused the link anyway. Every other name is a
+/// session's guard and is removed once there is a session.
+const LINK_MUTATIONS: [&str; 1] = ["accept-partial-fragment"];
 
 /// The subject binary, driven over the line protocol `specification/runner/subject.py` fixes.
 struct Subject {
@@ -583,11 +580,9 @@ fn roster_of(vector: &Value) -> Vec<String> {
     seats
 }
 
-/// What one `join` carries: the invite, the session's clock, the roster, the session
-/// keypair the vector names, and the two members §2 and §10 read before a socket — what
-/// `GET /meta` answered, and any version this client's own setting pins it to. The fixture key is
-/// the one seam of this layer and it is a test seam: `PROTOCOL.md` §13.1 mints a keypair per
-/// connection and nothing on a wire fixes one.
+/// What one `join` carries: the invite, the session's clock, the roster and the session keypair
+/// the vector names. The fixture key is the one seam of this layer and it is a test seam:
+/// `PROTOCOL.md` §13.1 mints a keypair per connection and nothing on a wire fixes one.
 fn join_command(
     fixture: &Fixture,
     vector: &Value,
@@ -605,7 +600,7 @@ fn join_command(
     let keepalive = scenario.get("keepalive").ok_or_else(|| {
         "`scenario.keepalive` is the session's clock".to_string()
     })?;
-    let mut command = json!({
+    Ok(json!({
         "cmd": "join",
         "invite": invite_of(fixture, step)?,
         "offline": true,
@@ -613,18 +608,7 @@ fn join_command(
         "seat": "p-subject",
         "roster": roster_of(vector),
         "session_key": seed,
-    });
-    // `meta` and `pin` are sent only when the vector carries them, which is what the runner does:
-    // a member present with a null value would be a third state this layer does not define.
-    let object = command
-        .as_object_mut()
-        .ok_or_else(|| "a join command is an object".to_string())?;
-    for member in ["meta", "pin"] {
-        if let Some(value) = step.get(member) {
-            let _ = object.insert(member.to_string(), value.clone());
-        }
-    }
-    Ok(command)
+    }))
 }
 
 /// What one `start` left: the subject process, the client's own words for a link it refused, and
@@ -905,9 +889,8 @@ fn recipe_plaintext(where_: &str, recipe: &Value) -> Result<Vec<u8>, String> {
 
 // --- the vectors ----------------------------------------------------------------
 
-/// The eight decision vectors a conforming client passes.
-const PASSABLE: [&str; 8] =
-    ["151", "152", "153", "154", "155", "156", "157", "158"];
+/// The seven decision vectors a conforming client passes.
+const PASSABLE: [&str; 7] = ["151", "152", "153", "154", "155", "156", "157"];
 
 fn fixture() -> Result<Fixture, String> {
     Fixture::load(&vectors_root().join("fixture").join("keys.json"))
@@ -922,18 +905,21 @@ fn every_decision_vector_a_conforming_client_passes_holds() {
     let vectors =
         load_decision_vectors().unwrap_or_else(|error| panic!("{error}"));
     let mut ran = 0;
+    let mut assertions = 0usize;
     for vector in &vectors {
         let id = vector.get("id").and_then(Value::as_str).unwrap_or("?");
         if !PASSABLE.contains(&id) {
             continue;
         }
         ran += 1;
-        let assertions = replay(vector, &fixture, None)
+        let count = replay(vector, &fixture, None)
             .unwrap_or_else(|error| panic!("vector {id}: {error}"));
-        assert!(assertions > 0, "vector {id} asserted nothing");
+        assert!(count > 0, "vector {id} asserted nothing");
+        assertions = assertions.saturating_add(count);
     }
-    // A sweep that read nothing reports a clean tree: the five are named, not counted.
+    // A sweep that read nothing reports a clean tree: the seven are named, not counted.
     assert_eq!(ran, PASSABLE.len(), "every passable vector was replayed");
+    println!("{ran} decision vectors replayed, {assertions} assertion steps");
 }
 
 #[test]
@@ -967,9 +953,9 @@ fn the_decision_vectors_go_red_under_the_guard_they_declare() {
             .unwrap_or_else(|| {
                 panic!("vector {id} is green under `{catches}`")
             });
-        // A link rule cannot red a report step: §5.1's fragment and §2/§10's version rule are
-        // decided before a socket, so the expectation they fail is `expectRefusal`. Both are
-        // assertion steps of this layer, and a red in either is a caught guard.
+        // A link rule cannot red a report step: §5.1's fragment is decided before a socket, so
+        // the expectation it fails is `expectRefusal`. That is an assertion step of this layer,
+        // and a red in it is a caught guard.
         assert!(
             red.contains("(`expectSubject`)")
                 || red.contains("(`expectRefusal`)"),

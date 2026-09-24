@@ -567,10 +567,10 @@ fn matches(
 }
 
 /// Members whose prose promises no order: matched as a multiset, then put into the wire's order
-/// (`CANONICAL.md` §2.7). `documents` is not here — `PROTOCOL.md` §6.2 promises it first-opened
-/// order, and the comparison holds the wire to that.
-const UNORDERED: [&str; 4] =
-    ["peers", "capabilities", "wire_versions", "roles"];
+/// (`CANONICAL.md` §2.7: `peers`, `capabilities` and `wire_versions` are sets). The one array
+/// the protocol does promise an order for is the sealed room state's `listing`, which is not a
+/// text frame's member and not this runner's to compare.
+const UNORDERED: [&str; 3] = ["peers", "capabilities", "wire_versions"];
 
 /// Matches an array the prose leaves unordered, and leaves `want` in the wire's order.
 ///
@@ -1033,20 +1033,15 @@ struct StepPlace {
 /// was — or what each connection still holds that no step reads, when the
 /// transcript stops reading early.
 pub async fn replay(vector: &Vector) -> Result<(), Failure> {
-    if vector.selvage != "selvage/1" || vector.canonical != "SJ-C/1" {
+    if vector.selvage != "selvage/2" || vector.canonical != "SJ-C/1" {
         return Err(format!(
-            "{} is bound to {} / {}, but this implementation speaks selvage/1 / SJ-C/1",
+            "{} is bound to {} / {}, but this protocol has one wire version, selvage/2 / SJ-C/1",
             vector.id, vector.selvage, vector.canonical
         )
         .into());
     }
-    // The corpus is the version-1 one, so it is replayed against a server that seats
-    // `selvage/1` alone: its `/meta` (vector 001) advertises one version and vector 005
-    // has a `selvage/2` hello refused, and both are claims about that server rather than
-    // about the default, which seats both.
     let config = ServerConfig {
         room_grace: Duration::from_millis(vector.harness.room_grace_ms),
-        serve_version_1_only: true,
         ..ServerConfig::default()
     };
     let harness = Harness::start_with(config).await;
@@ -1172,23 +1167,23 @@ mod tests {
             "event": "room.joined",
             "params": {
                 "peers": [
-                    {"display_name": "Ada", "peer_id": "$host_peer", "role": "host"},
-                    {"display_name": "Bob", "peer_id": "$guest_peer", "role": "guest"},
+                    {"display_name": "Ada", "peer_id": "$host_peer"},
+                    {"display_name": "Bob", "peer_id": "$guest_peer"},
                 ],
                 "room_id": "$room",
             },
-            "v": "selvage/1",
+            "v": "selvage/2",
         }));
         let actual = canonical(&serde_json::json!({
             "event": "room.joined",
             "params": {
                 "peers": [
-                    {"display_name": "Bob", "peer_id": "p-2", "role": "guest"},
-                    {"display_name": "Ada", "peer_id": "p-1", "role": "host"},
+                    {"display_name": "Bob", "peer_id": "p-2"},
+                    {"display_name": "Ada", "peer_id": "p-1"},
                 ],
                 "room_id": "r-1",
             },
-            "v": "selvage/1",
+            "v": "selvage/2",
         }));
         let mut bindings = Bindings::default();
         check_text(&actual, &expected, &mut bindings)
@@ -1213,22 +1208,22 @@ mod tests {
             "params": {
                 "a_peer": "$first",
                 "peers": [
-                    {"display_name": "Ada", "peer_id": "$host_peer", "role": "host"},
-                    {"display_name": "Bob", "peer_id": "$guest_peer", "role": "guest"},
+                    {"display_name": "Ada", "peer_id": "$host_peer"},
+                    {"display_name": "Bob", "peer_id": "$guest_peer"},
                 ],
             },
-            "v": "selvage/1",
+            "v": "selvage/2",
         }));
         let actual = canonical(&serde_json::json!({
             "event": "room.joined",
             "params": {
                 "a_peer": "p-9",
                 "peers": [
-                    {"display_name": "Bob", "peer_id": "p-2", "role": "guest"},
-                    {"display_name": "Ada", "peer_id": "p-1", "role": "host"},
+                    {"display_name": "Bob", "peer_id": "p-2"},
+                    {"display_name": "Ada", "peer_id": "p-1"},
                 ],
             },
-            "v": "selvage/1",
+            "v": "selvage/2",
         }));
         check_text(&actual, &expected, &mut Bindings::default()).expect(
             "a binding made before the array must survive the re-order",
@@ -1240,12 +1235,12 @@ mod tests {
         let expected = canonical(&serde_json::json!({
             "event": "room.joined",
             "params": {"capabilities": ["awareness", "y-protocols/1"], "room_id": "$room"},
-            "v": "selvage/1",
+            "v": "selvage/2",
         }));
         let actual = canonical(&serde_json::json!({
             "event": "room.joined",
-            "params": {"capabilities": ["awareness", "host-reclaim"], "room_id": "r-1"},
-            "v": "selvage/1",
+            "params": {"capabilities": ["awareness", "x.editor-state"], "room_id": "r-1"},
+            "v": "selvage/2",
         }));
         assert!(
             check_text(&actual, &expected, &mut Bindings::default()).is_err()
@@ -1253,18 +1248,20 @@ mod tests {
     }
 
     #[test]
-    fn an_ordered_array_in_another_order_is_not_the_same_frame() {
-        // `PROTOCOL.md` §6.2 promises `documents` first-opened order, so it is the one array
-        // the comparison holds to the order it was written in.
+    fn an_array_the_prose_does_not_leave_unordered_is_compared_in_order() {
+        // `CANONICAL.md` §2.7 makes the arrays this protocol defines sets and names them,
+        // so the comparison reorders those and holds every other array to the order the
+        // vector wrote. The one array the prose does order — the sealed room state's
+        // `listing` — is bytes inside a sealed payload, not a member a text frame carries.
         let expected = canonical(&serde_json::json!({
-            "event": "doc.opened",
-            "params": {"documents": ["a.rs", "b.rs"], "path": "a.rs"},
-            "v": "selvage/1",
+            "event": "room.joined",
+            "params": {"listing": ["a.rs", "b.rs"], "room_id": "$room"},
+            "v": "selvage/2",
         }));
         let actual = canonical(&serde_json::json!({
-            "event": "doc.opened",
-            "params": {"documents": ["b.rs", "a.rs"], "path": "a.rs"},
-            "v": "selvage/1",
+            "event": "room.joined",
+            "params": {"listing": ["b.rs", "a.rs"], "room_id": "r-1"},
+            "v": "selvage/2",
         }));
         assert!(
             check_text(&actual, &expected, &mut Bindings::default()).is_err()
@@ -1275,11 +1272,11 @@ mod tests {
     fn a_vector_not_in_canonical_form_is_refused() {
         // A vector whose bytes are not the form a frame is written in is not readable as a
         // claim, so the comparison refuses it before it matches anything.
-        let expected = r#"{"v":"selvage/1","event":"room.gone","params":{"room_id":"$room","reason":"done"}}"#;
+        let expected = r#"{"v":"selvage/2","event":"session.error","params":{"message":"$_","code":"bad_message"}}"#;
         let actual = canonical(&serde_json::json!({
-            "event": "room.gone",
-            "params": {"reason": "done", "room_id": "r-1"},
-            "v": "selvage/1",
+            "event": "session.error",
+            "params": {"code": "bad_message", "message": "no"},
+            "v": "selvage/2",
         }));
         let error = check_text(&actual, expected, &mut Bindings::default())
             .expect_err("a vector that is not canonical has no readable claim");

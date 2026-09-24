@@ -54,7 +54,7 @@ pub struct PeerInvite {
 }
 
 /// §5.1's two keys are not printed. A derived `Debug` would put the room key and the host key
-/// in whatever log an invite — or the [`crate::ConnectOptions`] holding one — is written to,
+/// in whatever log this invite is written to,
 /// which is the one thing the fragment exists to prevent. Their ids are in every frame's clear
 /// prefix already (`CANONICAL.md` §6.1), so those stand in for them.
 impl fmt::Debug for PeerInvite {

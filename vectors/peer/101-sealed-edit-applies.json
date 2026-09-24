@@ -1,7 +1,7 @@
 {
   "id": "101",
   "title": "A sealed edit is verified against the key the room state commits, and applied",
-  "spec": "CANONICAL.md#61-sealed-frames-selvage2",
+  "spec": "CANONICAL.md#61-sealed-frames",
   "notes": "The positive control of the frame layer: every other peer vector asserts a refusal, and a receiver that refuses everything passes all of them and fails this one. The state is sealed by the host key and applied first, because a joiner holds no committed key until one arrives — until then the envelope's own key resolution, and not a second rule beside it, refuses every content frame. The edit is vector 009's SyncStep2, the one whose plaintext names `src/main.rs`, so the text it applies is the text that vector's own `expectDoc` asserts.",
   "layer": "peer",
   "kind": "frame",

@@ -3,7 +3,7 @@
 # genuine ELF of the right architecture, on every architecture it carries
 # (not just the host's binary running because the host happens to execute it
 # natively), and that the server inside it answers `/meta` with that version
-# and the `selvage/1` wire version on the runner's own architecture.
+# and the `selvage/2` wire version on the runner's own architecture.
 #
 #   scripts/assert-image-version.sh <image-ref> <version> [port]
 #

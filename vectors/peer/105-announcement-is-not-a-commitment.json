@@ -1,7 +1,7 @@
 {
   "id": "105",
   "title": "A key an announcement names and no state commits has its content refused `uncommitted_key`",
-  "spec": "PROTOCOL.md#71-the-sealed-frame-selvage2",
+  "spec": "PROTOCOL.md#71-the-sealed-frame",
   "notes": "The announcement is accepted — it is the frame that makes a key knowable at all, and its counter leaves a mark — and its sender still holds no role and owns no content: a claim about a key is the announcer's, and the state is the room's answer to it. The content frame carries counter 2, above the mark the announcement left, so what refuses it is step 4 and not a replay. This is the vector that fails a receiver which verifies a frame against any key it happens to hold.",
   "layer": "peer",
   "kind": "frame",

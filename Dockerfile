@@ -31,11 +31,14 @@ ARG VERSION=dev
 ARG REVISION=unknown
 # The browser client revision the baked page is built from: a commit on
 # `selvage-protocol/web_client`, as a full SHA (a shallow fetch by revision
-# demands one). It names the commit that repository's newest release tag names —
-# a revision of another repository, so it moves when that one releases, and a
+# demands one). The page it builds must speak the wire this server seats, so the
+# pin names a revision whose bundle names `selvage/2`: a revision that names
+# another wire builds a page that cannot join the container beside it, and
+# `scripts/container-smoke.sh` asserts that string of the served bundle. The pin
+# is a revision of another repository, so it moves when that one releases, and a
 # wave that cuts the two together repins it before this image is cut. The image
 # records the revision it carries in `com.selvage.page.revision`.
-ARG WEB_CLIENT_SHA=197fe3edae8f482bf59da3e31441775fac0471d4
+ARG WEB_CLIENT_SHA=1409d20de175eb66dcbb4535376492c8a99e6db2
 
 # One cross-toolchain image per target, always run natively on the build host:
 # each stage cross-compiles its target triple, so building arm64 needs no

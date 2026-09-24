@@ -1,33 +1,32 @@
-//! Memory-only session state: rooms, membership, the open-document set, and the
-//! host-reconnect grace period.
+//! Memory-only session state: rooms, membership and the room's grace period.
 //!
 //! Nothing here looks at document or awareness payloads. A room knows only which
-//! peers are connected and which documents they have declared open.
+//! peers are connected to it.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use selvage_protocol as proto;
-use selvage_protocol::{Keepalive, PeerInfo, Role};
+use selvage_protocol::Keepalive;
+use selvage_protocol::PeerInfo;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::oneshot;
 
 /// How many frames one connection may have queued but unwritten. Past it the peer is
 /// slow: its frames are not dropped silently, the peer is disconnected and the room is
-/// told `peer.left`. Frames alone cannot bound memory — one full-set echo already
-/// wires to ~4.2 MiB (`crates/harness/tests/bounds.rs`) — so `MAX_QUEUE_BYTES` bounds
-/// the bytes beside it and this stays as the backstop for a flood of small frames.
+/// told `peer.left`. Frames alone cannot bound memory — one relayed frame already
+/// wires to ~8 MiB — so `MAX_QUEUE_BYTES` bounds the bytes beside it and this stays as
+/// the backstop for a flood of small frames.
 pub const MAX_QUEUE_FRAMES: usize = 32;
 
 /// How many payload bytes one connection may have queued but unwritten: the default for
 /// [`ServerConfig::max_queue_bytes`](crate::ServerConfig::max_queue_bytes), and 32 MiB —
-/// four times the largest frame a legitimate session sends (an 8 MiB update, measured in
-/// `crates/harness/tests/session.rs`), so a full-state sync plus concurrent traffic
-/// still fits. Past it the peer is slow, like past the frame cap. One slow peer holds
-/// at most the configured cap in counted bytes — the count includes the frame being
-/// written, released only after its send completes — plus the kernel's own buffers; the
-/// 33rd frame, or the byte past the cap, disconnects it instead.
+/// four times the largest frame a legitimate session sends (an 8 MiB update), so a
+/// full-state sync plus concurrent traffic still fits. Past it the peer is slow, like
+/// past the frame cap. One slow peer holds at most the configured cap in counted bytes
+/// — the count includes the frame being written, released only after its send completes
+/// — plus the kernel's own buffers; the 33rd frame, or the byte past the cap,
+/// disconnects it instead.
 pub const MAX_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 
 /// A frame the connection task should write out.
@@ -155,44 +154,16 @@ impl Peer {
 pub struct Room {
     pub id: String,
     pub token: String,
-    /// The wire version this room was minted in. A room cannot serve both: a `selvage/1`
-    /// client expects the server to hold the document set, and a `selvage/2` one requires
-    /// that it does not, so the minting connection pins the version and a connection
-    /// speaking the other one is refused `unsupported_version` (§10).
-    pub version: proto::Version,
     pub keepalive: Keepalive,
     pub peers: HashMap<String, Peer>,
-    /// The paths peers have declared open, in first-opened order. The set belongs to the
-    /// room and outlives the peers that opened a path; only `doc.close` removes one.
-    documents: Vec<String>,
-    /// The host's listing of its working tree, in the order the host wrote it. Like the
-    /// open-document set it belongs to the room and outlives the peers in it; only a
-    /// `doc.grant` changes it, and only the host may send one.
-    grant: Vec<String>,
-    /// Which paths each connected peer currently holds open.
-    open: HashMap<String, BTreeSet<String>>,
-    host: Option<String>,
-    /// Bumped whenever the host attaches or detaches, so a stale grace timer cannot
-    /// destroy a room that has been reclaimed.
+    /// Bumped whenever a peer leaves, so a stale grace timer cannot destroy a room
+    /// that has been reoccupied since the timer was armed.
     generation: u64,
     /// The arrival counter a newly seated peer takes its place from.
     arrivals: u64,
 }
 
 impl Room {
-    #[must_use]
-    pub fn host_present(&self) -> bool {
-        self.host
-            .as_ref()
-            .is_some_and(|id| self.peers.contains_key(id))
-    }
-
-    /// Whether `peer_id` is the connection the server holds as this room's host.
-    #[must_use]
-    pub fn is_host(&self, peer_id: &str) -> bool {
-        self.host.as_deref() == Some(peer_id)
-    }
-
     #[must_use]
     pub fn peers_except(&self, peer_id: &str) -> Vec<PeerInfo> {
         // In join order, so that two runs of the same transcript write the same bytes. The
@@ -228,19 +199,6 @@ impl Room {
             .collect()
     }
 
-    pub fn attach_host(&mut self, peer_id: &str) {
-        self.host = Some(peer_id.to_string());
-        self.generation = self.generation.saturating_add(1);
-    }
-
-    /// Hands the host role back. Returns the new generation, which is what stops a grace
-    /// timer armed before this point from destroying a room the host has since reclaimed.
-    pub fn detach_host(&mut self) -> u64 {
-        self.host = None;
-        self.generation = self.generation.saturating_add(1);
-        self.generation
-    }
-
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
@@ -251,45 +209,6 @@ impl Room {
     pub const fn bump_generation(&mut self) -> u64 {
         self.generation = self.generation.saturating_add(1);
         self.generation
-    }
-
-    /// Records a peer's hold on a path, returning whether the path is newly in the
-    /// room's set — or `None` when the set is at its cap and the path is not in it. A
-    /// path the room already holds is always fine: re-opening one grows nothing.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "an open names its peer, path and the cap it is checked against"
-    )]
-    pub fn open_document(
-        &mut self,
-        peer_id: &str,
-        path: &str,
-        max_documents: usize,
-    ) -> Option<bool> {
-        if self.documents.iter().any(|p| p == path) {
-            self.claims_mut(peer_id).insert(path.to_string());
-            return Some(false);
-        }
-        if self.documents.len() >= max_documents {
-            return None;
-        }
-        self.claims_mut(peer_id).insert(path.to_string());
-        self.documents.push(path.to_string());
-        Some(true)
-    }
-
-    /// Releases one peer's hold on a path. The path leaves the room only when no peer
-    /// still holds it open.
-    pub fn close_document(&mut self, peer_id: &str, path: &str) -> bool {
-        if let Some(mine) = self.open.get_mut(peer_id) {
-            mine.remove(path);
-        }
-        if self.open.values().any(|paths| paths.contains(path)) {
-            return false;
-        }
-        let before = self.documents.len();
-        self.documents.retain(|p| p != path);
-        self.documents.len() != before
     }
 
     /// Renames a seated peer in place, returning the record as it now reads. The arrival
@@ -305,53 +224,20 @@ impl Room {
         peer.info.display_name = display_name.to_string();
         Some(peer.info.clone())
     }
-
-    /// The room's open-document set.
-    #[must_use]
-    pub fn documents(&self) -> &[String] {
-        &self.documents
-    }
-
-    /// Replaces the room's grant wholesale: a listing is a snapshot, not a delta, and its
-    /// order is the host's, carried unchanged (`CANONICAL.md` §2.7).
-    pub fn set_grant(&mut self, paths: Vec<String>) {
-        self.grant = paths;
-    }
-
-    /// The room's grant.
-    #[must_use]
-    pub fn grant(&self) -> &[String] {
-        &self.grant
-    }
-
-    /// Forgets what a peer held open. The paths stay in the room's set: it outlives the
-    /// peers that opened them, so a host that reconnects is told what was in play.
-    fn forget_claims(&mut self, peer_id: &str) {
-        self.open.remove(peer_id);
-    }
-
-    fn claims_mut(&mut self, peer_id: &str) -> &mut BTreeSet<String> {
-        self.open.entry(peer_id.to_string()).or_default()
-    }
 }
 
-/// A room about to be minted: its id, its invite token, the wire version the minting
-/// connection pinning it, and the keepalive it advertises.
+/// A room about to be minted: its id, its invite token and the keepalive it advertises.
 pub struct NewRoom {
     pub id: String,
     pub token: String,
-    pub version: proto::Version,
     pub keepalive: Keepalive,
 }
 
-/// A connection's claim on a room: which room, with which token, in which role, and the
-/// wire version it speaks.
+/// A connection's claim on a room: which room and with which token.
 #[derive(Debug, Clone, Copy)]
 pub struct Claim<'a> {
     pub room_id: &'a str,
     pub token: Option<&'a str>,
-    pub role: Role,
-    pub version: proto::Version,
 }
 
 /// Queues one frame on every snapshotted queue, returning the ids whose queue
@@ -371,10 +257,7 @@ pub fn send_all(queues: &[(String, Queue)], out: &Outbound) -> Vec<String> {
 pub enum SeatError {
     Unknown,
     TokenMismatch,
-    HostPresent,
     RoomFull,
-    /// The room is pinned to the other wire version.
-    VersionMismatch,
 }
 
 #[derive(Default)]
@@ -413,36 +296,23 @@ impl Registry {
         let mut room = Room {
             id: new.id.clone(),
             token: new.token,
-            version: new.version,
             keepalive: new.keepalive,
             peers: HashMap::new(),
-            documents: Vec::new(),
-            grant: Vec::new(),
-            open: HashMap::new(),
-            host: None,
             generation: 0,
             arrivals: 0,
         };
-        if new.version == proto::Version::V1 {
-            // `selvage/1`'s host is a value the server keeps; `selvage/2`'s is whoever
-            // holds the host key, and the server records a peer like any other.
-            room.attach_host(&host.info.peer_id);
-        }
         room.seat(host);
         self.rooms.insert(new.id, room);
         Some(id)
     }
 
-    /// Seats a connection in an existing room. The claimed role is honoured only while
-    /// the room is between host connections.
+    /// Seats a connection in an existing room.
     ///
     /// # Errors
     ///
     /// Returns [`SeatError::Unknown`] for a room that does not exist,
-    /// [`SeatError::TokenMismatch`] for a wrong token, [`SeatError::HostPresent`]
-    /// when the host role is taken, and [`SeatError::RoomFull`] when the room seats no
-    /// more peers. A host reclaiming a host-less room always seats: the room's owner
-    /// must be able to come back to a full room.
+    /// [`SeatError::TokenMismatch`] for a wrong token, and [`SeatError::RoomFull`]
+    /// when the room seats no more peers.
     #[expect(
         clippy::too_many_arguments,
         reason = "an admission names its claim, peer and the cap it is checked against"
@@ -457,29 +327,11 @@ impl Registry {
             .rooms
             .get_mut(claim.room_id)
             .ok_or(SeatError::Unknown)?;
-        // The version is judged before the token, as §11 orders the checks on a frame: a
-        // connection speaking the other version is a version fault whatever else it got
-        // wrong, and the room it named is not its room.
-        if room.version != claim.version {
-            return Err(SeatError::VersionMismatch);
-        }
         if Some(room.token.as_str()) != claim.token {
             return Err(SeatError::TokenMismatch);
         }
-        if room.version == proto::Version::V1
-            && claim.role == Role::Host
-            && room.host_present()
-        {
-            return Err(SeatError::HostPresent);
-        }
-        let reclaiming = room.version == proto::Version::V1
-            && claim.role == Role::Host
-            && !room.host_present();
-        if room.peers.len() >= max_peers && !reclaiming {
+        if room.peers.len() >= max_peers {
             return Err(SeatError::RoomFull);
-        }
-        if reclaiming {
-            room.attach_host(&peer.info.peer_id);
         }
         room.seat(peer);
         Ok(())
@@ -496,31 +348,20 @@ impl Registry {
         self.tasks.remove(peer_id)
     }
 
-    /// Detaches a peer. Returns whether it was the host, so the caller can announce
-    /// `host.detached`. `None` when the room is gone or the peer was never in it:
+    /// Detaches a peer. `None` when the room is gone or the peer was never in it:
     /// detaching twice announces once.
     #[must_use]
     pub fn detach(&mut self, room_id: &str, peer_id: &str) -> Option<Detach> {
         let room = self.rooms.get_mut(room_id)?;
-        let was_host = room.host.as_deref() == Some(peer_id);
         room.peers.remove(peer_id)?;
-        room.forget_claims(peer_id);
-        // Every leave a version-2 room sees advances the generation, so the timer armed by
-        // a leave that emptied it cannot outlive a later leave that armed its own: the
-        // stale timer finds a generation that is no longer the room's and reaps nothing.
-        let generation = if was_host {
-            room.detach_host()
-        } else if room.version == proto::Version::V2 {
-            room.bump_generation()
-        } else {
-            room.generation()
-        };
+        // Every leave advances the generation, so the timer armed by a leave that
+        // emptied the room cannot outlive a later leave that armed its own: the stale
+        // timer finds a generation that is no longer the room's and reaps nothing.
+        let generation = room.bump_generation();
         Some(Detach {
-            was_host,
             generation,
-            version: room.version,
-            // `selvage/2`'s room survives its last connection for `room_grace_ms`, so the
-            // caller arms the timer on exactly this: the leave that emptied the room.
+            // A room survives its last connection for `room_grace_ms`, so the caller arms
+            // the timer on exactly this: the leave that emptied the room.
             empty: room.peers.is_empty(),
         })
     }
@@ -545,11 +386,11 @@ impl Registry {
     }
 
     /// Tears a room down if it holds nobody and is still at `generation`, returning the
-    /// peers that were (`selvage/2`'s life, `PROTOCOL.md` §9). The timer arms when the
-    /// room's **last** connection ends, so the predicate is "the room holds nobody", and
-    /// the generation keeps a timer armed by an earlier empty window from reaping a room
-    /// whose grace has only just started. A connection seated in the window makes this
-    /// return nothing, and a later last-leave arms a fresh timer.
+    /// peers that were (`PROTOCOL.md` §9). The timer arms when the room's **last**
+    /// connection ends, so the predicate is "the room holds nobody", and the generation
+    /// keeps a timer armed by an earlier empty window from reaping a room whose grace has
+    /// only just started. A connection seated in the window makes this return nothing,
+    /// and a later last-leave arms a fresh timer.
     #[must_use]
     pub fn reap_if_empty(
         &mut self,
@@ -567,36 +408,10 @@ impl Registry {
             .map(|room| room.peers.into_values().collect())
             .unwrap_or_default()
     }
-
-    /// Tears a room down if it is still host-less at `generation`, returning the
-    /// peers that were in it so the caller can tell them.
-    #[must_use]
-    pub fn reap_if_host_absent(
-        &mut self,
-        room_id: &str,
-        generation: u64,
-    ) -> Vec<Peer> {
-        let Some(room) = self.rooms.get(room_id) else {
-            return Vec::new();
-        };
-        if room.generation() != generation || room.host_present() {
-            return Vec::new();
-        }
-        self.rooms
-            .remove(room_id)
-            .map(|room| room.peers.into_values().collect())
-            .unwrap_or_default()
-    }
 }
 
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "whether it was the host and whether the room is now empty are two different questions"
-)]
 pub struct Detach {
-    pub was_host: bool,
     pub generation: u64,
-    pub version: proto::Version,
     pub empty: bool,
 }
 
@@ -613,25 +428,27 @@ pub fn peer_channel(
 mod tests {
     use super::*;
 
+    fn peer(peer_id: &str, display_name: &str) -> PeerInfo {
+        PeerInfo {
+            peer_id: peer_id.to_string(),
+            display_name: display_name.to_string(),
+            awareness_client_id: None,
+        }
+    }
+
     /// The queue bound is exact: a full queue's worth of frames fits, and the next
     /// send past it reports the peer slow instead of queueing without bound.
     #[test]
     fn a_full_queue_reports_the_peer_slow() {
         let mut registry = Registry::default();
-        let info = PeerInfo {
-            peer_id: "p-slow".to_string(),
-            display_name: "Slow".to_string(),
-            role: Role::Guest,
-            awareness_client_id: None,
-        };
-        let (peer, _leftovers) = peer_channel(info, MAX_QUEUE_BYTES);
+        let (peer, _leftovers) =
+            peer_channel(peer("p-slow", "Slow"), MAX_QUEUE_BYTES);
         assert_eq!(
             registry
                 .create(
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
-                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     peer,
@@ -656,20 +473,14 @@ mod tests {
     #[test]
     fn queued_bytes_past_the_cap_report_the_peer_slow() {
         let mut registry = Registry::default();
-        let info = PeerInfo {
-            peer_id: "p-slow".to_string(),
-            display_name: "Slow".to_string(),
-            role: Role::Guest,
-            awareness_client_id: None,
-        };
-        let (peer, _leftovers) = peer_channel(info, MAX_QUEUE_BYTES);
+        let (peer, _leftovers) =
+            peer_channel(peer("p-slow", "Slow"), MAX_QUEUE_BYTES);
         assert_eq!(
             registry
                 .create(
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
-                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     peer,
@@ -703,20 +514,14 @@ mod tests {
     #[test]
     fn a_snapshot_outlives_the_seat_it_was_taken_from() {
         let mut registry = Registry::default();
-        let info = PeerInfo {
-            peer_id: "p-ada".to_string(),
-            display_name: "Ada".to_string(),
-            role: Role::Host,
-            awareness_client_id: None,
-        };
-        let (peer, mut leftovers) = peer_channel(info, MAX_QUEUE_BYTES);
+        let (peer, mut leftovers) =
+            peer_channel(peer("p-ada", "Ada"), MAX_QUEUE_BYTES);
         assert_eq!(
             registry
                 .create(
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
-                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     peer,
@@ -745,22 +550,14 @@ mod tests {
     #[test]
     fn a_colliding_room_id_is_regenerated() {
         let mut registry = Registry::default();
-        let (host, _leftovers) = peer_channel(
-            PeerInfo {
-                peer_id: "p-ada".to_string(),
-                display_name: "Ada".to_string(),
-                role: Role::Host,
-                awareness_client_id: None,
-            },
-            MAX_QUEUE_BYTES,
-        );
+        let (host, _leftovers) =
+            peer_channel(peer("p-ada", "Ada"), MAX_QUEUE_BYTES);
         assert_eq!(
             registry
                 .create(
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
-                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     host,
@@ -769,21 +566,13 @@ mod tests {
                 .as_deref(),
             Some("r-1")
         );
-        let (guest, _leftovers) = peer_channel(
-            PeerInfo {
-                peer_id: "p-bob".to_string(),
-                display_name: "Bob".to_string(),
-                role: Role::Guest,
-                awareness_client_id: None,
-            },
-            MAX_QUEUE_BYTES,
-        );
+        let (guest, _leftovers) =
+            peer_channel(peer("p-bob", "Bob"), MAX_QUEUE_BYTES);
         let minted = registry
             .create(
                 NewRoom {
                     id: "r-1".to_string(),
                     token: "t".to_string(),
-                    version: proto::Version::V1,
                     keepalive: Keepalive::default(),
                 },
                 guest,
@@ -800,20 +589,14 @@ mod tests {
     #[test]
     fn detaching_an_absent_peer_is_silent() {
         let mut registry = Registry::default();
-        let info = PeerInfo {
-            peer_id: "p-ada".to_string(),
-            display_name: "Ada".to_string(),
-            role: Role::Host,
-            awareness_client_id: None,
-        };
-        let (peer, _leftovers) = peer_channel(info, MAX_QUEUE_BYTES);
+        let (peer, _leftovers) =
+            peer_channel(peer("p-ada", "Ada"), MAX_QUEUE_BYTES);
         assert_eq!(
             registry
                 .create(
                     NewRoom {
                         id: "r-1".to_string(),
                         token: "t".to_string(),
-                        version: proto::Version::V1,
                         keepalive: Keepalive::default(),
                     },
                     peer,
