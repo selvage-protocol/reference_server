@@ -1,0 +1,26 @@
+# The one root command the CI user on the Pi may run, and nothing else.
+#
+# The same line as `packaging/prod/deployci.sudoers`, on the other box, for the
+# same reason: Tailscale SSH cannot restrict a command — the tailnet policy's
+# `ssh` rules carry `action`, `src`, `dst`, `users`, `checkPeriod`, `acceptEnv`
+# and `srcPosture`, and there is no `cmd` field — so an SSH grant is a shell
+# grant, and `pi` on the Pi has passwordless sudo. Granting CI `root` or `pi`
+# would mean "GitHub can be root on the Pi", so this is a user of its own whose
+# only privilege is this line.
+#
+# There is deliberately **no argument wildcard**, and the trailing `""` is what
+# says so: `/usr/local/sbin/selvage-pi-deploy ""` permits that one program and no
+# argument at all, whereas the same line without the `""` would permit *any*
+# argument, because an empty argument list in sudoers means "any" rather than
+# "none". That distinction is the whole bound, and it is why the deploy request
+# arrives on stdin.
+#
+# The script is root-owned mode 0755 under `/usr/local/sbin` (root:root 0755), so
+# the user it is granted to cannot change what it does.
+#
+# Installs to `/etc/sudoers.d/selvage-deploy-pi`, root:root, mode 0440, and is
+# read with `visudo -c -f` before it is put there. **Neither half of this is
+# installed on the Pi today** — there is no `deployci` user on that box and no
+# line in `/etc/sudoers.d` — which is part of why the deploy workflow cannot
+# reach it; `README.md` beside this file owns that gap.
+deployci ALL=(root) NOPASSWD: /usr/local/sbin/selvage-pi-deploy ""

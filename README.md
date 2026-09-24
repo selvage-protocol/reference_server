@@ -10,10 +10,10 @@ two-client harness that gates it in CI.
 its surface. The shortest route to a running server is the published image:
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.2.1
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.4.0
 ```
 
-The GHCR package is public, so a pull needs no account and no `docker login`. `0.2.1` is
+The GHCR package is public, so a pull needs no account and no `docker login`. `0.4.0` is
 the current release; `0.1.2` was the first built separately for each architecture, and
 `0.1.0` and `0.1.1` carry the amd64 binary in their `linux/arm64` leg.
 `packaging/README.md` owns the full tag list and what each tag contains.
@@ -61,7 +61,12 @@ membership, or mode bits. Inaccessible files return `404`. With no page director
 server still answers `/meta` and `/session`, and `/` is `404`.
 
 `packaging/README.md` is the rest of it: tags and version truthfulness, the multi-arch
-build, the FSL-1.1-MIT redistribution question, the systemd user unit, and the Pi demo.
+build, the FSL-1.1-MIT redistribution question, the systemd user unit, and the two
+running deployments. The public demo and the Pi are each a tracked shape with a deploy
+script that box's CI user may run as root — `packaging/prod/` and `packaging/pi/` —
+dispatched by `.github/workflows/deploy-prod.yml` and
+`.github/workflows/deploy-pi.yml`. Moving every artefact of a release together is the
+release runbook's job: `ai_notes/docs/runbook-release.md`.
 
 ### Nix
 
@@ -325,16 +330,20 @@ fragment. `crates/harness/tests/relay_selvaged.rs` is that pair against a real `
 
 Two suites hold that layer. `crates/harness/tests/peer_vectors.rs` replays the corpus's
 nineteen **frame** vectors against the sealed layer, and `crates/harness/tests/decisions.rs`
-drives its six **decision** vectors against the client through `selvage-subject`, the binary
+drives its eight **decision** vectors against the client through `selvage-subject`, the binary
 that speaks the corpus's subject protocol
-(`cargo run -p selvage-harness --bin selvage-subject`). The specification's own runner can
+(`cargo run -p selvage-harness --bin selvage-subject`). Six of the eight are about what a client
+did with a frame it was handed; the other two are about the decisions a link carries before any
+frame at all — §5.1's half-copied fragment and §2/§10's version-1-only server — which the
+subject answers as a refusal in its own words, decided by the client library's own rules rather
+than by a copy of them. The specification's own runner can
 drive the same binary:
 
 ```
 python3 runner/run_peer.py --subject <checkout>/reference_server/target/debug/selvage-subject
 ```
 
-All six decision vectors pass, and each goes red under the guard it declares it catches: the
+All eight decision vectors pass, and each goes red under the guard it declares it catches: the
 same suite removes the one guard a vector names and shows the vector fail, so a rule vector
 cannot pass by asserting nothing.
 

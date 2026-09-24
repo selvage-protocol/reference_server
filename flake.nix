@@ -264,6 +264,20 @@
               touch $out
             '';
 
+          # The same guard for `packaging/pi/deploy.py`, the Pi's copy of the
+          # request grammar that is the only lever a CI credential has on that
+          # box. The properties are asserted once, in `packaging/prod/test_deploy.py`,
+          # and the Pi's own test file runs that suite against this box's module;
+          # so this check needs both directories, not just the one it runs in.
+          pi-deploy =
+            pkgs.runCommand "pi-deploy-test" {
+              nativeBuildInputs = [pkgs.python3];
+            } ''
+              cd ${./packaging}/pi
+              python3 -B test_deploy.py
+              touch $out
+            '';
+
           # The public demo's front, under its real configuration and a real nginx:
           # whether a source is refused at all, and whether one metered endpoint can
           # spend another's budget. Both are questions about a running proxy, and the

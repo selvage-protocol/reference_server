@@ -1,11 +1,15 @@
-# The Pi demo's shape
+# The Pi demo's native shape
 
-The exact files that run the live demo on `lumi-raspberrypi`, tracked here so a
-deployment artefact has a reviewable home instead of existing only on the
-machine. This is **the Pi demo's shape, not the container path**: the image in
-`packaging/` runs one process on one port and needs no front, because a
-container's port mapping is the boundary. Here the boundary is the tailnet and
-the front is a TLS terminator outside the server.
+The exact files the native deployment on `lumi-raspberrypi` ran, tracked here so
+a deployment artefact has a reviewable home instead of existing only on the
+machine. **The Pi runs containers now** — `pi/` beside this directory owns that
+shape — and these files are stopped on the box and kept as the rollback recipe.
+
+The native shape is not the container path, which is the whole reason it looked
+the way it did: a container's port mapping is its boundary, so the image in
+`packaging/` binds `0.0.0.0:8080` and needs no front, while the Pi's boundary is
+the tailnet and `selvaged` speaks no TLS, so a terminator sat outside the server
+and one user unit served the page, `/meta` and `/session` on that one origin.
 
 The live state — the URL, the units, the boundaries, the upgrade procedure — is
 `ai_notes/docs/runbook-pi-demo.md` (the project's private notes, not a path a
@@ -67,13 +71,16 @@ Two consequences worth keeping:
   `reference_server` `main` (aarch64, the machine's own toolchain, `--locked`,
   `CARGO_BUILD_JOBS=2`). Nothing is installed system-wide and there is no
   cross-compile.
-- **No Docker.** The image and compose file beside this directory are for
-  other people's machines.
+- **No Docker.** This shape ran the binary as a `pi` user unit. The container
+  shape that replaced it is `pi/` beside this directory, and the image and
+  compose file in `packaging/` are the self-hoster's path, which is neither.
 
 ## Deploy and upgrade
 
-The runbook's upgrade procedure is the one to follow; the short form, from a
-checkout of `reference_server` at the new commit:
+These are this shape's own steps, kept because it is the container shape's
+rollback rather than because anything runs them. The runbook's upgrade procedure
+is the one to follow; the short form, from a checkout of `reference_server` at the
+new commit:
 
 ```sh
 git archive <sha> | ssh pi@lumi-raspberrypi 'tar -x -C ~/selvage-demo/source'

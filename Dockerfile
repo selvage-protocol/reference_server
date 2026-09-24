@@ -30,10 +30,12 @@ ARG RUNTIME=scratch
 ARG VERSION=dev
 ARG REVISION=unknown
 # The browser client revision the baked page is built from: a commit on
-# `selvage-protocol/web_client` main, as a full SHA (a shallow fetch by
-# revision demands one). The page is updated by editing this line alone, and
-# the image names the revision it carries in `com.selvage.page.revision`.
-ARG WEB_CLIENT_SHA=a861d36cdc1ec7e603ad0eb5ffd25ac95199d43e
+# `selvage-protocol/web_client`, as a full SHA (a shallow fetch by revision
+# demands one). It names the commit that repository's newest release tag names —
+# a revision of another repository, so it moves when that one releases, and a
+# wave that cuts the two together repins it before this image is cut. The image
+# records the revision it carries in `com.selvage.page.revision`.
+ARG WEB_CLIENT_SHA=197fe3edae8f482bf59da3e31441775fac0471d4
 
 # One cross-toolchain image per target, always run natively on the build host:
 # each stage cross-compiles its target triple, so building arm64 needs no

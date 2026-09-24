@@ -1,14 +1,15 @@
 # Packaging and deployment
 
-Four shapes, for four audiences:
+Five shapes, for five audiences:
 
 | Path | Who it is for | What it is |
 |---|---|---|
-| `pi-demo/` | The live Pi demo, exactly as it runs | The TLS front and the user units that are deployed — tracked here so a deployment artefact is reviewable |
-| `prod/` | The live public demo, exactly as it runs | The TLS front, the router and the three-service compose file for one public origin — the Pi's pattern with a page container of its own — plus the deploy script that box's CI user may run as root |
+| `pi/` | The live Pi demo, exactly as it runs | The two-service compose file for the tailnet, the environment file that names both images by digest, and the deploy script that box's CI user may run as root |
+| `pi-demo/` | The Pi's native shape, retired 2026-09-21 | The TLS front and the user units it ran — tracked here so a deployment artefact is reviewable, and left on the machine as the rollback recipe |
+| `prod/` | The live public demo, exactly as it runs | The TLS front, the router and the three-service compose file for one public origin — the Pi's container pattern plus a front that terminates TLS and routes — plus the deploy script that box's CI user may run as root |
 | `systemd/` | A self-hoster on their own machine | A user unit plus install docs — the proven path, generalized, with no front |
 | `Dockerfile` + `compose.yaml` | Strangers self-hosting on their own machines | A multi-arch image and a one-service compose file — never the Pi |
-The server is memory-only under all four: restarts end all rooms, and
+The server is memory-only under all five: restarts end all rooms, and
 there is nothing to persist — hence no data volume anywhere here. The image
 carries its page; the mounts are the optional read-only page override, which the
 server only ever reads, and the public demo's origin certificate, which is what
@@ -52,20 +53,24 @@ What the acceptance stands on, all of it in the artefacts themselves:
   commercial product or service that substitutes for it is the Competing Use
   the licence still forbids.
 
-## The Pi demo's shape (`pi-demo/`)
+## The Pi demo's shapes (`pi/`, `pi-demo/`)
 
-`pi-demo/` is the demo that is live right now, tracked file for file: the
-`selvaged` user unit (`--serve-page`, so the page, `/meta` and `/session`
-share one origin), the stdlib TLS front in front of it, the front's unit, and
-the front's environment documented. It is a deployment record as much as a
-recipe — `reference_server/packaging/pi-demo/README.md` says what each file
-installs to, how the three hashes are compared, and how to roll back, and
-`ai_notes/docs/runbook-pi-demo.md` owns the live state.
+`pi/` is what the Pi runs now, tracked file for file: the two-service compose
+file for the tailnet (the page on 80, the server on 8080), the environment file
+that names both images by digest, the deploy script `deployci` may run as root,
+and the pin that bounds the host's image updater. `pi-demo/` beside it is the
+native shape this replaced — the `selvaged` user unit, the stdlib TLS front in
+front of it, the front's unit and the front's environment documented — stopped on
+2026-09-21 and left in place as the rollback recipe. Both are deployment records
+as much as recipes: each `README.md` says what every file installs to and how to
+roll back, and `ai_notes/docs/runbook-pi-demo.md` owns the live state.
 
-**This is not the container path.** The container's port mapping is its
-boundary, so it binds `0.0.0.0:8080` and needs no front; the Pi's boundary is
-the tailnet, and it binds the tailnet address with a TLS terminator in front
-of it because `selvaged` speaks no TLS. Nor is it the `systemd/` unit above,
+**The native shape is not the container path.** The container's port mapping is
+its boundary, so it binds `0.0.0.0:8080` and needs no front; the Pi's boundary is
+the tailnet, so the native shape bound the tailnet address with a TLS terminator
+in front of it because `selvaged` speaks no TLS. What runs there now needs no
+terminator: the two images publish the tailnet address themselves, and one of
+them is the page, so nothing routes. Nor is `pi-demo/` the `systemd/` unit above,
 which is the same binary with no front — a self-hoster supplies TLS with
 `tailscale serve`, caddy or their own edge.
 
@@ -252,7 +257,7 @@ are the same build is already on GHCR when the job goes red, which is how `0.1.0
 A stranger pulls it with no account:
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.2.1
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.4.0
 ```
 
 and `compose.yaml`'s `build: .` remains the route for an image built from a checkout.
@@ -277,22 +282,28 @@ or not that tag is pullable yet.
 `selvaged --serve-page DIR` serves the browser page on the same origin as
 `/session` and `/meta` (see the root README). The image bakes the page at
 `/page` and its default command passes `--serve-page /page`, so one container
-and one port answer the page, the meta document and the socket. The Pi demo
-does the same thing behind a TLS front (`pi-demo/`), so neither shape needs a
-CORS proxy or a second page server.
+and one port answer the page, the meta document and the socket, and a
+self-hoster needs no CORS proxy and no second page server. The Pi's native shape
+did the same thing behind its TLS front (`pi-demo/`). Neither deployed shape does
+it: `prod/` and `pi/` each run the page as its own container and turn the baked
+page off, which is why both name a page image beside the server image.
 
 **The page is built into the image.** The `web_client` bundle is not vendored
 here: the `Dockerfile`'s `page` stage clones that repository at the revision in
 the `WEB_CLIENT_SHA` build argument, runs `npm ci && npm run build` on a Debian
 trixie node image (the client's icon renderer shells out to ImageMagick 7's
 `magick`), and copies the resulting `dist/` to `/page`. The pin is
-`a861d36cdc1ec7e603ad0eb5ffd25ac95199d43e`, `web_client`'s `main` head when this
-was written (2026-09-19), and updating it is editing that one argument; the
+`197fe3edae8f482bf59da3e31441775fac0471d4`, the commit `web_client`'s newest
+release tag `v0.3.1` names, and updating it is editing that one argument; the
 image records the revision it carries in `com.selvage.page.revision`. The page
 is built from that revision's source rather than copied from the `dist/`
-committed there, and at this pin the two are byte-identical — a clone built with
-`npm ci && npm run build` leaves `git status` clean — so the image carries the
-reviewed bytes and the page cannot fall behind its source.
+committed there; `web_client`'s own `checks` job rebuilds that `dist/` on every
+pull request and compares the two with `scripts/check-dist.sh`, which is why the
+bytes are the reviewed ones and why the page cannot fall behind its source. The
+pin is a revision of another repository, so it moves when *that* repository
+releases: a wave that cuts `web_client` and this repository together repins it to
+the released commit before this image is cut, because the page inside the image
+is only as new as the revision named here.
 
 Overriding the baked page is a mount over `/page` (`-v …/dist:/page:ro`), and it
 needs no command override: the image's own command already names that directory.

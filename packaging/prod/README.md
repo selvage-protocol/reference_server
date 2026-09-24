@@ -1,15 +1,16 @@
 # The public demo's shape
 
 The exact files that run `selvage-demo.dontblameme.dev`, tracked here so the
-deployment's shape is a reviewable artefact in a repository. `pi-demo/` beside
-this directory is the same idea for the Pi.
+deployment's shape is a reviewable artefact in a repository. `pi/` beside this
+directory is the same idea for the Pi, and `pi-demo/` is the native shape that
+one replaced.
 
-The two shapes differ in where the front is. The Pi is tailnet-only, so its
-front is a TLS terminator and nothing else: `selvaged` serves the page itself
-with `--serve-page`, and the front relays every path to it. Here the origin is
-public and the owner's decision of 2026-09-21 was a page container of its own, so
-this front terminates TLS *and* routes, and `selvaged` serves `/session` and
-`/meta` alone.
+The two shapes differ in where the front is, and the Pi's is where it is not.
+Neither runs a front now: the Pi is tailnet-only and publishes each container's own
+port, so nothing routes and nothing terminates anything. Here the origin is public
+and the owner's decision of 2026-09-21 was a page container of its own, so this
+front terminates TLS *and* routes, and `selvaged` serves `/session` and `/meta`
+alone.
 
 The live state — the host, the images running, the network security group, the
 upgrade procedure — is `ai_notes/docs/runbook-prod-demo.md` (the project's own
@@ -408,7 +409,7 @@ git archive <sha> packaging/prod | ssh selvage@selvage-protocol-prod 'sudo tar -
 and this is the public origin.
 
 ```sh
-scripts/image-digest.py ghcr.io/selvage-protocol/selvaged:0.2.0
+scripts/image-digest.py ghcr.io/selvage-protocol/selvaged:0.2.1
 ```
 
 That is the same anonymous pull flow `assert-multiarch-layers.py` uses
@@ -416,7 +417,7 @@ That is the same anonymous pull flow `assert-multiarch-layers.py` uses
 one line of it a deploy needs is:
 
 ```sh
-repo=selvage-protocol/selvaged; tag=0.2.0
+repo=selvage-protocol/selvaged; tag=0.2.1
 tok=$(curl -s "https://ghcr.io/token?scope=repository:$repo:pull&service=ghcr.io" \
       | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
 curl -sI -H "Authorization: Bearer $tok" \
@@ -495,8 +496,8 @@ cannot fail it).
 
 ```sh
 gh workflow run deploy-prod.yml --ref main -f server_version=0.2.1
-gh workflow run deploy-prod.yml --ref main -f web_version=0.1.1
-gh workflow run deploy-prod.yml --ref main -f server_version=0.3.0 -f web_version=0.2.0
+gh workflow run deploy-prod.yml --ref main -f web_version=0.3.1
+gh workflow run deploy-prod.yml --ref main -f server_version=0.2.1 -f web_version=0.3.1
 ```
 
 An input it is not given means **leave that service exactly as it is**, so a page

@@ -1,13 +1,24 @@
 //! The peer corpus's decision layer, replayed against this client's `selvage/2` session.
 //!
-//! `specification/vectors/peer/151…156.json` are the six vectors that are about what a client
-//! *did* with a frame it received — what it applied, what it dropped and why, what it
-//! published, whether it ended — and none of that is on a socket. The specification drives
-//! them through `specification/runner/subject.py` and `runner/run_peer.py --subject`; this
-//! drives the same files through the same subject binary, `selvage-subject`
-//! (`crates/harness/src/bin/selvage-subject.rs`), so the decision half of the corpus is
-//! evidence in this repository's own suite and not only wherever the specification's runner is
-//! pointed by hand.
+//! `specification/vectors/peer/151…158.json` are the eight vectors that are about what a client
+//! decided. Six of them (`151…156`) are about what it *did* with a frame it received — what it
+//! applied, what it dropped and why, what it published, whether it ended — and none of that is on
+//! a socket. The other two (`157`, `158`) are about the two decisions a link carries **before a
+//! socket**: `PROTOCOL.md` §5.1's half-copied fragment and §2/§10's version-1-only server. A
+//! client that holds either rule refuses the link locally, in its own words, so the step that
+//! asserts one is `expectRefusal` and the words are the subject's own.
+//!
+//! The specification drives them through `specification/runner/subject.py` and
+//! `runner/run_peer.py --subject`; this drives the same files through the same subject binary,
+//! `selvage-subject` (`crates/harness/src/bin/selvage-subject.rs`), so the decision half of the
+//! corpus is evidence in this repository's own suite and not only wherever the specification's
+//! runner is pointed by hand.
+//!
+//! A `start` hands the subject the link and, because this layer opens no socket, the two things
+//! §2 and §10 read before one: what `GET /meta` answered (`meta`) and the version this client's
+//! own setting pins it to (`pin`). A guard that sits on the **link** is removed *before* the
+//! `join` that reads its link, which is where a client reads it; every other guard is removed
+//! after the join, once there is a session to hold it.
 //!
 //! The runner in Python seals each recipe and hands the bytes over; so does this, with
 //! `sealed::seal`, and both check the bytes against the `hex` the vector carries for the
@@ -202,6 +213,14 @@ fn decision_vector(path: &Path) -> Result<Option<Value>, String> {
 
 // --- the subject, as a child process --------------------------------------------
 
+/// The guards of `PROTOCOL.md` §13.11's table that a caller has to remove **before** the `join`
+/// that reads its link, under the names `specification/runner/subject.py` gives them
+/// (`LINK_MUTATIONS`): §5.1's fragment and §2/§10's version rule are decided about the link
+/// itself, so a subject asked for one after it was seated could not have refused the link
+/// anyway. Every other name is a session's guard and is removed once there is a session.
+const LINK_MUTATIONS: [&str; 2] =
+    ["accept-partial-fragment", "fall-back-to-version-1"];
+
 /// The subject binary, driven over the line protocol `specification/runner/subject.py` fixes.
 struct Subject {
     child: Child,
@@ -240,7 +259,7 @@ impl Subject {
 
     /// One command and one reply, bounded: `PROTOCOL.md` §13's decisions are what the reply
     /// carries, and a subject that stops answering fails the vector rather than the run.
-    fn request(&mut self, command: &Value) -> Result<Value, String> {
+    fn exchange(&mut self, command: &Value) -> Result<Value, String> {
         let line = format!("{command}\n");
         self.stdin
             .write_all(line.as_bytes())
@@ -253,9 +272,15 @@ impl Subject {
             Err(RecvTimeoutError::Timeout) => return Err(silent(command)),
             Err(RecvTimeoutError::Disconnected) => return Err(self.closed()),
         };
-        let reply: Value = serde_json::from_str(&answer).map_err(|error| {
+        serde_json::from_str(&answer).map_err(|error| {
             format!("the subject answered something that is not JSON: {error}")
-        })?;
+        })
+    }
+
+    /// One command and one accepted reply: a refusal is a failure here, and a caller that has to
+    /// read one asks with `exchange`.
+    fn request(&mut self, command: &Value) -> Result<Value, String> {
+        let reply = self.exchange(command)?;
         if reply.get("ok") != Some(&Value::Bool(true)) {
             return Err(format!(
                 "the subject refused `{}`: {}",
@@ -558,9 +583,11 @@ fn roster_of(vector: &Value) -> Vec<String> {
     seats
 }
 
-/// What one `join` carries: the invite, the session's clock, the roster, and the session
-/// keypair the vector names. The fixture key is the one seam of this layer and it is a test
-/// seam: `PROTOCOL.md` §13.1 mints a keypair per connection and nothing on a wire fixes one.
+/// What one `join` carries: the invite, the session's clock, the roster, the session
+/// keypair the vector names, and the two members §2 and §10 read before a socket — what
+/// `GET /meta` answered, and any version this client's own setting pins it to. The fixture key is
+/// the one seam of this layer and it is a test seam: `PROTOCOL.md` §13.1 mints a keypair per
+/// connection and nothing on a wire fixes one.
 fn join_command(
     fixture: &Fixture,
     vector: &Value,
@@ -578,7 +605,7 @@ fn join_command(
     let keepalive = scenario.get("keepalive").ok_or_else(|| {
         "`scenario.keepalive` is the session's clock".to_string()
     })?;
-    Ok(json!({
+    let mut command = json!({
         "cmd": "join",
         "invite": invite_of(fixture, step)?,
         "offline": true,
@@ -586,7 +613,126 @@ fn join_command(
         "seat": "p-subject",
         "roster": roster_of(vector),
         "session_key": seed,
-    }))
+    });
+    // `meta` and `pin` are sent only when the vector carries them, which is what the runner does:
+    // a member present with a null value would be a third state this layer does not define.
+    let object = command
+        .as_object_mut()
+        .ok_or_else(|| "a join command is an object".to_string())?;
+    for member in ["meta", "pin"] {
+        if let Some(value) = step.get(member) {
+            let _ = object.insert(member.to_string(), value.clone());
+        }
+    }
+    Ok(command)
+}
+
+/// What one `start` left: the subject process, the client's own words for a link it refused, and
+/// whether it is seated.
+struct Started {
+    subject: Subject,
+    refusal: Option<String>,
+    seated: bool,
+}
+
+/// One `start`: a subject process handed the link, and what it did with it.
+///
+/// The answer is the pair the runner keeps: the client's own words for a link it will not join
+/// with and `seated: false`, or none and a seated subject. A guard that sits on the **link** is
+/// removed before the `join` that reads its link, which is where a client reads it; one that sits
+/// in a session is removed once there is a session to hold it, which is why the two removals are
+/// on either side of the answer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the vector, its fixture, one step of it and the guard this run removed"
+)]
+fn start(
+    vector: &Value,
+    fixture: &Fixture,
+    step: &Value,
+    mutation: Option<&str>,
+) -> Result<Started, String> {
+    let mut subject = Subject::start()?;
+    let on_the_link =
+        mutation.is_some_and(|name| LINK_MUTATIONS.contains(&name));
+    if let Some(removed) = mutation.filter(|_| on_the_link) {
+        subject.request(&json!({"cmd": "mutate", "name": removed}))?;
+    }
+    let answer = subject.exchange(&join_command(fixture, vector, step)?)?;
+    if answer.get("ok") != Some(&Value::Bool(true)) {
+        // A link this client refuses is a decision and not a failure: §5.1's fragment and
+        // §2/§10's version rule are answered before a socket is opened, in the client's own
+        // words, and `expectRefusal` asserts what they carry.
+        let words = answer.get("error");
+        let refusal = Some(words.and_then(Value::as_str).map_or_else(
+            || words.unwrap_or(&Value::Null).to_string(),
+            str::to_string,
+        ));
+        return Ok(Started {
+            subject,
+            refusal,
+            seated: false,
+        });
+    }
+    if let Some(removed) = mutation.filter(|_| !on_the_link) {
+        subject.request(&json!({"cmd": "mutate", "name": removed}))?;
+    }
+    Ok(Started {
+        subject,
+        refusal: None,
+        seated: true,
+    })
+}
+
+/// One `expectRefusal`: the subject refused the link, and its own words name what the vector says
+/// they must.
+///
+/// `PROTOCOL.md` §2 and §5.1 leave the sentence to the client — "the sentence is the client's" —
+/// so what a vector can hold an implementation to is the **naming**: every string `names` lists is
+/// in the refusal. A subject that joined the link instead has answered the one question the step
+/// asks, and its report is printed so a reader sees what it did instead.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one step's expectation, the subject it is about and the state `start` left"
+)]
+fn expect_refusal(
+    where_: &str,
+    step: &Value,
+    subject: Option<&mut Subject>,
+    refusal: Option<&str>,
+    seated: bool,
+) -> Result<(), String> {
+    let names = step
+        .get("names")
+        .and_then(Value::as_array)
+        .filter(|names| !names.is_empty())
+        .ok_or_else(|| {
+            format!("{where_}: `names` is the list of strings the refusal must carry")
+        })?;
+    if seated {
+        let running = subject
+            .ok_or_else(|| format!("{where_}: no subject is running"))?;
+        let report = running.report(&json!({"cmd": "report"}))?;
+        return Err(format!(
+            "{where_}: the subject joined the link instead of refusing it, and reports \
+             {report} — a client that would speak the wire's version refuses this link locally, \
+             before a socket"
+        ));
+    }
+    let words = refusal.ok_or_else(|| {
+        format!("{where_}: the subject has not been handed a link to refuse")
+    })?;
+    let absent: Vec<&str> = names
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|name| !words.contains(name))
+        .collect();
+    if !absent.is_empty() {
+        return Err(format!(
+            "{where_}: the refusal must name {absent:?} and it says {words:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// One decision vector, driven step by step, with a mutation removed if one is named.
@@ -610,19 +756,21 @@ fn replay(
         .cloned()
         .ok_or_else(|| format!("{name} has no steps"))?;
     let mut subject: Option<Subject> = None;
+    // The link the last `start` was refused with, in the client's own words, and whether the
+    // subject is seated. A refusal seats nobody, so the subject is free for the next `start`,
+    // which is what lets one vector hold a refusal and its control leg.
+    let mut refusal: Option<String> = None;
+    let mut seated = false;
     let mut assertions: usize = 0;
     for (index, step) in steps.iter().enumerate() {
         let op = step.get("op").and_then(Value::as_str).unwrap_or("?");
         let where_ = format!("{name} step {index} (`{op}`)");
         match op {
             "start" => {
-                let mut started = Subject::start()?;
-                started.request(&join_command(fixture, vector, step)?)?;
-                if let Some(removed) = mutation {
-                    started
-                        .request(&json!({"cmd": "mutate", "name": removed}))?;
-                }
-                subject = Some(started);
+                let started = start(vector, fixture, step, mutation)?;
+                refusal = started.refusal;
+                seated = started.seated;
+                subject = Some(started.subject);
             }
             "deliver" => {
                 let raw = delivered(&where_, fixture, step)?;
@@ -656,6 +804,16 @@ fn replay(
                 if step.get("frozen").is_some() {
                     freeze(running, &where_, step, &report, deadline)?;
                 }
+            }
+            "expectRefusal" => {
+                assertions = assertions.saturating_add(1);
+                expect_refusal(
+                    &where_,
+                    step,
+                    subject.as_mut(),
+                    refusal.as_deref(),
+                    seated,
+                )?;
             }
             "stop" => {
                 if let Some(mut running) = subject.take() {
@@ -747,8 +905,9 @@ fn recipe_plaintext(where_: &str, recipe: &Value) -> Result<Vec<u8>, String> {
 
 // --- the vectors ----------------------------------------------------------------
 
-/// The six decision vectors a conforming client passes.
-const PASSABLE: [&str; 6] = ["151", "152", "153", "154", "155", "156"];
+/// The eight decision vectors a conforming client passes.
+const PASSABLE: [&str; 8] =
+    ["151", "152", "153", "154", "155", "156", "157", "158"];
 
 fn fixture() -> Result<Fixture, String> {
     Fixture::load(&vectors_root().join("fixture").join("keys.json"))
@@ -808,8 +967,12 @@ fn the_decision_vectors_go_red_under_the_guard_they_declare() {
             .unwrap_or_else(|| {
                 panic!("vector {id} is green under `{catches}`")
             });
+        // A link rule cannot red a report step: §5.1's fragment and §2/§10's version rule are
+        // decided before a socket, so the expectation they fail is `expectRefusal`. Both are
+        // assertion steps of this layer, and a red in either is a caught guard.
         assert!(
-            red.contains("(`expectSubject`)"),
+            red.contains("(`expectSubject`)")
+                || red.contains("(`expectRefusal`)"),
             "vector {id} failed under `{catches}` before any expectation: {red}"
         );
     }

@@ -1,6 +1,7 @@
 # Self-host for someone evaluating selvage on their own machine. The other
-# deployment shapes are in packaging/README.md; the Pi demo has its own units
-# under packaging/pi-demo/.
+# deployment shapes are in packaging/README.md; the Pi's two are under
+# packaging/pi/ (what runs there now) and packaging/pi-demo/ (the native shape it
+# replaced).
 #
 # No volumes: the image carries the browser page it serves, and the server is
 # memory-only, so there is nothing to persist and nothing to mount. The `./page`
@@ -11,7 +12,7 @@
 services:
   selvaged:
     build: .
-    image: ghcr.io/selvage-protocol/selvaged:0.2.1
+    image: ghcr.io/selvage-protocol/selvaged:0.4.0
     ports:
       # Loopback by default: a stranger evaluating locally reaches it, and
       # nothing else does. To serve other machines, rebind deliberately, e.g.

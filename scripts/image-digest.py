@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Turn a release version into the digest-pinned reference the deployment records.
 
-    scripts/image-digest.py ghcr.io/selvage-protocol/selvaged:0.2.0
-    sha256:98022660aeb788d27658c54ba0bfce736bc36785b79d0bdc1a4ee15b8a41cc3c
+    scripts/image-digest.py ghcr.io/selvage-protocol/selvaged:0.2.1
+    sha256:87e13601f5b491fd9a4957237d037893cb78d7feeffd394682e370b3c32a35fe
 
 The deploy workflow resolves each version this way before it touches the box, and
 writes `ghcr.io/selvage-protocol/<repo>@<digest>` into `/etc/selvage/.env`. A
