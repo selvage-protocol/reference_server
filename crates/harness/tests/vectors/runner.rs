@@ -1239,7 +1239,7 @@ mod tests {
         }));
         let actual = canonical(&serde_json::json!({
             "event": "room.joined",
-            "params": {"capabilities": ["awareness", "host-reclaim"], "room_id": "r-1"},
+            "params": {"capabilities": ["awareness", "x.editor-state"], "room_id": "r-1"},
             "v": "selvage/2",
         }));
         assert!(
