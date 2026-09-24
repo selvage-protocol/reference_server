@@ -99,13 +99,14 @@ pub struct RelaySessionInfo {
     pub base_url: String,
 }
 
-/// Why a `selvage/2` session is over. §13.10's three are [`Ending`]'s own; `room-gone` is the
+/// Why a `selvage/2` session is over. §13.10's four are [`Ending`]'s own; `room-gone` is the
 /// relay's, which no peer can sign because the room is not a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayEnding {
     Closing,
     HostAway,
     NoState,
+    FrameBudget,
     RoomGone,
 }
 
@@ -117,6 +118,7 @@ impl RelayEnding {
             Self::Closing => Some(Ending::Closing.as_str()),
             Self::HostAway => Some(Ending::HostAway.as_str()),
             Self::NoState => Some(Ending::NoState.as_str()),
+            Self::FrameBudget => Some(Ending::FrameBudget.as_str()),
             Self::RoomGone => None,
         }
     }
@@ -294,6 +296,7 @@ impl RelaySession {
                 listing: options.listing,
                 store: options.store,
             }),
+            frame_budget: None,
         })
         .map_err(|error| sealed(&error))?;
         // §5.1: the room key and the host's public key in the fragment, in the order the
@@ -357,6 +360,7 @@ impl RelaySession {
             declared_role: options.declared_role,
             awareness_client_id: Some(awareness_client_id),
             host: None,
+            frame_budget: None,
         })
         .map_err(|error| sealed(&error))?;
         Ok(start(dial.socket, session, info, None))
@@ -1089,6 +1093,7 @@ const fn relay_ending(ending: Ending) -> RelayEnding {
         Ending::Closing => RelayEnding::Closing,
         Ending::HostAway => RelayEnding::HostAway,
         Ending::NoState => RelayEnding::NoState,
+        Ending::FrameBudget => RelayEnding::FrameBudget,
     }
 }
 
@@ -1527,6 +1532,7 @@ mod tests {
             declared_role: None,
             awareness_client_id: Some(7),
             host,
+            frame_budget: None,
         }
     }
 

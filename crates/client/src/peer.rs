@@ -250,7 +250,15 @@ pub struct PeerOptions {
     /// can sign a state and a session without one cannot; the room's host publishes the state
     /// that every peer's key and role come from, and a session with no state produces none.
     pub host: Option<HostOptions>,
+    /// The room's frame budget (`CANONICAL.md` §6.1), [`FRAME_BUDGET`] when `None`. **A test
+    /// seam**: a live session has no reason to set it, and a smaller one only ends a room sooner.
+    pub frame_budget: Option<u64>,
 }
+
+/// `CANONICAL.md` §6.1's frame budget: half of SP 800-38D's 2³² bound on one key with random
+/// nonces, which is the room's and not one sender's, so that a client that missed frames the
+/// relay dropped still stops well short of it.
+pub const FRAME_BUDGET: u64 = 1 << 31;
 
 /// The same rule as [`PeerInvite`]'s: the room key, the host key and the two private seeds are
 /// not printed. A session's options are built from an invite, and §5.1 forbids what they carry
@@ -272,6 +280,7 @@ impl fmt::Debug for PeerOptions {
             .field("declared_role", &self.declared_role)
             .field("awareness_client_id", &self.awareness_client_id)
             .field("host", &self.host.as_ref().map(|_| "<redacted>"))
+            .field("frame_budget", &self.frame_budget)
             .finish()
     }
 }
@@ -347,8 +356,8 @@ pub struct Dropped {
     pub reason: String,
 }
 
-/// The three endings a session reaches on its own. What §13.10 calls "the room is destroyed"
-/// is the fourth and has no frame: a client learns it as `room_unknown` or close 4001 when it
+/// The four endings a session reaches on its own. What §13.10 calls "the room is destroyed"
+/// is the fifth and has no frame: a client learns it as `room_unknown` or close 4001 when it
 /// names the id, which is the socket's business and not this module's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ending {
@@ -359,6 +368,8 @@ pub enum Ending {
     HostAway,
     /// The no-state window passed with nothing applied (§13.3).
     NoState,
+    /// The room's frame count reached `CANONICAL.md` §6.1's frame budget.
+    FrameBudget,
 }
 
 /// One connection's `selvage/2` session.
@@ -413,6 +424,11 @@ pub struct PeerSession {
     published: u64,
     handshake: u64,
     frames: u64,
+    /// `CANONICAL.md` §6.1's count: every binary frame this session was delivered and every
+    /// frame it sealed, across reconnects, because the frame key it is counted against outlives
+    /// a socket.
+    room_frames: u64,
+    frame_budget: u64,
     applied: Vec<Applied>,
     dropped: Vec<Dropped>,
     ignored: Vec<u64>,
@@ -492,6 +508,8 @@ impl PeerSession {
             published: 0,
             handshake: 0,
             frames: 0,
+            room_frames: 0,
+            frame_budget: options.frame_budget.unwrap_or(FRAME_BUDGET),
             applied: Vec::new(),
             dropped: Vec::new(),
             ignored: Vec::new(),
@@ -722,6 +740,7 @@ impl PeerSession {
     /// One sealed frame, as the relay delivered it.
     pub fn deliver(&mut self, clock: Duration, frame: &[u8]) -> Outcome {
         self.frames = self.frames.saturating_add(1);
+        self.room_frames = self.room_frames.saturating_add(1);
         let index = self.frames.saturating_sub(1);
         // A closing folds into the receiver the moment it verifies, and §13.10 ignores one
         // handed to a client holding no state. The two values it moved are put back, because
@@ -762,6 +781,9 @@ impl PeerSession {
         self.expire_leases(clock);
         self.refresh_host_away(clock, false);
         if self.ending.is_some() {
+            return;
+        }
+        if self.budget_spent() {
             return;
         }
         if self.window_passed(clock) {
@@ -880,6 +902,9 @@ impl Ending {
             Self::Closing => "the room closed",
             Self::HostAway => "the host has been away past its window",
             Self::NoState => "no state arrived within the no-state window",
+            Self::FrameBudget => {
+                "the room has sealed as many frames as its key allows; start a new room"
+            }
         }
     }
 }
@@ -972,6 +997,9 @@ impl PeerSession {
     /// bytes, and before anything that follows the frame (`after_state`) so that a `SyncStep1`
     /// goes out only once a state commits this connection's key (§13.1's steps 4 and 6).
     fn publish_state(&mut self, clock: Duration, reason: HostReason) {
+        if self.room_frames >= self.frame_budget {
+            return;
+        }
         let Some(host) = self.host.as_mut() else {
             return;
         };
@@ -982,6 +1010,9 @@ impl PeerSession {
         let Some(publication) = owed else {
             return;
         };
+        if publication.fresh {
+            self.room_frames = self.room_frames.saturating_add(1);
+        }
         self.outbound.push_back(publication.frame);
         self.published = self.published.saturating_add(1);
         let fresh = publication.state.as_ref().filter(|_| publication.fresh);
@@ -1276,6 +1307,9 @@ impl PeerSession {
 
     /// One frame sealed under the frame key and signed by this connection's session key.
     fn publish(&mut self, what: Published, plaintext: &[u8]) {
+        if self.room_frames >= self.frame_budget {
+            return;
+        }
         let Ok(bytes) = self.sealed_frame(what.kind(), plaintext) else {
             // A CSPRNG that will not read, or an AEAD that refuses its own inputs. Neither
             // happens in practice, and a session that kept quiet about one would look like a
@@ -1283,6 +1317,7 @@ impl PeerSession {
             self.fault = Some(format!("a {what:?} frame could not be sealed"));
             return;
         };
+        self.room_frames = self.room_frames.saturating_add(1);
         self.outbound.push_back(bytes);
         let tally = match what.counted() {
             Counted::Publication => &mut self.published,
@@ -1402,9 +1437,28 @@ impl PeerSession {
             self.fault.get_or_insert(failed);
             return false;
         };
+        self.room_frames = self.room_frames.saturating_add(1);
         self.outbound.push_back(publication.frame);
         self.published = self.published.saturating_add(1);
         self.ending = Some(Ending::Closing);
+        true
+    }
+
+    /// `CANONICAL.md` §6.1's frame budget: once the room's count reaches it, nothing more is
+    /// sealed under the frame key. A host publishes its one closing first — the frame that ends
+    /// the room for every peer holding its state — and every session, the host's included, ends
+    /// and says why.
+    fn budget_spent(&mut self) -> bool {
+        if self.room_frames < self.frame_budget {
+            return false;
+        }
+        if let Some(publication) =
+            self.host.as_mut().and_then(HostProducer::closing)
+        {
+            self.outbound.push_back(publication.frame);
+            self.published = self.published.saturating_add(1);
+        }
+        self.ending = Some(Ending::FrameBudget);
         true
     }
 
@@ -1541,8 +1595,10 @@ impl PeerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::ListingSource;
     use crate::sealed::{Envelope, RoomKey, encode_key, opens, read_varuint};
     use serde_json::json;
+    use std::sync::Arc;
     use yrs::{Doc, Text, Transact};
 
     /// A room, a host keypair and a session keypair, all derived from constants: these are
@@ -1667,6 +1723,7 @@ mod tests {
             declared_role: None,
             awareness_client_id: None,
             host: None,
+            frame_budget: None,
         };
         PeerSession::new(&options).unwrap()
     }
@@ -2336,6 +2393,80 @@ mod tests {
         );
     }
 
+    fn budgeted(budget: u64, host: Option<HostOptions>) -> PeerSession {
+        let options = PeerOptions {
+            room_id: ROOM.to_string(),
+            room_key: room_key(),
+            host_key: self::host().public(),
+            renew: Duration::from_millis(300),
+            expire: Duration::from_millis(900),
+            seat: Some("p-self".to_string()),
+            roster: BTreeSet::new(),
+            fixed_session_key: Some([5; 32]),
+            declared_role: None,
+            awareness_client_id: None,
+            host,
+            frame_budget: Some(budget),
+        };
+        PeerSession::new(&options).unwrap()
+    }
+
+    #[test]
+    fn a_session_that_reaches_the_frame_budget_seals_nothing_more_and_ends() {
+        // `CANONICAL.md` §6.1: the announcement is the first frame the room counts and the
+        // state the second, so the handshake the state would be answered with is not sealed,
+        // and the next tick ends the session and says why.
+        let mut session = budgeted(2, None);
+        session.tick(Duration::ZERO);
+        assert_eq!(session.take_outbound().len(), 1, "the announcement");
+        let _ = session.deliver(
+            millis(1),
+            &state(&host(), 1, &[(&ours(), "guest", "p-self")]),
+        );
+        assert!(
+            session.take_outbound().is_empty(),
+            "nothing is sealed past the budget"
+        );
+        session.tick(millis(2));
+        assert_eq!(session.ending(), Some(Ending::FrameBudget));
+        assert!(Ending::FrameBudget.as_str().contains("new room"));
+        session.open(millis(3), "README.md");
+        session.tick(millis(400));
+        assert!(session.take_outbound().is_empty(), "and nothing after it");
+        assert_eq!(FRAME_BUDGET, 1 << 31);
+    }
+
+    #[test]
+    fn a_host_that_reaches_the_frame_budget_publishes_its_closing_and_ends() {
+        let listing: ListingSource = Arc::new(|| vec!["README.md".to_string()]);
+        let mut session = budgeted(
+            1,
+            Some(HostOptions {
+                host_seed: [3; 32],
+                listing,
+                store: None,
+            }),
+        );
+        session.tick(Duration::ZERO);
+        let out = session.take_outbound();
+        let kinds: Vec<u64> = out
+            .iter()
+            .map(|frame| Envelope::parse(frame).unwrap().kind)
+            .collect();
+        session.tick(millis(1));
+        let closing: Vec<u64> = session
+            .take_outbound()
+            .iter()
+            .map(|frame| Envelope::parse(frame).unwrap().kind)
+            .collect();
+        assert_eq!(
+            [kinds, closing].concat().last(),
+            Some(&2),
+            "the last frame this host seals is its closing"
+        );
+        assert_eq!(session.ending(), Some(Ending::FrameBudget));
+    }
+
     #[test]
     fn a_hold_message_from_a_key_no_state_commits_is_refused() {
         // `PROTOCOL.md` §13.4 and `CANONICAL.md` §6.1's step 4: a `kind = 3` frame resolves
@@ -2449,6 +2580,7 @@ mod tests {
             declared_role: None,
             awareness_client_id: None,
             host: None,
+            frame_budget: None,
         };
         let printed = format!("{options:?}");
         assert!(
