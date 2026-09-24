@@ -1,0 +1,85 @@
+{
+  "id": "013",
+  "title": "A room with no token, or the wrong one, is `token_invalid` and close 4002",
+  "spec": "PROTOCOL.md#51-room-and-token-in-the-connection-url",
+  "notes": "The invite URL carries both halves, and either one can be lost: `?room=` alone is a room the caller cannot prove it may enter, and a token that is not this room's is the same refusal. Both happen before a seat exists, so the fault is a `session.error` event and then close 4002, and neither mints anything. The last join shows the room itself was untouched by the two refusals.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "open",
+      "conn": "notoken",
+      "target": "/session?room=$room"
+    },
+    {
+      "op": "send",
+      "conn": "notoken",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Bob\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "notoken",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"token_invalid\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "notoken",
+      "code": 4002
+    },
+    {
+      "op": "open",
+      "conn": "wrong",
+      "target": "/session?room=$room&token=not-the-token"
+    },
+    {
+      "op": "send",
+      "conn": "wrong",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Bob\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "wrong",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"token_invalid\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "wrong",
+      "code": 4002
+    },
+    {
+      "op": "open",
+      "conn": "invited",
+      "target": "/session?room=$room&token=$token"
+    },
+    {
+      "op": "send",
+      "conn": "invited",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Bob\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "invited",
+      "text": "{\"event\":\"room.joined\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"}],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\"}},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\"}},\"v\":\"selvage/2\"}"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}

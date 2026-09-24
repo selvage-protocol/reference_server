@@ -1,0 +1,88 @@
+{
+  "id": "028",
+  "title": "The envelope and its `id` are judged before the method, and the method before its params",
+  "spec": "PROTOCOL.md#11-errors",
+  "notes": "One order decides which of two faults a frame carries is answered, and the envelope comes first: a first frame with no `id` is `bad_message` whatever method it names — even the version's own `session.rename` — so a client is told what was wrong with the bytes rather than with its choice. On a seated connection the method is judged before its params: an unknown name is `unknown_method` whatever its params look like, and a name the version has is `bad_params` when its params cannot be read. A params-first dispatcher would answer `bad_params` for the second frame and `unknown_method` for the first, so each pairing is what pins the order.",
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "first",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "first",
+      "refused": true,
+      "text": "{\"method\":\"session.rename\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "first",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "first",
+      "code": 4000
+    },
+    {
+      "op": "open",
+      "conn": "nameless",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "nameless",
+      "refused": true,
+      "text": "{\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "nameless",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "nameless",
+      "code": 4000
+    },
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":2,\"method\":\"doc.open\",\"params\":{\"x\":123},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"error\":{\"code\":\"unknown_method\",\"message\":\"$_\"},\"id\":2,\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":3,\"method\":\"session.rename\",\"params\":{\"display_name\":\"  \"},\"v\":\"selvage/2\"}",
+      "refused": true
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"error\":{\"code\":\"bad_params\",\"message\":\"$_\"},\"id\":3,\"v\":\"selvage/2\"}"
+    }
+  ]
+}

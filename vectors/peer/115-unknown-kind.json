@@ -1,7 +1,7 @@
 {
   "id": "115",
   "title": "A kind this version does not define is refused `unknown_kind`",
-  "spec": "CANONICAL.md#61-sealed-frames-selvage2",
+  "spec": "CANONICAL.md#61-sealed-frames",
   "notes": "Values above `4` are this version's to leave unused: a later revision defines one, and a receiver of this version refuses a frame that uses one rather than reading it by the nearest rule it knows. The frame sealed here is a valid envelope in every other respect — authentic, with a plaintext that a `kind = 0` frame would carry and a counter above the sender's mark — so what refuses it is the kind and only the kind, and a receiver that guessed `kind = 0` would apply it.",
   "layer": "peer",
   "kind": "frame",

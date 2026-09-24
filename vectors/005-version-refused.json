@@ -1,0 +1,109 @@
+{
+  "id": "005",
+  "title": "A `v` this server does not read is refused `bad_message`, before it is seated",
+  "spec": "PROTOCOL.md#10-the-wire-version-and-capabilities",
+  "notes": "`v` is part of the envelope, so a frame whose `v` this server does not read is a frame it cannot read at all, and §11 gives that one code: `bad_message`, refused and then closed **4000**, never `hello_required` and never a code of its own. Three values, one rule, because the member has one value: another major (`selvage/3`; `selvage/1` is the same case, the version this protocol removed), a value that is not the version at all (`selvage`, with no major; `selvage/03`, whose major carries a leading zero), and no `v` at all. None of them mints a room, and none is seated.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "major",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "major",
+      "refused": true,
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Major\"},\"v\":\"selvage/3\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "major",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "major",
+      "code": 4000
+    },
+    {
+      "op": "open",
+      "conn": "grammar",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "grammar",
+      "refused": true,
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Grammar\"},\"v\":\"selvage\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "grammar",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "grammar",
+      "code": 4000
+    },
+    {
+      "op": "open",
+      "conn": "seedling",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "seedling",
+      "refused": true,
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Seedling\"},\"v\":\"selvage/03\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "seedling",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "seedling",
+      "code": 4000
+    },
+    {
+      "op": "open",
+      "conn": "absent",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "absent",
+      "refused": true,
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Absent\"}}"
+    },
+    {
+      "op": "expect",
+      "conn": "absent",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "absent",
+      "code": 4000
+    },
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}

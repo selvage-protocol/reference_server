@@ -1,0 +1,30 @@
+{
+  "id": "001",
+  "title": "GET /meta advertises the server, its capabilities and its keepalive",
+  "spec": "PROTOCOL.md#2-transport",
+  "notes": "The `server` member is free-form, so it is not asserted: every other byte is exact. The reference server writes this body with `serde_json::to_string`, which is the canonical form of CANONICAL.md. `wire_versions` is a list with the one version in it. A path that is not `/meta` answers 404.",
+  "steps": [
+    {
+      "op": "http",
+      "target": "/meta"
+    },
+    {
+      "op": "expectStatus",
+      "status": 200
+    },
+    {
+      "op": "expectBody",
+      "text": "{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000,\"room_grace_ms\":30000},\"server\":\"$server\",\"wire_versions\":[\"selvage/2\"]}"
+    },
+    {
+      "op": "http",
+      "target": "/nope"
+    },
+    {
+      "op": "expectStatus",
+      "status": 404
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}

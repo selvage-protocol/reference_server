@@ -1,0 +1,50 @@
+{
+  "id": "036",
+  "title": "A string that decodes to a lone surrogate is `bad_message` on a seated connection",
+  "spec": "CANONICAL.md#23-strings",
+  "notes": "The frame is well-formed JSON, so the fault is the string, not the envelope: a lone surrogate is not a character, and a receiver that hands the decoded value to a Unicode library refuses it as `bad_message` rather than seating it. `session.rename` is the vehicle because it is the version's one method that carries a string a peer will read; the accepted rename beside it is the control.",
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":4,\"method\":\"session.rename\",\"params\":{\"display_name\":\"\\ud800\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":5,\"method\":\"session.rename\",\"params\":{\"display_name\":\"Ada L\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":5,\"result\":{},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.renamed\",\"params\":{\"display_name\":\"Ada L\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/2\"}"
+    }
+  ]
+}

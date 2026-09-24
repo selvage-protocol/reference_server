@@ -1,0 +1,45 @@
+{
+  "id": "008",
+  "title": "The first frame must be a text frame carrying `session.hello`",
+  "spec": "PROTOCOL.md#11-errors",
+  "notes": "A binary first frame is `bad_message`, not `hello_required`: what was wrong is the shape of the frame, and a client is told the code it would get for an unparsable envelope. A text frame that is not the handshake is `hello_required`. Before the handshake completes every fault closes the connection, with 4000 here.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "binary",
+      "target": "/session"
+    },
+    {
+      "op": "sendBinary",
+      "conn": "binary",
+      "hex": "00 01 02"
+    },
+    {
+      "op": "expect",
+      "conn": "binary",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "binary",
+      "code": 4000
+    },
+    {
+      "op": "open",
+      "conn": "chatty",
+      "target": "/session"
+    },
+    {
+      "op": "expect",
+      "conn": "chatty",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"hello_required\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "chatty",
+      "code": 4000
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}

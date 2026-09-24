@@ -1,7 +1,7 @@
 {
   "id": "109",
   "title": "A key that is not the canonical encoding is refused `bad_payload`",
-  "spec": "CANONICAL.md#61-sealed-frames-selvage2",
+  "spec": "CANONICAL.md#61-sealed-frames",
   "notes": "Two spellings of one key are one key only to a lenient reader, and a strict reader and a lenient one reaching opposite verdicts about the same state is the disagreement the encoding rule removes. Over 32 bytes base64url writes 43 characters whose last carries four bits of the value and two that are zero, so a 43-character key ending in `N` spells no 32-byte value however leniently a decoder reads it — and a 44-character one with a newline appended is not a key either, which is the case a `$`-anchored pattern alone would accept.",
   "layer": "peer",
   "kind": "frame",

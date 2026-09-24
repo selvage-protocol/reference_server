@@ -1,7 +1,7 @@
 {
   "id": "107",
   "title": "A room state signed by a key that is not the host key is refused `uncommitted_key`",
-  "spec": "CANONICAL.md#61-sealed-frames-selvage2",
+  "spec": "CANONICAL.md#61-sealed-frames",
   "notes": "`uncommitted_key` and not `bad_signature`, and the difference is the whole point of the step order: the frame is a perfectly good envelope, its AEAD opens and its signature verifies against the committed key that signed it — `expectPlaintext` asserts exactly that — and it is still refused, because a `kind = 1` frame is signed by the host key the invite's fragment names and by nothing else. `guest-1` holds a committed key in this vector, so a receiver that resolved a state against any committed key would apply a state claiming the room for itself.",
   "layer": "peer",
   "kind": "frame",

@@ -1,0 +1,51 @@
+{
+  "id": "027",
+  "title": "A seated connection that names a `v` the server does not read keeps its session",
+  "spec": "PROTOCOL.md#10-the-wire-version-and-capabilities",
+  "notes": "§11's split decides the shape: the fault is announced in the frame's own vocabulary, so a seated connection gets `session.error{bad_message}` and stays open — a peer that sent one unreadable frame can send a readable one next. The rename at the end is the control that the connection is still usable, and the version is judged before the method is resolved, so the `selvage/1` frame is answered for its `v` and not for what it asked.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "refused": true,
+      "text": "{\"id\":2,\"method\":\"session.rename\",\"params\":{\"display_name\":\"Ada Lovelace\"},\"v\":\"selvage/1\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":3,\"method\":\"session.rename\",\"params\":{\"display_name\":\"Ada Lovelace\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":3,\"result\":{},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.renamed\",\"params\":{\"display_name\":\"Ada Lovelace\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/2\"}"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}

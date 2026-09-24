@@ -1,0 +1,45 @@
+{
+  "id": "003",
+  "title": "A guest joins with the invite URL and is told the peers already there",
+  "spec": "PROTOCOL.md#61--62-roomcreated-and-roomjoined",
+  "notes": "The room and token are in the connection URL, not in `session.hello`. The joiner's `room.joined` carries the room id, the token's holder's roster without a `token`, and the peers already present; the host is told `peer.joined`. Neither `PeerInfo` carries an awareness client id, because neither connection claimed one. The room's listing is not here: it is the host's sealed state, which is the peer layer's business (`vectors/peer/`).",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "open",
+      "conn": "guest",
+      "target": "/session?room=$room&token=$token"
+    },
+    {
+      "op": "send",
+      "conn": "guest",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"awareness_client_id\":99,\"display_name\":\"Bob\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"room.joined\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"}],\"room_id\":\"$room\",\"self\":{\"awareness_client_id\":99,\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\"}},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"awareness_client_id\":99,\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\"}},\"v\":\"selvage/2\"}"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}

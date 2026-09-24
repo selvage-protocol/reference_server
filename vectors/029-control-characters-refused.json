@@ -1,0 +1,67 @@
+{
+  "id": "029",
+  "title": "A control character in a `display_name` is `bad_params`",
+  "spec": "PROTOCOL.md#sessionhello--the-handshake",
+  "notes": "PROTOCOL.md §5's Unicode `Cc` exclusion is on the identity the server reads, and it is judged on the received value before the trim: a name carrying U+0001 and one carrying a tab are both refused, and the connection closes. The same exclusion on a path and on a grant member is a receiver's rule and not the server's, and it is pinned in the peer layer (`vectors/peer/117`, `119`) and in `schema/common.json`'s own refusal, because `doc.*` is not a method of this version.",
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "bell",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "bell",
+      "refused": true,
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"A\\u0001da\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "bell",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_params\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "bell",
+      "code": 4000
+    },
+    {
+      "op": "open",
+      "conn": "tab",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "tab",
+      "refused": true,
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"A\\tda\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "tab",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_params\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "tab",
+      "code": 4000
+    },
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
+    }
+  ]
+}

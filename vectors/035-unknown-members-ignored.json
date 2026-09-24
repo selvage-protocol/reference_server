@@ -1,0 +1,25 @@
+{
+  "id": "035",
+  "title": "An unknown member at the top level or in `params` is ignored",
+  "spec": "PROTOCOL.md#41-request-client--server",
+  "notes": "Members a receiver does not know are dropped rather than refused, which is what makes a later minor able to add one: `capabilities` carries a name the server does not know, `params` carries a nested object it has never heard of, and the hello is seated normally. The asymmetry with methods is deliberate: an unknown *method* is answered `unknown_method` and never silently dropped.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"future\":\"ignored\",\"id\":1,\"method\":\"session.hello\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"x.future-cap\"],\"client_ext\":{\"nested\":{\"deep\":true}},\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}

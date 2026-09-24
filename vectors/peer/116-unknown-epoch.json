@@ -1,7 +1,7 @@
 {
   "id": "116",
   "title": "An epoch this version does not define is refused `unknown_epoch`",
-  "spec": "CANONICAL.md#61-sealed-frames-selvage2",
+  "spec": "CANONICAL.md#61-sealed-frames",
   "notes": "`epoch` is `0` and reserved in this version, and it is authenticated by the AEAD: the associated data carries it, so a frame sealed at one epoch does not open at another and a receiving implementation cannot quietly read it as epoch 0. A receiver that ignored the member instead of refusing its value would accept this frame — which is what the mutation does, and it is the only difference between the two.",
   "layer": "peer",
   "kind": "frame",

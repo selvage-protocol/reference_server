@@ -1,0 +1,122 @@
+{
+  "id": "009",
+  "title": "A binary exchange is relayed byte for byte, and applied to the receiver's replica",
+  "spec": "PROTOCOL.md#7-document-sync",
+  "notes": "The server is payload-opaque: its whole job on this path is to deliver what it was handed, to every peer but the sender. The bytes here are a y-protocols message stream, which is what a binary frame's plaintext is; in a real session they arrive inside the sealed frame of CANONICAL.md §6.1, and the wire layer pins the relay alone. The exchange includes a UTF-16 offset, so a receiver that splits the payload by byte rather than by code unit diverges at the emoji.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "open",
+      "conn": "guest",
+      "target": "/session?room=$room&token=$token"
+    },
+    {
+      "op": "send",
+      "conn": "guest",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Bob\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"room.joined\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"}],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\"}},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\"}},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "sendBinary",
+      "conn": "guest",
+      "hex": "00 00 01 00"
+    },
+    {
+      "op": "expectBinary",
+      "conn": "host",
+      "hex": "00 00 01 00"
+    },
+    {
+      "op": "sendBinary",
+      "conn": "host",
+      "hex": "00 01 1b 01 01 01 00 04 01 0b 73 72 63 2f 6d 61 69 6e 2e 72 73 07 61 f0 9f 98 80 62 63 00",
+      "apply": true
+    },
+    {
+      "op": "expectBinary",
+      "conn": "guest",
+      "hex": "00 01 1b 01 01 01 00 04 01 0b 73 72 63 2f 6d 61 69 6e 2e 72 73 07 61 f0 9f 98 80 62 63 00",
+      "apply": true
+    },
+    {
+      "op": "expectDoc",
+      "conn": "guest",
+      "path": "src/main.rs",
+      "text": "a😀bc"
+    },
+    {
+      "op": "sendBinary",
+      "conn": "host",
+      "hex": "00 02 0c 01 01 01 05 c4 01 03 01 04 01 58 00",
+      "apply": true
+    },
+    {
+      "op": "expectBinary",
+      "conn": "guest",
+      "hex": "00 02 0c 01 01 01 05 c4 01 03 01 04 01 58 00",
+      "apply": true
+    },
+    {
+      "op": "expectDoc",
+      "conn": "guest",
+      "path": "src/main.rs",
+      "text": "a😀bXc"
+    },
+    {
+      "op": "sendBinary",
+      "conn": "guest",
+      "hex": "00 02 0a 01 01 02 00 44 01 00 01 21 00",
+      "apply": true
+    },
+    {
+      "op": "expectBinary",
+      "conn": "host",
+      "hex": "00 02 0a 01 01 02 00 44 01 00 01 21 00",
+      "apply": true
+    },
+    {
+      "op": "expectDoc",
+      "conn": "host",
+      "path": "src/main.rs",
+      "text": "!a😀bXc"
+    },
+    {
+      "op": "expectDoc",
+      "conn": "guest",
+      "path": "src/main.rs",
+      "text": "!a😀bXc"
+    },
+    {
+      "op": "expectSameState",
+      "conns": [
+        "host",
+        "guest"
+      ]
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}

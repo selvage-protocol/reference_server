@@ -1,0 +1,65 @@
+{
+  "id": "032",
+  "title": "A `token` with no `room` mints a fresh room and discards the token",
+  "spec": "PROTOCOL.md#51-room-and-token-in-the-connection-url",
+  "notes": "The two query members are read together: a room without its token is `token_invalid` (vector 013), but a token without a room is not a join at all — the connection mints, the token in the URL is ignored, and the token the new room is minted with is not the one that was offered.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session?token=deadbeef"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "open",
+      "conn": "stranger",
+      "target": "/session?room=$room&token=deadbeef"
+    },
+    {
+      "op": "send",
+      "conn": "stranger",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Mallory\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "stranger",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"token_invalid\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "stranger",
+      "code": 4002
+    },
+    {
+      "op": "open",
+      "conn": "invited",
+      "target": "/session?room=$room&token=$token"
+    },
+    {
+      "op": "send",
+      "conn": "invited",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Bob\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "invited",
+      "text": "{\"event\":\"room.joined\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"}],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\"}},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\"}},\"v\":\"selvage/2\"}"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}

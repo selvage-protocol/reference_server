@@ -1,0 +1,89 @@
+{
+  "id": "012",
+  "title": "A room lives while it has connections and for the grace period after the last one ends",
+  "spec": "PROTOCOL.md#9-rooms-and-the-lifecycle",
+  "notes": "The room is the server's, and it outlives a connection: the second connection stays in the room after the first ends, and the room is destroyed `room_grace_ms` after its **last** connection ends, silently, so the next join learns it as `room_unknown` (close 4001). The grace is measured from the last leave and not from the first, which is what makes a room whose second connection arrives a moment later survive.",
+  "harness": {
+    "room_grace_ms": 400
+  },
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "open",
+      "conn": "guest",
+      "target": "/session?room=$room&token=$token"
+    },
+    {
+      "op": "send",
+      "conn": "guest",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Bob\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"room.joined\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"}],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\"}},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\"}},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "close",
+      "conn": "host"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"peer.left\",\"params\":{\"peer_id\":\"$host_peer\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "wait",
+      "ms": 200
+    },
+    {
+      "op": "close",
+      "conn": "guest"
+    },
+    {
+      "op": "wait",
+      "ms": 800
+    },
+    {
+      "op": "open",
+      "conn": "late",
+      "target": "/session?room=$room&token=$token"
+    },
+    {
+      "op": "send",
+      "conn": "late",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Cyd\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "late",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"room_unknown\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "late",
+      "code": 4001
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}

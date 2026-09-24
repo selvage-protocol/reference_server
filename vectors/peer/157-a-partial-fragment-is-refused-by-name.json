@@ -2,7 +2,7 @@
   "id": "157",
   "title": "A fragment that names one of §5.1's two keys and not the other is refused locally, by name of the missing one",
   "spec": "PROTOCOL.md#51-room-and-token-in-the-connection-url",
-  "notes": "The rule: a client that would speak `selvage/2` on this join MUST refuse an invite whose `k` or `h` is missing, locally and before it opens a socket, and the refusal names the key it is about (§5.1). This vector pins that refusal and its naming, with both directions of the fault: `k` alone is refused for the missing `h`, and `h` alone for the missing `k`. The subject is handed the link and answers the `join` itself, in its own words, because a refusal with no socket on it has no frame to report in; `expectRefusal` asserts the naming and not the sentence, since §5.1 leaves the sentence to the client. The two refused legs are also the evidence that neither seated anything: a subject left in a session after one would refuse the next `start` for that reason instead. The third leg is the control — the whole fragment, which must join — because the other way to pass a corpus of refusals is to refuse everything, and the two refusals above differ only in which key they must name. The failure this prevents is a client that treats a half-copied fragment as a version-1 join: it dials, the server seats it in the clear, and the room's contents are readable by the server the keys exist to keep out of them.",
+  "notes": "The rule: a client handed this link MUST refuse an invite whose `k` or `h` is missing or is not a 32-byte value, locally and before it opens a socket, and the refusal names the key it is about (§5.1). This vector pins that refusal and its naming, in both directions of both faults: `k` alone is refused for the missing `h`, and `h` alone for the missing `k`; a `k` whose final character carries non-zero padding bits is refused for `k`, and an `h` too short to be a key for `h`. The subject is handed the link and answers the `join` itself, in its own words, because a refusal with no socket on it has no frame to report in; `expectRefusal` asserts the naming and not the sentence, since §5.1 leaves the sentence to the client. The refused legs are also the evidence that none of them seated anything: a subject left in a session after one would report itself seated for the next `start`. The last leg is the control — the whole fragment, which must join — because the other way to pass a corpus of refusals is to refuse everything, and the refusals above differ only in which key they must name. The failure this prevents is a client that dials with half a fragment, or with a value that is not a key: it is seated, receives sealed frames it can neither read nor verify, and publishes frames no conforming peer can attribute, so the room it joins is one it can take no part in.",
   "layer": "peer",
   "kind": "decision",
   "fixture": "fixture/keys.json",
@@ -37,6 +37,28 @@
       "op": "expectRefusal",
       "conn": "peer",
       "names": ["`k`"]
+    },
+    {
+      "op": "start",
+      "conn": "peer",
+      "key": "guest-1",
+      "invite": "/session?room=$room&token=$token#k=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB&h=$host_key"
+    },
+    {
+      "op": "expectRefusal",
+      "conn": "peer",
+      "names": ["`k`"]
+    },
+    {
+      "op": "start",
+      "conn": "peer",
+      "key": "guest-1",
+      "invite": "/session?room=$room&token=$token#k=$room_key&h=AAAA"
+    },
+    {
+      "op": "expectRefusal",
+      "conn": "peer",
+      "names": ["`h`"]
     },
     {
       "op": "start",

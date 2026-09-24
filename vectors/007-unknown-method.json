@@ -1,0 +1,70 @@
+{
+  "id": "007",
+  "title": "An unknown method, including an `x.` one and a `doc.*` one, is an error and the connection stays open",
+  "spec": "PROTOCOL.md#unknown-methods",
+  "notes": "An unknown method is never silently dropped: silence turns version skew into a timeout. The `x.` namespace is reserved and answers exactly like any other unknown name, and so does `doc.open`, which this protocol does not define. Unknown *members* and capabilities are ignored; the asymmetry is deliberate. The rename at the end is the control: the connection is still usable after the errors.",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":2,\"method\":\"cursor.teleport\",\"params\":{},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"error\":{\"code\":\"unknown_method\",\"message\":\"$_\"},\"id\":2,\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":3,\"method\":\"x.example.teleport\",\"params\":{\"where\":\"down\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"error\":{\"code\":\"unknown_method\",\"message\":\"$_\"},\"id\":3,\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":4,\"method\":\"doc.open\",\"params\":{},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"error\":{\"code\":\"unknown_method\",\"message\":\"$_\"},\"id\":4,\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":5,\"method\":\"session.rename\",\"params\":{\"display_name\":\"Ada Lovelace\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":5,\"result\":{},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.renamed\",\"params\":{\"display_name\":\"Ada Lovelace\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/2\"}"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}
