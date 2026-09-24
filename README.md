@@ -242,6 +242,11 @@ scripts/ci-local.sh container  # docker build, docker run and a room join (needs
 workflow's two buildx jobs have no step here, since this host has no Docker, let alone
 buildx; a pull request's checks are where they run.
 
+`checks`, `nightly` and `image` refuse to run when the working tree differs from `HEAD`,
+because what they build is the tracked tree at its working-tree content and CI checks out the
+committed ref: an untracked file — a new test, a new vector — is invisible to the build, so its
+green run would be of a smaller suite than CI's. Commit, or stash, before running them.
+
 ## What lives here
 
 | Path | What it is |
