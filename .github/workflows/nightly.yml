@@ -15,11 +15,9 @@ permissions:
 
 jobs:
   nightly:
-    # GitHub-hosted, unlike the jobs in `ci.yml`: this is a scheduled audit and
-    # not a feedback path, so its minutes need not be bought, and the three
-    # commands below reach the whole network — the advisory database and the
-    # crates it compares against — where the Blacksmith runners have proved
-    # github-scoped egress only.
+    # GitHub-hosted `ubuntu-24.04`: this is a scheduled audit and not the
+    # pull-request feedback path, and its three commands below reach the whole
+    # network — the advisory database and the crates they compare against.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:

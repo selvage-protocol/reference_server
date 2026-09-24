@@ -53,9 +53,8 @@ name: deploy-prod
 # SHA behind a comment that claims a different version is worse than no pin, so
 # each one below was read back from the action's repository when it was written.
 #
-# `ubuntu-24.04` and not a Blacksmith runner: this job downloads a Tailscale
-# tarball from `pkgs.tailscale.com`, reads `ghcr.io` and speaks to the tailnet,
-# and Blacksmith runners have proved only GitHub-scoped egress. It also has to
+# `ubuntu-24.04`: this job downloads a Tailscale tarball from
+# `pkgs.tailscale.com`, reads `ghcr.io` and speaks to the tailnet. It also has to
 # support Node.js 24, which `tailscale/github-action@v4.1.3` declares
 # (`runs.using: node24`); the GitHub-hosted image does, and this repository
 # already runs `actions/checkout@v7.0.1` — also `node24` — on `ubuntu-24.04`
