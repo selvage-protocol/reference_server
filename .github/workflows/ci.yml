@@ -25,13 +25,22 @@ jobs:
         with:
           persist-credentials: false
 
-      # The runner image guarantees only ~14 GB free, and a cold cache has to fit a rust-overlay
-      # toolchain plus crane's dependency artefacts. These are the preinstalled toolchains nothing
-      # here uses. Each removal is non-fatal so an image change cannot break the job, and the df
-      # either side shows what it actually bought. No third-party action involved.
+      # The preinstalled toolchains nothing here uses. Each removal is non-fatal, so an image
+      # change cannot break the job, and the `df` in the step prints both sides of what it did.
+      # No third-party action involved.
       - name: free disk space
         run: |
           df -h /
+          # A cold Nix store — the rust-overlay toolchain plus crane's dependency
+          # artefacts — needs on the order of 10-20 GB, and the runner the job lands on
+          # has had 87 GB free, so this usually has nothing to do. It deletes only when
+          # the free space is genuinely short, which keeps the insurance without paying
+          # for it on every run.
+          available_kb=$(df --output=avail -k / | tail -n 1)
+          if [ "$available_kb" -ge $((30 * 1024 * 1024)) ]; then
+            echo "skipping: $((available_kb / 1024 / 1024)) GB free is enough for a cold Nix store"
+            exit 0
+          fi
           sudo rm -rf \
             /opt/ghc \
             /opt/hostedtoolcache/CodeQL \
