@@ -30,9 +30,9 @@ type Refusal = (&'static str, String);
 
 /// Capacity refusals are this server's policy, not the protocol's (`PROTOCOL.md` §2.1,
 /// §11): an implementation that needs a code of its own names it in the `x.` namespace
-/// rather than inventing a bare name a later version may want. Neither code is in the
-/// clients' terminal sets, so a refused client retries with its bounded backoff and
-/// then stops — the tolerable shape for a full server.
+/// rather than inventing a bare name a later version may want. A code in that namespace
+/// is terminal for a client (§9.1) — both engines stop on one rather than re-helloeing —
+/// which is the tolerable shape for a full server: a retry there cannot change anything.
 const SERVER_FULL: &str = "x.server_full";
 const ROOM_FULL: &str = "x.room_full";
 
