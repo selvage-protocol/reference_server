@@ -117,10 +117,10 @@ pub async fn handshake(
     // checks: a first frame that is both a non-hello method and another version was
     // answered `hello_required`, which tells the client the wrong thing about why it was
     // refused. The envelope and the id are judged first, the method after the version.
-    if !proto::is_compatible(&msg.v) {
+    if !proto::speaks(&msg.v) {
         return Err((
             code::BAD_MESSAGE,
-            format!("unsupported wire version {}", msg.v),
+            format!("a frame this server cannot read names {}", msg.v),
         ));
     }
     if msg.method != method::SESSION_HELLO {
@@ -716,20 +716,20 @@ impl Session {
             self.alert(code::BAD_MESSAGE, "a request needs an id");
             return;
         };
-        // §10: the version is checked on every request. Another version is a frame this
-        // server cannot read, which is `bad_message` like any other, and the connection
-        // stays open: a peer that sent one frame can send a readable one next.
-        if !proto::is_compatible(&msg.v) {
+        // §10: the version is checked on every request. A frame naming another version is a
+        // frame this server cannot read, which is `bad_message` like any other, and the
+        // connection stays open: a peer that sent one frame can send a readable one next.
+        if !proto::speaks(&msg.v) {
             self.alert(
                 code::BAD_MESSAGE,
-                format!("unsupported wire version {}", msg.v),
+                format!("a frame this server cannot read names {}", msg.v),
             );
             return;
         }
         let proto::ClientMessage { method, params, .. } = msg;
         let request = Request { id, params };
         // `PROTOCOL.md` §5: `session.hello` and `session.rename` are the whole method
-        // surface. Anything else, `doc.*` included, is the answer any unknown method gets.
+        // surface. Anything else is the answer any unknown method gets.
         match method.as_str() {
             method::SESSION_RENAME => self.rename(request, shared).await,
             method::SESSION_HELLO => {

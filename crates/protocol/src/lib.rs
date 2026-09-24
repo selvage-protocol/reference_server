@@ -660,47 +660,16 @@ pub fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// True when the wire version in an envelope is the one this implementation speaks.
+/// True when the wire version in an envelope is the one this protocol has.
 ///
-/// `PROTOCOL.md` §10: at major `2` the minor is not decisive, so every `selvage/2.x` is
-/// this version while `selvage/0.x`, `selvage/1` and `selvage/3` name another. A version
-/// outside the grammar of `CANONICAL.md` §2.5 is not this one either: the schema's
-/// `wireVersion` refuses it, so a receiver that seats one is a receiver a conforming peer
-/// cannot predict.
+/// `PROTOCOL.md` §10 with `CANONICAL.md` §2.5: the member has one value and there is no
+/// grammar to write a second spelling in, so `selvage/2.0`, `selvage/2.9`, `selvage/1`,
+/// `selvage/03` and `selvage` are all a version this receiver does not read, and the frame
+/// carrying one is `bad_message` like any frame it cannot read. Nothing is negotiated and
+/// nothing is compared by major.
 #[must_use]
-pub fn is_compatible(version: &str) -> bool {
-    parse_wire_version(version).is_some_and(|(major, _)| major == VERSION_MAJOR)
-}
-
-/// The major of [`WIRE_VERSION`].
-const VERSION_MAJOR: u64 = 2;
-
-/// `selvage/` major, optionally `.` minor, both plain decimal with no leading zero.
-///
-/// A second `.` leaves the minor unparsable, so it is refused with everything else the
-/// grammar does not admit.
-fn parse_wire_version(version: &str) -> Option<(u64, u64)> {
-    let rest = version.strip_prefix("selvage/")?;
-    let parts = rest.split_once('.');
-    let major = parse_version_number(parts.map_or(rest, |(head, _)| head))?;
-    let minor = match parts {
-        Some((_, tail)) => parse_version_number(tail)?,
-        None => 0,
-    };
-    Some((major, minor))
-}
-
-/// A number as `CANONICAL.md` §2.4 writes one: ASCII digits, and no leading zero.
-///
-/// `u64::from_str` is laxer than the grammar in two ways that matter on the wire — it
-/// accepts `+1` and it accepts `01` — so the shape is checked before the parse.
-fn parse_version_number(text: &str) -> Option<u64> {
-    let decimal =
-        !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
-    if !decimal || (text.len() > 1 && text.starts_with('0')) {
-        return None;
-    }
-    text.parse().ok()
+pub fn speaks(version: &str) -> bool {
+    version == WIRE_VERSION
 }
 
 #[cfg(test)]
@@ -981,42 +950,56 @@ mod tests {
         assert_eq!(parse_session_url("ws://h/meta"), None);
     }
 
+    /// The one value the member has, and every near miss: `CANONICAL.md` §2.5 makes
+    /// `selvage/2` the protocol's only version, so a spelling that is not exactly it is a
+    /// version this receiver does not read. The minor is the case that matters — it is
+    /// what a same-major comparison would have let through.
     #[test]
-    fn version_compatibility() {
-        assert!(is_compatible("selvage/2"));
-        // At major 2 the rule is same-major, so the minor is not decisive.
-        assert!(is_compatible("selvage/2.9"));
-        assert!(is_compatible("selvage/2.0"));
-        assert!(!is_compatible("selvage/1"));
-        assert!(!is_compatible("selvage/3"));
-        assert!(!is_compatible("selvage"));
-        assert!(!is_compatible("selvage/x"));
-        assert!(!is_compatible("other/2"));
+    fn the_one_wire_version_is_the_one_that_is_spoken() {
+        assert!(speaks("selvage/2"));
+        for version in [
+            "selvage/2.0",
+            "selvage/2.9",
+            "selvage/2.0.0",
+            "selvage/1",
+            "selvage/3",
+            "selvage/03",
+            "selvage",
+            "selvage/",
+            "selvage/x",
+            "other/2",
+            "selvage/2 ",
+            " selvage/2",
+            "SELVAGE/2",
+            "selvage/2\n",
+        ] {
+            assert!(
+                !speaks(version),
+                "{version} is not this protocol's version"
+            );
+        }
     }
 
-    /// The grammar of `CANONICAL.md` §2.5, which `schema/negotiation.json` encodes as
-    /// `wireVersion`. None of these is a `selvage/<number>[.<number>]` string, so none
-    /// is a version a receiver may seat.
+    /// The strings a version *could* be spelled as, and each one is refused for the same
+    /// reason: the member has one value. This is the list a grammar would have admitted,
+    /// which is why it is here — every entry is a near miss a parser would have seated.
     #[test]
-    fn versions_outside_the_grammar_are_not_compatible() {
+    fn a_version_that_is_not_the_exact_value_is_refused() {
         for version in [
             "selvage/2.2.3",
-            "selvage/2.0.0",
             "selvage/01",
             "selvage/2.09",
             "selvage/00",
             "selvage/2.",
             "selvage/.1",
             "selvage/2..3",
-            "selvage/",
             "selvage/+2",
             "selvage/-2",
             "selvage/ 2",
-            "selvage/2 ",
             "selvage/2.x",
             "selvage/99999999999999999999999",
         ] {
-            assert!(!is_compatible(version), "{version} must be refused");
+            assert!(!speaks(version), "{version} must be refused");
         }
     }
 }
