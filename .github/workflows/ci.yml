@@ -112,6 +112,12 @@ jobs:
       - name: the public demo's front limits
         run: nix build .#checks.x86_64-linux.prod-front --no-link --print-build-logs
 
+      # The command lines the tracked compose shapes give the server, run against
+      # the binary: a value it refuses is a container that exits 2 and
+      # restart-loops, which took the public demo's front down with it.
+      - name: the packaging command lines
+        run: nix build .#checks.x86_64-linux.packaging-args --no-link --print-build-logs
+
       # Unknown actions, bad expressions and shell mistakes, caught before the run.
       - name: lint the workflows
         run: nix develop . -c actionlint

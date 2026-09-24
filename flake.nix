@@ -293,6 +293,20 @@
               touch $out
             '';
 
+          # The command lines the tracked compose shapes give the server, run
+          # against the binary that runs them: a value it refuses is a container
+          # that exits 2 and restart-loops, which takes the front beside it down
+          # with it. Both shapes are read here, the public demo's and the Pi's,
+          # so one check covers both packaging trees.
+          packaging-args =
+            pkgs.runCommand "packaging-args-test" {
+              nativeBuildInputs = [pkgs.python3 package];
+            } ''
+              cd ${./packaging}
+              python3 -B prod/test_compose_args.py
+              touch $out
+            '';
+
           # The deploy workflow's verification: what it asserts (the origin,
           # read on the box through the front over the SSH path the deploy itself
           # used) and what it only reports (the public URL, behind an edge that

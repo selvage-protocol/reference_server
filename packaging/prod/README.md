@@ -109,8 +109,8 @@ have (at the defaults, `--max-connections × --outbound-queue-bytes` is 32 GiB).
 
 | Flag | Value | Why this one |
 |---|---|---|
-| `--max-connections` | 32 | Multiplies the per-connection queue, so it is the term that sizes the process: 32 × 8 MiB is a 256 MiB outbound ceiling, the largest surprise this host can absorb. A demo may have 32 live sockets; the server's own README ("Sizing a box") offers 32 as a defensible set for a box around this size. |
-| `--outbound-queue-bytes` | 8388608 | The server refuses anything below the largest frame this configuration can generate, and at these numbers that is one whole frame: 8 MiB (`net::MAX_FRAME_BYTES`). A relayed sealed frame is the largest frame there is, so 8 MiB is the smallest queue this configuration accepts, not a choice among larger ones. |
+| `--max-connections` | 32 | Multiplies the per-connection queue, so it is the term that sizes the process: 32 × 8454144 is a 258 MiB outbound ceiling, the largest surprise this host can absorb. A demo may have 32 live sockets; the server's own README ("Sizing a box") offers 32 as a defensible set for a box around this size. |
+| `--outbound-queue-bytes` | 8454144 | The floor, and a constant of the binary rather than of these flags: `ServerConfig::smallest_queue_bytes` is the 8 MiB frame bound (`net::MAX_FRAME_BYTES`, the largest frame a peer may relay) plus the 64 KiB of envelope headroom it counts for the peers list and the envelope around them, so 8388608 + 65536 = 8454144 is the smallest queue that can hold one whole frame. Below it `selvaged` exits 2 with the floor named, which on a `restart: unless-stopped` container is a restart loop, and the front behind it is down with it. Nothing above the floor is wanted here: 32 × it is the memory surprise this box has to absorb. |
 | `--max-rooms` | 64 | Rooms held at once. More than a demo needs, and each one holds a token and up to eight peers — membership, and nothing larger. |
 | `--max-peers-per-room` | 8 | One room is a session with a friend; eight peers is room for that and three who looked at the wrong link. |
 | `--max-envelope-bytes` | 5242880 | The default, unchanged on purpose: a text envelope is a session frame and never a payload, so 5 MiB is already far above any frame the server parses. A frame past it is refused with the bound named and the connection stays open. |
@@ -133,9 +133,9 @@ One term can reach the cap, and it is the one these numbers were chosen around.
 
 | term | worst case as configured | bounded by |
 |---|---|---|
-| outbound queues | 32 × 8 MiB = 256 MiB | `--max-connections`, `--outbound-queue-bytes` |
+| outbound queues | 32 × 8454144 = 258 MiB | `--max-connections`, `--outbound-queue-bytes` |
 
-The outbound queue is where the memory is: 32 connections × 8 MiB is 256 MiB if all of
+The outbound queue is where the memory is: 32 connections × 8454144 is 258 MiB if all of
 them hold a full queue, which a peer that stops reading can arrange, and that is what
 sizes the `320m` limit. The room state is membership — a token, a peer record and a queue
 handle per connection, at most eight to a room — so 64 rooms cost kilobytes rather than
