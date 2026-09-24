@@ -110,11 +110,10 @@ have (at the defaults, `--max-connections × --outbound-queue-bytes` is 32 GiB).
 | Flag | Value | Why this one |
 |---|---|---|
 | `--max-connections` | 32 | Multiplies the per-connection queue, so it is the term that sizes the process: 32 × 8 MiB is a 256 MiB outbound ceiling, the largest surprise this host can absorb. A demo may have 32 live sockets; the server's own README ("Sizing a box") offers 32 as a defensible set for a box around this size. |
-| `--outbound-queue-bytes` | 8388608 | The server refuses anything below the largest frame this configuration can generate, and at these numbers that is one whole frame: 8 MiB (`net::MAX_FRAME_BYTES`). The document set (256 × 4 KiB of paths, twice over for the ones JSON escapes) and the grant the envelope bound admits both fit inside it, so it is the frame bound that is the floor here. 8 MiB is therefore the smallest queue this configuration accepts, not a choice among larger ones. |
-| `--max-rooms` | 64 | Rooms held at once. More than a demo needs, and each one's documents are the other unbounded term, so it is bounded here. |
-| `--max-peers-per-room` | 8 | One room is a session with a friend; 8 peers × 256 paths is the coupling the README warns pairs with the queue. |
-| `--max-documents-per-room` | 256 | The document set is echoed whole to every peer on `doc.open`/`doc.close`, so lowering it is what lowers the echo — and it is what makes the 8 MiB queue the floor rather than something higher. |
-| `--max-envelope-bytes` | 5242880 | The default, unchanged on purpose: 4 MiB of listing bytes is the policy bound, and 5 MiB is what a `doc.grant` of ordinary paths carrying it wires to. A listing written in `"` or `\` doubles on the wire and is refused with the bound named — at the byte budget the frame is 8 MiB and could not arrive at all — which is the trade this row makes rather than a bound that admits every legal listing. |
+| `--outbound-queue-bytes` | 8388608 | The server refuses anything below the largest frame this configuration can generate, and at these numbers that is one whole frame: 8 MiB (`net::MAX_FRAME_BYTES`). A relayed sealed frame is the largest frame there is, so 8 MiB is the smallest queue this configuration accepts, not a choice among larger ones. |
+| `--max-rooms` | 64 | Rooms held at once. More than a demo needs, and each one holds a token and up to eight peers — membership, and nothing larger. |
+| `--max-peers-per-room` | 8 | One room is a session with a friend; eight peers is room for that and three who looked at the wrong link. |
+| `--max-envelope-bytes` | 5242880 | The default, unchanged on purpose: a text envelope is a session frame and never a payload, so 5 MiB is already far above any frame the server parses. A frame past it is refused with the bound named and the connection stays open. |
 | `--inbound-bytes-per-sec` | 1048576 | Half the default. The bound is on the JSON parse and the room relay, and a keystroke is tens of bytes billed at a 1 KiB floor, so a megabyte a second is still a hundred times what an editor sends. |
 | `--inbound-burst-bytes` | 33554432 | Half the default. A fresh connection starts with the whole burst, so this is the shape a flood of new connections can spend before the rate bites; 32 MiB still clears any initial sync a room this size can have. |
 | `--room-grace-ms` | 30000 | The reference value, deliberately: `/meta` advertises it and both clients size their reconnect budget from it. Changing it here alone would desync them. |
@@ -130,41 +129,18 @@ container is killed inside its own cgroup and `restart: unless-stopped` brings
 it back in seconds, having dropped every room, rather than the kernel picking a
 victim on the host.
 
-Two independent terms can reach the cap, and only the first of them was counted
-when these numbers were chosen.
-
-- **The outbound queue**: 32 connections × 8 MiB is 256 MiB if all of them hold a full
-  queue, which a peer that stops reading can arrange.
-- **The room state, which outlives the connections that made it**: a room's grant is its
-  host's listing, up to `MAX_GRANT_BYTES` (4 MiB of paths), and a room survives its host
-  for the whole grace window. 64 rooms × 4 MiB is 256 MiB of listing before any queue is
-  full — and a visitor needs no token to mint a room and publish one, because minting a
-  room seats the minter as its host. Measured on the release binary with these flags as
-  they are, the `selvaged` process's resident set reaches **211 MiB at 16 granted rooms,
-  393 MiB at 32, 507 MiB at 48 and 653 MiB at 64**: the cap is crossed with no queue
-  pressure at all. The front's per-source limits (8 sockets, 5 handshakes a second) put
-  that behind four source addresses and about a minute of uploads; they do not bound it.
-  The reproduction and its raw output are in `ai_notes/.tmp/harden-refserver-2026-09-21.md`.
-
-There is a third term, which is why moving one number is not the fix. A publish
-materialises the listing about three times — the text frame, the parsed value, and the
-`Vec<String>` the room keeps — so a host publishing 4 MiB of paths costs \~12 MiB while it
-does so, and up to `--max-connections` hosts may be doing that at once.
+One term can reach the cap, and it is the one these numbers were chosen around.
 
 | term | worst case as configured | bounded by |
 |---|---|---|
 | outbound queues | 32 × 8 MiB = 256 MiB | `--max-connections`, `--outbound-queue-bytes` |
-| room state | 64 × (4 MiB of paths + 1 MiB of documents) | `--max-rooms`, and the listing by `--max-envelope-bytes` |
-| publish transients | \~12 MiB × the hosts publishing at once | `--max-connections` |
 
-Each of the three can cross 320 MiB on its own, so they have to move together and the
-answer is a set: `--max-connections 8` with `--max-rooms 8` puts the queues at 64 MiB, the
-transients at \~96 MiB and the room state at 32 MiB of listings plus 8 MiB of document
-sets, which fits the cap with headroom. That is a change to what this demo *is* — 8
-sockets is one source's whole allowance at the front, so a single visitor could fill
-it — and it belongs to the owner rather than to a hardening pass. The tracked shape
-above therefore still carries the numbers that were chosen deliberately, and the fix is
-one hand install of `compose.yaml`.
+The outbound queue is where the memory is: 32 connections × 8 MiB is 256 MiB if all of
+them hold a full queue, which a peer that stops reading can arrange, and that is what
+sizes the `320m` limit. The room state is membership — a token, a peer record and a queue
+handle per connection, at most eight to a room — so 64 rooms cost kilobytes rather than
+the megabytes a listing did. Nothing a visitor uploads is stored: a text envelope is
+parsed and dropped, and a binary frame is relayed and dropped.
 
 ## What the front does that the server cannot
 

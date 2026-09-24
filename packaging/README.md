@@ -115,7 +115,7 @@ local-only server.
 
 ```sh
 systemctl --user is-active selvaged
-curl -sS http://<your-address>:8080/meta   # answers selvaged/<version> with selvage/1
+curl -sS http://<your-address>:8080/meta   # answers selvaged/<version> with selvage/2
 tail -f ~/selvage/selvaged.log             # the log — not the journal
 systemctl --user restart selvaged          # rooms die; the process returns in seconds
 ```
@@ -359,8 +359,8 @@ way (read-only root filesystem, `CapDrop: [ALL]`, `no-new-privileges`, no mount
 at all), that the container's `--version` and `/meta` agree with `Cargo.toml`,
 that the page baked into the image is served with the headers the static
 handler pins, and then mints a room in the container and joins it as a guest
-with the harness's client engine (`crates/harness/examples/join_room.rs`),
-converging on an edit. A `--version` or `/meta` check is not that proof: no
+with the harness's client (`crates/harness/examples/join_room.rs`), receiving
+the host's edit. A `--version` or `/meta` check is not that proof: no
 client had ever completed a handshake against the image.
 `scripts/ci-local.sh container` runs the same script where a Docker daemon and
 the compose plugin exist.
