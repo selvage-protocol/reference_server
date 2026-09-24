@@ -213,8 +213,8 @@ against it. `scripts/ci-local.sh image` runs that smoke anywhere nix does.
 ### Published releases
 
 The package holds `0.1.0-7d64cbb`, `0.1.0`, `0.1.1-a3f4b12`, `0.1.1`, `0.1.2-adc0ae2`, `0.1.2`,
-`0.2.0-67c3b7d`, `0.2.0`, `0.2.1-030615c`, `0.2.1`, `0.4.0-1a12e2f`, `0.4.0`, and the moving
-`latest`, which is `0.4.0` as this is written (2026-09-24).
+`0.2.0-67c3b7d`, `0.2.0`, `0.2.1-030615c`, `0.2.1`, `0.4.0-1a12e2f`, `0.4.0`, `0.4.1-42c6d10`,
+`0.4.1`, and the moving `latest`, which is `0.4.1` as this is written (2026-09-24).
 `v0.1.0` (2026-09-19, at `7d64cbb`, the merge of \#25) was the first: its tag run —
 https://github.com/selvage-protocol/reference\_server/actions/runs/35428735910 —
 published `ghcr.io/selvage-protocol/selvaged:0.1.0-7d64cbb`, `:0.1.0` and `:latest`
