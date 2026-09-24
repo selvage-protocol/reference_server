@@ -2,7 +2,7 @@
   "id": "015",
   "title": "A second `session.hello` on a seated connection is `already_seated` and changes nothing",
   "spec": "PROTOCOL.md#sessionhello--the-handshake",
-  "notes": "The handshake happens once per connection. A second hello is answered with an error response naming that request's id — not a `session.error` event, because the seated connection can correlate it — and the connection stays open: the document method after it still works. Re-hello is not a resume and not a second peer.",
+  "notes": "The handshake happens once per connection. A second hello is answered with an error response naming that request's id — not a `session.error` event, because the seated connection can correlate it — and the connection stays open: the rename after it is answered and announced. Re-hello is not a resume and not a second peer.",
   "steps": [
     {
       "op": "open",
@@ -28,6 +28,21 @@
       "op": "expect",
       "conn": "host",
       "text": "{\"error\":{\"code\":\"already_seated\",\"message\":\"$_\"},\"id\":2,\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":3,\"method\":\"session.rename\",\"params\":{\"display_name\":\"Ada Lovelace\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":3,\"result\":{},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.renamed\",\"params\":{\"display_name\":\"Ada Lovelace\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/2\"}"
     }
   ],
   "selvage": "selvage/2",

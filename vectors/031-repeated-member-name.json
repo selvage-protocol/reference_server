@@ -2,7 +2,7 @@
   "id": "031",
   "title": "A frame that repeats a JSON member name is `bad_message`",
   "spec": "PROTOCOL.md#4-session-envelope",
-  "notes": "A JSON object is a set of member names: PROTOCOL.md §4 forbids the same name twice at any depth, so a receiver never lets a parser's last-wins or first-wins decide what a frame says. The refusal is `bad_message` before any other fault the frame carries (§11), and the seated half shows that it is an event which leaves the connection open — including for a name repeated inside `params`, which is where a reader that only walks the envelope's own members stops looking. The last request holds the same path the repeated frames named, so the room is shown untouched by the two refusals.",
+  "notes": "A JSON object is a set of member names: PROTOCOL.md §4 forbids the same name twice at any depth, so a receiver never lets a parser's last-wins or first-wins decide what a frame says. The refusal is `bad_message` before any other fault the frame carries (§11). Before seating it closes the connection with 4000; on a seated connection it is a `session.error` event and the connection stays open, which the two seated legs pin — one repeating a member of the envelope, where `session.rename` and `session.hello` are what a first-wins and a last-wins reader would each resolve the frame to, and one repeating a member inside `params`, which is where a reader that only walks the envelope's own members stops looking. The rename after them is answered and announced, so the seat is shown to have survived both refusals.",
   "selvage": "selvage/2",
   "canonical": "SJ-C/1",
   "steps": [
@@ -15,7 +15,7 @@
       "op": "send",
       "conn": "repeated",
       "refused": true,
-      "text": "{\"id\":2,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+      "text": "{\"id\":1,\"id\":2,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
@@ -43,14 +43,41 @@
       "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
     },
     {
-      "op": "expect",
+      "op": "send",
       "conn": "host",
-      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+      "refused": true,
+      "text": "{\"id\":2,\"method\":\"session.rename\",\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
     },
     {
       "op": "expect",
       "conn": "host",
       "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "refused": true,
+      "text": "{\"id\":3,\"method\":\"session.rename\",\"params\":{\"display_name\":\"Ada\",\"display_name\":\"Bob\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"bad_message\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":4,\"method\":\"session.rename\",\"params\":{\"display_name\":\"Ada Lovelace\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"id\":4,\"result\":{},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.renamed\",\"params\":{\"display_name\":\"Ada Lovelace\",\"peer_id\":\"$host_peer\"},\"v\":\"selvage/2\"}"
     }
   ]
 }

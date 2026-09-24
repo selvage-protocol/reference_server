@@ -30,6 +30,11 @@
       "target": "/session"
     },
     {
+      "op": "send",
+      "conn": "chatty",
+      "text": "{\"id\":1,\"method\":\"session.rename\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
       "op": "expect",
       "conn": "chatty",
       "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"hello_required\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
