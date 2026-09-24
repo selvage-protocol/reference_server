@@ -200,6 +200,9 @@ require_header "$baked/index.headers" "content-security-policy: default-src 'non
 require_body "$baked/index.html" "<title>Selvage"
 require_header "$baked/app.headers" "content-type: text/javascript; charset=utf-8"
 require_header "$baked/app.headers" "cache-control: no-cache"
+# The served bundle must name the wire this server seats: the page the image
+# bakes is built from the `WEB_CLIENT_SHA` the Dockerfile pins, and one built
+# from a revision that names another wire cannot join the container beside it.
 require_body "$baked/app.js" "selvage/2"
 require_header "$baked/manifest.headers" "content-type: application/manifest+json; charset=utf-8"
 

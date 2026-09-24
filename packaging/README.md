@@ -291,17 +291,21 @@ here: the `Dockerfile`'s `page` stage clones that repository at the revision in
 the `WEB_CLIENT_SHA` build argument, runs `npm ci && npm run build` on a Debian
 trixie node image (the client's icon renderer shells out to ImageMagick 7's
 `magick`), and copies the resulting `dist/` to `/page`. The pin is
-`197fe3edae8f482bf59da3e31441775fac0471d4`, the commit `web_client`'s newest
-release tag `v0.3.1` names, and updating it is editing that one argument; the
-image records the revision it carries in `com.selvage.page.revision`. The page
-is built from that revision's source rather than copied from the `dist/`
+`1409d20de175eb66dcbb4535376492c8a99e6db2`, the commit `web_client`'s `main`
+names for its `0.4.0`; updating it is editing that one argument, and the image
+records the revision it carries in `com.selvage.page.revision`. The page is
+built from that revision's source rather than copied from the `dist/`
 committed there; `web_client`'s own `checks` job rebuilds that `dist/` on every
 pull request and compares the two with `scripts/check-dist.sh`, which is why the
-bytes are the reviewed ones and why the page cannot fall behind its source. The
-pin is a revision of another repository, so it moves when *that* repository
-releases: a wave that cuts `web_client` and this repository together repins it to
-the released commit before this image is cut, because the page inside the image
-is only as new as the revision named here.
+bytes are the reviewed ones and why the page cannot fall behind its source.
+The page the image serves must speak the wire this server seats, since one built
+from a revision that names another wire cannot join the container beside it: the
+pin therefore names a revision whose bundle names `selvage/2`, which is what
+`scripts/container-smoke.sh` asserts of the served bundle. It is a revision of
+another repository, so it moves when *that* repository releases, and a wave that
+cuts `web_client` and this repository together repins it to the released commit
+before this image is cut, because the page inside the image is only as new as
+the revision named here.
 
 Overriding the baked page is a mount over `/page` (`-v …/dist:/page:ro`), and it
 needs no command override: the image's own command already names that directory.
