@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
+use crate::peer::FRAME_BUDGET;
+
 use crate::sealed::{
     FrameKey, PeerEntry, PublicKey, Recipe, RoomState, SealedError, SessionKey,
     fresh_nonce, seal, usable_path,
@@ -39,13 +41,30 @@ pub const MAX_LISTING_PATHS: usize = 100_000;
 /// §13.3's third bound: the path bytes one listing may carry.
 pub const MAX_LISTING_BYTES: usize = 4 * 1024 * 1024;
 
-/// The two values §7.1 has a host keep together: the host key, and its `issued` beside it.
+/// `CANONICAL.md` §6.1's absence charge: what every return of the host costs its count, a fixed
+/// ceiling on the frames one absence can hide. 1024 returns spend the frame budget on charges
+/// alone. This client has no in-process reconnect, so its one return is a reload from its store.
+pub const ABSENCE_CHARGE: u64 = 1 << 21;
+
+/// The count a reload continues from (`CANONICAL.md` §6.1): the saved one with the absence charge
+/// on it, since a reload is a return, or the spent budget for a record written before the count
+/// existed.
+fn resumed_frames(saved: Option<u64>) -> u64 {
+    saved.map_or(FRAME_BUDGET, |frames| frames.saturating_add(ABSENCE_CHARGE))
+}
+
+/// What §7.1 has a host keep together: the host key, its `issued` beside it, and the room's
+/// frame count (`CANONICAL.md` §6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PersistedHost {
     /// The host key's 32-byte seed — the private half of the `h` the fragment carries.
     pub host_seed: [u8; 32],
     /// The highest `issued` this host has published.
     pub issued: u64,
+    /// The room's frame count as this host has kept it since the mint (`CANONICAL.md` §6.1's
+    /// frame budget). `None` is a record written before the count existed, which cannot say what
+    /// the room has sealed and so reads as a spent budget.
+    pub frames: Option<u64>,
 }
 
 /// Where a host keeps what makes it the host after a reload (§7.1, §9.1).
@@ -151,6 +170,11 @@ pub struct HostProducer {
 
     /// The highest `issued` this host has published.
     issued: u64,
+    /// `CANONICAL.md` §6.1: the room's frame count, which the host's session keeps from the mint.
+    frames: u64,
+    /// The count the store last holds, and the clock it was written at.
+    saved_frames: u64,
+    saved_at: Option<Duration>,
     /// The highest `issued` a state this host verified carried (§7.1).
     verified: u64,
     host_counter: u64,
@@ -214,6 +238,9 @@ impl HostProducer {
             own_seat: own_seat.to_string(),
             own_key,
             issued: 0,
+            frames: 0,
+            saved_frames: 0,
+            saved_at: None,
             verified: 0,
             host_counter: 0,
             order: 0,
@@ -234,9 +261,13 @@ impl HostProducer {
         if let Some(persisted) =
             producer.store.as_ref().and_then(|store| store.load())
             && persisted.host_seed == options.host_seed
-            && persisted.issued > 0
         {
             producer.issued = persisted.issued;
+            // `CANONICAL.md` §6.1: a reload is a return, so it costs the absence charge; a record
+            // with no count cannot say what the room has sealed, so it reads as a spent budget and
+            // the room closes at the first tick.
+            producer.frames = resumed_frames(persisted.frames);
+            producer.saved_frames = persisted.frames.unwrap_or(u64::MAX);
         }
         Ok(producer)
     }
@@ -257,6 +288,41 @@ impl HostProducer {
     #[must_use]
     pub const fn published_issued(&self) -> u64 {
         self.issued
+    }
+
+    /// The room's frame count this host continues from: `0` at a mint, the stored one on a
+    /// reload (`CANONICAL.md` §6.1).
+    #[must_use]
+    pub const fn room_frames(&self) -> u64 {
+        self.frames
+    }
+
+    /// The session's count as it moves, kept here so every save writes it beside `issued`.
+    pub const fn count_frames(&mut self, count: u64) {
+        self.frames = count;
+    }
+
+    /// Writes the count now, whatever the window: a session that is ending has no later tick to
+    /// leave it to, and a reload must continue from the frame that ended it.
+    pub fn save_frames(&mut self) {
+        if self.frames != self.saved_frames {
+            self.save(self.saved_at);
+        }
+    }
+
+    /// `CANONICAL.md` §6.1: the count is written at least once every `awareness_renew_ms` while
+    /// it moves, so a host that dies loses at most one renewal interval of it.
+    pub fn flush_frames(&mut self, clock: Duration) {
+        if self.frames == self.saved_frames {
+            return;
+        }
+        if self
+            .saved_at
+            .is_some_and(|at| clock.saturating_sub(at) < self.renew)
+        {
+            return;
+        }
+        self.save(Some(clock));
     }
 
     /// The seats the roster has, which §7.1 keeps "a statement about the seats the roster has".
@@ -372,7 +438,7 @@ impl HostProducer {
         }
         let issued = self.next_issued();
         let frame = self.seal_state(issued, &listing, &peers)?;
-        self.commit_series(issued);
+        self.commit_series(issued, Some(clock));
         let state = RoomState {
             issued,
             listing,
@@ -408,7 +474,7 @@ impl HostProducer {
         let issued = self.next_issued();
         let plaintext = canonical(&json!({"closing": true, "issued": issued}));
         let frame = self.seal(2, &plaintext)?;
-        self.commit_series(issued);
+        self.commit_series(issued, None);
         self.standing = Standing::Closed;
         Some(HostPublication {
             frame,
@@ -423,12 +489,25 @@ impl HostProducer {
         self.issued.max(self.verified).saturating_add(1)
     }
 
-    fn commit_series(&mut self, issued: u64) {
+    /// `clock` is the publication's own, and a save records it: the renewal-window batching in
+    /// [`Self::flush_frames`] measures from the last write of any kind. A closing has no clock of
+    /// its own and keeps the last one, which is harmless because nothing is published after it.
+    fn commit_series(&mut self, issued: u64, clock: Option<Duration>) {
         self.issued = issued;
-        let host_seed = self.host_seed;
-        if let Some(store) = &self.store {
-            store.save(PersistedHost { host_seed, issued });
-        }
+        self.save(clock.or(self.saved_at));
+    }
+
+    fn save(&mut self, clock: Option<Duration>) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        store.save(PersistedHost {
+            host_seed: self.host_seed,
+            issued: self.issued,
+            frames: Some(self.frames),
+        });
+        self.saved_frames = self.frames;
+        self.saved_at = clock;
     }
 
     /// §7.1's rate bound: the window the last published state opened.
@@ -840,6 +919,7 @@ mod tests {
         store.save(PersistedHost {
             host_seed: [9; 32],
             issued: 42,
+            frames: Some(7),
         });
         let host = producer(Some(store));
         assert_eq!(

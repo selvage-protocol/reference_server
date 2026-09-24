@@ -472,6 +472,9 @@ impl PeerSession {
                 Some(host_producer(options, frame_key, host_options, own_key)?)
             }
         };
+        // `CANONICAL.md` §6.1: the host's count is the room's, so a host continues the one it
+        // saved.
+        let room_frames = host.as_ref().map_or(0, HostProducer::room_frames);
         let mut roster = options.roster.clone();
         if let (Some(seat), true) = (options.seat.as_ref(), host.is_some()) {
             // §9: a host is seated in the room it minted, whether or not the roster it was
@@ -508,7 +511,7 @@ impl PeerSession {
             published: 0,
             handshake: 0,
             frames: 0,
-            room_frames: 0,
+            room_frames,
             frame_budget: options.frame_budget.unwrap_or(FRAME_BUDGET),
             applied: Vec::new(),
             dropped: Vec::new(),
@@ -740,7 +743,7 @@ impl PeerSession {
     /// One sealed frame, as the relay delivered it.
     pub fn deliver(&mut self, clock: Duration, frame: &[u8]) -> Outcome {
         self.frames = self.frames.saturating_add(1);
-        self.room_frames = self.room_frames.saturating_add(1);
+        self.count_frame();
         let index = self.frames.saturating_sub(1);
         // A closing folds into the receiver the moment it verifies, and §13.10 ignores one
         // handed to a client holding no state. The two values it moved are put back, because
@@ -778,6 +781,9 @@ impl PeerSession {
     /// state has not committed this key since — so a driver has one path to publish it and
     /// nothing has to remember to call it at the join.
     pub fn tick(&mut self, clock: Duration) {
+        if let Some(host) = self.host.as_mut() {
+            host.flush_frames(clock);
+        }
         self.expire_leases(clock);
         self.refresh_host_away(clock, false);
         if self.ending.is_some() {
@@ -1011,7 +1017,7 @@ impl PeerSession {
             return;
         };
         if publication.fresh {
-            self.room_frames = self.room_frames.saturating_add(1);
+            self.count_frame();
         }
         self.outbound.push_back(publication.frame);
         self.published = self.published.saturating_add(1);
@@ -1317,7 +1323,7 @@ impl PeerSession {
             self.fault = Some(format!("a {what:?} frame could not be sealed"));
             return;
         };
-        self.room_frames = self.room_frames.saturating_add(1);
+        self.count_frame();
         self.outbound.push_back(bytes);
         let tally = match what.counted() {
             Counted::Publication => &mut self.published,
@@ -1437,7 +1443,10 @@ impl PeerSession {
             self.fault.get_or_insert(failed);
             return false;
         };
-        self.room_frames = self.room_frames.saturating_add(1);
+        self.count_frame();
+        if let Some(host) = self.host.as_mut() {
+            host.save_frames();
+        }
         self.outbound.push_back(publication.frame);
         self.published = self.published.saturating_add(1);
         self.ending = Some(Ending::Closing);
@@ -1448,6 +1457,14 @@ impl PeerSession {
     /// sealed under the frame key. A host publishes its one closing first — the frame that ends
     /// the room for every peer holding its state — and every session, the host's included, ends
     /// and says why.
+    /// One more frame against the room's count, handed to the host's producer to persist.
+    const fn count_frame(&mut self) {
+        self.room_frames = self.room_frames.saturating_add(1);
+        if let Some(host) = self.host.as_mut() {
+            host.count_frames(self.room_frames);
+        }
+    }
+
     fn budget_spent(&mut self) -> bool {
         if self.room_frames < self.frame_budget {
             return false;
@@ -1455,8 +1472,14 @@ impl PeerSession {
         if let Some(publication) =
             self.host.as_mut().and_then(HostProducer::closing)
         {
+            self.count_frame();
             self.outbound.push_back(publication.frame);
             self.published = self.published.saturating_add(1);
+        }
+        // The session ends here, so the count is written now rather than on a tick that will not
+        // come.
+        if let Some(host) = self.host.as_mut() {
+            host.save_frames();
         }
         self.ending = Some(Ending::FrameBudget);
         true
@@ -1595,10 +1618,12 @@ impl PeerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::ListingSource;
+    use crate::host::{
+        ABSENCE_CHARGE, HostStore, ListingSource, PersistedHost,
+    };
     use crate::sealed::{Envelope, RoomKey, encode_key, opens, read_varuint};
     use serde_json::json;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use yrs::{Doc, Text, Transact};
 
     /// A room, a host keypair and a session keypair, all derived from constants: these are
@@ -2434,6 +2459,170 @@ mod tests {
         session.tick(millis(400));
         assert!(session.take_outbound().is_empty(), "and nothing after it");
         assert_eq!(FRAME_BUDGET, 1 << 31);
+    }
+
+    #[derive(Default)]
+    struct Saved(Mutex<Option<PersistedHost>>);
+
+    impl HostStore for Saved {
+        fn load(&self) -> Option<PersistedHost> {
+            *self.0.lock().unwrap()
+        }
+
+        fn save(&self, persisted: PersistedHost) {
+            *self.0.lock().unwrap() = Some(persisted);
+        }
+    }
+
+    fn stored_host(store: &Arc<Saved>) -> HostOptions {
+        let listing: ListingSource = Arc::new(|| vec!["README.md".to_string()]);
+        HostOptions {
+            host_seed: [3; 32],
+            listing,
+            store: Some(Arc::clone(store) as Arc<dyn HostStore>),
+        }
+    }
+
+    #[test]
+    fn a_host_continues_the_frame_count_it_saved() {
+        // `CANONICAL.md` §6.1: the host's count is the room's, so a reload continues it rather
+        // than starting at 0, and the budget is reached from there.
+        let store = Arc::new(Saved::default());
+        store.save(PersistedHost {
+            host_seed: [3; 32],
+            issued: 5,
+            frames: Some(10),
+        });
+        // A reload is a return, so the saved count is continued with the absence charge on it.
+        let mut session = budgeted(
+            ABSENCE_CHARGE.saturating_add(11),
+            Some(stored_host(&store)),
+        );
+        session.tick(Duration::ZERO);
+        session.tick(millis(1));
+        assert_eq!(
+            session.ending(),
+            Some(Ending::FrameBudget),
+            "from the saved count"
+        );
+    }
+
+    #[test]
+    fn a_host_writes_its_moving_frame_count_once_a_renewal_interval() {
+        let store = Arc::new(Saved::default());
+        let mut session = budgeted(FRAME_BUDGET, Some(stored_host(&store)));
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        // The mint state's own write opened the window at 0, so the count it could not yet carry
+        // is written on the first tick a window later.
+        session.tick(millis(300));
+        let first = store
+            .load()
+            .and_then(|saved| saved.frames)
+            .unwrap_or_default();
+        assert!(
+            first > 0,
+            "the frames the host sealed are written on the tick"
+        );
+        let _ =
+            session.deliver(millis(301), &holds(&peer(), 1, &["README.md"]));
+        session.tick(millis(600));
+        let saved = store.load().unwrap();
+        assert!(
+            saved.frames.unwrap_or_default() > first,
+            "a delivered frame is in the next write"
+        );
+        assert!(saved.issued > 0, "written beside `issued`");
+    }
+
+    #[test]
+    fn a_host_record_without_a_count_reads_as_a_spent_budget() {
+        // `CANONICAL.md` §6.1: a record written before the count existed cannot say what the
+        // room has sealed, so the host closes the room at its first tick rather than continue it.
+        let store = Arc::new(Saved::default());
+        store.save(PersistedHost {
+            host_seed: [3; 32],
+            issued: 3,
+            frames: None,
+        });
+        let mut session = budgeted(FRAME_BUDGET, Some(stored_host(&store)));
+        session.tick(Duration::ZERO);
+        let kinds: Vec<u64> = session
+            .take_outbound()
+            .iter()
+            .map(|frame| Envelope::parse(frame).unwrap().kind)
+            .collect();
+        assert_eq!(kinds, [2], "the closing, and nothing sealed before it");
+        assert_eq!(session.ending(), Some(Ending::FrameBudget));
+        assert_eq!(store.load().map(|saved| saved.issued), Some(4));
+    }
+
+    #[test]
+    fn a_host_that_closes_its_room_saves_the_count_with_the_closing_in_it() {
+        let store = Arc::new(Saved::default());
+        let mut session = budgeted(FRAME_BUDGET, Some(stored_host(&store)));
+        session.tick(Duration::ZERO);
+        let sealed = u64::try_from(session.take_outbound().len()).unwrap();
+        assert!(session.close_room());
+        assert_eq!(
+            store.load().and_then(|saved| saved.frames),
+            Some(sealed.saturating_add(1)),
+            "a reload continues from the frame that ended the room"
+        );
+    }
+
+    #[derive(Default)]
+    struct Counted {
+        saved: Saved,
+        saves: Mutex<u32>,
+    }
+
+    impl HostStore for Counted {
+        fn load(&self) -> Option<PersistedHost> {
+            self.saved.load()
+        }
+
+        fn save(&self, persisted: PersistedHost) {
+            let mut saves = self.saves.lock().unwrap();
+            *saves = saves.saturating_add(1);
+            self.saved.save(persisted);
+        }
+    }
+
+    #[test]
+    fn a_state_published_after_a_flush_counts_as_a_write_for_the_renewal_window()
+     {
+        let store = Arc::new(Counted::default());
+        let listing: ListingSource = Arc::new(|| vec!["README.md".to_string()]);
+        let options = HostOptions {
+            host_seed: [3; 32],
+            listing,
+            store: Some(Arc::clone(&store) as Arc<dyn HostStore>),
+        };
+        let mut session = budgeted(FRAME_BUDGET, Some(options));
+        session.tick(Duration::ZERO);
+        session.tick(millis(300));
+        // An announcement commits a key, so the host publishes a fresh state, and that write
+        // carries the count at its own clock: a frame that moves the count right after it waits
+        // for the next window rather than being written on the next tick.
+        session.seat_joined(millis(600), "p-alice");
+        let named = json!({ "key": peer().public().encode() }).to_string();
+        let _ = session
+            .deliver(millis(600), &frame(&peer(), 4, 1, named.as_bytes()));
+        let after_state = *store.saves.lock().unwrap();
+        let _ = session.deliver(millis(601), &[1, 2, 3]);
+        session.tick(millis(602));
+        assert_eq!(
+            *store.saves.lock().unwrap(),
+            after_state,
+            "no write inside the window"
+        );
+        session.tick(millis(900));
+        assert_eq!(
+            *store.saves.lock().unwrap(),
+            after_state.saturating_add(1),
+            "one once it has passed"
+        );
     }
 
     #[test]
