@@ -88,7 +88,14 @@ services:
     # gone and the limits are the ones sized for this box. `README.md` owns why
     # each number is what it is; the short form is that
     # `--max-connections × --outbound-queue-bytes` is the server's own outbound
-    # ceiling and 32 × 8 MiB is the largest one this host can be surprised by.
+    # ceiling, and 32 × 8454144 is 258 MiB, the largest one this host can be
+    # surprised by.
+    #
+    # 8454144 is the smallest queue `selvaged` accepts at all: the 8 MiB frame
+    # bound plus the 64 KiB envelope headroom its own `smallest_queue_bytes`
+    # counts. Below it the server exits 2 with the floor named, and the
+    # container restart-loops; `packaging/prod/test_compose_args.py` runs this
+    # command line so that a value below the floor cannot be committed again.
     #
     # The grace period is the reference value on purpose: `/meta` advertises it
     # and both clients size their reconnect budget from it.
@@ -104,7 +111,7 @@ services:
       - --max-peers-per-room
       - "8"
       - --outbound-queue-bytes
-      - "8388608"
+      - "8454144"
       - --max-envelope-bytes
       - "5242880"
       - --inbound-bytes-per-sec

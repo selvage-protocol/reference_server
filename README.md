@@ -106,7 +106,7 @@ usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]
 | `--max-connections N` | connections held at once, counted past the request head (default `1024`) |
 | `--max-rooms N` | rooms held at once; past it a room is not minted (default `1024`) |
 | `--max-peers-per-room N` | peers one room seats at once (default `128`) |
-| `--outbound-queue-bytes N` | payload bytes queued but unwritten for one connection before it is dropped as a peer that stopped reading (default `33554432`, 32 MiB; the command line refuses one that cannot hold the largest frame this configuration can generate, which is never below one whole frame, `8388608`) |
+| `--outbound-queue-bytes N` | payload bytes queued but unwritten for one connection before it is dropped as a peer that stopped reading (default `33554432`, 32 MiB; the command line refuses one that cannot hold one whole frame, which is the 8 MiB frame bound plus the 64 KiB of envelope headroom the floor counts, `8454144`) |
 | `--max-envelope-bytes N` | the largest inbound text envelope the server will parse, judged on the frame's length before `serde_json` sees it (default `5242880`, 5 MiB) |
 | `--inbound-bytes-per-sec N` | bytes one connection may send a second, refilled continuously (default `2097152`, 2 MiB) |
 | `--inbound-burst-bytes N` | how much of that rate one connection may spend at once (default `67108864`, 64 MiB) |
@@ -151,19 +151,21 @@ lowers first. The inbound budget bounds what one connection can spend of the CPU
 
 The queue is also the floor under every frame the server sends, and it is refused at
 startup if it cannot hold one. The largest frame is a relayed payload (the frame bound,
-8 MiB), and what is counted is the frame. A queue below that does not bound memory, it
-breaks sessions — a handshake frame nobody can queue seats nobody — so the command line
-refuses the combination and says which flag to move.
+8 MiB), the floor counts the envelope headroom around it as well, and what is counted is
+the frame's wire bytes: the two together are `8454144`, which is the smallest value the
+command line accepts. A queue below that does not bound memory, it breaks sessions — a
+handshake frame nobody can queue seats nobody — so the command line refuses the
+combination and says which flag to move.
 
 For a 1 GiB box with something else running on it, these are a defensible set:
 
 ```sh
 selvaged --listen 0.0.0.0:8080 --serve-page /page \
   --max-connections 32 --max-rooms 64 --max-peers-per-room 8 \
-  --outbound-queue-bytes 8388608
+  --outbound-queue-bytes 8454144
 ```
 
-That is an outbound ceiling of 256 MiB, not a figure anything reaches in a session: it is
+That is an outbound ceiling of 258 MiB, not a figure anything reaches in a session: it is
 every one of 32 connections holding a full queue of unwritten frames at once, which is what
 the queue's own cap ejects. The two inbound bounds keep their defaults here: 5 MiB is well
 above the largest sealed frame a peer sends, and 2 MiB/s is already far above what an
