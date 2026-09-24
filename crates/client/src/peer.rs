@@ -1347,7 +1347,14 @@ impl PeerSession {
             self.announce_holds(clock);
             return;
         }
-        if let Some(frame) = self.held_state_frame.clone() {
+        // §7.1: the re-send is for a room whose host is away — a joiner the host cannot answer,
+        // or a returning host that lost its `issued`. While the seat the `host` entry labels is
+        // seated, the host's own fresh state answers this join, and a copy from every peer would
+        // put the whole listing on every connection once per seated peer.
+        let host_away = self
+            .host_seat()
+            .is_none_or(|host_seat| !self.roster.contains(host_seat));
+        if host_away && let Some(frame) = self.held_state_frame.clone() {
             self.republish(&frame);
         }
         self.announce_holds(clock);
@@ -2290,6 +2297,43 @@ mod tests {
             .map(|frame| Envelope::parse(frame).unwrap().kind)
             .collect();
         assert_eq!(kinds, [1, 3], "the state the room holds, then the holds");
+    }
+
+    #[test]
+    fn a_state_is_re_sent_on_a_join_only_while_the_host_is_away() {
+        // `PROTOCOL.md` §7.1: while the seat the `host` entry labels is seated, the host's own
+        // fresh state answers a join, so this peer sends none; once that seat has gone, a new
+        // seat — a returning host among them — is sent the held state, unchanged.
+        let mut session = session(&["p-host"]);
+        session.tick(Duration::ZERO);
+        let held = state(
+            &host(),
+            1,
+            &[(&peer(), "host", "p-host"), (&ours(), "guest", "p-self")],
+        );
+        let _ = session.deliver(millis(1), &held);
+        let _ = session.take_outbound();
+
+        session.seat_joined(millis(2), "p-new");
+        let kinds: Vec<u64> = session
+            .take_outbound()
+            .iter()
+            .map(|frame| Envelope::parse(frame).unwrap().kind)
+            .collect();
+        assert!(
+            !kinds.contains(&1),
+            "no state goes back while the host is seated: {kinds:?}"
+        );
+
+        session.seat_left(millis(3), "p-host");
+        let _ = session.take_outbound();
+        session.seat_joined(millis(4), "p-host-again");
+        let out = session.take_outbound();
+        assert_eq!(
+            out.first().map(Vec::as_slice),
+            Some(held.as_slice()),
+            "the held state goes back first, unchanged"
+        );
     }
 
     #[test]
