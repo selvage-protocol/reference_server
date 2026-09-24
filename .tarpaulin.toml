@@ -1,2 +1,11 @@
+# Coverage of process entry points: `cargo tarpaulin` instruments the test binary, so
+# code that only runs in a child process it spawns is reported uncovered however
+# thoroughly it is exercised. The server and transcript binaries are entry points, and
+# `selvage-subject` is the subject `crates/harness/tests/decisions.rs` drives over its
+# stdin in a process of its own.
 [test_config]
-exclude-files = ["crates/selvaged/src/main.rs", "crates/harness/src/main.rs"]
+exclude-files = [
+  "crates/selvaged/src/main.rs",
+  "crates/harness/src/main.rs",
+  "crates/harness/src/bin/selvage-subject.rs",
+]

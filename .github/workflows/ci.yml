@@ -74,7 +74,7 @@ jobs:
       - name: clippy
         run: nix build .#checks.x86_64-linux.clippy --no-link --print-build-logs
 
-      # The vector replay is part of this suite: the vendored `vectors/` directory reaches the
+      # The corpus replay is part of this suite: the vendored `vectors/` directory reaches the
       # sandbox through `SELVAGE_VECTORS`, so no specification checkout is needed here.
       - name: tests
         run: nix build .#checks.x86_64-linux.nextest --no-link --print-build-logs

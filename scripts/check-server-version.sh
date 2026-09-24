@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Assert a running server's version truthfulness: `--version` output and
 # `GET <base-url>/meta` must both say `selvaged/<expected-version>`, and the
-# meta document must advertise the `selvage/1` wire version.
+# meta document must advertise the `selvage/2` wire version.
 #
 #   check-server-version.sh <base-url> <expected-version> [version-output]
 #
@@ -46,10 +46,10 @@ wires = meta.get("wire_versions", [])
 if server != want:
     print(f"/meta server is {server!r}, want {want!r}", file=sys.stderr)
     sys.exit(1)
-if "selvage/1" not in wires:
-    print(f"/meta wire_versions is {wires!r}, want 'selvage/1' among them",
+if "selvage/2" not in wires:
+    print(f"/meta wire_versions is {wires!r}, want 'selvage/2' among them",
           file=sys.stderr)
     sys.exit(1)
 EOF
 
-echo "version OK: $expected_server with selvage/1 at $base_url"
+echo "version OK: $expected_server with selvage/2 at $base_url"

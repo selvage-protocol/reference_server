@@ -7,9 +7,7 @@
 //! and runs the session's clocks on a timer of its own (§13.8) — a session renews nothing if
 //! only the caller moves it.
 //!
-//! **What it is not.** It is the relay and nothing above it: it says nothing to an editor. It
-//! is also not the version-1 engine ([`crate::SyncEngine`]), which stays where it is; a caller
-//! that holds a `selvage/2` invite joins with [`RelaySession::join`] instead.
+//! **What it is not.** It is the relay and nothing above it: it says nothing to an editor.
 //!
 //! **No TLS.** This workspace builds `tokio-tungstenite` with no TLS feature, so a `wss://`
 //! base cannot be reached from here at all: the dial refuses one by name rather than failing
@@ -32,10 +30,9 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
 
 use selvage_protocol as proto;
-use selvage_protocol::{code, event, method};
+use selvage_protocol::{event, method};
 
 use crate::Error;
-use crate::engine::read_meta;
 use crate::host::{HostOptions, HostStore, ListingSource};
 use crate::peer::{Ending, Outcome, PeerInvite, PeerOptions, PeerSession};
 use crate::sealed::{
@@ -47,8 +44,8 @@ type Socket = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = SplitSink<Socket, Message>;
 type Stream = SplitStream<Socket>;
 
-/// The version this module speaks. `selvage/1` is [`crate::SyncEngine`]'s and stays there.
-pub const WIRE_VERSION_V2: &str = proto::WIRE_VERSION_V2;
+/// The wire version this module speaks.
+pub const WIRE_VERSION: &str = proto::WIRE_VERSION;
 
 /// How long the upgrade and the handshake may take together before the connection is abandoned.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -73,7 +70,7 @@ pub const CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// the name back owes §8's producer half: publish a state, renew it every
 /// `keepalive.awareness_renew_ms`, forget a remote state not renewed inside
 /// `keepalive.awareness_expire_ms`, and republish on a `peer.joined` (§8.3's step 2).
-pub const CLIENT_CAPABILITIES_V2: &[&str] = &["y-protocols/1"];
+pub const CLIENT_CAPABILITIES: &[&str] = &["y-protocols/1"];
 
 /// A peer as `selvage/2` records it: `PROTOCOL.md` §6.1's `PeerInfo` without `role`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,7 +254,6 @@ impl RelaySession {
                 link_address(&options.base_url)
             ))
         })?;
-        refuse_a_version_this_client_cannot_speak_at(&base).await?;
         let room_key = match options.room_key {
             Some(key) => key,
             None => random_room_key()?,
@@ -325,9 +321,6 @@ impl RelaySession {
     pub async fn join(options: RelayJoinOptions) -> Result<Self, Error> {
         let invite =
             PeerInvite::parse(&options.invite).map_err(Error::Invite)?;
-        if let Some(base) = session_base(&invite.socket_url) {
-            refuse_a_version_this_client_cannot_speak_at(&base).await?;
-        }
         let awareness_client_id = mint_awareness_client_id()?;
         let dial = dial(
             &invite.socket_url,
@@ -590,7 +583,7 @@ impl RelaySession {
         }
         state.request_id = state.request_id.saturating_add(1);
         let request = serde_json::json!({
-            "v": WIRE_VERSION_V2,
+            "v": WIRE_VERSION,
             "id": state.request_id,
             "method": method::SESSION_RENAME,
             "params": { "display_name": display_name },
@@ -1141,8 +1134,7 @@ fn link_address(link: &str) -> &str {
 /// One `PeerInfo` from a `peer.joined`'s params, which wraps its record under `peer`.
 fn peer_of(params: &serde_json::Value) -> Option<RelayPeer> {
     let record = params.get("peer").unwrap_or(params);
-    let peer: proto::PeerInfoV2 =
-        serde_json::from_value(record.clone()).ok()?;
+    let peer: proto::PeerInfo = serde_json::from_value(record.clone()).ok()?;
     Some(RelayPeer {
         peer_id: peer.peer_id,
         display_name: peer.display_name,
@@ -1151,9 +1143,8 @@ fn peer_of(params: &serde_json::Value) -> Option<RelayPeer> {
 }
 
 /// The server base of a URL, without the endpoint path. It is what a mint dials and what the
-/// invite is built from, and it is the address §2/§10's refusal names — a caller that has a link
-/// and no session ([`refuse_a_version_this_client_cannot_speak`], driven by the corpus's
-/// subject) reads the base off the invite with this rather than re-deriving it.
+/// invite is built from, and a caller that has a link and no session reads the base off the
+/// invite with this rather than re-deriving it.
 ///
 /// `PROTOCOL.md` §5.1: the fragment carries the room's keys and is never part of a request, so
 /// an address with one is not a base. A base is what every URL this connection builds is made
@@ -1170,15 +1161,15 @@ pub fn session_base(url: &str) -> Option<String> {
     (!base.is_empty()).then(|| base.to_string())
 }
 
-/// `session.hello` at `selvage/2`: no `role`, because the version seats nobody as anything.
+/// `session.hello`: no `role`, because the server seats nobody as anything.
 fn hello(
     display_name: &str,
     client: Option<&String>,
     awareness_client_id: u64,
 ) -> String {
-    let params = proto::HelloParamsV2 {
+    let params = proto::HelloParams {
         awareness_client_id: Some(awareness_client_id),
-        capabilities: CLIENT_CAPABILITIES_V2
+        capabilities: CLIENT_CAPABILITIES
             .iter()
             .map(ToString::to_string)
             .collect(),
@@ -1186,7 +1177,7 @@ fn hello(
         display_name: display_name.to_string(),
     };
     serde_json::json!({
-        "v": WIRE_VERSION_V2,
+        "v": WIRE_VERSION,
         "id": 1,
         "method": method::SESSION_HELLO,
         "params": params,
@@ -1259,7 +1250,7 @@ async fn seating(
             _ => continue,
         }
         let Some(body) = frame.params else { continue };
-        let read: proto::SessionParamsV2 = serde_json::from_value(body)?;
+        let read: proto::SessionParams = serde_json::from_value(body)?;
         let base = session_base(url)
             .ok_or_else(|| Error::Invite(link_address(url).to_string()))?;
         let advertised = KeepaliveConfig::from(read.keepalive);
@@ -1290,7 +1281,7 @@ const fn overridden(
 }
 
 /// One seat as the handshake reply writes it.
-fn peer_info(peer: &proto::PeerInfoV2) -> RelayPeer {
+fn peer_info(peer: &proto::PeerInfo) -> RelayPeer {
     RelayPeer {
         peer_id: peer.peer_id.clone(),
         display_name: peer.display_name.clone(),
@@ -1309,61 +1300,6 @@ fn refuse_tls(url: &str) -> Result<(), Error> {
         )));
     }
     Ok(())
-}
-
-/// `PROTOCOL.md` §2's and §10's local stop: a reachable `/meta` that names no version at major
-/// 2 this client can speak is a refusal **before a socket is opened**, in this client's own
-/// words, and never a fall back to `selvage/1` — a version-2 peer and a version-1 peer cannot
-/// share a room, so a capability would only be a silent downgrade.
-///
-/// A `/meta` that could not be read is not that answer: §2 leaves the decision to the
-/// handshake, which refuses an unreadable server in its own words.
-async fn refuse_a_version_this_client_cannot_speak_at(
-    base: &str,
-) -> Result<(), Error> {
-    let Some(meta) = read_meta(base).await else {
-        return Ok(());
-    };
-    refuse_a_version_this_client_cannot_speak(base, &meta.wire_versions)
-}
-
-/// The same rule decided from the body rather than read.
-///
-/// One home for the decision, with two callers:
-/// [`refuse_a_version_this_client_cannot_speak_at`] in front of it with the `GET /meta` it made,
-/// and a caller that was handed the body and opens no socket —
-/// `crates/harness/src/bin/selvage-subject.rs`, which the peer corpus's decision layer drives —
-/// with one it already has. `wire_versions` is §2's own member and nothing else of the body is
-/// read: §10 decides by major alone, so any spelling at major 2 is a version this client can
-/// speak.
-///
-/// # Errors
-///
-/// Returns [`Error::Protocol`] carrying `code::UNSUPPORTED_VERSION` when nothing in the list is
-/// at major 2, in the client's own words: the caller must not connect, and `base` is the address
-/// those words name.
-pub fn refuse_a_version_this_client_cannot_speak(
-    base: &str,
-    wire_versions: &[String],
-) -> Result<(), Error> {
-    if wire_versions
-        .iter()
-        .any(|version| proto::version_of(version) == Some(proto::Version::V2))
-    {
-        return Ok(());
-    }
-    let listed = if wire_versions.is_empty() {
-        "no wire version".to_string()
-    } else {
-        wire_versions.join(", ")
-    };
-    Err(Error::Protocol {
-        code: code::UNSUPPORTED_VERSION.to_string(),
-        message: format!(
-            "{base} advertises {listed}: this client needs {WIRE_VERSION_V2} and does not \
-             fall back to an earlier version"
-        ),
-    })
 }
 
 /// A room key from the platform's CSPRNG (`CANONICAL.md` §6.1).
@@ -1387,7 +1323,7 @@ fn random_seed() -> Result<[u8; 32], Error> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Yjs`] when the platform's CSPRNG cannot be read.
+/// Returns [`Error::Sealed`] when the platform's CSPRNG cannot be read.
 fn mint_awareness_client_id() -> Result<u64, Error> {
     let nonce = fresh_nonce().map_err(|error| sealed(&error))?;
     let mut id: u64 = 0;
@@ -1399,7 +1335,7 @@ fn mint_awareness_client_id() -> Result<u64, Error> {
 
 /// Reports a sealed-layer failure as this crate's own error.
 fn sealed(error: &SealedError) -> Error {
-    Error::Yjs(error.to_string())
+    Error::Sealed(error.to_string())
 }
 
 #[cfg(test)]
@@ -1416,18 +1352,16 @@ mod tests {
 
     use futures_util::SinkExt;
     use futures_util::StreamExt;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{mpsc, oneshot};
     use tokio::task::JoinHandle;
-    use tokio::time::{sleep, timeout};
+    use tokio::time::sleep;
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{
         RelayHostOptions, RelayJoinOptions, RelaySession, RelaySessionInfo,
-        clock_period, hello, lock, refuse_a_version_this_client_cannot_speak,
-        session_base, start,
+        clock_period, hello, lock, session_base, start,
     };
     use crate::host::{HostOptions, ListingSource};
     use crate::peer::{PeerOptions, PeerSession};
@@ -2075,7 +2009,7 @@ mod tests {
     /// as "the peer publishes presence". This session publishes none — no state of its own, no
     /// renewal, no expiry — so the hello carries the one name it does speak.
     #[test]
-    fn the_version_two_hello_advertises_only_what_this_client_speaks() {
+    fn the_hello_advertises_only_what_this_client_speaks() {
         let client = "selvage-test/0.1.0".to_string();
         let text = hello("Ada", Some(&client), 7);
         let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -2089,49 +2023,7 @@ mod tests {
         assert_eq!(
             frame["params"]["awareness_client_id"],
             serde_json::json!(7),
-            "the id is claimed in both versions and is an identity in neither (§8.4)"
-        );
-    }
-
-    /// §2/§10's no-fallback rule, decided from the body: what it refuses, and what it does not.
-    ///
-    /// The socket path calls this with the `/meta` it read, and the peer corpus's subject calls it
-    /// with the body a vector handed it (`crates/harness/src/bin/selvage-subject.rs`), so the rule
-    /// is one function with two callers and this is where its two answers are pinned.
-    #[test]
-    fn a_body_at_major_one_alone_is_refused_and_one_at_major_two_is_not() {
-        let base = "ws://h:8080";
-        let refused = refuse_a_version_this_client_cannot_speak(
-            base,
-            &["selvage/1".to_string()],
-        )
-        .expect_err("a body that seats no version at major 2 is refused");
-        let said = refused.to_string();
-        assert!(said.contains(base), "the refusal names the address: {said}");
-        assert!(
-            said.contains("selvage/2"),
-            "and the version this client would need: {said}"
-        );
-        assert!(
-            said.contains("selvage/1"),
-            "and what the server advertised instead: {said}"
-        );
-
-        for offered in ["selvage/2", "selvage/2.1"] {
-            assert!(
-                refuse_a_version_this_client_cannot_speak(
-                    base,
-                    &[offered.to_string()],
-                )
-                .is_ok(),
-                "§10 decides by major alone, so {offered} seats this client"
-            );
-        }
-        let empty = refuse_a_version_this_client_cannot_speak(base, &[])
-            .expect_err("an empty list seats nothing");
-        assert!(
-            empty.to_string().contains("no wire version"),
-            "a list with nothing in it says so rather than reading as an advertisement: {empty}"
+            "the id is an identity in no version (§8.4)"
         );
     }
 
@@ -2157,10 +2049,8 @@ mod tests {
         );
     }
 
-    /// A server that answers `GET /meta` and then completes the handshake and seats the
-    /// connection in another room: the one reply that makes `RelaySession::join` disagree with
-    /// the address it dialled. `PROTOCOL.md` §2 has a client read `/meta` before it dials, so a
-    /// fixture that seats a client serves that read first.
+    /// A server that completes the handshake and seats the connection in another room: the
+    /// one reply that makes `RelaySession::join` disagree with the address it dialled.
     #[expect(
         clippy::excessive_nesting,
         reason = "a task's handshake is one place: the listener, the accept and the reply belong together"
@@ -2173,97 +2063,34 @@ mod tests {
         let seated = room.to_string();
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
-                // Peeked and not read: the WebSocket handshake that follows a `/meta` read is
-                // read by `accept_async`, which needs those bytes still in the socket.
-                let asks_for_meta = request_line(&tcp)
-                    .await
-                    .is_some_and(|line| line.starts_with("GET /meta"));
-                if !asks_for_meta {
-                    let Ok(mut socket) =
-                        tokio_tungstenite::accept_async(tcp).await
-                    else {
-                        continue;
-                    };
-                    // The client's hello, then the seating reply.
-                    let _ = socket.next().await;
-                    let reply = serde_json::json!({
-                        "v": "selvage/2",
-                        "event": "room.joined",
-                        "params": {
-                            "room_id": seated,
-                            "self": {"peer_id": "p-2", "display_name": "Bob"},
-                            "peers": [],
-                            "capabilities": [],
-                            "keepalive": {
-                                "awareness_renew_ms": 15000,
-                                "awareness_expire_ms": 30000,
-                                "ping_interval_ms": 30000,
-                            },
+                let Ok(mut socket) = tokio_tungstenite::accept_async(tcp).await
+                else {
+                    continue;
+                };
+                // The client's hello, then the seating reply.
+                let _ = socket.next().await;
+                let reply = serde_json::json!({
+                    "v": "selvage/2",
+                    "event": "room.joined",
+                    "params": {
+                        "room_id": seated,
+                        "self": {"peer_id": "p-2", "display_name": "Bob"},
+                        "peers": [],
+                        "capabilities": [],
+                        "keepalive": {
+                            "awareness_renew_ms": 15000,
+                            "awareness_expire_ms": 30000,
+                            "ping_interval_ms": 30000,
                         },
-                    });
-                    let _ = socket.send(Message::text(reply.to_string())).await;
-                    // Hold the socket open so the dial reads the reply before any close.
-                    let _ = socket.next().await;
-                    return;
-                }
-                let mut tcp = tcp;
-                // Consumed before the answer: a socket closed with bytes still unread in it is
-                // reset rather than ended, and this client reads to the end of the body.
-                let _ = drain_request(&mut tcp).await;
-                let body = br#"{"capabilities":["y-protocols/1","awareness"],"server":"selvage-test/0.1.0","wire_versions":["selvage/1","selvage/2"]}"#;
-                let answer = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = tcp.write_all(answer.as_bytes()).await;
-                let _ = tcp.write_all(body).await;
+                    },
+                });
+                let _ = socket.send(Message::text(reply.to_string())).await;
+                // Hold the socket open so the dial reads the reply before any close.
+                let _ = socket.next().await;
+                return;
             }
         });
         Ok(format!("ws://{addr}"))
-    }
-
-    /// The first line of a request, peeked and never consumed, so that the handshake behind it
-    /// can still be read. `None` for a connection that says nothing.
-    async fn request_line(tcp: &TcpStream) -> Option<String> {
-        let mut head = [0u8; 64];
-        let mut read = timeout(WAIT, tcp.peek(&mut head)).await.ok()?.ok()?;
-        while read > 0 && line_end(head.get(..read)?).is_none() {
-            read = timeout(WAIT, tcp.peek(&mut head)).await.ok()?.ok()?;
-        }
-        let arrived = head.get(..read)?;
-        String::from_utf8(arrived.get(..line_end(arrived)?)?.to_vec()).ok()
-    }
-
-    /// Where the first line of one request ends, or `None` while it has not arrived whole.
-    fn line_end(head: &[u8]) -> Option<usize> {
-        head.windows(2).position(|pair| pair == b"\r\n")
-    }
-
-    /// Reads one connection's request to its end, leaving nothing in the socket for the close
-    /// after the answer to turn into a reset.
-    async fn drain_request(tcp: &mut TcpStream) -> Option<()> {
-        let mut request: Vec<u8> = Vec::new();
-        let mut whole = false;
-        while !whole {
-            whole = read_a_chunk(tcp, &mut request).await?;
-        }
-        Some(())
-    }
-
-    /// One chunk of a request, appended, and whether the headers are now whole.
-    async fn read_a_chunk(
-        tcp: &mut TcpStream,
-        request: &mut Vec<u8>,
-    ) -> Option<bool> {
-        let mut chunk = [0u8; 64];
-        let read = timeout(WAIT, tcp.read(&mut chunk)).await.ok()?.ok()?;
-        request.extend_from_slice(chunk.get(..read)?);
-        Some(read == 0 || header_end(request).is_some())
-    }
-
-    /// Where one request's headers end, or `None` while they have not arrived whole.
-    fn header_end(request: &[u8]) -> Option<usize> {
-        request.windows(4).position(|four| four == b"\r\n\r\n")
     }
 
     /// R1: a refusal names the address, never the link. §5.1 forbids the fragment leaving a

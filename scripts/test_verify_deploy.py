@@ -59,7 +59,7 @@ class Enough(Exception):
 
 
 def meta(version):
-    return '{"capabilities":["awareness"],"server":"selvaged/%s","wire_versions":["selvage/1"]}' % version
+    return '{"capabilities":["awareness"],"server":"selvaged/%s","wire_versions":["selvage/2"]}' % version
 
 
 def public(status, body, headers="HTTP/2 200 \r\nserver: cloudflare\r\n"):

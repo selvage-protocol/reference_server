@@ -14,9 +14,8 @@ const DEFAULT_ADDRESS: &str = "127.0.0.1:8080";
 const USAGE: &str = concat!(
     "usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]\n",
     "                [--max-connections N] [--max-rooms N] [--max-peers-per-room N]\n",
-    "                [--max-documents-per-room N] [--outbound-queue-bytes N]\n",
-    "                [--max-envelope-bytes N] [--inbound-bytes-per-sec N]\n",
-    "                [--inbound-burst-bytes N] [--serve-version-1-only]",
+    "                [--outbound-queue-bytes N] [--max-envelope-bytes N]\n",
+    "                [--inbound-bytes-per-sec N] [--inbound-burst-bytes N]",
 );
 
 #[tokio::main]
@@ -126,11 +125,6 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Action, String> {
                 )?;
                 config.room_grace = grace(&value)?;
             }
-            // The flag that narrows the default: a server that seats `selvage/1` alone.
-            // A room is pinned to the version that minted it either way.
-            "--serve-version-1-only" => {
-                config.serve_version_1_only = true;
-            }
             "--serve-page" => {
                 let value = args
                     .next()
@@ -147,10 +141,6 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Action, String> {
             "--max-peers-per-room" => {
                 let flag = "--max-peers-per-room";
                 config.max_peers_per_room = limit(&mut args, flag)?;
-            }
-            "--max-documents-per-room" => {
-                let flag = "--max-documents-per-room";
-                config.max_documents_per_room = limit(&mut args, flag)?;
             }
             "--outbound-queue-bytes" => {
                 let flag = "--outbound-queue-bytes";
@@ -172,20 +162,15 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Action, String> {
         }
     }
     // The outbound queue has to hold one whole frame, and the largest frame this
-    // configuration can be asked to carry is the room's open-document set echoed to every
-    // peer, the whole grant, or a relayed payload. A queue below that does not bound
-    // memory, it breaks sessions: a handshake frame nobody can queue seats nobody, and
-    // every peer — the one that asked included — is dropped for opening a path the server
-    // echoed. What a frame costs is its wire bytes, so a set of paths JSON has to escape
-    // costs twice their length, which is the usual reason this fires.
+    // configuration can be asked to carry is a relayed payload. A queue below that does
+    // not bound memory, it breaks sessions: a handshake frame nobody can queue seats
+    // nobody. What a frame costs is its wire bytes.
     let smallest = config.smallest_queue_bytes();
     if config.max_queue_bytes < smallest {
         return Err(format!(
             "--outbound-queue-bytes {} is below the {smallest} bytes this configuration \
-             needs: the queue has to hold one whole frame, which is the room's \
-             open-document set echoed to every peer, the whole grant, or a relayed \
-             payload, counted in the bytes the frame wires to. Raise \
-             --outbound-queue-bytes, or lower --max-documents-per-room",
+             needs: the queue has to hold one whole frame, a relayed payload, counted in \
+             the bytes the frame wires to. Raise --outbound-queue-bytes",
             config.max_queue_bytes
         ));
     }
@@ -236,9 +221,6 @@ fn default_for(flag: &str) -> String {
         "--max-connections" => default.max_connections.to_string(),
         "--max-rooms" => default.max_rooms.to_string(),
         "--max-peers-per-room" => default.max_peers_per_room.to_string(),
-        "--max-documents-per-room" => {
-            default.max_documents_per_room.to_string()
-        }
         "--outbound-queue-bytes" => default.max_queue_bytes.to_string(),
         "--max-envelope-bytes" => default.max_envelope_bytes.to_string(),
         "--inbound-bytes-per-sec" => default.inbound_bytes_per_sec.to_string(),
@@ -287,7 +269,7 @@ fn endpoint_help(default: &ServerConfig) -> Vec<(&'static str, String)> {
         (
             "--room-grace-ms MS",
             format!(
-                "how long a room survives its host disconnecting, in milliseconds \
+                "how long a room survives its last connection ending, in milliseconds \
                  (default {}s)",
                 default.room_grace.as_secs()
             ),
@@ -295,14 +277,6 @@ fn endpoint_help(default: &ServerConfig) -> Vec<(&'static str, String)> {
         (
             "--serve-page DIR",
             "serve the browser page from DIR, on the same origin as /session and /meta"
-                .to_string(),
-        ),
-        (
-            "--serve-version-1-only",
-            "seat `selvage/1` alone. Every version is seated by default, so `/meta` \
-             advertises `selvage/2` too; a server that must refuse a version-2 hello \
-             — the version-1 corpus's own shape — names this. A room is pinned to \
-             the version that minted it either way"
                 .to_string(),
         ),
     ]
@@ -332,13 +306,6 @@ fn capacity_help(default: &ServerConfig) -> Vec<(&'static str, String)> {
             format!(
                 "peers one room seats at once (default {})",
                 default.max_peers_per_room
-            ),
-        ),
-        (
-            "--max-documents-per-room N",
-            format!(
-                "paths one room's open-document set holds (default {})",
-                default.max_documents_per_room
             ),
         ),
         (
@@ -430,13 +397,11 @@ fn startup_lines(local: SocketAddr, config: &ServerConfig) -> Vec<String> {
             "selvaged listening on ws://{local}/session (meta at http://{local}/meta)"
         ),
         format!(
-            "limits: {} connections, {} rooms, {} peers per room, {} documents per \
-             room, {} outbound per connection, {} inbound text envelope, {}/s inbound \
-             with a {} burst",
+            "limits: {} connections, {} rooms, {} peers per room, {} outbound per \
+             connection, {} inbound text envelope, {}/s inbound with a {} burst",
             config.max_connections,
             config.max_rooms,
             config.max_peers_per_room,
-            config.max_documents_per_room,
             mib_label(config.max_queue_bytes),
             mib_label(config.max_envelope_bytes),
             mib_label(config.inbound_bytes_per_sec),
@@ -464,7 +429,7 @@ fn startup_lines(local: SocketAddr, config: &ServerConfig) -> Vec<String> {
         ));
     }
     lines.push(format!(
-        "rooms live {}s after their host disconnects — rejoin with the same invite \
+        "rooms live {}s after their last connection ends — rejoin with the same invite \
         link within the window to keep the room",
         config.room_grace.as_secs_f64()
     ));
@@ -526,23 +491,6 @@ mod tests {
         assert_eq!(plan.config, ServerConfig::default());
     }
 
-    /// Both wire versions are seated by default, and the one flag that narrows it reaches
-    /// the field `/meta` and the handshake both read.
-    #[test]
-    fn the_default_seats_both_wire_versions_and_one_flag_narrows_it() {
-        assert_eq!(
-            defaults().config.wire_versions(),
-            vec![selvage_protocol::Version::V1, selvage_protocol::Version::V2],
-            "a server with no flags seats both versions"
-        );
-        let only = plan(&["--serve-version-1-only"]);
-        assert!(only.config.serve_version_1_only);
-        assert_eq!(
-            only.config.wire_versions(),
-            vec![selvage_protocol::Version::V1]
-        );
-    }
-
     #[test]
     fn flags_set_the_bind_address_and_the_grace() {
         let plan =
@@ -566,21 +514,17 @@ mod tests {
             "7",
             "--max-peers-per-room",
             "6",
-            "--max-documents-per-room",
-            "5",
             "--outbound-queue-bytes",
             "16777216",
         ]);
         assert_eq!(plan.config.max_connections, 8);
         assert_eq!(plan.config.max_rooms, 7);
         assert_eq!(plan.config.max_peers_per_room, 6);
-        assert_eq!(plan.config.max_documents_per_room, 5);
         assert_eq!(plan.config.max_queue_bytes, 16 * 1024 * 1024);
         let untouched = ServerConfig {
             max_connections: 8,
             max_rooms: 7,
             max_peers_per_room: 6,
-            max_documents_per_room: 5,
             max_queue_bytes: 16 * 1024 * 1024,
             ..ServerConfig::default()
         };
@@ -612,7 +556,6 @@ mod tests {
             ("--max-connections", "1024"),
             ("--max-rooms", "1024"),
             ("--max-peers-per-room", "128"),
-            ("--max-documents-per-room", "1024"),
             ("--outbound-queue-bytes", "33554432"),
             ("--max-envelope-bytes", "5242880"),
             ("--inbound-bytes-per-sec", "2097152"),
@@ -681,11 +624,9 @@ mod tests {
         assert!(help.contains("30s"), "{help}");
         for flag in [
             "--serve-page",
-            "--serve-version-1-only",
             "--max-connections",
             "--max-rooms",
             "--max-peers-per-room",
-            "--max-documents-per-room",
             "--outbound-queue-bytes",
             "--max-envelope-bytes",
             "--inbound-bytes-per-sec",
@@ -699,7 +640,6 @@ mod tests {
             default.max_connections.to_string(),
             default.max_rooms.to_string(),
             default.max_peers_per_room.to_string(),
-            default.max_documents_per_room.to_string(),
             "32 MiB".to_string(),
             "5 MiB".to_string(),
             "2 MiB".to_string(),
@@ -714,20 +654,15 @@ mod tests {
 
     /// An outbound queue below what one frame needs is refused at the command line, with
     /// the flag named: the failure it would otherwise cause is a handshake that seats
-    /// nobody, or every peer dropped, the publisher included, for a `doc.open` the
-    /// server itself echoed.
+    /// nobody.
     #[test]
     fn a_queue_that_cannot_hold_a_frame_is_refused() {
-        // The 8 MiB frame bound `PROTOCOL.md` §2.1 states, which a deployment reaches for
-        // first and which is not the floor at the reference document cap.
+        // The 8 MiB frame bound `PROTOCOL.md` §2.1 states, which the floor counts.
         const FRAME_BOUND: usize = 8 * 1024 * 1024;
         let smallest = ServerConfig::default().smallest_queue_bytes();
-        // The floor counts the frame and not the path: the reference document cap holds
-        // 4 MiB of path bytes, which JSON may write as 8 MiB, so the largest frame the
-        // server can echo is wider than the frame bound.
         assert!(
             smallest > FRAME_BOUND,
-            "an escaped set is wider than the frame bound: {smallest}"
+            "the floor is the frame bound plus the envelope headroom: {smallest}"
         );
         let refused = args(&[
             "--outbound-queue-bytes",
@@ -736,16 +671,6 @@ mod tests {
         .expect_err("a queue below one frame is refused");
         assert!(refused.contains("--outbound-queue-bytes"), "{refused}");
         assert!(refused.contains(&smallest.to_string()), "{refused}");
-        // The floor is not a fixed number: a document set past it raises it, so the same
-        // queue is refused for one configuration and accepted for another.
-        let wide = args(&[
-            "--outbound-queue-bytes",
-            &smallest.to_string(),
-            "--max-documents-per-room",
-            "8192",
-        ])
-        .expect_err("an open-document set wider than the queue is refused");
-        assert!(wide.contains("--max-documents-per-room"), "{wide}");
         let accepted = plan(&["--outbound-queue-bytes", &smallest.to_string()]);
         assert_eq!(accepted.config.max_queue_bytes, smallest);
     }
@@ -805,7 +730,6 @@ mod tests {
             max_connections: 8,
             max_rooms: 7,
             max_peers_per_room: 6,
-            max_documents_per_room: 5,
             max_queue_bytes: 4 * 1024 * 1024,
             max_envelope_bytes: 1024 * 1024,
             inbound_bytes_per_sec: 512 * 1024,
@@ -814,7 +738,7 @@ mod tests {
         };
         let joined = startup_lines(local, &config).join("\n");
         for wanted in [
-            "limits: 8 connections, 7 rooms, 6 peers per room, 5 documents per room",
+            "limits: 8 connections, 7 rooms, 6 peers per room",
             "4 MiB outbound per connection",
             "1 MiB inbound text envelope",
             "524288 bytes/s inbound with a 2 MiB burst",

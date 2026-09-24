@@ -1,20 +1,21 @@
-//! Runs the whole slice end to end against a real server and prints the transcript.
+//! Runs the slice end to end against a real server and prints the transcript.
 //!
 //! `cargo run -p selvage-harness` — the same path the integration tests assert on,
 //! but observable.
 
 use std::error::Error as StdError;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use selvage_harness::{
-    Harness, Presence, Room, SelectionOffsets, SyncEngine, wait_for,
-};
+use selvage_client::relay::{RelayHostOptions, RelayJoinOptions, RelaySession};
+use selvage_client::session::KeepaliveConfig;
+use selvage_harness::{Harness, wait_for, wait_for_described};
 
-const PATH: &str = "src/main.rs";
+const PATH: &str = "notes.txt";
 
 /// Anything this transcript can fail with.
 type Failure = Box<dyn StdError>;
@@ -24,148 +25,122 @@ async fn main() -> Result<(), Failure> {
     let harness = Harness::start(Duration::from_secs(30)).await;
     println!("server     {}", harness.ws_base());
 
-    let (host, room) = harness.host("Ada").await?;
-    println!("room       {} (host Ada)", room.id);
-    println!("invite     {}", room.invite_url);
+    let host = RelaySession::host(RelayHostOptions {
+        base_url: harness.ws_base(),
+        display_name: "Ada".to_string(),
+        listing: Arc::new(|| vec![PATH.to_string()]),
+        room_key: None,
+        host_seed: None,
+        store: None,
+        client: Some("selvage-harness/transcript".to_string()),
+        keepalive: Some(KeepaliveConfig::default()),
+    })
+    .await?;
+    let invite = host.invite().ok_or("a host is handed a link to send")?;
+    println!("room       {} (host Ada)", host.session_info().room_id);
+    println!("invite     {invite}");
     println!(
         "meta       {}",
         http_get(&format!("{}/meta", harness.http_base())).await?
     );
 
-    let guest = harness.join(&room, "Bob").await?;
-    println!("guest      Bob joined as {:?}", guest.session().role);
+    let guest = RelaySession::join(RelayJoinOptions {
+        invite,
+        display_name: "Bob".to_string(),
+        declared_role: None,
+        client: Some("selvage-harness/transcript".to_string()),
+        keepalive: Some(KeepaliveConfig::default()),
+    })
+    .await?;
+    println!(
+        "guest      Bob joined as a peer of {}",
+        guest.session_info().room_id
+    );
 
-    seed(&host, &guest).await?;
-    cursors(&host, &guest).await?;
-    merge(&host, &guest).await?;
+    listing(&host, &guest).await?;
+    sync(&host, &guest).await?;
+    rename(&host, &guest).await?;
     guest_leaves(&host, &guest).await?;
-    host_returns(&harness, &room, &host).await
+    host.disconnect();
+    Ok(())
+}
+
+/// The host's sealed listing reaches the guest, which is what a link's fragment is for.
+async fn listing(
+    host: &RelaySession,
+    guest: &RelaySession,
+) -> Result<(), Failure> {
+    let host_listing = wait_for("the host's own state to commit", || async {
+        let listing = host.listing();
+        (!listing.is_empty()).then_some(listing)
+    })
+    .await;
+    println!("listing    host {host_listing:?}");
+    let guest_listing = wait_for_described(
+        "the guest to apply the host's listing",
+        || async { format!("{:?}", guest.listing()) },
+        || async {
+            let listing = guest.listing();
+            (!listing.is_empty()).then_some(listing)
+        },
+    )
+    .await;
+    println!("listing    guest {guest_listing:?}");
+    Ok(())
 }
 
 /// One document, seeded by the host and received by the guest.
-async fn seed(host: &SyncEngine, guest: &SyncEngine) -> Result<(), Failure> {
-    host.open(PATH).await?;
-    guest.open(PATH).await?;
-    println!("documents  {:?}", host.documents().await?);
-
-    host.insert(PATH, 0, "fn main() {\n    println!(\"hello\");\n}\n")
-        .await?;
+async fn sync(
+    host: &RelaySession,
+    guest: &RelaySession,
+) -> Result<(), Failure> {
+    host.open(PATH)?;
+    guest.open(PATH)?;
+    host.insert(PATH, 0, "fn main() {\n    println!(\"hello\");\n}\n")?;
     let seeded = wait_for("the guest to see the seed", || async {
-        let text = guest.text(PATH).await.ok()?;
-        (text.contains("hello")).then_some(text)
+        let text = guest.text(PATH);
+        text.contains("hello").then_some(text)
     })
     .await;
     println!("seeded     {seeded:?}");
     Ok(())
 }
 
-/// Both cursors, each visible to the other side.
-async fn cursors(host: &SyncEngine, guest: &SyncEngine) -> Result<(), Failure> {
-    host.set_selection(PATH, SelectionOffsets { anchor: 3, head: 7 })
-        .await?;
-    guest
-        .set_selection(
-            PATH,
-            SelectionOffsets {
-                anchor: 11,
-                head: 15,
-            },
-        )
-        .await?;
-    let presence = wait_for("both cursors", || async {
-        let on_host = host.presence().await.ok()?;
-        let on_guest = guest.presence().await.ok()?;
-        (seen(&on_host, "Bob") && seen(&on_guest, "Ada"))
-            .then_some((on_host, on_guest))
-    })
+/// A rename, which the room is told about as `peer.renamed`.
+async fn rename(
+    host: &RelaySession,
+    guest: &RelaySession,
+) -> Result<(), Failure> {
+    let bob = guest.session_info().seat.clone();
+    guest.rename("Bob B.")?;
+    let seen = wait_for_described(
+        "the host to hear the rename",
+        || async { format!("{:?}", host.peers()) },
+        || async {
+            host.peers()
+                .into_iter()
+                .find(|peer| peer.peer_id == bob)
+                .filter(|peer| peer.display_name == "Bob B.")
+        },
+    )
     .await;
-    print_presence(&presence.0);
-    print_presence(&presence.1);
-    Ok(())
-}
-
-/// Concurrent edits: both clients buffer their frames, so neither edit can be in the
-/// other's causal history.
-async fn merge(host: &SyncEngine, guest: &SyncEngine) -> Result<(), Failure> {
-    for engine in [host, guest] {
-        engine.set_outbound_paused(true).await?;
-    }
-    host.insert(PATH, 0, "// host edit\n").await?;
-    guest.insert(PATH, 0, "// guest edit\n").await?;
-    println!("paused     host={:?}", host.text(PATH).await?);
-    println!("paused     guest={:?}", guest.text(PATH).await?);
-    for engine in [host, guest] {
-        engine.set_outbound_paused(false).await?;
-    }
-
-    let merged = wait_for("convergence", || async {
-        let left = host.text(PATH).await.ok()?;
-        let right = guest.text(PATH).await.ok()?;
-        (left == right).then_some(left)
-    })
-    .await;
-    println!("merged     {merged:?}");
-
-    let vectors = wait_for("state vectors to match", || async {
-        let left = host.state_vector().await.ok()?;
-        let right = guest.state_vector().await.ok()?;
-        (left == right).then_some(left)
-    })
-    .await;
-    println!("vectors    {vectors:?}");
+    println!("renamed    {} is now {}", seen.peer_id, seen.display_name);
     Ok(())
 }
 
 /// The guest disconnects; the host is told.
 async fn guest_leaves(
-    host: &SyncEngine,
-    guest: &SyncEngine,
+    host: &RelaySession,
+    guest: &RelaySession,
 ) -> Result<(), Failure> {
-    let noticed = wait_for("the host to notice the guest leaving", || async {
-        let peers = host.peers().await.ok()?;
-        peers.is_empty().then_some(())
+    let seat = guest.session_info().seat.clone();
+    let left = wait_for("the host to notice the guest leaving", || async {
+        (!host.peers().iter().any(|peer| peer.peer_id == seat)).then_some(())
     });
-    guest.disconnect().await?;
-    noticed.await;
+    guest.disconnect();
+    left.await;
     println!("left       guest disconnected");
     Ok(())
-}
-
-/// The host leaves and comes back into the same room, which kept its documents.
-async fn host_returns(
-    harness: &Harness,
-    room: &Room,
-    host: &SyncEngine,
-) -> Result<(), Failure> {
-    host.disconnect().await?;
-    let reconnected = harness.reclaim(room, "Ada").await?;
-    println!(
-        "reconnect   host returned as {:?} to {} with documents {:?}",
-        reconnected.session().role,
-        reconnected.session().room_id,
-        reconnected.documents().await?
-    );
-    reconnected.disconnect().await?;
-    Ok(())
-}
-
-fn seen(list: &[Presence], name: &str) -> bool {
-    list.iter().any(|p| {
-        p.display_name() == Some(name)
-            && p.selection().is_some()
-            && p.path() == Some(PATH)
-    })
-}
-
-fn print_presence(list: &[Presence]) {
-    for entry in list {
-        println!(
-            "presence   {} @ {:?} {:?}",
-            entry.display_name().unwrap_or("(unknown)"),
-            entry.path(),
-            entry.selection()
-        );
-    }
 }
 
 /// Reads `GET /path` over a throwaway connection and returns the response body.

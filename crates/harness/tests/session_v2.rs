@@ -1,10 +1,9 @@
-//! `selvage/2` on the wire: what a version-2 connection gets from the server.
+//! `selvage/2` on the wire: what a connection gets from the server.
 //!
-//! The version-1 corpus is replayed by `vectors.rs`; this drives a server on its defaults,
-//! which seat both versions, with raw sockets, because the client library in this
-//! workspace speaks version 1. What is asserted is what `PROTOCOL.md` §3,
-//! §6.1 and §9 say the version-2 server is: membership, a relay, and nothing a room's
-//! contents could be read from.
+//! This drives a server on its defaults with raw sockets, because the relay library is
+//! better exercised by `relay_selvaged.rs`. What is asserted is what `PROTOCOL.md` §3,
+//! §6.1 and §9 say the server is: membership, a relay, and nothing a room's contents could
+//! be read from.
 
 use std::error::Error as StdError;
 use std::time::Duration;
@@ -20,14 +19,6 @@ use tokio_tungstenite::tungstenite::Message;
 
 type Raw = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// A server that seats `selvage/1` alone, for the refusals a version-2 connection gets.
-fn version_1_only() -> ServerConfig {
-    ServerConfig {
-        serve_version_1_only: true,
-        ..ServerConfig::default()
-    }
-}
-
 /// Anything this test can fail with.
 type Failure = Box<dyn StdError>;
 
@@ -38,13 +29,8 @@ struct Peer {
 
 impl Peer {
     /// Opens a socket at `base` with `query`, sends `session.hello` and reads the reply.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a join names its address, its version, its query and its display name"
-    )]
     async fn join(
         base: &str,
-        version: &str,
         query: &str,
         name: &str,
     ) -> Result<(Self, Value), Failure> {
@@ -59,7 +45,7 @@ impl Peer {
             "id": 1,
             "method": "session.hello",
             "params": { "display_name": name },
-            "v": version,
+            "v": "selvage/2",
         });
         peer.send_text(&frame.to_string()).await?;
         let reply = peer.recv_json().await?;
@@ -123,13 +109,11 @@ fn join_query(created: &Value) -> Result<String, Failure> {
     Ok(format!("room={room}&token={token}"))
 }
 
-/// A version-2 mint is seated by its reply, and the reply is version 2.
+/// A mint is seated by its reply, and the reply carries membership and nothing else.
 #[tokio::test]
-async fn a_version_two_mint_is_seated_by_a_version_two_reply()
--> Result<(), Failure> {
+async fn a_mint_is_seated_by_its_reply() -> Result<(), Failure> {
     let harness = Harness::start_with(ServerConfig::default()).await;
-    let (host, created) =
-        Peer::join(&harness.ws_base(), "selvage/2", "", "Ada").await?;
+    let (host, created) = Peer::join(&harness.ws_base(), "", "Ada").await?;
 
     assert_eq!(created["v"], "selvage/2");
     assert_eq!(created["event"], "room.created");
@@ -138,7 +122,7 @@ async fn a_version_two_mint_is_seated_by_a_version_two_reply()
     assert_eq!(
         params["capabilities"],
         serde_json::json!(["y-protocols/1", "awareness"]),
-        "a version-2 server advertises the two names that version defines"
+        "a server advertises the two names the version defines"
     );
     // §6.1: `documents` is not a member, and `PeerInfo` carries no `role`.
     assert!(
@@ -154,64 +138,16 @@ async fn a_version_two_mint_is_seated_by_a_version_two_reply()
     Ok(())
 }
 
-/// A version-1 connection is refused a version-2 room: the room is pinned by its mint.
+/// The relay: a frame arrives byte for byte, and no frame the server authors names a path
+/// or a role (`PROTOCOL.md` §3).
 #[tokio::test]
-async fn a_version_one_connection_is_refused_a_version_two_room()
+async fn a_room_relays_bytes_and_authors_nothing_about_them()
 -> Result<(), Failure> {
     let harness = Harness::start_with(ServerConfig::default()).await;
-    let (host, created) =
-        Peer::join(&harness.ws_base(), "selvage/2", "", "Ada").await?;
-    let query = join_query(&created)?;
-
-    let (mut guest, reply) =
-        Peer::join(&harness.ws_base(), "selvage/1", &query, "Bob").await?;
-    assert_eq!(reply["event"], "session.error");
-    assert_eq!(reply["params"]["code"], "unsupported_version");
-    assert_eq!(
-        reply["v"], "selvage/1",
-        "the refusal answers the client's own version"
-    );
-    let close = guest.recv_message().await?;
-    let Message::Close(Some(frame)) = close else {
-        return Err(format!("expected a close, got {close:?}").into());
-    };
-    assert_eq!(
-        u16::from(frame.code),
-        4005,
-        "close 4005 is the version close"
-    );
-    host.close().await;
-    Ok(())
-}
-
-/// And the other way round: a version-1 room refuses a version-2 connection.
-#[tokio::test]
-async fn a_version_two_connection_is_refused_a_version_one_room()
--> Result<(), Failure> {
-    let harness = Harness::start_with(ServerConfig::default()).await;
-    let (host, created) =
-        Peer::join(&harness.ws_base(), "selvage/1", "", "Ada").await?;
-    let query = join_query(&created)?;
-
-    let (_guest, reply) =
-        Peer::join(&harness.ws_base(), "selvage/2", &query, "Bob").await?;
-    assert_eq!(reply["event"], "session.error");
-    assert_eq!(reply["params"]["code"], "unsupported_version");
-    host.close().await;
-    Ok(())
-}
-
-/// The relay: a version-2 frame arrives byte for byte, and no frame the server authors
-/// names a path or a role (`PROTOCOL.md` §3).
-#[tokio::test]
-async fn a_version_two_room_relays_bytes_and_authors_nothing_about_them()
--> Result<(), Failure> {
-    let harness = Harness::start_with(ServerConfig::default()).await;
-    let (mut host, created) =
-        Peer::join(&harness.ws_base(), "selvage/2", "", "Ada").await?;
+    let (mut host, created) = Peer::join(&harness.ws_base(), "", "Ada").await?;
     let query = join_query(&created)?;
     let (mut guest, joined) =
-        Peer::join(&harness.ws_base(), "selvage/2", &query, "Bob").await?;
+        Peer::join(&harness.ws_base(), &query, "Bob").await?;
     assert_eq!(joined["event"], "room.joined");
     assert!(joined["params"].get("documents").is_none());
     assert!(joined["params"]["peers"][0].get("role").is_none());
@@ -222,7 +158,7 @@ async fn a_version_two_room_relays_bytes_and_authors_nothing_about_them()
     assert_eq!(announced["v"], "selvage/2");
     assert!(
         announced["params"]["peer"].get("role").is_none(),
-        "a version-2 `PeerInfo` has no role: {announced}"
+        "a `PeerInfo` has no role: {announced}"
     );
 
     // A sealed frame is opaque: the bytes that arrive are the bytes that were sent.
@@ -251,7 +187,7 @@ fn assert_no_path_or_role(frame: &Value) -> Result<(), Failure> {
     for forbidden in ["\"path\"", "\"documents\"", "\"role\"", "\"paths\""] {
         if text.contains(forbidden) {
             return Err(format!(
-                "a server-authored version-2 frame carries {forbidden}: {text}"
+                "a server-authored frame carries {forbidden}: {text}"
             )
             .into());
         }
@@ -262,11 +198,10 @@ fn assert_no_path_or_role(frame: &Value) -> Result<(), Failure> {
 /// The method surface is two methods: a `doc.*` request is `unknown_method`, and the
 /// connection stays open.
 #[tokio::test]
-async fn the_doc_methods_do_not_exist_in_a_version_two_room()
--> Result<(), Failure> {
+async fn the_doc_methods_do_not_exist() -> Result<(), Failure> {
     let harness = Harness::start_with(ServerConfig::default()).await;
     let (mut host, _created) =
-        Peer::join(&harness.ws_base(), "selvage/2", "", "Ada").await?;
+        Peer::join(&harness.ws_base(), "", "Ada").await?;
     let request = serde_json::json!({
         "id": 2,
         "method": "doc.open",
@@ -295,25 +230,23 @@ async fn the_doc_methods_do_not_exist_in_a_version_two_room()
     Ok(())
 }
 
-/// A version-2 room lives while it has connections and for `room_grace_ms` after its
-/// last one ends; the destruction is silent, and the next join learns it as
-/// `room_unknown` (`PROTOCOL.md` §6, §9).
+/// A room lives while it has connections and for `room_grace_ms` after its last one ends;
+/// the destruction is silent, and the next join learns it as `room_unknown`
+/// (`PROTOCOL.md` §6, §9).
 #[tokio::test]
-async fn a_version_two_room_is_destroyed_after_its_last_connection()
--> Result<(), Failure> {
+async fn a_room_is_destroyed_after_its_last_connection() -> Result<(), Failure>
+{
     let harness = Harness::start_with(ServerConfig {
         room_grace: Duration::from_millis(200),
         ..ServerConfig::default()
     })
     .await;
-    let (host, created) =
-        Peer::join(&harness.ws_base(), "selvage/2", "", "Ada").await?;
+    let (host, created) = Peer::join(&harness.ws_base(), "", "Ada").await?;
     let query = join_query(&created)?;
     host.close().await;
 
     sleep(Duration::from_millis(600)).await;
-    let (_late, reply) =
-        Peer::join(&harness.ws_base(), "selvage/2", &query, "Bob").await?;
+    let (_late, reply) = Peer::join(&harness.ws_base(), &query, "Bob").await?;
     assert_eq!(reply["event"], "session.error");
     assert_eq!(reply["params"]["code"], "room_unknown");
     Ok(())
@@ -330,20 +263,19 @@ async fn a_stale_grace_timer_does_not_reap_a_room_that_emptied_later()
         ..ServerConfig::default()
     })
     .await;
-    let (host, created) =
-        Peer::join(&harness.ws_base(), "selvage/2", "", "Ada").await?;
+    let (host, created) = Peer::join(&harness.ws_base(), "", "Ada").await?;
     let query = join_query(&created)?;
     host.close().await;
 
     sleep(Duration::from_millis(120)).await;
     let (guest, _joined) =
-        Peer::join(&harness.ws_base(), "selvage/2", &query, "Bob").await?;
+        Peer::join(&harness.ws_base(), &query, "Bob").await?;
     guest.close().await;
 
     // Past the first timer's deadline and before the second's: the room is still here.
     sleep(Duration::from_millis(380)).await;
     let (again, joined) =
-        Peer::join(&harness.ws_base(), "selvage/2", &query, "Cara").await?;
+        Peer::join(&harness.ws_base(), &query, "Cara").await?;
     assert_eq!(
         joined["event"], "room.joined",
         "the stale timer reaped a room whose grace had only just started: {joined}"
@@ -352,63 +284,33 @@ async fn a_stale_grace_timer_does_not_reap_a_room_that_emptied_later()
 
     // And the timer the last leave armed does reap it.
     sleep(Duration::from_millis(500)).await;
-    let (_late, reply) =
-        Peer::join(&harness.ws_base(), "selvage/2", &query, "Dan").await?;
+    let (_late, reply) = Peer::join(&harness.ws_base(), &query, "Dan").await?;
     assert_eq!(reply["params"]["code"], "room_unknown");
     Ok(())
 }
 
-/// `/meta` is what the configuration advertises: both versions on the default server, and
-/// one on a server that seats `selvage/1` alone (`PROTOCOL.md` §2).
+/// `/meta` is what the configuration advertises: the one wire version, the two capability
+/// names and the server's identity, on a listener that takes its sockets
+/// (`PROTOCOL.md` §2).
 #[tokio::test]
-async fn the_version_list_is_what_the_server_seats() -> Result<(), Failure> {
-    let both = Harness::start_with(ServerConfig::default()).await;
-    let body = http_get(&both.http_base(), "/meta").await?;
+async fn meta_advertises_the_one_wire_version() -> Result<(), Failure> {
+    let harness = Harness::start_with(ServerConfig::default()).await;
+    let body = http_get(&harness.http_base(), "/meta").await?;
     let meta: Value = serde_json::from_str(&body)?;
-    assert_eq!(
-        meta["wire_versions"],
-        serde_json::json!(["selvage/1", "selvage/2"])
-    );
+    assert_eq!(meta["wire_versions"], serde_json::json!(["selvage/2"]));
     assert_eq!(
         meta["capabilities"],
-        serde_json::json!([
-            "y-protocols/1",
-            "awareness",
-            "open-document-set",
-            "host-reclaim"
-        ])
+        serde_json::json!(["y-protocols/1", "awareness"])
     );
-
-    let only = Harness::start_with(version_1_only()).await;
-    let body = http_get(&only.http_base(), "/meta").await?;
-    let meta: Value = serde_json::from_str(&body)?;
-    assert_eq!(meta["wire_versions"], serde_json::json!(["selvage/1"]));
-    assert_eq!(meta["roles"], serde_json::json!(["host", "guest"]));
-    Ok(())
-}
-
-/// A version-2 hello on a server that seats `selvage/1` alone is refused, which is the
-/// version-1 corpus's own claim (vector 005) and what the version-1-only mode exists for.
-#[tokio::test]
-async fn a_version_one_only_server_refuses_a_version_two_hello()
--> Result<(), Failure> {
-    let harness = Harness::start_with(version_1_only()).await;
-    let (mut peer, reply) =
-        Peer::join(&harness.ws_base(), "selvage/2", "", "Ada").await?;
-    assert_eq!(reply["event"], "session.error");
-    assert_eq!(reply["params"]["code"], "unsupported_version");
-    assert_eq!(
-        reply["v"], "selvage/1",
-        "the refusal answers the client's own version"
+    assert!(
+        meta.get("roles").is_none(),
+        "the server seats nobody, so nothing says which roles it seats: {meta}"
     );
-    let close = peer.recv_message().await?;
-    let Message::Close(Some(frame)) = close else {
-        return Err(format!("expected a close, got {close:?}").into());
-    };
-    assert_eq!(
-        u16::from(frame.code),
-        4005,
-        "close 4005 is the version close"
+    assert!(
+        meta["server"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("selvaged/")),
+        "the server names itself: {meta}"
     );
     Ok(())
 }

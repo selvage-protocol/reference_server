@@ -1,8 +1,7 @@
-//! Headless harness: one server, two clients, driven programmatically.
+//! Headless harness: one server, on an ephemeral port, driven by the tests that use it.
 //!
-//! The integration tests and the `selvage-harness` binary both use this. Nothing here
-//! sleeps and hopes: waiting is always bounded polling of a real predicate, and a
-//! timeout reports the state it actually observed.
+//! The integration tests use this. Nothing here sleeps and hopes: waiting is always bounded
+//! polling of a real predicate, and a timeout reports the state it actually observed.
 
 use std::future::Future;
 use std::io;
@@ -17,16 +16,8 @@ use selvaged::Server;
 pub use selvaged::ServerConfig;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
-
-use selvage_client::ConnectOptions;
-pub use selvage_client::{
-    Anchor, AwarenessState, EditorAdapter, EngineEvent, Error, Invite, ItemId,
-    PeerInfo, Presence, Role, Selection, SelectionOffsets, SyncEngine,
-    drive_editor,
-};
 
 /// How long a test is willing to wait for a condition that should hold immediately.
 pub const WAIT: Duration = Duration::from_secs(5);
@@ -137,22 +128,6 @@ pub struct Harness {
     panics: PanicWatch,
 }
 
-/// A room that a host client minted.
-#[derive(Debug, Clone)]
-pub struct Room {
-    pub id: String,
-    pub token: String,
-    pub invite_url: String,
-}
-
-impl Room {
-    /// What a guest needs to join.
-    #[must_use]
-    pub fn invite(&self) -> Invite {
-        Invite::new(self.id.clone(), self.token.clone())
-    }
-}
-
 impl Harness {
     /// Starts a server with a short room grace period, so lifecycle tests do not take
     /// thirty seconds.
@@ -206,119 +181,6 @@ impl Harness {
     #[must_use]
     pub fn upstream(&self) -> String {
         self.addr.to_string()
-    }
-
-    /// Connects a host, which mints a room.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] when the host cannot connect.
-    pub async fn host(
-        &self,
-        display_name: &str,
-    ) -> Result<(SyncEngine, Room), Error> {
-        self.host_at(&self.ws_base(), display_name).await
-    }
-
-    /// Connects a host through `base` — a relay's address — which mints a room.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] when the host cannot connect.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the server does not invite the host that minted the room.
-    #[expect(
-        clippy::expect_used,
-        reason = "the server always invites the host that minted the room; a session \
-                  without a token means it did not, which must fail the test"
-    )]
-    pub async fn host_at(
-        &self,
-        base: &str,
-        display_name: &str,
-    ) -> Result<(SyncEngine, Room), Error> {
-        let engine =
-            SyncEngine::connect(ConnectOptions::host(base, display_name))
-                .await?;
-        let session = engine.session();
-        let room = Room {
-            id: session.room_id.clone(),
-            token: session.token.clone().expect("a host is told the token"),
-            invite_url: session
-                .invite_url()
-                .expect("a host can build an invite URL"),
-        };
-        Ok((engine, room))
-    }
-
-    /// Connects a guest with the room's invite.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] when the guest cannot connect or the server refuses it.
-    pub async fn join(
-        &self,
-        room: &Room,
-        display_name: &str,
-    ) -> Result<SyncEngine, Error> {
-        self.join_at(&self.ws_base(), room, display_name).await
-    }
-
-    /// Connects a guest through `base` — a relay's address.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] when the guest cannot connect or the server refuses it.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a relay address, a room and a display name are the three things a join is"
-    )]
-    pub async fn join_at(
-        &self,
-        base: &str,
-        room: &Room,
-        display_name: &str,
-    ) -> Result<SyncEngine, Error> {
-        let options = ConnectOptions::guest(base, display_name, room.invite());
-        SyncEngine::connect(options).await
-    }
-
-    /// Joins with a published invite URL — the link itself, not the room id and token
-    /// taken out of it. This is what a human does when they paste the link, so it fails
-    /// when the link cannot be used as one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Invite`] when the URL is not a connection URL this client can
-    /// use, [`Error::InvalidInvite`] when it carries a fragment that is not §5.1's room key
-    /// and host key — which is refused here, before a socket is opened — and whatever
-    /// [`SyncEngine::connect`] returns when the server refuses.
-    pub async fn join_url(
-        &self,
-        invite_url: &str,
-        display_name: &str,
-    ) -> Result<SyncEngine, Error> {
-        let options =
-            ConnectOptions::read_invite_url(invite_url, display_name)?;
-        SyncEngine::connect(options).await
-    }
-
-    /// Reconnects a host that had disconnected: same room, hosts again.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] when the reconnect is refused, e.g. because a host is present.
-    pub async fn reclaim(
-        &self,
-        room: &Room,
-        display_name: &str,
-    ) -> Result<SyncEngine, Error> {
-        let options =
-            ConnectOptions::guest(self.ws_base(), display_name, room.invite())
-                .with_role(Role::Host);
-        SyncEngine::connect(options).await
     }
 
     pub fn abort(&self) {
@@ -471,7 +333,7 @@ where
 /// [`wait_for_described`], bounded by `deadline` instead of [`WAIT`].
 ///
 /// A wait whose effect is known to be slower than [`WAIT`] needs a longer bound than a
-/// local engine operation: the room ejecting a peer after relaying tens of mebibytes to
+/// local operation: the room ejecting a peer after relaying tens of mebibytes to
 /// a socket that never drains is I/O under coverage, not a scheduling turn. The bound
 /// bounds both callbacks as well as polling. Diagnostics are sampled after failed checks
 /// while time remains, so a timeout reports the last completed observation without
@@ -530,116 +392,6 @@ fn as_suffix(observed: &str) -> String {
         return String::new();
     }
     format!("; observed {observed}")
-}
-
-/// Waits until both engines hold identical text for `path`, then returns it.
-///
-/// Convergence is not text equality alone: the replicas must hold the same history
-/// too, so the wait covers the state vectors as well. Text-equal but
-/// history-divergent replicas keep waiting.
-///
-/// # Panics
-///
-/// Panics when the replicas do not converge within [`WAIT`].
-pub async fn wait_for_convergence(
-    a: &SyncEngine,
-    b: &SyncEngine,
-    path: &str,
-) -> String {
-    wait_for_described(
-        &format!("replicas to converge on {path}"),
-        || async {
-            format!("{:?} and {:?}", a.text(path).await, b.text(path).await)
-        },
-        || async {
-            let (left, right) =
-                (a.text(path).await.ok()?, b.text(path).await.ok()?);
-            let (a_vector, b_vector) =
-                (a.state_vector().await.ok()?, b.state_vector().await.ok()?);
-            (left == right && a_vector == b_vector).then_some(left)
-        },
-    )
-    .await
-}
-
-/// Waits until `engine` can see a remote peer with this display name.
-///
-/// # Panics
-///
-/// Panics when the peer does not appear within [`WAIT`].
-pub async fn wait_for_peer(
-    engine: &SyncEngine,
-    display_name: &str,
-) -> PeerInfo {
-    wait_for_described(
-        &format!("peer {display_name} to appear"),
-        || async { format!("{:?}", engine.peers().await) },
-        || async {
-            engine
-                .peers()
-                .await
-                .ok()?
-                .into_iter()
-                .find(|peer| peer.display_name == display_name)
-        },
-    )
-    .await
-}
-
-/// Waits until `engine` sees awareness from a peer with this display name.
-///
-/// # Panics
-///
-/// Panics when the presence does not appear within [`WAIT`].
-pub async fn wait_for_presence(
-    engine: &SyncEngine,
-    display_name: &str,
-) -> Presence {
-    wait_for_described(
-        &format!("presence from {display_name}"),
-        || async { format!("{:?}", engine.presence().await) },
-        || async {
-            engine
-                .presence()
-                .await
-                .ok()?
-                .into_iter()
-                .find(|presence| presence.display_name() == Some(display_name))
-        },
-    )
-    .await
-}
-
-/// Waits for a specific engine event, ignoring the others.
-///
-/// # Panics
-///
-/// Panics when the event does not arrive within [`WAIT`], or when the engine's event
-/// stream closes first.
-#[expect(
-    clippy::panic,
-    reason = "a wait that timed out is a test failure, not a value the caller can recover from"
-)]
-pub async fn wait_for_event(
-    engine: &SyncEngine,
-    label: &str,
-    matches: impl Fn(&EngineEvent) -> bool,
-) -> EngineEvent {
-    let mut events = engine.subscribe();
-    let start = Instant::now();
-    loop {
-        assert!(
-            start.elapsed() < WAIT,
-            "timed out after {WAIT:?} waiting for {label}"
-        );
-        match timeout(Duration::from_millis(50), events.recv()).await {
-            Ok(Ok(event)) if matches(&event) => return event,
-            Ok(Err(RecvError::Closed)) => {
-                panic!("the engine stream closed while waiting for {label}");
-            }
-            _ => {}
-        }
-    }
 }
 
 #[cfg(test)]

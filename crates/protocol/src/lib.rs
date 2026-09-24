@@ -1,4 +1,4 @@
-//! Wire types for the Selvage Session Protocol, wire version `selvage/1`.
+//! Wire types for the Selvage Session Protocol, wire version `selvage/2`.
 //!
 //! The protocol itself — the prose of `PROTOCOL.md`, the byte rule of `CANONICAL.md` and the
 //! JSON Schema — lives in the specification repository
@@ -28,10 +28,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// Wire version carried in every session envelope.
-pub const WIRE_VERSION: &str = "selvage/1";
-
-/// The revision's wire version, which this server also speaks.
-pub const WIRE_VERSION_V2: &str = "selvage/2";
+pub const WIRE_VERSION: &str = "selvage/2";
 
 /// WebSocket endpoint path.
 pub const ENDPOINT_PATH: &str = "/session";
@@ -39,55 +36,8 @@ pub const ENDPOINT_PATH: &str = "/session";
 /// Negotiation endpoint path, served over plain HTTP on the same listener.
 pub const META_PATH: &str = "/meta";
 
-/// Capabilities this implementation advertises.
-pub const CAPABILITIES: &[&str] = &[
-    "y-protocols/1",
-    "awareness",
-    "open-document-set",
-    "host-reclaim",
-];
-
-/// The two names `selvage/2` defines for a server (`PROTOCOL.md` §2).
-pub const CAPABILITIES_V2: &[&str] = &["y-protocols/1", "awareness"];
-
-/// A wire version this server can seat (`PROTOCOL.md` §10).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Version {
-    V1,
-    V2,
-}
-
-impl Version {
-    /// The string this version writes in `v`.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::V1 => WIRE_VERSION,
-            Self::V2 => WIRE_VERSION_V2,
-        }
-    }
-
-    /// Whether a frame's `v` names this version under §10's compatibility rule: same
-    /// major, and nothing else, since neither version is at major 0.
-    #[must_use]
-    pub fn accepts(self, version: &str) -> bool {
-        version_of(version) == Some(self)
-    }
-}
-
-/// The version a `v` member names, by major alone; `None` outside the grammar.
-///
-/// `PROTOCOL.md` §10: at major `1` or `2` the minor is not decisive, so every
-/// `selvage/1.x` is version 1 and every `selvage/2.x` is version 2, while
-/// `selvage/0.x`, `selvage/3` and every string outside the grammar name none.
-#[must_use]
-pub fn version_of(version: &str) -> Option<Version> {
-    match parse_wire_version(version)?.0 {
-        1 => Some(Version::V1),
-        2 => Some(Version::V2),
-        _ => None,
-    }
-}
+/// Capabilities this implementation advertises (`PROTOCOL.md` §2).
+pub const CAPABILITIES: &[&str] = &["y-protocols/1", "awareness"];
 
 /// The longest `display_name` a server seats, in UTF-16 code units (`PROTOCOL.md` §5).
 ///
@@ -116,9 +66,6 @@ pub fn has_control_characters(text: &str) -> bool {
 pub mod method {
     pub const SESSION_HELLO: &str = "session.hello";
     pub const SESSION_RENAME: &str = "session.rename";
-    pub const DOC_OPEN: &str = "doc.open";
-    pub const DOC_CLOSE: &str = "doc.close";
-    pub const DOC_GRANT: &str = "doc.grant";
 }
 
 /// Server -> client event names.
@@ -128,11 +75,6 @@ pub mod event {
     pub const PEER_JOINED: &str = "peer.joined";
     pub const PEER_LEFT: &str = "peer.left";
     pub const PEER_RENAMED: &str = "peer.renamed";
-    pub const DOC_OPENED: &str = "doc.opened";
-    pub const DOC_CLOSED: &str = "doc.closed";
-    pub const DOC_GRANTED: &str = "doc.granted";
-    pub const HOST_DETACHED: &str = "host.detached";
-    pub const HOST_ATTACHED: &str = "host.attached";
     pub const ROOM_GONE: &str = "room.gone";
     pub const SESSION_ERROR: &str = "session.error";
 }
@@ -142,16 +84,10 @@ pub mod code {
     pub const UNKNOWN_METHOD: &str = "unknown_method";
     pub const BAD_MESSAGE: &str = "bad_message";
     pub const BAD_PARAMS: &str = "bad_params";
-    pub const UNSUPPORTED_VERSION: &str = "unsupported_version";
     pub const HELLO_REQUIRED: &str = "hello_required";
     pub const ROOM_UNKNOWN: &str = "room_unknown";
     pub const ROOM_GONE: &str = "room_gone";
     pub const TOKEN_INVALID: &str = "token_invalid";
-    pub const HOST_PRESENT: &str = "host_present";
-    /// Reserved and never produced by this slice (`PROTOCOL.md` §11,
-    /// `schema/errors.json`): named here so receivers and senders spell it the same
-    /// way, not because any frame carries it. Closing a path nobody holds succeeds.
-    pub const DOC_NOT_OPEN: &str = "doc_not_open";
     pub const ALREADY_SEATED: &str = "already_seated";
 }
 
@@ -161,8 +97,6 @@ pub mod close {
     pub const ROOM_UNKNOWN: u16 = 4001;
     pub const TOKEN_INVALID: u16 = 4002;
     pub const ROOM_GONE: u16 = 4003;
-    pub const HOST_PRESENT: u16 = 4004;
-    pub const UNSUPPORTED_VERSION: u16 = 4005;
 }
 
 /// Maps a fatal session error code to the close code used to end the connection.
@@ -172,40 +106,8 @@ pub fn close_code_for(code: &str) -> u16 {
         code::ROOM_UNKNOWN => close::ROOM_UNKNOWN,
         code::TOKEN_INVALID => close::TOKEN_INVALID,
         code::ROOM_GONE => close::ROOM_GONE,
-        code::HOST_PRESENT => close::HOST_PRESENT,
-        code::UNSUPPORTED_VERSION => close::UNSUPPORTED_VERSION,
         _ => close::PROTOCOL_ERROR,
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    Host,
-    Guest,
-}
-
-impl Role {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Host => "host",
-            Self::Guest => "guest",
-        }
-    }
-}
-
-/// A participant as seen by the session layer. Peers are keyed by `peer_id`; the
-/// display name is a label, and nothing stops two peers sharing one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerInfo {
-    /// Which y-protocols awareness client id this peer speaks with. Lets an editor
-    /// adapter attribute a remote cursor without putting identity into awareness.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub awareness_client_id: Option<u64>,
-    pub display_name: String,
-    pub peer_id: String,
-    pub role: Role,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,15 +243,6 @@ impl ServerMessage {
         }
     }
 
-    /// The same frame carrying another wire version in `v`. A `selvage/2` connection is
-    /// answered in `selvage/2` (`PROTOCOL.md` §4), so every frame the server authors for
-    /// it is stamped at the one place it leaves the server.
-    #[must_use]
-    pub fn for_version(mut self, version: Version) -> Self {
-        self.v = version.as_str().to_string();
-        self
-    }
-
     /// Serializes the envelope.
     ///
     /// # Errors
@@ -374,47 +267,9 @@ impl ServerMessage {
     }
 }
 
-/// `session.hello` params in `selvage/2`: the v1 shape with `role` gone
-/// (`PROTOCOL.md` §5). A `role` member a caller sends is ignored as an unknown name.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HelloParamsV2 {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub awareness_client_id: Option<u64>,
-    #[serde(default)]
-    pub capabilities: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client: Option<String>,
-    pub display_name: String,
-}
-
-/// A peer as `selvage/2` records it: `PROTOCOL.md` §6.1's `PeerInfo` without `role`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerInfoV2 {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub awareness_client_id: Option<u64>,
-    pub display_name: String,
-    pub peer_id: String,
-}
-
-/// `selvage/2`'s `room.created` / `room.joined` params: the members that carried the
-/// server's state are gone and nothing took their place (`PROTOCOL.md` §6.1).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionParamsV2 {
-    #[serde(default)]
-    pub capabilities: Vec<String>,
-    #[serde(default)]
-    pub keepalive: Keepalive,
-    #[serde(default)]
-    pub peers: Vec<PeerInfoV2>,
-    pub room_id: String,
-    #[serde(rename = "self")]
-    pub self_peer: PeerInfoV2,
-    /// Present only for the connection that minted the room.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-}
-
-/// `session.hello` params — the client's half of the handshake.
+/// `session.hello` params — the client's half of the handshake (`PROTOCOL.md` §5).
+/// There is no `role` to claim: the server seats nobody as anything, and a `role` member
+/// a caller sends is ignored as an unknown name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -424,19 +279,24 @@ pub struct HelloParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
     pub display_name: String,
-    /// Defaults to host when the connection carried no room, guest otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<Role>,
 }
 
-/// Result of `session.hello`: the server's half of the handshake. Sent as
-/// `room.created` (host, includes the token) or `room.joined` (guest).
+/// A peer as the server records it: `PROTOCOL.md` §6.1's `PeerInfo`. `role` is not a
+/// member — it is the sealed room state's, not the server's (§1.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awareness_client_id: Option<u64>,
+    pub display_name: String,
+    pub peer_id: String,
+}
+
+/// `room.created` / `room.joined` params: the members that carried the server's state
+/// are gone and nothing took their place (`PROTOCOL.md` §6.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionParams {
     #[serde(default)]
     pub capabilities: Vec<String>,
-    #[serde(default)]
-    pub documents: Vec<String>,
     #[serde(default)]
     pub keepalive: Keepalive,
     #[serde(default)]
@@ -444,29 +304,9 @@ pub struct SessionParams {
     pub room_id: String,
     #[serde(rename = "self")]
     pub self_peer: PeerInfo,
-    /// Present only for the host that minted the room.
+    /// Present only for the connection that minted the room.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-}
-
-/// `doc.open` params.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocOpenParams {
-    pub path: String,
-}
-
-/// `doc.close` params.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocCloseParams {
-    pub path: String,
-}
-
-/// `doc.grant` params: the host's whole listing of the working tree, replacing the room's
-/// grant wholesale. The order is part of what the frame says (`CANONICAL.md` §2.7) and a
-/// server carries it unchanged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrantParams {
-    pub paths: Vec<String>,
 }
 
 /// `session.rename` params: the name this connection wants from now on. The bound is the
@@ -491,37 +331,6 @@ pub struct PeerRenamedParams {
     pub peer_id: String,
 }
 
-/// `doc.opened` / `doc.closed` params. `documents` is the room's open-document set
-/// after the change, so every peer holds the same view of it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocEvent {
-    #[serde(default)]
-    pub documents: Vec<String>,
-    pub path: String,
-    pub peer_id: String,
-}
-
-/// `doc.granted` params: the room's grant as it now stands, in the order its host wrote it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrantedParams {
-    pub paths: Vec<String>,
-}
-
-/// The result of `doc.open` / `doc.close`: the room's open-document set after the
-/// change, which is what makes a request's effect visible to its own caller.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DocSet {
-    #[serde(default)]
-    pub documents: Vec<String>,
-}
-
-/// `room.gone` params.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoomGoneParams {
-    pub reason: String,
-    pub room_id: String,
-}
-
 /// What this implementation calls itself in `GET /meta` (`PROTOCOL.md` §2). Free-form and
 /// not stable: a peer **MUST NOT** depend on it.
 pub const SERVER_NAME: &str = concat!("selvaged/", env!("CARGO_PKG_VERSION"));
@@ -538,7 +347,7 @@ pub struct MetaKeepalive {
     pub awareness_expire_ms: u64,
     pub awareness_renew_ms: u64,
     pub ping_interval_ms: u64,
-    /// How long a room survives its host's connection ending (`PROTOCOL.md` §2, §9).
+    /// How long a room survives its last connection ending (`PROTOCOL.md` §2, §9).
     pub room_grace_ms: u64,
 }
 
@@ -560,10 +369,6 @@ pub struct Meta {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub keepalive: MetaKeepalive,
-    /// The roles this server seats. A server that does not serve `selvage/1` has nothing
-    /// to put here, and the member leaves with that version (`PROTOCOL.md` §2).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub roles: Vec<String>,
     pub server: String,
     pub wire_versions: Vec<String>,
 }
@@ -579,40 +384,8 @@ impl Meta {
                 .map(ToString::to_string)
                 .collect(),
             keepalive: MetaKeepalive::from((keepalive, room_grace_ms)),
-            roles: vec!["host".to_string(), "guest".to_string()],
             server: SERVER_NAME.to_string(),
             wire_versions: vec![WIRE_VERSION.to_string()],
-        }
-    }
-
-    /// What a server that seats every version in `versions` advertises.
-    ///
-    /// A server that implements both lists both (`PROTOCOL.md` §2): the list is what it
-    /// accepts, and §10 forbids a client that can speak `selvage/2` to take an earlier
-    /// version from it. `roles` stays while `selvage/1` is served, because a version-1
-    /// client reads it, and the two names only that version's server machinery needs
-    /// (`open-document-set`, `host-reclaim`) stay with it.
-    #[must_use]
-    pub fn for_versions(
-        keepalive: Keepalive,
-        room_grace_ms: u64,
-        versions: &[Version],
-    ) -> Self {
-        let v1 = versions.contains(&Version::V1);
-        let names = if v1 { CAPABILITIES } else { CAPABILITIES_V2 };
-        Self {
-            capabilities: names.iter().map(ToString::to_string).collect(),
-            keepalive: MetaKeepalive::from((keepalive, room_grace_ms)),
-            roles: if v1 {
-                vec!["host".to_string(), "guest".to_string()]
-            } else {
-                Vec::new()
-            },
-            server: SERVER_NAME.to_string(),
-            wire_versions: versions
-                .iter()
-                .map(|version| version.as_str().to_string())
-                .collect(),
         }
     }
 }
@@ -887,27 +660,20 @@ pub fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// True when the wire version in an envelope is compatible with this implementation.
-/// Compatible means same major; while at 0.x, same minor.
+/// True when the wire version in an envelope is the one this implementation speaks.
 ///
-/// A version outside the grammar of `CANONICAL.md` §2.5 is not compatible either: the
-/// schema's `wireVersion` refuses it, so a receiver that seats one is a receiver a
-/// conforming peer cannot predict.
+/// `PROTOCOL.md` §10: at major `2` the minor is not decisive, so every `selvage/2.x` is
+/// this version while `selvage/0.x`, `selvage/1` and `selvage/3` name another. A version
+/// outside the grammar of `CANONICAL.md` §2.5 is not this one either: the schema's
+/// `wireVersion` refuses it, so a receiver that seats one is a receiver a conforming peer
+/// cannot predict.
 #[must_use]
 pub fn is_compatible(version: &str) -> bool {
-    match (
-        parse_wire_version(version),
-        parse_wire_version(WIRE_VERSION),
-    ) {
-        (Some(a), Some(b)) => {
-            if a.0 != b.0 {
-                return false;
-            }
-            b.0 != 0 || a.1 == b.1
-        }
-        _ => false,
-    }
+    parse_wire_version(version).is_some_and(|(major, _)| major == VERSION_MAJOR)
 }
+
+/// The major of [`WIRE_VERSION`].
+const VERSION_MAJOR: u64 = 2;
 
 /// `selvage/` major, optionally `.` minor, both plain decimal with no leading zero.
 ///
@@ -945,19 +711,19 @@ mod tests {
     fn envelope_shapes() {
         let req = ClientMessage::new(
             7,
-            method::DOC_OPEN,
-            serde_json::json!({"path": "a.rs"}),
+            method::SESSION_RENAME,
+            serde_json::json!({"display_name": "a.rs"}),
         );
         let text = req.to_text().unwrap();
         assert_eq!(
             text,
-            r#"{"id":7,"method":"doc.open","params":{"path":"a.rs"},"v":"selvage/1"}"#
+            r#"{"id":7,"method":"session.rename","params":{"display_name":"a.rs"},"v":"selvage/2"}"#
         );
 
         let ok = ServerMessage::response(7, serde_json::json!({}))
             .to_text()
             .unwrap();
-        assert_eq!(ok, r#"{"id":7,"result":{},"v":"selvage/1"}"#);
+        assert_eq!(ok, r#"{"id":7,"result":{},"v":"selvage/2"}"#);
 
         let err =
             ServerMessage::error(7, code::UNKNOWN_METHOD, "no such method")
@@ -965,7 +731,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             err,
-            r#"{"error":{"code":"unknown_method","message":"no such method"},"id":7,"v":"selvage/1"}"#
+            r#"{"error":{"code":"unknown_method","message":"no such method"},"id":7,"v":"selvage/2"}"#
         );
 
         let ev =
@@ -974,7 +740,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             ev,
-            r#"{"event":"peer.left","params":{"x":1},"v":"selvage/1"}"#
+            r#"{"event":"peer.left","params":{"x":1},"v":"selvage/2"}"#
         );
     }
 
@@ -987,7 +753,7 @@ mod tests {
         );
         assert_eq!(
             request.to_text().unwrap(),
-            r#"{"id":2,"method":"session.rename","params":{"display_name":"Ada Lovelace"},"v":"selvage/1"}"#
+            r#"{"id":2,"method":"session.rename","params":{"display_name":"Ada Lovelace"},"v":"selvage/2"}"#
         );
 
         let event = ServerMessage::event(
@@ -999,7 +765,7 @@ mod tests {
         );
         assert_eq!(
             event.to_text().unwrap(),
-            r#"{"event":"peer.renamed","params":{"display_name":"Ada Lovelace","peer_id":"p-1"},"v":"selvage/1"}"#
+            r#"{"event":"peer.renamed","params":{"display_name":"Ada Lovelace","peer_id":"p-1"},"v":"selvage/2"}"#
         );
 
         // The wire is the contract in both directions: what this crate builds is what it
@@ -1015,42 +781,8 @@ mod tests {
     }
 
     #[test]
-    fn grant_frames() {
-        // The listing is an ordered array and the order survives both directions: this crate
-        // writes what it was given and reads it back unchanged.
-        let paths = vec!["README.md".to_string(), "ｆ.txt".to_string()];
-        let request = ClientMessage::new(
-            3,
-            method::DOC_GRANT,
-            serde_json::json!(GrantParams {
-                paths: paths.clone()
-            }),
-        );
-        assert_eq!(
-            request.to_text().unwrap(),
-            r#"{"id":3,"method":"doc.grant","params":{"paths":["README.md","ｆ.txt"]},"v":"selvage/1"}"#
-        );
-
-        let event = ServerMessage::event(
-            event::DOC_GRANTED,
-            serde_json::json!(GrantedParams { paths }),
-        );
-        assert_eq!(
-            event.to_text().unwrap(),
-            r#"{"event":"doc.granted","params":{"paths":["README.md","ｆ.txt"]},"v":"selvage/1"}"#
-        );
-
-        let parsed: GrantParams =
-            serde_json::from_value(request.params).unwrap();
-        assert_eq!(parsed.paths, vec!["README.md", "ｆ.txt"]);
-        let params: GrantedParams =
-            serde_json::from_value(event.params.unwrap_or_default()).unwrap();
-        assert_eq!(params.paths, vec!["README.md", "ｆ.txt"]);
-    }
-
-    #[test]
     fn unknown_fields_are_ignored() {
-        let raw = r#"{"v":"selvage/1","id":1,"method":"session.hello",
+        let raw = r#"{"v":"selvage/2","id":1,"method":"session.hello",
                       "params":{"display_name":"Ada","nonsense":true},"future_field":9}"#;
         let msg: ClientMessage = serde_json::from_str(raw).unwrap();
         assert_eq!(msg.id, Some(1));
@@ -1126,13 +858,13 @@ mod tests {
     fn a_repeated_member_anywhere_in_a_frame_is_refused() {
         let repeated = [
             // The envelope itself, which `serde` catches as well.
-            r#"{"v":"selvage/1","id":1,"method":"doc.open","params":{"path":"a"},"v":"selvage/1"}"#,
+            r#"{"v":"selvage/2","id":1,"method":"session.rename","params":{"display_name":"a"},"v":"selvage/2"}"#,
             // A member of `params`: the shape a duplicate could silently win before.
-            r#"{"v":"selvage/1","id":1,"method":"doc.open","params":{"path":"a","path":"b"}}"#,
+            r#"{"v":"selvage/2","id":1,"method":"session.rename","params":{"display_name":"a","display_name":"b"}}"#,
             // A member of an object nested below `params`.
-            r#"{"v":"selvage/1","id":1,"method":"doc.open","params":{"path":"a","x":{"y":1,"y":2}}}"#,
+            r#"{"v":"selvage/2","id":1,"method":"session.rename","params":{"display_name":"a","x":{"y":1,"y":2}}}"#,
             // And inside an array of objects.
-            r#"{"v":"selvage/1","id":1,"method":"doc.grant","params":{"paths":[],"extra":[{"z":1,"z":2}]}}"#,
+            r#"{"v":"selvage/2","id":1,"method":"session.rename","params":{"display_name":"a","extra":[{"z":1,"z":2}]}}"#,
         ];
         for text in repeated {
             let error = ClientMessage::from_text(text)
@@ -1145,7 +877,7 @@ mod tests {
 
         // The same rule reads a server frame in the other direction.
         let error = ServerMessage::from_text(
-            r#"{"v":"selvage/1","id":1,"result":{},"result":{}}"#,
+            r#"{"v":"selvage/2","id":1,"result":{},"result":{}}"#,
         )
         .expect_err("a repeated member is refused");
         assert!(error.to_string().contains("duplicate"), "{error}");
@@ -1153,11 +885,11 @@ mod tests {
         // And an ordinary frame is not refused: the same member twice in *different*
         // objects is not a repetition, and numbers, strings and arrays carry none.
         let msg = ClientMessage::from_text(
-            r#"{"v":"selvage/1","id":1,"method":"doc.open","params":{"path":"a","same":1,"other":{"same":2},"list":[1,"x",null,true,1.5]}}"#,
+            r#"{"v":"selvage/2","id":1,"method":"session.rename","params":{"display_name":"a","same":1,"other":{"same":2},"list":[1,"x",null,true,1.5]}}"#,
         )
         .expect("a frame with no repetition parses");
         assert_eq!(msg.id, Some(1));
-        assert_eq!(msg.params["path"], "a");
+        assert_eq!(msg.params["display_name"], "a");
     }
 
     /// §5.1: a join query names `room` and `token` once. Which of two values a connection
@@ -1251,14 +983,15 @@ mod tests {
 
     #[test]
     fn version_compatibility() {
-        assert!(is_compatible("selvage/1"));
-        // At major 1 the rule is same-major, so the minor is not decisive.
-        assert!(is_compatible("selvage/1.9"));
-        assert!(is_compatible("selvage/1.0"));
-        assert!(!is_compatible("selvage/2"));
+        assert!(is_compatible("selvage/2"));
+        // At major 2 the rule is same-major, so the minor is not decisive.
+        assert!(is_compatible("selvage/2.9"));
+        assert!(is_compatible("selvage/2.0"));
+        assert!(!is_compatible("selvage/1"));
+        assert!(!is_compatible("selvage/3"));
         assert!(!is_compatible("selvage"));
         assert!(!is_compatible("selvage/x"));
-        assert!(!is_compatible("other/1"));
+        assert!(!is_compatible("other/2"));
     }
 
     /// The grammar of `CANONICAL.md` §2.5, which `schema/negotiation.json` encodes as
@@ -1267,20 +1000,20 @@ mod tests {
     #[test]
     fn versions_outside_the_grammar_are_not_compatible() {
         for version in [
-            "selvage/1.2.3",
-            "selvage/1.0.0",
+            "selvage/2.2.3",
+            "selvage/2.0.0",
             "selvage/01",
-            "selvage/1.09",
+            "selvage/2.09",
             "selvage/00",
-            "selvage/1.",
+            "selvage/2.",
             "selvage/.1",
-            "selvage/1..2",
+            "selvage/2..3",
             "selvage/",
-            "selvage/+1",
-            "selvage/-1",
-            "selvage/ 1",
-            "selvage/1 ",
-            "selvage/1.x",
+            "selvage/+2",
+            "selvage/-2",
+            "selvage/ 2",
+            "selvage/2 ",
+            "selvage/2.x",
             "selvage/99999999999999999999999",
         ] {
             assert!(!is_compatible(version), "{version} must be refused");

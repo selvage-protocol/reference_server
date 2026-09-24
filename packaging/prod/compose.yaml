@@ -103,8 +103,6 @@ services:
       - "64"
       - --max-peers-per-room
       - "8"
-      - --max-documents-per-room
-      - "256"
       - --outbound-queue-bytes
       - "8388608"
       - --max-envelope-bytes
