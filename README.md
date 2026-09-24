@@ -385,11 +385,9 @@ outside the Cargo workspace, so `flake.nix` hands the directory in explicitly.
 
 `crates/harness/tests/vectors.rs` is that replay: each of the corpus's 24 wire transcripts is
 driven against a server the harness starts, and every frame it answers with is compared to the
-bytes the vector writes. One vector, `031`, is a defect of the corpus rather than of the
-server — the re-baseline onto `selvage/2` collapsed the repeated member it exists to send, so
-the frame it carries repeats nothing — and the suite names it, replays it and asserts it still
-fails, so the entry cannot outlive the defect. The specification's own runner
-(`runner/run_vectors.py`, against a built `selvaged`) replays the same files.
+bytes the vector writes. None of the 24 is skipped: a vector this server cannot answer is a
+defect to fix in the corpus or in the server, never a hole in the sweep. The specification's
+own runner (`runner/run_vectors.py`, against a built `selvaged`) replays the same files.
 
 ## What this slice does not do
 
