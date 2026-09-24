@@ -370,6 +370,7 @@ fn sealed_peer(
         // this subject does not hold, so both are the session's own.
         awareness_client_id: None,
         host: None,
+        frame_budget: None,
     };
     PeerSession::new(&options).map_err(|error| error.to_string())
 }
