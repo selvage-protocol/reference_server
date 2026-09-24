@@ -249,8 +249,8 @@ buildx; a pull request's checks are where they run.
 | `crates/protocol` | the `selvage/2` session envelope, method/event/error vocabulary, invite URLs. No I/O. |
 | `crates/selvaged` | the server: rooms, membership, payload-opaque relay, `GET /meta` |
 | `crates/client` | the `selvage/2` client: the sealed frame (`sealed.rs`), the peer session (`peer.rs`), the host's producer half (`host.rs`) and the relay that puts a session on a socket (`relay.rs`) |
-| `crates/harness` | one server and the waits the integration tests share; also a runnable transcript, the peer corpus's replay over `vectors/`, and `selvage-subject`, the client the corpus's decision layer drives |
-| `vectors/` | the wire vectors, vendored from the specification; `scripts/sync-vectors.sh` refreshes them |
+| `crates/harness` | one server and the waits the integration tests share; the wire corpus's replay over `vectors/`, the runnable transcript (`cargo run -p selvage-harness`), the peer layer's two suites, and `selvage-subject`, the client the corpus's decision layer drives |
+| `vectors/` | the wire vectors and the peer corpus, vendored from the specification; `scripts/sync-vectors.sh` refreshes them |
 
 ## The server's shape
 
@@ -382,6 +382,14 @@ the specification remains the canonical source.
 
 The replay reads `vectors/`, or `SELVAGE_VECTORS` when that is set. The Nix build cannot see
 outside the Cargo workspace, so `flake.nix` hands the directory in explicitly.
+
+`crates/harness/tests/vectors.rs` is that replay: each of the corpus's 24 wire transcripts is
+driven against a server the harness starts, and every frame it answers with is compared to the
+bytes the vector writes. One vector, `031`, is a defect of the corpus rather than of the
+server — the re-baseline onto `selvage/2` collapsed the repeated member it exists to send, so
+the frame it carries repeats nothing — and the suite names it, replays it and asserts it still
+fails, so the entry cannot outlive the defect. The specification's own runner
+(`runner/run_vectors.py`, against a built `selvaged`) replays the same files.
 
 ## What this slice does not do
 

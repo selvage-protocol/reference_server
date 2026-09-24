@@ -53,8 +53,9 @@
           pname = binName;
 
           # `cleanCargoSource` copies the Cargo workspace and nothing else, so without this the
-          # sandbox cannot see `vectors/` and `crates/harness/tests/peer_vectors.rs` and
-          # `decisions.rs` panic on the corpus instead of running. It belongs on the shared args
+          # sandbox cannot see `vectors/` and `crates/harness/tests/vectors.rs`,
+          # `peer_vectors.rs` and `decisions.rs` panic on the corpus instead of running. It
+          # belongs on the shared args
           # rather than on one check: `nextest` and `tarpaulin` each carried their own copy,
           # `packages.default` — which is `checks.build` — carried none, and that is why it
           # failed to build from the day the vectors were vendored.

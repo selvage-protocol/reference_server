@@ -905,18 +905,21 @@ fn every_decision_vector_a_conforming_client_passes_holds() {
     let vectors =
         load_decision_vectors().unwrap_or_else(|error| panic!("{error}"));
     let mut ran = 0;
+    let mut assertions = 0usize;
     for vector in &vectors {
         let id = vector.get("id").and_then(Value::as_str).unwrap_or("?");
         if !PASSABLE.contains(&id) {
             continue;
         }
         ran += 1;
-        let assertions = replay(vector, &fixture, None)
+        let count = replay(vector, &fixture, None)
             .unwrap_or_else(|error| panic!("vector {id}: {error}"));
-        assert!(assertions > 0, "vector {id} asserted nothing");
+        assert!(count > 0, "vector {id} asserted nothing");
+        assertions = assertions.saturating_add(count);
     }
-    // A sweep that read nothing reports a clean tree: the five are named, not counted.
+    // A sweep that read nothing reports a clean tree: the seven are named, not counted.
     assert_eq!(ran, PASSABLE.len(), "every passable vector was replayed");
+    println!("{ran} decision vectors replayed, {assertions} assertion steps");
 }
 
 #[test]
