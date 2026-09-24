@@ -4,7 +4,8 @@
 # has no Docker or Podman, so `act` cannot run here).
 #
 #   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval, the TLS front, the public
-#                                 # demo's deploy guard and front limits, the deploy workflow's verification, lint, typos
+#                                 # demo's deploy guard and front limits, the packaging command lines, the deploy
+#                                 # workflow's verification, lint, typos
 #   scripts/ci-local.sh nightly   # coverage, the rest of cargo-deny and cargo-audit (slow)
 #   scripts/ci-local.sh lint      # actionlint over the workflow files, on its own
 #   scripts/ci-local.sh image     # the `image` workflow's smoke: nix-built image,
@@ -94,6 +95,12 @@ job_checks() {
   # proxy, so neither can be read out of the configuration.
   say "checks: the public demo's front limits"
   nix build .#checks.x86_64-linux.prod-front --no-link --print-build-logs
+  # The command lines the tracked compose shapes give the server, run against the
+  # binary: a value it refuses is a container that exits 2 and restart-loops,
+  # which took the public demo's front down with it. Both packaging trees are
+  # read, so the Pi's shape cannot carry a value its own image would refuse.
+  say "checks: the packaging command lines"
+  nix build .#checks.x86_64-linux.packaging-args --no-link --print-build-logs
   # The deploy workflow's verification: what it asserts (the origin, on the box
   # through the front) and what it only reports (the public URL, behind an edge
   # that answers a datacenter client with a challenge).
