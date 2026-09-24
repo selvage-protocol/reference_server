@@ -93,12 +93,21 @@ jobs:
         with:
           persist-credentials: false
 
-      # Same preamble as the checks job: the runner image guarantees only
-      # ~14 GB free, and a cold nix store has to fit a rust-overlay
-      # toolchain plus crane's dependency artefacts.
+      # Same preamble as the checks job in `ci.yml`: the preinstalled toolchains nothing
+      # here uses, non-fatal and gated on the free space the runner actually has.
       - name: free disk space
         run: |
           df -h /
+          # A cold Nix store — the rust-overlay toolchain plus crane's dependency
+          # artefacts — needs on the order of 10-20 GB, and the runner the job lands on
+          # has had 87 GB free, so this usually has nothing to do. It deletes only when
+          # the free space is genuinely short, which keeps the insurance without paying
+          # for it on every run.
+          available_kb=$(df --output=avail -k / | tail -n 1)
+          if [ "$available_kb" -ge $((30 * 1024 * 1024)) ]; then
+            echo "skipping: $((available_kb / 1024 / 1024)) GB free is enough for a cold Nix store"
+            exit 0
+          fi
           sudo rm -rf \
             /opt/ghc \
             /opt/hostedtoolcache/CodeQL \
@@ -138,10 +147,20 @@ jobs:
       # This job is the heaviest three-store user in the repository: a Docker
       # build's own layers and target directory, and the dev shell whose cargo
       # builds the engine the smoke joins with. The same preamble as the jobs
-      # above, for the same reason.
+      # above, and the same gate on the free space the runner actually has.
       - name: free disk space
         run: |
           df -h /
+          # A cold Nix store — the rust-overlay toolchain plus crane's dependency
+          # artefacts — needs on the order of 10-20 GB, and the runner the job lands on
+          # has had 87 GB free, so this usually has nothing to do. It deletes only when
+          # the free space is genuinely short, which keeps the insurance without paying
+          # for it on every run.
+          available_kb=$(df --output=avail -k / | tail -n 1)
+          if [ "$available_kb" -ge $((30 * 1024 * 1024)) ]; then
+            echo "skipping: $((available_kb / 1024 / 1024)) GB free is enough for a cold Nix store"
+            exit 0
+          fi
           sudo rm -rf \
             /opt/ghc \
             /opt/hostedtoolcache/CodeQL \
@@ -187,9 +206,21 @@ jobs:
         with:
           persist-credentials: false
 
+      # The preinstalled toolchains nothing here uses, as in the jobs above, gated on the
+      # free space the runner actually has.
       - name: free disk space
         run: |
           df -h /
+          # A cold Nix store — the rust-overlay toolchain plus crane's dependency
+          # artefacts — needs on the order of 10-20 GB, and the runner the job lands on
+          # has had 87 GB free, so this usually has nothing to do. It deletes only when
+          # the free space is genuinely short, which keeps the insurance without paying
+          # for it on every run.
+          available_kb=$(df --output=avail -k / | tail -n 1)
+          if [ "$available_kb" -ge $((30 * 1024 * 1024)) ]; then
+            echo "skipping: $((available_kb / 1024 / 1024)) GB free is enough for a cold Nix store"
+            exit 0
+          fi
           sudo rm -rf \
             /opt/ghc \
             /opt/hostedtoolcache/CodeQL \
@@ -280,9 +311,21 @@ jobs:
         with:
           persist-credentials: false
 
+      # The preinstalled toolchains nothing here uses, as in the jobs above, gated on the
+      # free space the runner actually has.
       - name: free disk space
         run: |
           df -h /
+          # A cold Nix store — the rust-overlay toolchain plus crane's dependency
+          # artefacts — needs on the order of 10-20 GB, and the runner the job lands on
+          # has had 87 GB free, so this usually has nothing to do. It deletes only when
+          # the free space is genuinely short, which keeps the insurance without paying
+          # for it on every run.
+          available_kb=$(df --output=avail -k / | tail -n 1)
+          if [ "$available_kb" -ge $((30 * 1024 * 1024)) ]; then
+            echo "skipping: $((available_kb / 1024 / 1024)) GB free is enough for a cold Nix store"
+            exit 0
+          fi
           sudo rm -rf \
             /opt/ghc \
             /opt/hostedtoolcache/CodeQL \
