@@ -12,11 +12,8 @@ name: image
 # — with nothing pushed to GHCR; the publish job pushes, on release tags only.
 # See packaging/README.md.
 #
-# Everything that needs buildx runs on GitHub-hosted `ubuntu-24.04`. The
-# Blacksmith runners this repository otherwise uses proved only github-scoped
-# egress and could not execute buildx builds over nine red rounds, so the
-# release path lives where buildx works; the pull-request feedback jobs that do
-# not need it (the checks, and the nix smoke) stay on Blacksmith.
+# The workflow runs on GitHub-hosted runners throughout — `ubuntu-24.04` for
+# x86_64 and `ubuntu-24.04-arm` for arm64.
 #
 # A pull request runs all of it only when it changes something the image is
 # built from or a script a job reads: a prose edit does not build an image.
@@ -81,12 +78,11 @@ jobs:
     strategy:
       # One leg's failure must never cancel the other's proof.
       fail-fast: false
-      # Both legs run on every event. The arm64 leg is a GitHub-hosted runner
-      # and costs no Blacksmith minutes, so restricting it to tags would save
-      # nothing and give up the arm64 image on the event that reviews it.
+      # Both legs run on every event: restricting the arm64 leg to tags would
+      # give up the arm64 image on the event that reviews it.
       matrix:
         include:
-          - runner: blacksmith-4vcpu-ubuntu-2404
+          - runner: ubuntu-24.04
             goarch: amd64
           - runner: ubuntu-24.04-arm
             goarch: arm64
@@ -127,13 +123,11 @@ jobs:
   container:
     # `docker build`, `docker run` and a room joined in the container, which is
     # what the job above cannot prove: it builds the image without a daemon and
-    # never runs it. The runner is chosen for the daemon — GitHub-hosted
-    # `ubuntu-24.04` ships Docker and reaches the whole network, while the
-    # Blacksmith runners this repository otherwise uses proved only
-    # github-scoped egress and could not execute buildx builds over nine red
-    # rounds. No buildx and nothing pushed: one architecture, a plain local
-    # build of the repository's own Dockerfile, and scripts/container-smoke.sh,
-    # which runs the container hardened and asserts the page the image bakes.
+    # never runs it. The runner is chosen for its daemon and its full egress —
+    # GitHub-hosted `ubuntu-24.04` ships Docker and reaches the whole network.
+    # No buildx and nothing pushed: one architecture, a plain local build of
+    # the repository's own Dockerfile, and scripts/container-smoke.sh, which
+    # runs the container hardened and asserts the page the image bakes.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:

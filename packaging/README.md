@@ -182,9 +182,7 @@ no QEMU — only *running* the arm64 image does. Build and run it on any
 machine with a working Docker; the `container` job below does exactly that on
 GitHub-hosted `ubuntu-24.04` (the amd64 path), and the `publish-rehearsal` job
 builds both architectures there with buildx, so the `Dockerfile` is CI-proven
-as well as human-verified. The Blacksmith runners are not such machines: they
-proved only github-scoped egress and could not execute buildx builds (see CI
-below).
+as well as human-verified.
 
 Fallback is the same static binary on `gcr.io/distroless/static:nonroot`
 (`--build-arg RUNTIME=distroless`). If a future dependency ever breaks the
@@ -340,24 +338,21 @@ origin as the socket is what makes that one terminator enough.
 `.github/workflows/image.yml` has five jobs. `smoke` runs on a pull request
 that changes something the image is built from — `crates/`, the manifests, the
 `Dockerfile`, `compose.yaml`, `packaging/`, the flake, and the scripts a job
-reads — and on a release tag, one leg per architecture (`amd64` on the usual
-Blacksmith runners, `arm64` on GitHub-hosted ARM — each building natively, no
+reads — and on a release tag, one leg per architecture (`amd64` on
+`ubuntu-24.04`, `arm64` on `ubuntu-24.04-arm` — each building natively, no
 cross-compilation): the same nix preamble as the checks job, then
-`scripts/image-smoke.sh`, which needs no Docker daemon at all. Nine CI
-rounds established that these runners cannot execute buildx builds (daemon,
-setup actions, pulls and builder bootstrap all green; every build dead in
-seconds, including `FROM scratch`), so the smoke builds the image the way
-the runners provably can — `nix build .#image` — and verifies it with
-skopeo. The `Dockerfile` stays the portable static variant for
+`scripts/image-smoke.sh`, which needs no Docker daemon at all: it builds the
+image with `nix build .#image` and verifies the manifest and container config
+with skopeo. The `Dockerfile` stays the portable static variant for
 machines with a working Docker; both agree on entrypoint, port, user,
 licence label and tag scheme, and the smoke asserts exactly those fields. The
 nix image is the daemon-free shape and carries the server alone: the page is the
 `Dockerfile`'s own, and `container` is where it is proved.
 
 `container` is the other half, and the only job that runs the image, on one
-architecture: GitHub-hosted `ubuntu-24.04`, chosen for its Docker daemon and its
-egress (the Blacksmith runners proved only github-scoped egress), a plain
-`docker build` of the `Dockerfile`, and `scripts/container-smoke.sh`. That script
+architecture: GitHub-hosted `ubuntu-24.04`, chosen for its Docker daemon and
+its full egress, a plain `docker build` of the `Dockerfile`, and
+`scripts/container-smoke.sh`. That script
 asserts
 `compose.yaml` carries the hardened run, that the container actually runs that
 way (read-only root filesystem, `CapDrop: [ALL]`, `no-new-privileges`, no mount

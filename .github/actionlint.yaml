@@ -1,5 +1,0 @@
-# Blacksmith's runner labels are real to GitHub but not in actionlint's list of GitHub-hosted
-# labels, so they are declared here rather than narrowing the check.
-self-hosted-runner:
-  labels:
-    - blacksmith-4vcpu-ubuntu-2404
