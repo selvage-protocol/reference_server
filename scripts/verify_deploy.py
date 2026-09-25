@@ -34,7 +34,7 @@ header, because the front is the server for `selvage-demo.dontblameme.dev` and
 closes the connection for any other name: a loopback address is where the front
 is, not a name it answers.
 
-    scripts/verify_deploy.py --expect-version 0.4.4
+    scripts/verify_deploy.py --expect-version 0.4.5
     scripts/verify_deploy.py                      # a page-only deploy: /meta is read, not compared
 """
 
