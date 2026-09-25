@@ -259,7 +259,7 @@ are the same build is already on GHCR when the job goes red, which is how `0.1.0
 A stranger pulls it with no account:
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.4.3
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.4.4
 ```
 
 and `compose.yaml`'s `build: .` remains the route for an image built from a checkout.
@@ -295,8 +295,8 @@ here: the `Dockerfile`'s `page` stage clones that repository at the revision in
 the `WEB_CLIENT_SHA` build argument, runs `npm ci && npm run build` on a Debian
 trixie node image (the client's icon renderer shells out to ImageMagick 7's
 `magick`), and copies the resulting `dist/` to `/page`. The pin is
-`2ea6d45b4df171628f92925bab9fbc29bb5c7a5a`, the commit `web_client`'s `main`
-names for its `0.4.3`; updating it is editing that one argument, and the image
+`d9a86e6ed29f9f59c1fade0fc7f6c702f8b0b2a6`, the commit `web_client`'s `main`
+names for its `0.4.4`; updating it is editing that one argument, and the image
 records the revision it carries in `com.selvage.page.revision`. The page is
 built from that revision's source rather than copied from the `dist/`
 committed there; `web_client`'s own `checks` job rebuilds that `dist/` on every
