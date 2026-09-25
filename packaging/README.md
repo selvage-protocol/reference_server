@@ -213,7 +213,8 @@ against it. `scripts/ci-local.sh image` runs that smoke anywhere nix does.
 ### Published releases
 
 Read the list from the registry rather than from this file: a pull token from
-`https://ghcr.io/token?scope=repository:selvage-protocol/selvaged:pull&service=ghcr.io` answers
+`https://ghcr.io/token?scope=repository:selvage-protocol/selvaged:pull&service=ghcr.io`, sent as
+`Authorization: Bearer <token>`, answers
 `https://ghcr.io/v2/selvage-protocol/selvaged/tags/list`. Read that way on 2026-09-24, the moving
 `<version>` alias of each release was `0.1.0`, `0.1.1`, `0.1.2`, `0.2.0`, `0.2.1`, `0.4.0`, `0.4.1`
 and `0.4.2`, each with its `<version>-<short-sha>` tag beside it, and `latest` was the digest of
