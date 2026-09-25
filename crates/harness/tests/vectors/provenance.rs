@@ -68,8 +68,9 @@ fn vector(id: &str) -> Result<Vector, Failure> {
 }
 
 /// One awareness frame, as this implementation's encoder writes it: publish `state` on
-/// `awareness` and take the update that produces. The harness builds its frames the same way
-/// (`tests/awareness.rs`), which is what makes the vector's bytes reproducible.
+/// `awareness` and take the update that produces. A peer's frames come out of the same
+/// `Awareness` (`crates/client/src/peer.rs`), which is what makes the vector's bytes
+/// reproducible.
 fn encoded(awareness: &mut Awareness, state: &str) -> Result<Vec<u8>, Failure> {
     awareness.set_local_state_raw(state);
     let update = awareness.update()?;
