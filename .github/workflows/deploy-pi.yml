@@ -33,11 +33,11 @@ on:
   workflow_dispatch:
     inputs:
       server_version:
-        description: 'selvaged version to deploy (e.g. 0.4.2). Empty leaves the running one alone.'
+        description: 'selvaged version to deploy (e.g. 0.4.3). Empty leaves the running one alone.'
         required: false
         default: ''
       web_version:
-        description: 'selvage-web version to deploy (e.g. 0.4.2). Empty leaves the running one alone.'
+        description: 'selvage-web version to deploy (e.g. 0.4.3). Empty leaves the running one alone.'
         required: false
         default: ''
 
