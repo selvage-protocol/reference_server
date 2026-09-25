@@ -29,7 +29,7 @@
 //! - `insert`'s reply carries `published` — whether the frame went out, which is `false`
 //!   until a state commits this connection's key (§13.1's step 4).
 //!
-//! `vscode_client/test/interop.test.ts` is the caller that matters: it hosts from the
+//! `vscode_client/test/interop-v2.test.ts` is the caller that matters: it hosts from the
 //! TypeScript engine, spawns this as the guest, and asserts both sides converge on the
 //! same text, the same room and the same state vectors.
 
