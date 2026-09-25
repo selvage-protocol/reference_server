@@ -38,7 +38,7 @@ ARG REVISION=unknown
 # is a revision of another repository, so it moves when that one releases, and a
 # wave that cuts the two together repins it before this image is cut. The image
 # records the revision it carries in `com.selvage.page.revision`.
-ARG WEB_CLIENT_SHA=75cd9fee4dcce852219be1c4a6f9a91442f14524
+ARG WEB_CLIENT_SHA=c981676ac1664404ddd839a40482cb7d18ebe9ca
 
 # One cross-toolchain image per target, always run natively on the build host:
 # each stage cross-compiles its target triple, so building arm64 needs no

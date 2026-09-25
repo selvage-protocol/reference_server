@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release, matching Cargo.toml (e.g. 0.4.4)'
+        description: 'Version to release, matching Cargo.toml (e.g. 0.4.5)'
         required: true
 
 concurrency:
