@@ -212,9 +212,12 @@ against it. `scripts/ci-local.sh image` runs that smoke anywhere nix does.
 
 ### Published releases
 
-The package holds `0.1.0-7d64cbb`, `0.1.0`, `0.1.1-a3f4b12`, `0.1.1`, `0.1.2-adc0ae2`, `0.1.2`,
-`0.2.0-67c3b7d`, `0.2.0`, `0.2.1-030615c`, `0.2.1`, `0.4.0-1a12e2f`, `0.4.0`, `0.4.1-42c6d10`,
-`0.4.1`, and the moving `latest`, which is `0.4.1` as this is written (2026-09-24).
+Read the list from the registry rather than from this file: a pull token from
+`https://ghcr.io/token?scope=repository:selvage-protocol/selvaged:pull&service=ghcr.io` answers
+`https://ghcr.io/v2/selvage-protocol/selvaged/tags/list`. Read that way on 2026-09-24, the moving
+`<version>` alias of each release was `0.1.0`, `0.1.1`, `0.1.2`, `0.2.0`, `0.2.1`, `0.4.0`, `0.4.1`
+and `0.4.2`, each with its `<version>-<short-sha>` tag beside it, and `latest` was the digest of
+`0.4.2`.
 `v0.1.0` (2026-09-19, at `7d64cbb`, the merge of \#25) was the first: its tag run —
 https://github.com/selvage-protocol/reference\_server/actions/runs/35428735910 —
 published `ghcr.io/selvage-protocol/selvaged:0.1.0-7d64cbb`, `:0.1.0` and `:latest`
