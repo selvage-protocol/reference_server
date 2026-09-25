@@ -213,8 +213,8 @@ against it. `scripts/ci-local.sh image` runs that smoke anywhere nix does.
 ### Published releases
 
 The package holds `0.1.0-7d64cbb`, `0.1.0`, `0.1.1-a3f4b12`, `0.1.1`, `0.1.2-adc0ae2`, `0.1.2`,
-`0.2.0-67c3b7d`, `0.2.0`, `0.2.1-030615c`, `0.2.1`, `0.4.0-1a12e2f`, `0.4.0`, and the moving
-`latest`, which is `0.4.0` as this is written (2026-09-24).
+`0.2.0-67c3b7d`, `0.2.0`, `0.2.1-030615c`, `0.2.1`, `0.4.0-1a12e2f`, `0.4.0`, `0.4.1-42c6d10`,
+`0.4.1`, and the moving `latest`, which is `0.4.1` as this is written (2026-09-24).
 `v0.1.0` (2026-09-19, at `7d64cbb`, the merge of \#25) was the first: its tag run —
 https://github.com/selvage-protocol/reference\_server/actions/runs/35428735910 —
 published `ghcr.io/selvage-protocol/selvaged:0.1.0-7d64cbb`, `:0.1.0` and `:latest`
@@ -255,7 +255,7 @@ are the same build is already on GHCR when the job goes red, which is how `0.1.0
 A stranger pulls it with no account:
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.4.1
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.4.2
 ```
 
 and `compose.yaml`'s `build: .` remains the route for an image built from a checkout.
@@ -291,8 +291,8 @@ here: the `Dockerfile`'s `page` stage clones that repository at the revision in
 the `WEB_CLIENT_SHA` build argument, runs `npm ci && npm run build` on a Debian
 trixie node image (the client's icon renderer shells out to ImageMagick 7's
 `magick`), and copies the resulting `dist/` to `/page`. The pin is
-`02f3ff72e79bb8f903ded482215d1394f545f96e`, the commit `web_client`'s `main`
-names for its `0.4.1`; updating it is editing that one argument, and the image
+`609eac29f77886fc0effdfa7eaa34827d155b174`, the commit `web_client`'s `main`
+names for its `0.4.2`; updating it is editing that one argument, and the image
 records the revision it carries in `com.selvage.page.revision`. The page is
 built from that revision's source rather than copied from the `dist/`
 committed there; `web_client`'s own `checks` job rebuilds that `dist/` on every
