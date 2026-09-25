@@ -295,7 +295,7 @@ here: the `Dockerfile`'s `page` stage clones that repository at the revision in
 the `WEB_CLIENT_SHA` build argument, runs `npm ci && npm run build` on a Debian
 trixie node image (the client's icon renderer shells out to ImageMagick 7's
 `magick`), and copies the resulting `dist/` to `/page`. The pin is
-`d9a86e6ed29f9f59c1fade0fc7f6c702f8b0b2a6`, the commit `web_client`'s `main`
+`75cd9fee4dcce852219be1c4a6f9a91442f14524`, the commit `web_client`'s `main`
 names for its `0.4.4`; updating it is editing that one argument, and the image
 records the revision it carries in `com.selvage.page.revision`. The page is
 built from that revision's source rather than copied from the `dist/`
