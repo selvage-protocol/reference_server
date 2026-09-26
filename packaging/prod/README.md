@@ -104,10 +104,10 @@ the two halves of one certificate; the other two have none.
 
 ## The limits, and why these numbers
 
-The box has 2 vCPU, 892 MiB of RAM and **no swap**. Three containers and the
-Docker daemon have to fit in that, so the server is told what it may hold rather
-than left on its reference defaults, which assume headroom this host does not
-have (at the defaults, `--max-connections × --outbound-queue-bytes` is 32 GiB).
+The box has 2 vCPU, 892 MiB of RAM and a 10 GiB swapfile. Three containers and
+the Docker daemon have to fit in that, so the server is told what it may hold
+rather than left on its reference defaults, which assume headroom this host does
+not have (at the defaults, `--max-connections × --outbound-queue-bytes` is 32 GiB).
 
 | Flag | Value | Why this one |
 |---|---|---|
@@ -467,7 +467,8 @@ ssh "$box" 'set -e
 
 The box first ran from `/etc/selvage`, with root's Compose and digest pins. The
 move keeps the project name, so one `up -d` from the new directory recreates the
-three containers in place. That step is the only downtime, a few seconds.
+three containers in place. That step is the only downtime, about 20 seconds,
+most of it the old front closing its connections.
 
 1. `docker compose pull --help | grep ignore-buildable`, as `selvage`. The timer
    needs that flag. Note the versions running now, from each container's
