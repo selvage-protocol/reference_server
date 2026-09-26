@@ -6,9 +6,9 @@
 # the page answers everything else. `README.md` beside this file owns the shape
 # and the live state, and `web_client`'s README owns the page.
 #
-# This file is the source of truth for the deployment's shape and lives in this
-# repository. The box's copy is `/etc/selvage/compose.yaml`, installed by hand
-# once; the deployment changes which *images* run, never this shape.
+# The box runs a copy of this directory at `/srv/selvage/`, which is
+# self-contained: this file, `.env`, `proxy/` and `tls/`. `README.md` has the
+# hand commands and the update timer that pulls the tags `.env` names.
 #
 # Every service below is hardened the same way, and the readback of that is what
 # the deployment is gated on: read-only root filesystem, every capability
@@ -33,13 +33,9 @@ services:
     # published image for this front and there should not be one, because its
     # configuration is the deployment's own.
     image: selvage-prod-proxy:local
-    # Rebuild on every `up`, not only when the image is missing. The front is the
-    # one service here whose content is this directory, so "the repository is the
-    # source of truth" is only true if a change to `proxy/` reaches the running
-    # container — and `docker compose up -d` will not rebuild an image that
-    # already exists without being told to. With this, the one deployment command
-    # is also the one that deploys a configuration change.
-    pull_policy: build
+    # Built only when the image is missing, so an `up -d` that changes nothing
+    # else leaves the front and its WebSockets alone. A change to `proxy/` is
+    # deployed with `docker compose up -d --build proxy`.
     # Started after the two upstreams so that their names resolve. The front
     # resolves `selvaged` and `selvage-web` once, at startup, and caches the
     # addresses, so `restart: true` matters as much as the ordering: recreating
@@ -67,12 +63,13 @@ services:
     # outside its own image. Read-only, twice over: the front never writes a
     # certificate and cannot, and every directory it does need to write — the
     # pid file and the five temp paths — is already on the runtime's own tmpfs.
+    # The target path is the one `proxy/conf.d/default.conf` names.
     #
     # The key is mode 640 owned by `root` and group 101 on the host, which is
     # the group uid 101 is in inside this image. `README.md` owns that readback.
     volumes:
-      - /etc/selvage/tls/origin.pem:/etc/selvage/tls/origin.pem:ro
-      - /etc/selvage/tls/origin.key:/etc/selvage/tls/origin.key:ro
+      - ./tls/origin.pem:/etc/selvage/tls/origin.pem:ro
+      - ./tls/origin.key:/etc/selvage/tls/origin.key:ro
     read_only: true
     cap_drop:
       - ALL
@@ -82,7 +79,7 @@ services:
     restart: unless-stopped
 
   selvaged:
-    image: ${SELVAGED_IMAGE:?set SELVAGED_IMAGE in .env to the published image, by digest}
+    image: ${SELVAGED_IMAGE:?set SELVAGED_IMAGE in .env}
     # The image's own command serves a page from `/page` on one listener. This
     # deployment splits the page into its own container, so the page flag is
     # gone and the limits are the ones sized for this box. `README.md` owns why
@@ -129,7 +126,7 @@ services:
     restart: unless-stopped
 
   selvage-web:
-    image: ${SELVAGE_WEB_IMAGE:?set SELVAGE_WEB_IMAGE in .env to the published image, by digest}
+    image: ${SELVAGE_WEB_IMAGE:?set SELVAGE_WEB_IMAGE in .env}
     # No `ports:` here either. The page image already runs as uid 101 on 8080
     # with the base's own hardening (`web_client/compose.yaml`), so this service
     # is the same shape with the two things added that the one-origin deployment

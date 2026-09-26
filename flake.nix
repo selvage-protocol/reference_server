@@ -255,7 +255,8 @@
           # The guard around `packaging/prod/deploy.py`, which is the whole of the
           # public demo's privilege model: `/usr/local/sbin/selvage-deploy` is the
           # only root command the CI user on that box may run. Nothing else in this
-          # repository can see what its request grammar refuses.
+          # repository can see what its request grammar refuses, or that the compose
+          # file and the update unit agree with it.
           prod-deploy =
             pkgs.runCommand "prod-deploy-test" {
               nativeBuildInputs = [pkgs.python3];
