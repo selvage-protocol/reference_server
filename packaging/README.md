@@ -6,7 +6,7 @@ Five shapes, for five audiences:
 |---|---|---|
 | `pi/` | The live Pi demo, exactly as it runs | The two-service compose file for the tailnet, the environment file that names both images by digest, and the deploy script that box's CI user may run as root |
 | `pi-demo/` | The Pi's native shape, retired 2026-09-21 | The TLS front and the user units it ran — tracked here so a deployment artefact is reviewable, and left on the machine as the rollback recipe |
-| `prod/` | The live public demo, exactly as it runs | The TLS front, the router and the three-service compose file for one public origin — the Pi's container pattern plus a front that terminates TLS and routes — plus the deploy script that box's CI user may run as root |
+| `prod/` | The live public demo, exactly as it runs | The TLS front, the router and the three-service compose file for one public origin — the Pi's container pattern plus a front that terminates TLS and routes — plus the update timer that follows the image tags, and the deploy script that box's CI user may run as root |
 | `systemd/` | A self-hoster on their own machine | A user unit plus install docs — the proven path, generalized, with no front |
 | `Dockerfile` + `compose.yaml` | Strangers self-hosting on their own machines | A multi-arch image and a one-service compose file — never the Pi |
 The server is memory-only under all five: restarts end all rooms, and

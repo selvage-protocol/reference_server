@@ -19,12 +19,14 @@ those facts; this directory owns the files, and the two must agree.
 
 | File | Installs to | What it is |
 |---|---|---|
-| `compose.yaml` | `/etc/selvage/compose.yaml` | The three services, the hardening and the memory limits |
-| `.env.example` | `/etc/selvage/.env` | The two image references the next `up` runs |
-| `deploy.py` | `/usr/local/sbin/selvage-deploy` | The deploy: reads one request on stdin, verifies the shape, pulls and ups |
+| `compose.yaml` | `/srv/selvage/compose.yaml` | The three services, the hardening and the memory limits |
+| `.env.example` | `/srv/selvage/.env` | The two image tags the next `up` runs, and the timer follows |
+| `selvage-update.service` | `/etc/systemd/system/` | One pull and `up -d` as `selvage`, then a prune |
+| `selvage-update.timer` | `/etc/systemd/system/` | Runs that every five minutes |
+| `deploy.py` | `/usr/local/sbin/selvage-deploy` | The CI deploy: reads one request on stdin, rewrites those `.env` lines, pulls and ups |
 | `deployci.sudoers` | `/etc/sudoers.d/selvage-deploy` | The one root command the CI user on this box may run |
-| `test_deploy.py` | nowhere; run where it is | What the request grammar refuses, and that a shape mismatch touches nothing |
-| `proxy/Dockerfile` | build context `/etc/selvage/proxy/` | The front's image, from the two files below it |
+| `test_deploy.py` | nowhere; run where it is | What the request grammar refuses, that a failed deploy leaves `.env` alone, and that the units and the shape agree with the script |
+| `proxy/Dockerfile` | build context `/srv/selvage/proxy/` | The front's image, from the two files below it |
 | `proxy/nginx.conf` | baked into that image | Process and http scope: the log policy, the temp paths, the per-source zones |
 | `proxy/conf.d/default.conf` | baked into that image | The server block: TLS, the routes, the limits, the terms banner, and the location that serves the page below |
 | `proxy/conf.d/cloudflare-ips.conf` | baked into that image | Cloudflare's published ranges, for `real_ip` |
@@ -332,94 +334,174 @@ stays.
 
 ## Deploy
 
-From this directory, on a host that already has the two files installed:
+The box runs a self-contained copy of this directory, owned by `selvage` (uid
+1000, in the `docker` group):
 
-```sh
-sudo docker compose -f /etc/selvage/compose.yaml up -d
+```text
+/srv/selvage/            selvage:selvage 0755
+  compose.yaml, proxy/   from this directory
+  .env                   selvage 0600, from .env.example
+  tls/                   root:root 0750
+    origin.pem           root:root 0644
+    origin.key           root:101  0640
 ```
 
-One command: it builds the front from `/etc/selvage/proxy/`, pulls whatever
-`.env` names, creates the network and starts the three services.
+Every hand command runs as `selvage` from `/srv/selvage`, with no `sudo` and no
+`-f`: Compose reads `compose.yaml` and `.env` from the working directory, and the
+file's own `name:` makes the project `selvage-prod`. The timer and
+`selvage-deploy` run Compose the same way, so a `compose.override.yaml` put
+beside it applies to all three.
 
-Two settings make that one command reflect a change:
+| To | Run |
+|---|---|
+| apply an edited `.env` | `docker compose pull && docker compose up -d` |
+| restart one service | `docker compose restart <service>` |
+| deploy a change to `proxy/` | `docker compose up -d --build proxy` |
+| see what runs | `docker compose ps`, `docker compose images` |
+| take the demo down | `sudo systemctl stop selvage-update.timer`, then `docker compose down` |
+| bring it back | `docker compose up -d`, then `sudo systemctl start selvage-update.timer` |
 
-- the front has `pull_policy: build`, so `up` rebuilds it even when the image
-  already exists. Without it a configuration change would sit in this repository
-  and not in the running container, because Compose does not rebuild for changed
-  build-context content on its own;
-- the front's `depends_on` entries carry `restart: true`, so recreating
-  `selvaged` or `selvage-web` restarts the front too. It resolves those two names
-  once, at startup, and a recreated container can come back on a different
-  address — a proxy left running would go on dialling the old one.
+The timer runs `up -d` every five minutes, so a `stop` or `down` made while it
+runs is undone on the next tick. Stop the timer first, for one service as much
+as for all three.
 
-**That rebuild has a cost.**
-With BuildKit's default attestations the built image's manifest — and so its
-image ID — is stamped per build even when `proxy/` has not changed at all, and
-Compose recreates any container whose image ID moved. So this command replaces
-the front *every* time, which drops the WebSockets through it and makes the origin
-unreachable for a second or two. Rooms survive: `selvaged` is not recreated, and
-the clients reconnect on their own. Three builds of one context on this box,
-with nothing edited between them:
+A plain `pull` also asks the registry for the front's local image and warns that
+it cannot find it; `--ignore-buildable` skips that. `up -d` recreates only a
+service whose image or configuration changed. The front is built only when its
+image is missing, so it moves only with `--build`. Its `depends_on` entries carry
+`restart: true`, so recreating `selvaged` or `selvage-web` restarts the front
+too. The front resolves those names once, at startup, and a recreated container
+can come back on a different address.
 
-    sha256:702235e5…  sha256:74fb7a39…  sha256:6f4c1cdd…
+Recreating the front drops the WebSockets through it for a second or two, and
+rooms survive it. Recreating `selvaged` ends every room, because the server is
+memory-only and there is no reclaim after a restart.
 
-`deploy.py` sets `BUILDX_NO_DEFAULT_ATTESTATIONS=1` for the Compose it runs, which
-makes that rebuild content-addressed instead — the same three builds then produce
-one image ID — so a deployment whose images have not changed recreates nothing at
-all. That is why the automated path is quieter than this command, and the only
-reason the two differ. The front's image is local and nothing is published from
-it, so the attestations are worth nothing here; Compose's own `build.provenance: false` was tried first and did not take effect on Compose 2.40.3.
+### The update timer
 
-Bootstrap, once, from a checkout of `reference_server`:
-
-```sh
-git archive <sha> packaging/prod | ssh selvage@selvage-protocol-prod 'sudo tar -x -C /etc/selvage --strip-components=2 packaging/prod'
-# then: /etc/selvage/.env from .env.example, and the key's permissions (below)
-```
-
-### Moving an image
-
-`.env` names the images. Resolve a release version to its index digest, put
-`ghcr.io/selvage-protocol/selvaged@sha256:…` in `/etc/selvage/.env`, and run the
-`up -d` above. **A digest, not a tag**: a tag is a name someone else can repoint,
-and this is the public origin.
+`selvage-update.timer` runs `selvage-update.service` every five minutes. The
+service runs as `selvage` in `/srv/selvage`:
 
 ```sh
-scripts/image-digest.py ghcr.io/selvage-protocol/selvaged:0.2.1
+docker compose pull --ignore-buildable --quiet && docker compose up -d && docker image prune --force
 ```
 
-That is the same anonymous pull flow `assert-multiarch-layers.py` uses
-(`scripts/registry.py`), and it is what the deploy workflow calls. By hand, the
-one line of it a deploy needs is:
+A tick with nothing new recreates nothing. A new `latest` reaches the demo
+within five minutes and with no approval, and a new `selvaged` ends every room.
+That is the price of following `latest`. Pin a version to opt out, as below. For
+`selvaged`, `latest` moves on every release tag of `reference_server` that is
+not a prerelease. For `selvage-web`, `web_client`'s image workflow moves it on
+every `v*` tag, a prerelease included. The prune removes the dangling images a
+recreation leaves behind, because the box has 29 GB of disk.
+
+A tick fails, rather than starting Docker, while `docker.service` is stopped
+(`Requisite=`).
 
 ```sh
-repo=selvage-protocol/selvaged; tag=0.2.1
-tok=$(curl -s "https://ghcr.io/token?scope=repository:$repo:pull&service=ghcr.io" \
-      | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
-curl -sI -H "Authorization: Bearer $tok" \
-     -H 'Accept: application/vnd.oci.image.index.v1+json' \
-     "https://ghcr.io/v2/$repo/manifests/$tag" | tr -d '\r' \
-  | grep -i docker-content-digest
+systemctl list-timers selvage-update.timer    # when it last ran and runs next
+journalctl -u selvage-update.service -n 50    # what it did
+sudo systemctl start selvage-update.service   # one tick now
+sudo systemctl stop selvage-update.timer      # stop until the next boot
+sudo systemctl disable --now selvage-update.timer   # stop until re-enabled
 ```
 
-`docker compose up -d` is safe to run while the demo is live, and it does not
-preserve sessions: `selvaged` is memory-only, so a recreate ends every room and
-a guest sees the room gone. There is no reclaim after a restart.
+The service and `selvage-deploy` take the same lock, `/srv/selvage/.update.lock`.
+A tick that finds a deploy running does nothing, and a deploy waits up to ten
+minutes for a tick to finish.
+
+### Pinning a version
+
+`.env` names a tag per image. `latest` follows every release. A version stays
+where it is, and every tick leaves it there. A pinned service is behind the CI
+approval again, apart from a republish of that same version tag:
+
+```sh
+cd /srv/selvage
+sed -i 's|^SELVAGED_IMAGE=.*|SELVAGED_IMAGE=ghcr.io/selvage-protocol/selvaged:0.4.6|' .env
+docker compose pull && docker compose up -d
+```
+
+To unpin, write `:latest` back and run the same two commands. The CI dispatch
+below makes the same edit: `server_version=0.4.6` pins and
+`server_version=latest` unpins.
 
 ### Rollback
 
-`.env` holds one generation and `deploy.py` keeps the file it replaced as
-`/etc/selvage/.env.prev`, so rolling back by hand is restoring that file and
-running the `up -d` above. A run that *failed* changed neither: the references it
-was deploying are in `/etc/selvage/.env.deploy`, and the `up -d` above goes back
-to what `.env` still names. The automated path is a dispatch of the same workflow
-with the older `server_version` — the same mechanism as a deploy, which is why it
-is exercised by every deploy rather than rotting until the day it is needed.
+Pin the previous version. `selvage-deploy` keeps the `.env` it replaced as
+`/srv/selvage/.env.prev`, so after a CI deploy `cp .env.prev .env` followed by
+the two commands also goes back. A deploy that *failed* changed neither file.
+Its references are left in `.env.deploy`, and the next tick returns to what
+`.env` names. Rolling back `selvaged` ends every live room a second time.
 
-Either way, rolling back `selvaged` ends every live room a second time. That is
-what the approval gate is for. The front has no version of its own to roll back
-to and does not need one: it is built from the files in this directory, so an
-older front is that directory at an older commit and the same `up -d`.
+The front has no version of its own. An older front is `proxy/` at an older
+commit, followed by `up -d --build proxy`.
+
+### Installing
+
+From a checkout of `reference_server`, only the files the box runs:
+
+```sh
+box=selvage@selvage-protocol-prod
+ssh "$box" 'sudo install -d -o selvage -g selvage -m 0755 /srv/selvage'
+git archive <sha> packaging/prod/compose.yaml packaging/prod/.env.example packaging/prod/proxy \
+  | ssh "$box" 'tar -x -C /srv/selvage --strip-components=2'
+ssh "$box" 'cd /srv/selvage && cp -n .env.example .env && chmod 600 .env
+  sudo install -d -o root -g root -m 0750 tls'
+# then origin.pem and origin.key into tls/, and the key's permissions (below)
+```
+
+The units, then the timer:
+
+```sh
+scp packaging/prod/selvage-update.service packaging/prod/selvage-update.timer "$box:"
+ssh "$box" 'set -e
+  sudo install -o root -g root -m 0644 selvage-update.service selvage-update.timer /etc/systemd/system/
+  rm selvage-update.service selvage-update.timer
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now selvage-update.timer'
+```
+
+`selvage-deploy` and its sudoers line are under *Deploying a release from CI*.
+
+### Moving from `/etc/selvage`
+
+The box first ran from `/etc/selvage`, with root's Compose and digest pins. The
+move keeps the project name, so one `up -d` from the new directory recreates the
+three containers in place. That step is the only downtime, a few seconds.
+
+1. `docker compose pull --help | grep ignore-buildable`, as `selvage`. The timer
+   needs that flag. Note the versions running now, from each container's
+   `org.opencontainers.image.version` label.
+2. Install `/srv/selvage` as above, but copy `tls/` with
+   `sudo cp -a /etc/selvage/tls /srv/selvage/`, which keeps the key's owner and
+   mode. Then pin both lines of `.env` to the versions step 1 found, so the move
+   is not also an upgrade:
+   `sed -i 's|^SELVAGED_IMAGE=.*|SELVAGED_IMAGE=ghcr.io/selvage-protocol/selvaged:<version>|' .env`,
+   and the same for `SELVAGE_WEB_IMAGE`.
+3. Prepare in `/srv/selvage`, which changes nothing running: `docker compose config -q`,
+   `docker compose pull --ignore-buildable` and `docker compose build proxy`.
+   Without the buildx plugin, Compose warns that it cannot use Bake and builds
+   with the daemon's own BuildKit; `DOCKER_BUILDKIT=0` is the fallback if that
+   fails. Then `docker compose run --rm --no-deps --entrypoint /usr/sbin/nginx proxy -t`,
+   a throwaway front with the real `./tls/` binds and no published port, whose
+   `-t` reads the certificate and key as the front will. It resolves `selvaged`
+   and `selvage-web`, so run it while the old containers are up. If it cannot
+   mount `tls/`, run `sudo chgrp selvage /srv/selvage/tls` and try again; the
+   key stays `root:101 0640`.
+4. `docker compose up -d`. This is the cutover.
+5. Check it. `docker compose ps` should show three `running` services, and the
+   front's mounts should now name `/srv/selvage/tls`. The origin read:
+   `curl -sk -H 'Host: selvage-demo.dontblameme.dev' https://127.0.0.1/meta`.
+6. Install the new `selvage-deploy`, then the units and the timer.
+7. Once it has run a day, retire `/etc/selvage`. It holds the only other copy of
+   the key.
+8. Unpin, if that is the plan, as its own observed change.
+
+To go back, until step 7: `sudo systemctl disable --now selvage-update.timer`
+if step 6 installed it, then `cd /etc/selvage && sudo docker compose up -d`.
+Stop the timer first. Both directories are the project `selvage-prod`, so a
+tick would recreate the containers from `/srv/selvage` again, and its prune
+can delete the images the old `.env` names.
 
 ## Cloudflare answers a datacenter client with a challenge
 
@@ -468,33 +550,42 @@ answering 200. The
 public URL is read too: a challenge, an unreadable read or any other answer that
 is not a version is a report, and a 200 reporting a version other than the one
 the dispatch named fails the run (the challenge above is why the first three
-cannot fail it).
+cannot fail it). `server_version=latest` names no version, so `/meta` is read
+and not compared, as for a page-only dispatch.
 
 ```sh
-gh workflow run deploy-prod.yml --ref main -f server_version=0.2.1
-gh workflow run deploy-prod.yml --ref main -f web_version=0.3.1
-gh workflow run deploy-prod.yml --ref main -f server_version=0.2.1 -f web_version=0.3.1
+gh workflow run deploy-prod.yml --ref main -f server_version=0.4.6
+gh workflow run deploy-prod.yml --ref main -f web_version=latest
+gh workflow run deploy-prod.yml --ref main -f server_version=latest -f web_version=latest
 ```
 
-An input it is not given means **leave that service exactly as it is**, so a page
-release and a server release are separable and a rollback is a dispatch with an
-older version. The run then waits on the GitHub environment `prod`, whose
-required reviewer is the owner: the approval *is* the moment the credential
-exists, and it is the moment the live-session cost above is chosen.
+An input it is not given means **leave that line of `.env` exactly as it is**,
+so a page release and a server release are separable, a version pins, `latest`
+unpins, and a rollback is a dispatch with an older version. The run then waits
+on the GitHub environment `prod`, whose required reviewer is the owner: the
+approval *is* the moment the credential exists, and it is the moment the
+live-session cost above is chosen, for what CI does. It is not a gate on a
+service `.env` leaves on `latest`: the timer follows a new `latest` with no
+approval at all (*The update timer*, above).
 
 What a run may change is bounded by construction rather than by convention. It
-hands the box two digest-pinned references and the sha256 of `compose.yaml`, and
-nothing else: `deploy.py` matches every value against one fixed pattern and
-**verifies** the compose file against that hash instead of writing it. A run
-cannot add a port, drop a capability, mount a certificate or raise a memory
-limit, and it cannot rewrite the shape to do so later. Anything else it might
-want is a pull request and a hand install.
+hands the box one tag reference per image and nothing else. `deploy.py` matches
+every value against one fixed pattern, `ghcr.io/selvage-protocol/<image>:<tag>`,
+and rewrites those lines of `/srv/selvage/.env` and no other file. A run cannot
+add a port, drop a capability, mount a certificate or raise a memory limit.
+Anything else it might want is a pull request and a hand install.
 
-A run that fails also leaves `/etc/selvage/.env` alone: the references it was
-deploying live in `/etc/selvage/.env.deploy` while it works, and the persistent
-file — the intent for the next `up -d`, and so for the next hand command — is
-written only once the containers are up and converged. One bad release therefore
-cannot leave a box that a later `up -d` reproduces.
+The request stays a tag and is not resolved to a digest. `.env` names a tag so
+that the timer can follow it, and pinning here means writing a version tag. What
+a tag named when the box pulled it is printed in the deploy log, and later
+`docker image inspect --format '{{join .RepoDigests " "}}' <reference>` reads it
+back.
+
+A run that fails also leaves `/srv/selvage/.env` alone. The references it was
+deploying live in `/srv/selvage/.env.deploy` while it works, and `.env` is
+written only once the containers are up and converged. It is the input for the
+next tick and the next hand command, so one bad release cannot leave a box that
+a later `up -d` reproduces. A deploy holds the timer's lock from start to end.
 
 Getting in is Tailscale SSH as `deployci`, a local user on the box with no
 password, no key, no group but its own, and exactly one permitted root command —
@@ -540,7 +631,7 @@ policy is the only way in. That policy is not in this repository: the runbook in
 
 A dispatch naming only `web_version` leaves the verification at the page itself:
 the origin's `/` must answer 200 and `/meta` must be readable, the page container
-is asserted to run the digest the dispatch resolved, and the public read compares
+is asserted to run the image its tag pulled, and the public read compares
 nothing, because there is no server version in it. **It cannot tell which page
 build is being served**, and that is worth knowing plainly rather than
 discovering.
@@ -571,9 +662,9 @@ against the image it has just pushed, and that asserts the version label and the
 per architecture, that a *running* image serves `/index.html`, `/app.js`,
 `/site.webmanifest` and a content-hashed chunk with the sha256 of the committed
 `dist/` (`scripts/check-page.sh`); this deployment's `deploy.py` asserts the page
-container runs the digest the dispatch resolved. Under a digest pin those bytes
-cannot drift, so the reads that remain worth making are the ones that are made:
-the container runs what was named, and the front answers its page.
+container runs the image the requested tag pulled, and prints its digest. The
+reads that remain worth making are the ones that are made: the container runs
+what was named, and the front answers its page.
 
 **The honest way to give the page a version read is to publish one as a value** —
 a `version.json`, or a `<meta>` in the built page, written by `web_client`'s build
@@ -596,16 +687,17 @@ wildcard matches one label, so a nested name such as `a.b.dontblameme.dev` is
 not covered by it, and a host serving one needs a certificate that names it,
 either its own or an entry on this certificate's SAN list.
 
-The owner placed it at `/etc/selvage/tls/origin.pem` and
-`/etc/selvage/tls/origin.key`, and the front reads both by path, so a
-replacement is a file copy and `docker compose restart proxy` — never a
-rebuild.
+It lives at `/srv/selvage/tls/origin.pem` and `/srv/selvage/tls/origin.key`.
+Compose mounts both by relative path, at the path inside the front that
+`proxy/conf.d/default.conf` names, so a replacement is a file copy and
+`docker compose restart proxy` — never a rebuild.
 
 The key is mode **640**, owned `root` and group **101** on the host, which is the
 group uid 101 is in inside the front's image. The front is the only thing that
 reads it: the page container has no mount, the server has no mount, and the
 `messagebus` group that also owns gid 101 on the host cannot reach the file
-through `/etc/selvage/tls`, which is mode 750 `root:root`. Server private keys
+through `/srv/selvage/tls`, which is mode 750 `root:root`. `selvage` cannot read
+it either: its Compose names the path and the daemon does the reading. Server private keys
 are never printed, copied into this directory, or checked in.
 
 ## The isolated proof
