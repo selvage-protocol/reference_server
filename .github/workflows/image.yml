@@ -247,6 +247,7 @@ jobs:
 
       # The same build the publish job runs, including the moving `<version>`
       # and `latest` aliases, so a malformed tag name cannot reach a release.
+      # `latest` is left off for a prerelease version, as `publish` leaves it.
       - name: build both architectures
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -256,7 +257,7 @@ jobs:
           tags: |
             localhost:5000/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}
             localhost:5000/selvage-protocol/selvaged:${{ steps.tags.outputs.version }}
-            localhost:5000/selvage-protocol/selvaged:latest
+            ${{ steps.tags.outputs.latest == 'true' && 'localhost:5000/selvage-protocol/selvaged:latest' || '' }}
           build-args: |
             VERSION=${{ steps.tags.outputs.version }}
             REVISION=${{ github.sha }}
@@ -357,10 +358,12 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          # A prerelease never moves `latest`: the public demo follows it
+          # unapproved (`deploy-prod.yml`), and a blank line here is no tag.
           tags: |
             ghcr.io/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}
             ghcr.io/selvage-protocol/selvaged:${{ steps.tags.outputs.version }}
-            ghcr.io/selvage-protocol/selvaged:latest
+            ${{ steps.tags.outputs.latest == 'true' && 'ghcr.io/selvage-protocol/selvaged:latest' || '' }}
           build-args: |
             VERSION=${{ steps.tags.outputs.version }}
             REVISION=${{ github.sha }}

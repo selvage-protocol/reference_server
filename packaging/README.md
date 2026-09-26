@@ -48,7 +48,8 @@ What the acceptance stands on, all of it in the artefacts themselves:
   links `selvaged`, so a redistributed harness binary carries FSL code — the
   top-level README already says so, and the image never ships one.)
 - A published tag names the revision it was built from (`<version>-<sha>`); the
-  moving `<version>` and `latest` aliases follow only a release.
+  moving `<version>` alias follows only a release, and `latest` only a release
+  that is not a prerelease (no `-` suffix): the public demo follows it.
 - Nothing here says a *service* built on the software is permitted: a
   commercial product or service that substitutes for it is the Competing Use
   the licence still forbids.
@@ -197,9 +198,10 @@ reachable address explicitly.
 
 Image tags are `<cargo-version>-<short-sha>` (e.g. `0.1.0-e617d81`), computed
 by `scripts/image-tag.sh`, plus moving `<version>`/`latest` aliases only on
-published releases; `scripts/release-tags.sh` computes the same identity for
-the two buildx jobs and refuses a release tag whose name is not the Cargo
-version, so a tag cut from the wrong commit cannot publish a mismatch.
+published releases (`latest` never on a prerelease); `scripts/release-tags.sh`
+computes the same identity for the two buildx jobs and refuses a release tag
+whose name is not the Cargo version, so a tag cut from the wrong commit cannot
+publish a mismatch.
 `--version`, `/meta`, and `CARGO_PKG_VERSION` are already
 wired together in code (`Meta::reference`, test-enforced by
 `version_matches_what_meta_serves`); `scripts/check-server-version.sh`

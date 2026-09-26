@@ -23,6 +23,13 @@ case "$ref" in
         ;;
 esac
 
+# `release-tags.sh` keeps a prerelease off `latest`, so its notes do not list it.
+latest_line=''
+case "$version" in
+    *-*) ;;
+    *) latest_line=$'\n- `ghcr.io/selvage-protocol/selvaged:latest`' ;;
+esac
+
 cat <<EOF
 selvaged $version ($sha).
 
@@ -32,8 +39,7 @@ both architectures back out of the registry and checked \`--version\` and
 \`/meta\` against \`$version\`:
 
 - \`ghcr.io/selvage-protocol/selvaged:$version-$sha\`
-- \`ghcr.io/selvage-protocol/selvaged:$version\`
-- \`ghcr.io/selvage-protocol/selvaged:latest\`
+- \`ghcr.io/selvage-protocol/selvaged:$version\`${latest_line}
 
 \`\`\`sh
 docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:$version
