@@ -1,15 +1,11 @@
 """The guard around `packaging/pi/deploy.py`, which is the whole of the Pi's
-privilege model the way `/usr/local/sbin/selvage-deploy` is the public demo's:
-the request it reads on stdin is the only lever anything holding a CI credential
-has on that box.
+privilege model: the request it reads on stdin is the only lever anything
+holding a CI credential has on that box.
 
-The Pi's deploy is the public demo's deploy with this box's paths, so the two
-properties that carry the weight — only digest-pinned references in this registry
-and nothing else, and a shape mismatch that stops the run before a container is
-touched — are asserted at length in `packaging/prod/test_deploy.py`. This file
-runs that suite against this box's module rather than restating it, because a
-second copy of five hundred lines of guard is a second copy to keep true, and the
-two scripts are meant to refuse exactly the same things.
+The two properties that carry the weight — only digest-pinned references in this
+registry and nothing else, and a shape mismatch that stops the run before a
+container is touched — are asserted in `request_guard.py` beside this file, which
+this file runs against this box's module.
 
 What is asserted here and not there is the other direction: the compose file this
 box deploys names the services the deploy records, and interpolates the variables
@@ -36,9 +32,9 @@ HERE = Path(__file__).resolve().parent
 def module_from(name, path):
     """A module loaded by its path, so its name cannot decide what it imports.
 
-    Both this box and the public demo have a `deploy.py` and a `test_deploy.py`,
-    so two `import`s by name would be a question about `sys.path` order rather
-    than about which file is meant.
+    Both this box and the public demo have a `deploy.py`, so two `import`s by
+    name would be a question about `sys.path` order rather than about which file
+    is meant.
     """
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
@@ -48,15 +44,12 @@ def module_from(name, path):
 
 
 pi_deploy = module_from("pi_deploy", HERE / "deploy.py")
-# The public demo's suite reads the guard through the name `deploy`, which is
-# what its module imports at the top. Registering this box's module under that
-# name before that file is executed is the whole of what makes the suite run
-# against the Pi's script instead of the one beside it.
+# The suite reads the guard through the name `deploy`, which is what its module
+# imports at the top; registering this box's module under that name first is what
+# makes it the one under test.
 sys.modules["deploy"] = pi_deploy
-prod_guard = module_from(
-    "prod_test_deploy", HERE.parent / "prod" / "test_deploy.py"
-)
-prod_guard.deploy = pi_deploy
+request_guard = module_from("pi_request_guard", HERE / "request_guard.py")
+request_guard.deploy = pi_deploy
 
 
 def compose_body(text: str) -> str:
@@ -150,8 +143,8 @@ class ComposeShapeTest(unittest.TestCase):
 
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
-    for name in sorted(dir(prod_guard)):
-        case = getattr(prod_guard, name)
+    for name in sorted(dir(request_guard)):
+        case = getattr(request_guard, name)
         if isinstance(case, type) and issubclass(case, unittest.TestCase):
             suite.addTests(loader.loadTestsFromTestCase(case))
     suite.addTests(loader.loadTestsFromTestCase(ComposeShapeTest))

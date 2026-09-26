@@ -58,9 +58,8 @@ matching `ghcr.io/selvage-protocol/(selvaged|selvage-web)@sha256:…` and nothin
 else. The compose file is *verified* against the sha256 the request names and
 never written, so a request cannot add a port, publish another address, drop a
 capability or change a command. The grammar, the staging and the convergence
-check are the public demo's, in `packaging/pi/deploy.py`; the properties are
-asserted in `packaging/prod/test_deploy.py`, which `test_deploy.py` here runs
-against this box's module.
+check are in `packaging/pi/deploy.py`; the properties are asserted in
+`request_guard.py`, which `test_deploy.py` here runs against this box's module.
 
 ## The auto-update, bounded
 
@@ -140,8 +139,7 @@ Resolve a release version to its index digest, put the pinned reference in
 scripts/image-digest.py ghcr.io/selvage-protocol/selvaged:0.2.1
 ```
 
-That is the same anonymous pull flow the deploy workflow calls and the same
-command `packaging/prod/README.md` documents for the public demo.
+That is the same anonymous pull flow the deploy workflow calls.
 
 ### Rollback
 
