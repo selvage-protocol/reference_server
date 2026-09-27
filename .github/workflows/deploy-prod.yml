@@ -12,10 +12,11 @@ name: deploy-prod
 # this organisation has ID-based OIDC subject claims enabled, and the plain form is
 # rejected with a 403 at the exchange. So this workflow runs on `main` and nowhere
 # else, and the *credential* is what enforces it: a dispatch at a tag or another
-# branch presents `…:ref:refs/heads/<other>` and is refused at the exchange. A job
-# that **declares an environment** is refused as well, which is why no such line
-# is left in this file: it would present `…:environment:prod`, and nothing in the
-# console matches that any more.
+# branch presents a subject naming the ref it ran at — `…:ref:refs/tags/<tag>` or
+# `…:ref:refs/heads/<branch>` — rather than `refs/heads/main`, and is refused at
+# the exchange. A job that **declares an environment** is refused as well, which is
+# why no such line is left in this file: it would present `…:environment:prod`, and
+# nothing in the console matches that any more.
 #
 # What the deleted environment used to bound, written down because it is no longer
 # a bound: a change **CI initiates** now reaches the box with no human in the loop.
