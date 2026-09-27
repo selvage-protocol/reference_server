@@ -36,8 +36,11 @@ work="$repo/.tmp/proxy-check-front"
 server_conf="$proxy/nginx.conf"
 default_conf="$proxy/conf.d/default.conf"
 
-if [ -n "${NGINX:-}" ]; then
-    ngx=$NGINX
+# Which nginx runs the front: a named one, then the host's, then nixpkgs'. The
+# override is `NGINX_BIN` — `test_front_limits.py` reads that name for the same
+# choice — and never `NGINX`, which is a variable nginx itself owns.
+if [ -n "${NGINX_BIN:-}" ]; then
+    ngx=$NGINX_BIN
 elif command -v nginx >/dev/null 2>&1; then
     ngx=$(command -v nginx)
 elif command -v nix >/dev/null 2>&1; then
@@ -46,6 +49,14 @@ else
     printf 'no nginx on PATH and no nix to get one; nothing was proved\n' >&2
     exit 2
 fi
+
+# nginx reads `NGINX` as the list of sockets a socket-activated parent handed it,
+# the one environment variable it does not ignore. A value that is not a socket
+# number is logged and passed over, but its *presence* is what nginx acts on: it
+# takes itself for inherited, skips daemonising, and runs the master in the
+# foreground. The start below would then never return, so a front that failed to
+# start would hang where it has to exit. An inherited value is dropped here.
+unset NGINX
 
 failures=0
 ok() { printf '  ok    %s\n' "$*"; }
