@@ -504,12 +504,12 @@ class IdempotenceTest(unittest.TestCase):
             [
                 ("file", "compose.yaml", COMPOSE),
                 ("file", "proxy/Dockerfile", b"FROM nginx\n"),
-                ("file", "proxy/www/terms.html", b"<p>terms</p>\n"),
+                ("file", "proxy/www/404.html", b"<p>not found</p>\n"),
             ]
         )
         self.assertEqual(self.box.run(stream), 0, self.box.stderr)
         self.assertEqual(self.box.calls, [["docker", "compose", "up", "-d", "--build", "proxy"]])
-        self.assertEqual((self.box.srv / "proxy" / "www" / "terms.html").read_bytes(), b"<p>terms</p>\n")
+        self.assertEqual((self.box.srv / "proxy" / "www" / "404.html").read_bytes(), b"<p>not found</p>\n")
 
 
 class SudoersTest(unittest.TestCase):
