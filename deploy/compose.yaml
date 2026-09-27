@@ -3,12 +3,11 @@
 # Three containers on one origin, on an Azure `Standard_B2ats_v2`: 2 vCPU,
 # 892 MiB of RAM and a 10 GiB swapfile. The front terminates TLS for the
 # Cloudflare Origin CA certificate and routes; the server answers `/session` and
-# `/meta`; the page answers everything else. `README.md` beside this file owns
-# the shape and the live state, and `web_client`'s README owns the page.
+# `/meta`; the page answers everything else. `web_client`'s README owns the page.
 #
 # The box runs a copy of this directory at `/srv/selvage/`, which is
-# self-contained: this file, `.env`, `proxy/` and `tls/`. `README.md` has the
-# hand commands and the update timer that pulls the tags `.env` names.
+# self-contained: this file, `.env`, `proxy/` and `tls/`. The update timer beside
+# this file pulls the tags `.env` names.
 #
 # Every service below is hardened the same way, and the readback of that is what
 # the deployment is gated on: read-only root filesystem, every capability
@@ -66,7 +65,7 @@ services:
     # The target path is the one `proxy/conf.d/default.conf` names.
     #
     # The key is mode 640 owned by `root` and group 101 on the host, which is
-    # the group uid 101 is in inside this image. `README.md` owns that readback.
+    # the group uid 101 is in inside this image.
     volumes:
       - ./tls/origin.pem:/etc/selvage/tls/origin.pem:ro
       - ./tls/origin.key:/etc/selvage/tls/origin.key:ro
@@ -82,8 +81,7 @@ services:
     image: ${SELVAGED_IMAGE:?set SELVAGED_IMAGE in .env}
     # The image's own command serves a page from `/page` on one listener. This
     # deployment splits the page into its own container, so the page flag is
-    # gone and the limits are the ones sized for this box. `README.md` owns why
-    # each number is what it is; the short form is that
+    # gone and the limits are the ones sized for this box; the short form is that
     # `--max-connections × --outbound-queue-bytes` is the server's own outbound
     # ceiling, and 32 × 8454144 is 258 MiB, the largest one this host can be
     # surprised by.
@@ -91,7 +89,7 @@ services:
     # 8454144 is the smallest queue `selvaged` accepts at all: the 8 MiB frame
     # bound plus the 64 KiB envelope headroom its own `smallest_queue_bytes`
     # counts. Below it the server exits 2 with the floor named, and the
-    # container restart-loops; `packaging/prod/test_compose_args.py` runs this
+    # container restart-loops; `deploy/test_compose_args.py` runs this
     # command line so that a value below the floor cannot be committed again.
     #
     # The grace period is the reference value on purpose: `/meta` advertises it

@@ -134,7 +134,7 @@ jobs:
           fi
           python3 -B - "$request" <<'EOF'
           import sys
-          sys.path.insert(0, "packaging/prod")
+          sys.path.insert(0, "deploy")
           import deploy
           try:
               deploy.parse_request(open(sys.argv[1], "rb").read())
@@ -214,10 +214,10 @@ jobs:
       # deployed is green, so where the edge does let a client like this one through
       # the check comes back on its own.
       #
-      # `scripts/verify_deploy.py` is both reads, and `packaging/prod/README.md`
-      # has the evidence for the challenge. Each read polls a real predicate with
-      # its own 60 s deadline and reports what it last observed, so a step that
-      # cannot pass says so in about a minute instead of looking hung.
+      # `scripts/verify_deploy.py` is both reads. Each read polls a real
+      # predicate with its own 60 s deadline and reports what it last observed,
+      # so a step that cannot pass says so in about a minute instead of looking
+      # hung.
       - name: verify the origin serves what was deployed
         env:
           SERVER_VERSION: ${{ inputs.server_version }}

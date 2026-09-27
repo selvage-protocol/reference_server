@@ -3,7 +3,7 @@
 
 Installed by hand as `/usr/local/sbin/selvage-deploy`, root-owned and mode 0755,
 and the only command the `deployci` user may run through sudo
-(`packaging/prod/deployci.sudoers`, whose line ends in `""` so that sudo permits
+(`deploy/deployci.sudoers`, whose line ends in `""` so that sudo permits
 no argument at all rather than any). That confinement is why this takes **no
 arguments**: an argument to a script that reaches `docker compose` is a root shell
 with extra steps. The request arrives on stdin instead — one or both image
@@ -31,8 +31,6 @@ The residual, plainly: a deploy request is a deployment. Whoever can send one
 chooses which published tag runs, ends every live room by replacing the server,
 and can move the deployment to an older release. The content behind a tag is the
 publisher's; following tags rather than digests is the owner's choice.
-
-`README.md` beside this file owns the box's layout and its hand-install.
 """
 
 import fcntl
