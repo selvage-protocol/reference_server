@@ -29,9 +29,18 @@ docker rm -f selvaged-solo
 The name and the host port above are this example's own, so it and the card's
 pair can be up at once: the card's server runs as `selvaged` and its page
 publishes `8080`, and neither its teardown nor this one touches the other's
-container. This container serves the session protocol and no page, so a client
-is what joins it; for a room you can open in a browser, run the two containers
-the Run card prints, at <https://selvage.dontblameme.dev/#try>. The page image is
+container. A client reaches this container at `ws://127.0.0.1:8081` — the host
+port the mapping above publishes. That is not the address the container's own
+startup line prints: that line names the interface and port it bound inside the
+container, `ws://0.0.0.0:8080/session`, and `0.0.0.0` is not an address to
+dial. And it is not the `ws://127.0.0.1:8080` that `vscode_client`'s first
+session names for a server on this machine: `8080` on this machine is the
+card's page container while the pair is up, and that page relays the session
+endpoint to the card's server, so an editor pointed at `8080` hosts on the
+card's server rather than this one — and answers nothing when the pair is down.
+This container serves the session protocol and no page, so a client is what
+joins it; for a room you can open in a browser, run the two containers the Run
+card prints, at <https://selvage.dontblameme.dev/#try>. The page image is
 `web_client`'s and its README owns that image's configuration and its tags. Both
 GHCR packages are public, so a pull needs no account and no `docker login`.
 
