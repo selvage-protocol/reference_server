@@ -94,9 +94,10 @@ say "the harness"
 # The root the front serves the terms page from, read out of the configuration
 # rather than repeated here: the Dockerfile below is asserted to install it
 # there, so the two cannot drift apart in silence.
-terms_root=$(sed -n 's/^[[:space:]]*root \(.*\);$/\1/p' "$default_conf")
-if [ -z "$terms_root" ]; then
-    printf 'no root directive in %s: the harness has nothing to point at\n' "$default_conf" >&2
+# The terms page and the not-found page share it, so there is one to read.
+terms_root=$(sed -n 's/^[[:space:]]*root \(.*\);$/\1/p' "$default_conf" | sort -u)
+if [ -z "$terms_root" ] || [ "$(printf '%s\n' "$terms_root" | wc -l)" != 1 ]; then
+    printf 'not exactly one root in %s: the harness has nothing to point at\n' "$default_conf" >&2
     exit 2
 fi
 
@@ -343,6 +344,44 @@ if grep -q 'GET /termsomething' "$work/page.log"; then
     ok 'a sibling path reaches the page container, not the terms file'
 else
     bad '/termsomething did not reach the page container'
+fi
+
+say "the not-found page, in place of the page container's"
+
+# The stand-in answers a path it does not have with its own 404 page, which
+# ends in `</body>`: without the interception it would reach the visitor with
+# the banner substituted into it.
+answer=$(fetch "http://127.0.0.1:$listen_port/no/such/path" "$work/served-missing.html")
+if [ "${answer%% *}" = 404 ]; then
+    ok 'a missing path still answers 404'
+else
+    bad "a missing path answers ${answer%% *}, want 404"
+fi
+case ${answer#* } in
+text/html*) ok "the not-found page is served as ${answer#* }" ;;
+*) bad "the not-found page is served as ${answer#* }" ;;
+esac
+if cmp -s "$work/served-missing.html" "$proxy/www/404.html"; then
+    ok 'the bytes served for a missing path are www/404.html, with no banner'
+else
+    bad 'a missing path is not answered with www/404.html as it is'
+fi
+if grep -q 'GET /no/such/path' "$work/page.log"; then
+    ok 'the missing path was asked of the page container first'
+else
+    bad 'the missing path never reached the page container'
+fi
+if grep -qF -- 'href="/terms"' "$work/served-missing.html"; then
+    ok 'the not-found page links to the terms'
+else
+    bad 'the not-found page no longer links to the terms'
+fi
+
+answer=$(fetch "http://127.0.0.1:$listen_port/404.html" "$work/served-direct.html")
+if [ "${answer%% *}" = 404 ]; then
+    ok '/404.html is not an address of its own: it answers 404'
+else
+    bad "/404.html answers ${answer%% *}, want 404"
 fi
 
 say "the name the front is the server for"

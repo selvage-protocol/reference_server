@@ -16,6 +16,10 @@ exclude = [
   # that on purpose rather than leaving it to that default, and the address stays
   # a link a person can write to.
   "^mailto:",
+  # `/terms` as a root-relative link, from the demo's not-found page. The front
+  # serves it out of `proxy/www/terms.html`, so there is no `terms` at the root of
+  # this checkout for it to resolve to; `check-terms.sh` fetches both pages.
+  "^file:[/]{3}.*/terms$",
   "https://fsf.org/",
   # The public demo's front proxying to its sibling containers by their Compose
   # service names (`packaging/prod/`). Those names resolve only inside that

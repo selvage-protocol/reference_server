@@ -26,7 +26,8 @@ those facts; this directory owns the files, and the two must agree.
 | `proxy/conf.d/default.conf` | baked into that image | The server block: TLS, the routes, the limits, the terms banner, and the location that serves the page below |
 | `proxy/conf.d/cloudflare-ips.conf` | baked into that image | Cloudflare's published ranges, for `real_ip` |
 | `proxy/www/terms.html` | baked into that image at `/usr/share/selvage/www/` | The terms of this instance, which is the page `/terms` answers with |
-| `check-terms.sh` | nowhere; run where it is | The notice read back out of the bytes the front serves, without Docker |
+| `proxy/www/404.html` | baked into that image at `/usr/share/selvage/www/` | The page a missing path answers with, in place of the page container's 404 and without the banner |
+| `check-terms.sh` | nowhere; run where it is | The notice and the not-found page read back out of the bytes the front serves, without Docker |
 | `test_front_limits.py` | nowhere; run where it is | That the front serves one name, refuses a source, and that one metered endpoint cannot spend another's budget |
 
 ## The shape
