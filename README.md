@@ -227,7 +227,7 @@ The harness is the quickest way to watch the protocol work:
 
 ```sh
 nix develop . -c cargo run -p selvage-harness                  # the whole slice, printed step by step
-nix develop . -c cargo test                                    # unit tests and every integration suite
+nix develop . -c cargo test --all-targets                      # unit tests, every integration suite and the examples' own
 ```
 
 `cargo run -p selvage-harness` runs a scripted demo transcript: it starts a

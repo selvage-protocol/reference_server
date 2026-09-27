@@ -218,6 +218,11 @@
               inherit cargoArtifacts;
               partitions = 1;
               partitionType = "count";
+              # `cargo nextest`'s default target selection leaves examples out, and clippy's
+              # `--all-targets` does not stand in for it: cargo checks an example as the binary
+              # it ships, so the `#[cfg(test)]` module one carries — `interop_peer`'s command
+              # line — was built by nothing. It did not compile, and no suite could say so.
+              cargoNextestExtraArgs = "--all-targets";
               # The vectors sit outside this Cargo workspace, so the sandbox — which receives
               # only the workspace — is handed them explicitly.
               SELVAGE_VECTORS = ./vectors;

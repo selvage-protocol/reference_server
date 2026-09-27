@@ -209,6 +209,10 @@ fn emit(value: &Value) {
     println!("{value}");
 }
 
+/// The command line the interop proof drives this binary through, pinned here.
+///
+/// An example is built as a test only under `--all-targets`, and `checks.nextest` is what
+/// passes it: a plain `cargo test` runs none of this.
 #[cfg(test)]
 mod tests {
     use super::options_of;
@@ -239,8 +243,11 @@ mod tests {
         );
         let mut unknown = base();
         unknown.push("--version".to_string());
-        let refused = options_of(unknown.into_iter())
-            .expect_err("only the three flags are read");
+        // Read out of the `Err` rather than with `expect_err`, which would ask for
+        // `Options: Debug` — and the invite it holds is not something this project prints.
+        let Err(refused) = options_of(unknown.into_iter()) else {
+            panic!("only the three flags are read");
+        };
         assert!(
             refused.to_string().contains("--version"),
             "the error names the argument: {refused}"
