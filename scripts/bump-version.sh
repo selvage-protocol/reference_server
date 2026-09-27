@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 #
-# Move the two values a release carries that a tag is not: the version every
-# manifest agrees on, and the `web_client` revision the server image bakes into
-# the page it serves beside its binary.
+# The version a release is cut at, one bump word at a time, from the version this
+# repository already carries.
 #
-#   scripts/bump-version.sh <X.Y.Z> --page-sha <40 lowercase hex>
+#   scripts/bump-version.sh <major|minor|patch> [--dry-run]
 #
-# The caller — the release coordinator, which computes the next version — commits
-# what this changes. This script never commits, tags or pushes, and it writes
-# three files and no others:
+# The version it moved to is the last line of stdout, and the only line on
+# stdout: the release workflow names the tag, the image and the Release from that
+# line, so nothing else may share it. Everything it says about what it did goes to
+# stderr.
+#
+# What it writes, and what it deliberately does not:
 #
 #   Cargo.toml   `[workspace.package] version`, the string a release tag is
 #                asserted against (`scripts/release-tags.sh`). Which string each
@@ -16,24 +18,29 @@
 #   Cargo.lock   regenerated with cargo (`update --workspace`), never edited by
 #                hand: the four local packages carry the workspace version, and a
 #                lock that disagrees with the manifest fails the build.
-#   Dockerfile   `ARG WEB_CLIENT_SHA=`, the revision the page stage clones and the
-#                value it records in `com.selvage.page.revision`.
 #
-# Everything else that names a version in prose — `.env.example`'s example tag,
-# a workflow's dispatch description — is an example, not a home for the value.
+# **`Dockerfile` is not here.** Its `ARG WEB_CLIENT_SHA=` pins a revision of
+# another repository — the page the image bakes beside its own binary — and the
+# release resolves that from `web_client`'s latest release at build time and
+# overrides the arg there. A pin a release bump moves by hand is a pin that can
+# rot, and it did: it stood two releases behind. Leave it, and leave anything
+# that is a *home* for a different number (a dispatch input's example, a fixture)
+# to its own file: the two above are the only files this moves, and each only
+# because it carries this repository's version.
 #
-# `--page-sha` is required even when it does not move: a release that built a page
-# has a revision, and a caller that omits it would leave the image serving the
-# previous one. A tree that already carries both values is a no-op and exit 0, not
-# an error, because the coordinator may run this against a version it has already
-# bumped.
+# `--dry-run` prints the version it would move to and writes nothing, so a caller
+# can compute the tag before it has decided to cut it.
 #
-# Refusals happen before anything is written, and any later failure restores what
-# it had touched, so a failed run leaves a tree that is the tree it started from
-# rather than a half-bumped one for someone to commit.
+# Nothing is written for a refusal. Exit 2 refuses the arguments — a word that is
+# not one of the three (including the `X.Y.Z` form this used to take), a second
+# word, an unknown option, a second `--dry-run` — and exit 1 refuses the tree: a
+# manifest that does not carry a plain `X.Y.Z` (fewer than three parts, a
+# prerelease, a leading zero) has no next version to compute, and a missing file
+# has none either. A failure after an edit restores what it had touched, so a
+# failed run is not a half-bumped tree for someone to commit.
 set -euo pipefail
 
-usage='usage: scripts/bump-version.sh <X.Y.Z> --page-sha <40 lowercase hex>'
+usage='usage: scripts/bump-version.sh <major|minor|patch> [--dry-run]'
 
 refuse() {
     printf 'refused: %s\n%s\n' "$*" "$usage" >&2
@@ -45,39 +52,36 @@ fail() {
     exit 1
 }
 
-version=''
-page_sha=''
+bump=''
+dry_run=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        --page-sha)
-            [ $# -ge 2 ] || refuse '--page-sha needs a value'
-            [ -z "$page_sha" ] || refuse '--page-sha is given twice'
-            page_sha=$2
-            shift 2
+        --dry-run)
+            [ "$dry_run" = 0 ] || refuse '--dry-run is given twice'
+            dry_run=1
+            shift
             ;;
-        --*)
+        -*)
             refuse "unknown option $1"
             ;;
         *)
-            [ -z "$version" ] || refuse "more than one version given: $version and $1"
-            version=$1
+            [ -z "$bump" ] || refuse "more than one bump word given: $bump and $1"
+            bump=$1
             shift
             ;;
     esac
 done
 
-[ -n "$version" ] || refuse 'no version given'
-# The one grammar a tag can carry: no leading `v`, three numbers, and no
-# prerelease or build-metadata suffix, which the tag scheme spells separately.
-[[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
-    refuse "not a MAJOR.MINOR.PATCH version: $version"
-[ -n "$page_sha" ] || refuse '--page-sha is required: the web_client commit the server image bakes'
-[[ $page_sha =~ ^[0-9a-f]{40}$ ]] || refuse "not 40 lowercase hex characters: $page_sha"
+case "$bump" in
+    major | minor | patch) ;;
+    '') refuse 'no bump word given: say major, minor or patch' ;;
+    *) refuse "not a bump word: $bump (major, minor or patch)" ;;
+esac
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
-for file in Cargo.toml Cargo.lock Dockerfile; do
+for file in Cargo.toml Cargo.lock; do
     [ -f "$file" ] || fail "$repo_root/$file is not there"
 done
 
@@ -85,16 +89,25 @@ read_manifest_version() {
     local found
     found=$(grep -c '^version = "' Cargo.toml || true)
     [ "$found" = 1 ] ||
-        fail "Cargo.toml has $found top-level version lines; want exactly one"
+        fail "Cargo.toml has $found top-level version lines; want exactly one, its [workspace.package] version"
     sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml
 }
 
-read_page_sha() {
-    local found
-    found=$(grep -c '^ARG WEB_CLIENT_SHA=' Dockerfile || true)
-    [ "$found" = 1 ] ||
-        fail "Dockerfile has $found ARG WEB_CLIENT_SHA= lines; want exactly one"
-    sed -n 's/^ARG WEB_CLIENT_SHA=\(.*\)$/\1/p' Dockerfile
+# The next version, or non-zero when `current` is not a plain `MAJOR.MINOR.PATCH`
+# to compute from: three decimal parts, no leading zero. A prerelease or a
+# two-part version has no unambiguous next version, so the caller is told rather
+# than handed a guess.
+next_version() {
+    local current="$1" major minor patch
+    [[ $current =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+    major=${BASH_REMATCH[1]}
+    minor=${BASH_REMATCH[2]}
+    patch=${BASH_REMATCH[3]}
+    case "$bump" in
+        major) printf '%s.0.0\n' "$((major + 1))" ;;
+        minor) printf '%s.%s.0\n' "$major" "$((minor + 1))" ;;
+        patch) printf '%s.%s.%s\n' "$major" "$minor" "$((patch + 1))" ;;
+    esac
 }
 
 # `name version` for every local package the lock carries. Cargo writes no
@@ -119,8 +132,8 @@ lock_is_current() {
     members=$(lock_members)
     [ -n "$members" ] || fail 'Cargo.lock carries no local package; it is not this workspace'"'"'s lock'
     while read -r member member_version; do
-        [ "$member_version" = "$version" ] ||
-            { printf '%s is %s, not %s\n' "$member" "$member_version" "$version" >&2; return 1; }
+        [ "$member_version" = "$1" ] ||
+            { printf '%s is %s, not %s\n' "$member" "$member_version" "$1" >&2; return 1; }
     done <<<"$members"
 }
 
@@ -149,78 +162,48 @@ set_manifest_version() {
     mv "$temporary" Cargo.toml
 }
 
-set_page_sha() {
-    local temporary="$work/Dockerfile.new"
-    cp -p Dockerfile "$temporary"
-    awk -v new="$1" '
-        /^ARG WEB_CLIENT_SHA=/ { print "ARG WEB_CLIENT_SHA=" new; found += 1; next }
-        { print }
-        END { if (found != 1) exit 3 }
-    ' Dockerfile >"$temporary" || return 1
-    mv "$temporary" Dockerfile
-}
+current=$(read_manifest_version)
+if ! version=$(next_version "$current"); then
+    fail "Cargo.toml carries $current, which is not a plain MAJOR.MINOR.PATCH; there is no next version to compute"
+fi
 
-manifest_version=$(read_manifest_version)
-current_sha=$(read_page_sha)
-members_stale=0
-lock_is_current || members_stale=1
+printf 'version %s -> %s\n' "$current" "$version" >&2
 
-if [ "$manifest_version" = "$version" ] && [ "$current_sha" = "$page_sha" ] && [ "$members_stale" = 0 ]; then
-    printf 'already at %s with page-sha %s; nothing changed\n' "$version" "$page_sha"
+if [ "$dry_run" = 1 ]; then
+    printf '%s\n' "$version"
     exit 0
 fi
 
-# The originals, so a cargo that refuses or a Dockerfile that has lost its one
-# `ARG WEB_CLIENT_SHA=` line ends with the tree it began with. Inside the
-# checkout: nowhere here writes to a system temporary directory.
+# The originals, so a cargo that refuses or a manifest that has lost its version
+# line ends with the tree it began with. Inside the checkout: nowhere here writes
+# to a system temporary directory.
 work="$repo_root/.tmp/bump-version.$$"
 mkdir -p "$work"
 restore() {
     cp -p "$work/Cargo.toml" Cargo.toml
     cp -p "$work/Cargo.lock" Cargo.lock
-    cp -p "$work/Dockerfile" Dockerfile
 }
-# The `.tmp` directory goes too when it was made for this run and nothing else
-# is in it, so a bumped tree is the tree it was plus the three files.
+# The `.tmp` directory goes too when it was made for this run and nothing else is
+# in it, so a bumped tree is the tree it was plus the two files.
 trap 'rm -rf "$work"; rmdir "$repo_root/.tmp" 2>/dev/null || true' EXIT
-cp -p Cargo.toml Cargo.lock Dockerfile "$work/"
+cp -p Cargo.toml Cargo.lock "$work/"
 
-touch_manifest=0
-touch_lock=0
-touch_page=0
-[ "$manifest_version" = "$version" ] || touch_manifest=1
-[ "$members_stale" = 0 ] || touch_lock=1
-[ "$current_sha" = "$page_sha" ] || touch_page=1
-
-if [ "$touch_manifest" = 1 ] || [ "$touch_lock" = 1 ]; then
-    if [ "$touch_manifest" = 1 ]; then
-        set_manifest_version "$version" || { restore; fail 'Cargo.toml has no [workspace.package] version line'; }
-    fi
-    if ! run_cargo update --workspace; then
-        restore
-        fail 'cargo update --workspace failed; Cargo.toml and Cargo.lock are as they were'
-    fi
-fi
-
-if [ "$touch_page" = 1 ]; then
-    set_page_sha "$page_sha" || { restore; fail 'Dockerfile has no one ARG WEB_CLIENT_SHA= line to set'; }
+set_manifest_version "$version" ||
+    { restore; fail 'Cargo.toml has no [workspace.package] version line to set'; }
+if ! run_cargo update --workspace; then
+    restore
+    fail 'cargo update --workspace failed; Cargo.toml and Cargo.lock are as they were'
 fi
 
 if [ "$(read_manifest_version)" != "$version" ]; then
     restore
     fail "Cargo.toml still does not carry $version; the tree is as it was"
 fi
-if [ "$(read_page_sha)" != "$page_sha" ]; then
-    restore
-    fail "Dockerfile still does not carry $page_sha; the tree is as it was"
-fi
-if ! lock_is_current; then
+if ! lock_is_current "$version"; then
     restore
     fail "Cargo.lock does not carry $version for every local package; the tree is as it was"
 fi
 
-printf 'version %s -> %s\n' "$manifest_version" "$version"
-printf 'page-sha %s -> %s\n' "$current_sha" "$page_sha"
-[ "$touch_manifest" = 0 ] || printf 'changed: Cargo.toml\n'
-[ "$touch_lock" = 0 ] || printf 'changed: Cargo.lock\n'
-[ "$touch_page" = 0 ] || printf 'changed: Dockerfile\n'
+printf 'changed: Cargo.toml\n' >&2
+printf 'changed: Cargo.lock\n' >&2
+printf '%s\n' "$version"

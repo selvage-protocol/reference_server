@@ -297,12 +297,13 @@
               touch $out
             '';
 
-          # The guard around `scripts/bump-version.sh`, the command the release
-          # coordinator runs before it commits a version: the version and the
-          # `web_client` revision move in the three files that carry them and in no
-          # other, and a version, a sha or an argument that is not one this takes
-          # writes nothing at all. It reaches cargo through `PATH`, so this runs it
-          # against a stand-in and needs no toolchain.
+          # The guard around `scripts/bump-version.sh`, the command this
+          # repository's release workflow runs before it commits a version: a bump
+          # word in, the next version on the last line of stdout, and the two files
+          # that carry the version moving together — with nothing written at all for
+          # a word, an argument or a manifest it cannot compute a version from. It
+          # reaches cargo through `PATH`, so this runs it against a stand-in and
+          # needs no toolchain.
           bump-version =
             pkgs.runCommand "bump-version-test" {
               nativeBuildInputs = [pkgs.python3];

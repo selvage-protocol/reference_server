@@ -97,9 +97,9 @@ job_checks() {
   # which took the public demo's front down with it.
   say "checks: the deployed command line"
   nix build .#checks.x86_64-linux.deploy-args --no-link --print-build-logs
-  # The version bump the release coordinator runs before it commits: the version
-  # and the `web_client` revision move in the three files that carry them and
-  # nowhere else, and a bad argument writes nothing.
+  # The version bump this repository's release workflow runs before it commits:
+  # the next version from a bump word, on the last line of stdout, and nothing
+  # written for a word or a manifest it cannot compute from.
   say "checks: the version bump"
   nix build .#checks.x86_64-linux.bump-version --no-link --print-build-logs
   # The deploy workflow's verification: what it asserts (the origin, on the box
