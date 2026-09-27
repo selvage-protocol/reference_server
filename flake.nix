@@ -328,6 +328,23 @@
               python3 -B test_verify_deploy.py
               touch $out
             '';
+
+          # The command that names the page the server image bakes
+          # (`scripts/page-revision.sh`): `web_client`'s latest release, peeled
+          # from its tag to the commit the page stage fetches — an annotated tag
+          # is an object of its own and only the peeled line is a commit — and a
+          # refusal, with nothing on stdout, when there is nothing to name. The
+          # release hands the value to `bump-version.sh --page-sha`. Both commands
+          # are reached through `PATH`, so this runs against stand-ins and needs
+          # no network, no token and no sibling checkout.
+          page-revision =
+            pkgs.runCommand "page-revision-test" {
+              nativeBuildInputs = [pkgs.python3];
+            } ''
+              cd ${./scripts}
+              python3 -B test_page_revision.py
+              touch $out
+            '';
         };
 
         devShells.default = craneLib.devShell {

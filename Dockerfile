@@ -32,9 +32,11 @@ ARG REVISION=unknown
 # demands one). The page it builds must speak the wire this server seats, so the
 # pin names a revision whose bundle names `selvage/2`: a revision that names
 # another wire builds a page that cannot join the container beside it, and
-# `scripts/container-smoke.sh` asserts that string of the served bundle. The pin
-# is a revision of another repository, so it moves when that one releases, and a
-# wave that cuts the two together repins it before this image is cut. The image
+# `scripts/container-smoke.sh` asserts that string of the served bundle. **A
+# release moves it, rather than a hand**: `scripts/page-revision.sh` names
+# `web_client`'s latest release and `scripts/bump-version.sh --page-sha` writes it
+# here in the same commit as the version, so the value in the tree is what the
+# last release baked and a build from the tree stays reproducible. The image
 # records the revision it carries in `com.selvage.page.revision`.
 ARG WEB_CLIENT_SHA=ecd07aa5daabdcc224f892784202b156b4c5f6a7
 

@@ -38,6 +38,25 @@ What a stream can and cannot do, because that is the whole of the argument:
   install — deleting under a root process on the strength of a stream is a bigger
   lever than installing one needs.
 
+**It does nothing it does not have to**, because a release now installs the shape
+on every deploy and the front serves live sessions. The shape on disk is compared
+with the stream *before* the write, by content and not by mtime — a rewrite of the
+bytes that were already there changes nothing, and rebuilding the front for it
+costs the WebSockets through it a second or two — and three cases follow:
+
+* every entry already holds what the stream carries: nothing is written, no
+  `docker compose` runs at all, and the run says so and exits 0;
+* only `compose.yaml` differs: the services are brought up to it with
+  `docker compose up -d`, which recreates the service that changed and nothing
+  else;
+* anything under `proxy/` differs, missing or added files included: the front's
+  configuration is baked into its image, so that one is built with
+  `docker compose up -d --build proxy`.
+
+The comparison is taken before the write for the obvious reason — after it there
+is nothing left to compare with — and the run prints which of the three cases it
+took.
+
 And the residual that is a race rather than a decision: between the preflight and
 the write, something with access to `/srv/selvage` (`selvage` owns it) could
 replace a directory with a link. The write then refuses that entry, because every
@@ -65,7 +84,8 @@ LOCK = SRV / ".update.lock"
 LOCK_WAIT_SECONDS = 600.0
 
 FRONT = "proxy"
-COMPOSE_ARGV = ["docker", "compose", "up", "-d", "--build", FRONT]
+UP_ARGV = ["docker", "compose", "up", "-d"]
+REBUILD_ARGV = [*UP_ARGV, "--build", FRONT]
 FILE_MODE = 0o644
 DIRECTORY_MODE = 0o755
 
@@ -241,6 +261,53 @@ def preflight(entries: list[Entry]) -> None:
             raise Refused(f"{entry.name} is there and is not a regular file")
 
 
+def _directory_is_there(name: str) -> bool:
+    """Whether `SRV/name` resolves, through directories only, to a directory."""
+    try:
+        os.close(open_below(name))
+        return True
+    except OSError:
+        return False
+
+
+def _carries_the_bytes(name: str, content: bytes) -> bool:
+    """Whether `SRV/name` is a regular file holding exactly `content`."""
+    parent_name, _, leaf = name.rpartition("/")
+    try:
+        descriptor = open_below(parent_name)
+    except OSError:
+        return False
+    try:
+        handle = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+    try:
+        with os.fdopen(handle, "rb") as stream:
+            return stream.read() == content
+    except OSError:
+        return False
+
+
+def differences(entries: list[Entry]) -> list[str]:
+    """The entries whose content is not what `SRV` already holds, in name order.
+
+    Read before the write, and by content rather than by mtime: an install that
+    rewrites the bytes that were already there has changed nothing, and a
+    `--build` for it rebuilds the front for nothing. A missing file, a missing
+    directory and a file that is there with other bytes are all differences.
+    """
+    changed = []
+    for entry in sorted(entries, key=lambda item: item.name):
+        if entry.is_directory:
+            if not _directory_is_there(entry.name):
+                changed.append(entry.name)
+        elif not _carries_the_bytes(entry.name, entry.content or b""):
+            changed.append(entry.name)
+    return changed
+
+
 def install(entries: list[Entry]) -> list[str]:
     """Write the shape under `SRV`, in name order, and return what was written."""
     written = []
@@ -286,15 +353,17 @@ def take_lock() -> int:
             time.sleep(1)
 
 
-def compose() -> subprocess.CompletedProcess:
-    """The one command that makes an installed `proxy/` live: as root, in `SRV`.
+def compose(argv: list[str]) -> subprocess.CompletedProcess:
+    """One of the two commands that make an installed shape live: as root, in `SRV`.
 
     No `-f`: Compose finds `compose.yaml` in the working directory, and a
     `compose.override.yaml` beside it too, exactly as the timer and every hand
     command do. The front's files are baked into its image, so an installed
-    `proxy/` is not what runs until this rebuilds it.
+    `proxy/` is not what runs until `--build` rebuilds it; a `compose.yaml` alone
+    needs no build and takes the shorter command. Which one is `differences`'
+    answer, not this function's.
     """
-    return subprocess.run(COMPOSE_ARGV, cwd=SRV, check=False)
+    return subprocess.run(argv, cwd=SRV, check=False)
 
 
 def main(argv: list[str]) -> int:
@@ -310,18 +379,33 @@ def main(argv: list[str]) -> int:
         preflight(entries)
         lock = take_lock()
         try:
+            changed = differences(entries)
+            if not changed:
+                print("=== already current ===")
+                print(
+                    f"nothing differs: every entry of the shape under {SRV} already holds "
+                    f"what this stream carries, so nothing was written and no container was touched"
+                )
+                return 0
+            # A `compose.yaml` alone is read by Compose at `up -d`; the front's files
+            # are baked into its image, so they need the build.
+            rebuilding = any(name == FRONT or name.startswith(f"{FRONT}/") for name in changed)
+            argv = REBUILD_ARGV if rebuilding else UP_ARGV
             written = install(entries)
             print("=== installed ===")
             for name in written:
                 print(f"{SRV}/{name}")
             print(f"left alone: {SRV}/.env (live; selvage-deploy and the owner write it)")
             print(f"left alone: {SRV}/.env.example, tls/ and the systemd units (never part of the shape)")
-            print(f"=== docker compose {' '.join(COMPOSE_ARGV[2:])} ===")
-            if compose().returncode != 0:
-                raise Refused(
-                    f"`docker compose {' '.join(COMPOSE_ARGV[2:])}` failed; the shape is on disk "
-                    f"and the front was not rebuilt, so it goes on serving the previous one"
+            print(f"changed ({len(changed)}): {' '.join(changed)}")
+            print(f"=== docker compose {' '.join(argv[2:])} ===")
+            if compose(argv).returncode != 0:
+                residual = (
+                    "the front was not rebuilt, so it goes on serving the previous configuration"
+                    if rebuilding
+                    else "the services were not brought up, so they go on running what they had"
                 )
+                raise Refused(f"`docker compose {' '.join(argv[2:])}` failed; the shape is on disk and {residual}")
         finally:
             os.close(lock)
         return 0

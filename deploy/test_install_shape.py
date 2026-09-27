@@ -136,7 +136,13 @@ def conf_stream() -> bytes:
 
 
 def snapshot(root: Path) -> dict:
-    """Every path under `root`: its kind, its mode and its bytes."""
+    """Every path under `root`: its kind, its mode, its mtime and its bytes.
+
+    The mtime is what makes "writes nothing" a claim a refusal and an
+    already-current install have to meet rather than describe: a rewrite of the
+    same bytes does not change the mode or the content, and would slip past a
+    snapshot that recorded only those.
+    """
     taken = {}
     for path in sorted(root.rglob("*")):
         info = path.lstat()
@@ -144,9 +150,9 @@ def snapshot(root: Path) -> dict:
         if stat.S_ISLNK(info.st_mode):
             taken[relative] = ("link", os.readlink(path))
         elif stat.S_ISDIR(info.st_mode):
-            taken[relative] = ("dir", info.st_mode & 0o777)
+            taken[relative] = ("dir", info.st_mode & 0o777, info.st_mtime_ns)
         else:
-            taken[relative] = ("file", info.st_mode & 0o777, path.read_bytes())
+            taken[relative] = ("file", info.st_mode & 0o777, info.st_mtime_ns, path.read_bytes())
     return taken
 
 
@@ -173,9 +179,9 @@ class Box:
     def link(self, name: str, target) -> None:
         (self.srv / name).symlink_to(target)
 
-    def compose(self):
-        self.calls.append(list(install_shape.COMPOSE_ARGV))
-        return subprocess.CompletedProcess(list(install_shape.COMPOSE_ARGV), self.status, "", "")
+    def compose(self, argv):
+        self.calls.append(list(argv))
+        return subprocess.CompletedProcess(list(argv), self.status, "", "")
 
     def run(self, stream: bytes, argv=("selvage-install-shape",), root=True, status=0, bound=None, compose=None):
         self.status = status
@@ -391,14 +397,15 @@ class InstallTest(unittest.TestCase):
     def test_the_front_is_the_only_service_and_the_command_is_the_hand_command(self):
         self.box.run(shape())
         self.assertEqual(self.box.calls, [["docker", "compose", "up", "-d", "--build", "proxy"]])
-        for argument in ("-f", "--project-directory", "--env-file"):
-            self.assertNotIn(argument, install_shape.COMPOSE_ARGV)
+        for argv in (install_shape.UP_ARGV, install_shape.REBUILD_ARGV):
+            for argument in ("-f", "--project-directory", "--env-file"):
+                self.assertNotIn(argument, argv)
 
     def test_compose_runs_in_the_box_directory(self):
         called = []
         with mock.patch("subprocess.run", lambda argv, **options: called.append((argv, options.get("cwd"))) or subprocess.CompletedProcess(argv, 0, "", "")):
-            install_shape.compose()
-        self.assertEqual(called, [(install_shape.COMPOSE_ARGV, install_shape.SRV)])
+            install_shape.compose(install_shape.UP_ARGV)
+        self.assertEqual(called, [(install_shape.UP_ARGV, install_shape.SRV)])
 
     def test_a_front_that_fails_to_build_is_a_non_zero_exit(self):
         code = self.box.run(shape(), status=1)
@@ -412,7 +419,7 @@ class InstallTest(unittest.TestCase):
 
         held = []
 
-        def composing():
+        def composing(argv):
             probe = open(self.box.srv / ".update.lock", "r")
             try:
                 fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -422,7 +429,7 @@ class InstallTest(unittest.TestCase):
                 held.append(False)
             finally:
                 probe.close()
-            return self.box.compose()
+            return self.box.compose(argv)
 
         self.assertEqual(self.box.run(shape(), compose=composing), 0)
         self.assertEqual(held, [True], "the install did not hold the update timer's lock")
@@ -435,6 +442,74 @@ class InstallTest(unittest.TestCase):
         for path in sorted((HERE / "proxy").rglob("*")):
             if path.is_file():
                 self.assertEqual((self.box.srv / "proxy" / path.relative_to(HERE / "proxy")).read_bytes(), path.read_bytes(), path)
+
+class IdempotenceTest(unittest.TestCase):
+    """A release installs the shape on every deploy, so the box must not be
+    restarted for a stream it already holds, and the two differences that can be
+    left are the two compose commands there are."""
+
+    def setUp(self):
+        self.box = Box()
+        self.assertEqual(self.box.run(shape()), 0, self.box.stderr)
+        self.box.calls = []
+
+    def test_a_stream_the_box_already_holds_writes_nothing_and_runs_nothing(self):
+        # By content, not by mtime: a file whose bytes are right is right however
+        # old it looks, and a reinstall that rewrote it would restart a live front.
+        os.utime(self.box.srv / "compose.yaml")
+        os.utime(self.box.srv / "proxy" / "conf.d" / "default.conf")
+        before = snapshot(self.box.srv)
+        self.assertEqual(self.box.run(shape()), 0, self.box.stderr)
+        self.assertEqual(snapshot(self.box.srv), before, "an already-current install wrote to the box")
+        self.assertEqual(self.box.calls, [], "an already-current install reached docker compose")
+        self.assertIn("nothing differs", self.box.stdout)
+        self.assertNotIn("=== installed ===", self.box.stdout)
+
+    def test_a_compose_only_change_brings_the_services_up_without_a_build(self):
+        moved = COMPOSE + b"  web:\n    image: example\n"
+        stream = archive(
+            [
+                ("file", "compose.yaml", moved),
+                ("dir", "proxy/", b""),
+                ("file", "proxy/Dockerfile", b"FROM nginx\n"),
+                ("dir", "proxy/conf.d/", b""),
+                ("file", "proxy/conf.d/default.conf", DEFAULT_CONF),
+            ]
+        )
+        self.assertEqual(self.box.run(stream), 0, self.box.stderr)
+        self.assertEqual(self.box.calls, [["docker", "compose", "up", "-d"]])
+        self.assertEqual((self.box.srv / "compose.yaml").read_bytes(), moved)
+        self.assertIn("compose.yaml", self.box.stdout)
+        self.assertIn("=== docker compose up -d ===", self.box.stdout)
+
+    def test_a_proxy_change_rebuilds_the_front(self):
+        moved = b"server { listen 8080; listen 8081; }\n"
+        stream = archive(
+            [
+                ("file", "compose.yaml", COMPOSE),
+                ("dir", "proxy/", b""),
+                ("file", "proxy/Dockerfile", b"FROM nginx\n"),
+                ("dir", "proxy/conf.d/", b""),
+                ("file", "proxy/conf.d/default.conf", moved),
+            ]
+        )
+        self.assertEqual(self.box.run(stream), 0, self.box.stderr)
+        self.assertEqual(self.box.calls, [["docker", "compose", "up", "-d", "--build", "proxy"]])
+        self.assertEqual((self.box.srv / "proxy" / "conf.d" / "default.conf").read_bytes(), moved)
+        self.assertIn("proxy/conf.d/default.conf", self.box.stdout)
+        self.assertIn("=== docker compose up -d --build proxy ===", self.box.stdout)
+
+    def test_a_file_the_box_does_not_have_yet_is_a_rebuild(self):
+        stream = archive(
+            [
+                ("file", "compose.yaml", COMPOSE),
+                ("file", "proxy/Dockerfile", b"FROM nginx\n"),
+                ("file", "proxy/www/terms.html", b"<p>terms</p>\n"),
+            ]
+        )
+        self.assertEqual(self.box.run(stream), 0, self.box.stderr)
+        self.assertEqual(self.box.calls, [["docker", "compose", "up", "-d", "--build", "proxy"]])
+        self.assertEqual((self.box.srv / "proxy" / "www" / "terms.html").read_bytes(), b"<p>terms</p>\n")
 
 
 class SudoersTest(unittest.TestCase):
