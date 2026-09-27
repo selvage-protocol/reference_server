@@ -34,7 +34,7 @@ header, because the front is the server for `selvage-demo.dontblameme.dev` and
 closes the connection for any other name: a loopback address is where the front
 is, not a name it answers.
 
-    scripts/verify_deploy.py --expect-version 0.4.6
+    scripts/verify_deploy.py --expect-version x.x.x
     scripts/verify_deploy.py                      # a page-only deploy: /meta is read, not compared
 """
 
@@ -187,7 +187,11 @@ def classify_public(reading: Public, expect_version: str | None) -> tuple[str, s
     marker = next((m for m in INTERSTITIAL_BODY_MARKERS if m in lowered), "")
     if mitigated or marker:
         detail = f"{reading.status or 'no status'} with "
-        detail += f"{MITIGATION_HEADER}: {mitigated}" if mitigated else f"a Cloudflare interstitial body ({marker})"
+        detail += (
+            f"{MITIGATION_HEADER}: {mitigated}"
+            if mitigated
+            else f"a Cloudflare interstitial body ({marker})"
+        )
         return CHALLENGE, detail
     if reading.status == "200":
         served = json_server(reading.body)
@@ -202,7 +206,9 @@ def classify_public(reading: Public, expect_version: str | None) -> tuple[str, s
     return UNREADABLE, f"{reading.status or 'no status'}"
 
 
-def wait_for_public(read, expect_version: str | None, deadline: float, interval: float) -> tuple[str, str]:
+def wait_for_public(
+    read, expect_version: str | None, deadline: float, interval: float
+) -> tuple[str, str]:
     """Read the public origin, ending at the first challenge rather than polling it.
 
     A challenge is an answer about the edge, not about the deployment, and it cannot
@@ -253,15 +259,25 @@ def read_origin(ssh_target: str, origin_url: str) -> Origin:
     ]
     try:
         done = subprocess.run(
-            argv, capture_output=True, text=True, timeout=SPAWN_TIMEOUT_SECONDS, check=False
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=SPAWN_TIMEOUT_SECONDS,
+            check=False,
         )
     except subprocess.TimeoutExpired:
-        return Origin("", "", f"ssh to {ssh_target} did not answer within {SPAWN_TIMEOUT_SECONDS}s")
+        return Origin(
+            "",
+            "",
+            f"ssh to {ssh_target} did not answer within {SPAWN_TIMEOUT_SECONDS}s",
+        )
     except OSError as failed:
         return Origin("", "", f"ssh could not be run: {failed}")
     if done.returncode != 0:
         return Origin(
-            "", "", f"ssh to {ssh_target} exited {done.returncode}: {done.stderr.strip()}"
+            "",
+            "",
+            f"ssh to {ssh_target} exited {done.returncode}: {done.stderr.strip()}",
         )
     page = ""
     meta = ""
@@ -271,7 +287,9 @@ def read_origin(ssh_target: str, origin_url: str) -> Origin:
         elif line.startswith(META_MARKER):
             meta = line[len(META_MARKER) :].strip()
     if not page:
-        return Origin("", "", f"the read produced no page status: {done.stdout.strip()!r}")
+        return Origin(
+            "", "", f"the read produced no page status: {done.stdout.strip()!r}"
+        )
     return Origin(page, meta)
 
 
@@ -301,28 +319,49 @@ def read_public(public_url: str) -> Public:
         ]
         try:
             done = subprocess.run(
-                argv, capture_output=True, text=True, timeout=SPAWN_TIMEOUT_SECONDS, check=False
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=SPAWN_TIMEOUT_SECONDS,
+                check=False,
             )
         except subprocess.TimeoutExpired:
-            return Public("", "", "", f"curl did not answer within {SPAWN_TIMEOUT_SECONDS}s")
+            return Public(
+                "", "", "", f"curl did not answer within {SPAWN_TIMEOUT_SECONDS}s"
+            )
         except OSError as failed:
             return Public("", "", "", f"curl could not be run: {failed}")
         status = done.stdout.strip()
-        header_text = headers.read_text(encoding="utf-8", errors="replace") if headers.exists() else ""
-        body_text = body.read_text(encoding="utf-8", errors="replace") if body.exists() else ""
+        header_text = (
+            headers.read_text(encoding="utf-8", errors="replace")
+            if headers.exists()
+            else ""
+        )
+        body_text = (
+            body.read_text(encoding="utf-8", errors="replace") if body.exists() else ""
+        )
         if done.returncode != 0:
-            return Public(status, header_text, body_text, f"curl exited {done.returncode}: {done.stderr.strip()}")
+            return Public(
+                status,
+                header_text,
+                body_text,
+                f"curl exited {done.returncode}: {done.stderr.strip()}",
+            )
     return Public(status, header_text, body_text)
 
 
-def origin_sentence(reading: Origin, origin_url: str, ssh_target: str, expect_version: str | None) -> str:
+def origin_sentence(
+    reading: Origin, origin_url: str, ssh_target: str, expect_version: str | None
+) -> str:
     """The line a passing origin assertion prints."""
     sentence = (
         f"the origin: {origin_url} through the front on {ssh_target} reports "
         f"{json_server(reading.meta)}, and the page answers {reading.page}"
     )
     if expect_version is None:
-        sentence += " (no server version was dispatched, so /meta is read and not compared)"
+        sentence += (
+            " (no server version was dispatched, so /meta is read and not compared)"
+        )
     return sentence
 
 
@@ -360,8 +399,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="the selvaged version this run deployed; without it /meta is read and not compared",
     )
-    parser.add_argument("--origin-deadline", type=float, default=ORIGIN_DEADLINE_SECONDS)
-    parser.add_argument("--public-deadline", type=float, default=PUBLIC_DEADLINE_SECONDS)
+    parser.add_argument(
+        "--origin-deadline", type=float, default=ORIGIN_DEADLINE_SECONDS
+    )
+    parser.add_argument(
+        "--public-deadline", type=float, default=PUBLIC_DEADLINE_SECONDS
+    )
     parser.add_argument("--poll-interval", type=float, default=POLL_INTERVAL_SECONDS)
     args = parser.parse_args(argv)
 
@@ -375,7 +418,9 @@ def main(argv: list[str] | None = None) -> int:
     except OriginAssertion as failed:
         print(f"the origin did not serve what was deployed: {failed}", file=sys.stderr)
         return 1
-    print(origin_sentence(origin, args.origin_url, args.ssh_target, args.expect_version))
+    print(
+        origin_sentence(origin, args.origin_url, args.ssh_target, args.expect_version)
+    )
 
     verdict, detail = wait_for_public(
         partial(read_public, args.public_url),
@@ -393,16 +438,25 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.flush()
         print(
             MISMATCH_REPORT.format(
-                url=args.public_url, served=detail, expected=f"selvaged/{args.expect_version}"
+                url=args.public_url,
+                served=detail,
+                expected=f"selvaged/{args.expect_version}",
             ),
             file=sys.stderr,
         )
         return 1
     else:
-        expected = f"selvaged/{args.expect_version}" if args.expect_version else "a server version"
+        expected = (
+            f"selvaged/{args.expect_version}"
+            if args.expect_version
+            else "a server version"
+        )
         print(
             UNREADABLE_REPORT.format(
-                url=args.public_url, expected=expected, seconds=args.public_deadline, detail=detail
+                url=args.public_url,
+                expected=expected,
+                seconds=args.public_deadline,
+                detail=detail,
             )
         )
     return 0
