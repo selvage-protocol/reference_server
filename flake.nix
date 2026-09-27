@@ -334,6 +334,21 @@
               touch $out
             '';
 
+          # The watcher the release's last step runs (`scripts/wait_for_deploy.py`):
+          # `gh workflow run` prints no run id, so the run to wait on is the newest
+          # one of the workflow that is not the newest seen before the dispatch, and
+          # the release fails unless that run concludes `success`. The suite drives
+          # the poll loops with injected reads and runs the `gh`-facing edges against
+          # a stand-in on `PATH`, so it needs no network, no token and no real run.
+          deploy-wait =
+            pkgs.runCommand "deploy-wait-test" {
+              nativeBuildInputs = [pkgs.python3];
+            } ''
+              cd ${./scripts}
+              python3 -B test_wait_for_deploy.py
+              touch $out
+            '';
+
           # The command that names the page the server image bakes
           # (`scripts/page-revision.sh`): `web_client`'s latest release, peeled
           # from its tag to the commit the page stage fetches — an annotated tag

@@ -6,7 +6,8 @@
 #   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval, the public
 #                                 # demo's deploy guard, front limits and command line, the version
 #                                 # bump, the page revision, the deploy workflow's verification,
-#                                 # the release workflow's dry_run gating, lint, typos
+#                                 # the release's wait for its deploy, the release workflow's
+#                                 # dry_run gating, lint, typos
 #   scripts/ci-local.sh nightly   # coverage, the rest of cargo-deny and cargo-audit (slow)
 #   scripts/ci-local.sh lint      # actionlint over the workflow files, on its own
 #   scripts/ci-local.sh image     # the `image` workflow's smoke: nix-built image,
@@ -113,6 +114,12 @@ job_checks() {
   # that answers a datacenter client with a challenge).
   say "checks: the deploy workflow's verification"
   nix build .#checks.x86_64-linux.deploy-verify --no-link --print-build-logs
+  # The watcher the release's last step runs: `gh workflow run` prints no run id,
+  # so the run to wait on is the newest one not seen before the dispatch, and the
+  # release fails unless it concludes `success`. The suite drives the polls with
+  # injected reads and a stand-in `gh` on `PATH`.
+  say "checks: the release waits for its deploy"
+  nix build .#checks.x86_64-linux.deploy-wait --no-link --print-build-logs
   # The guard around a workflow's `dry_run` input: `release.yml` printed a plan
   # promising that nothing would be resolved, written or dispatched, and then did
   # all of it, because the plan step was the only step carrying a condition.
