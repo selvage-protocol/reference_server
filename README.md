@@ -61,12 +61,10 @@ ownership, group membership, or mode bits. Inaccessible files return `404`. With
 no page directory the server still answers `/meta` and `/session`, and `/` is
 `404`.
 
-`packaging/README.md` is the rest of it: tags and version truthfulness, the
-multi-arch build, the FSL-1.1-MIT redistribution question, the systemd user
-unit, and the running deployment. The public demo is a tracked shape with a
-deploy script that box's CI user may run as root, `packaging/prod/`, dispatched
-by `.github/workflows/deploy-prod.yml`. Moving every artefact of a release
-together is the release runbook's job: `ai_notes/docs/runbook-release.md`.
+The public demo is a tracked shape with its own compose file and proxy in
+`deploy/`, and the deploy script `.github/workflows/deploy-prod.yml` runs on the
+box. The published image is built multi-arch and tagged by
+`.github/workflows/image.yml`.
 
 ### Nix
 
@@ -450,10 +448,13 @@ The server is licensed differently from everything beside it.
 Functional Source License 1.1 is free for any non-competing purpose: a company
 self-hosting it internally is free, as are non-commercial education and
 research. It forbids making the software available to others in a commercial
-product or service that substitutes for it. `packaging/README.md` records what
-the owner accepted for this project's published image, and where that acceptance
-stops. Each release converts to MIT on the second anniversary of the date it was
-made available, irrevocably.
+product or service that substitutes for it. The acceptance that governs this
+project's published image is stated where the image is built:
+`crates/selvaged/LICENSE` travels inside it, the
+`org.opencontainers.image.licenses` label names the licence, and `Dockerfile`
+and `.github/workflows/image.yml` record what was accepted and when. Each
+release converts to MIT on the second anniversary of the date it was made
+available, irrevocably.
 
 The harness links `selvaged`, so its own `MIT OR Apache-2.0` covers the crate
 while a redistributed `selvage-harness` binary carries FSL code with it. That
