@@ -7,10 +7,10 @@
 # terms page's way back to the demo is exactly that link — same-origin by
 # design, so it must not name the origin — and against this checkout it resolves
 # to a path that is here. That the link works when the front serves the page is
-# `packaging/prod/check-terms.sh`'s assertion, which fetches it.
+# `deploy/check-terms.sh`'s assertion, which fetches it.
 root_dir = "."
 exclude = [
-  # The contact address `packaging/prod/proxy/www/terms.html` hands a reader. It
+  # The contact address `deploy/proxy/www/terms.html` hands a reader. It
   # is a `mailto:`, and lychee runs here without `--include-mail`, which reads an
   # address's shape and cannot follow it to anything live. Naming the scheme says
   # that on purpose rather than leaving it to that default, and the address stays
@@ -22,7 +22,7 @@ exclude = [
   "^file:[/]{3}.*/terms$",
   "https://fsf.org/",
   # The public demo's front proxying to its sibling containers by their Compose
-  # service names (`packaging/prod/`). Those names resolve only inside that
+  # service names (`deploy/`). Those names resolve only inside that
   # deployment's own network.
   "http://selvaged:8080",
   "http://selvage-web:8080",

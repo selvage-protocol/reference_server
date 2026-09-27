@@ -21,7 +21,7 @@ rebuilt by a plain `up`, and the timer takes the lock the script takes.
 
 Run it directly:
 
-    python3 packaging/prod/test_deploy.py
+    python3 deploy/test_deploy.py
 
 or as the flake check the workflows run: `nix build .#checks.<system>.prod-deploy`.
 """

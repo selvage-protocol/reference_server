@@ -92,7 +92,7 @@ def work_root():
     on this project's host, and a build there has taken a machine down."""
     root = os.environ.get("FRONT_LIMITS_WORKDIR")
     if not root:
-        root = os.path.join(os.path.dirname(os.path.dirname(HERE)), ".tmp", "front-limits")
+        root = os.path.join(os.path.dirname(HERE), ".tmp", "front-limits")
     shutil.rmtree(root, ignore_errors=True)
     return root
 
@@ -372,8 +372,7 @@ def phase_header_posture(port, label, host, expect_sts):
     property of the host rather than of the response that carried it -- so a
     second field here would buy the deployment nothing and would make which of
     the two a browser honours depend on their order, since a user agent
-    processes only the first (`RFC 6797` §8.1). `README.md` owns why the edge
-    owns it and what the zone's own field currently says.
+    processes only the first (`RFC 6797` §8.1).
 
     The claim is a negative, so it carries the check that it is reading the
     thing it claims to: a response with no header block at all would satisfy it

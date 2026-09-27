@@ -1,4 +1,4 @@
-"""The guard around the command line each packaging shape gives `selvaged`.
+"""The guard around the command line each deployed shape gives `selvaged`.
 
 A command line this server refuses is a deployment that never starts. The box's
 copy of `compose.yaml` is installed from the file tracked here, so `docker
@@ -13,7 +13,7 @@ The authority on what the binary accepts is the binary. This file restates no
 rule and no number: it reads the `command:` each tracked shape declares, hands
 it to `selvaged`, and fails if the server does not come up.
 
-The deployed compose shape is read: `packaging/prod/compose.yaml`, the public
+The deployed compose shape is read: `deploy/compose.yaml`, the public
 demo. The shapes are listed rather than globbed, and a shape that declares no
 `command:` fails instead of being skipped, so one cannot drop out of this guard
 without a reader seeing it.
@@ -25,10 +25,10 @@ server takes. Every flag that carries a limit is the shape's own.
 
 Run it directly, with a `selvaged` on `PATH` or one built into `target/`:
 
-    python3 packaging/prod/test_compose_args.py
+    python3 deploy/test_compose_args.py
 
 or as the flake check the workflows run:
-`nix build .#checks.<system>.packaging-args`.
+`nix build .#checks.<system>.deploy-args`.
 """
 
 import json
@@ -42,7 +42,7 @@ import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parent.parent
+REPO = HERE.parent
 
 # The tracked shapes that hand `selvaged` a command line, in the order the tests
 # below name them, and the flag the defect that wrote this guard was carried on.
@@ -150,7 +150,7 @@ def binary() -> str:
             return candidate
     raise AssertionError(
         "no `selvaged` to run: build one (`cargo build -p selvaged`) or run this "
-        "as the flake check (`nix build .#checks.<system>.packaging-args`), which "
+        "as the flake check (`nix build .#checks.<system>.deploy-args`), which "
         "puts the built binary on `PATH`"
     )
 

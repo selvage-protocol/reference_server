@@ -84,7 +84,7 @@
         # along, so this image is nix-idiomatic rather than static-minimal.
         # The Dockerfile stays the portable static variant for machines with
         # a working Docker; both agree on entrypoint, port, user, licence
-        # label and the <version>-<sha> tag scheme (see packaging/README.md).
+        # label and the <version>-<sha> tag scheme.
         # It additionally bakes the browser page and passes `--serve-page` in
         # its command, which this one does not: the page needs node to build,
         # and this image is the daemon-free shape the smoke can build.
@@ -240,7 +240,7 @@
             inherit src;
           };
 
-          # The guard around `packaging/prod/deploy.py`, which is the whole of the
+          # The guard around `deploy/deploy.py`, which is the whole of the
           # public demo's privilege model: `/usr/local/sbin/selvage-deploy` is the
           # only root command the CI user on that box may run. Nothing else in this
           # repository can see what its request grammar refuses, or that the compose
@@ -249,7 +249,7 @@
             pkgs.runCommand "prod-deploy-test" {
               nativeBuildInputs = [pkgs.python3];
             } ''
-              cd ${./packaging/prod}
+              cd ${./deploy}
               python3 -B test_deploy.py
               touch $out
             '';
@@ -263,7 +263,7 @@
             pkgs.runCommand "prod-front-test" {
               nativeBuildInputs = [pkgs.python3 pkgs.nginx];
             } ''
-              cd ${./packaging/prod}
+              cd ${./deploy}
               FRONT_LIMITS_WORKDIR="''${TMPDIR:-/build}/front-limits" python3 -B test_front_limits.py
               touch $out
             '';
@@ -272,12 +272,12 @@
           # against the binary that runs them: a value it refuses is a container
           # that exits 2 and restart-loops, which takes the front beside it down
           # with it.
-          packaging-args =
-            pkgs.runCommand "packaging-args-test" {
+          deploy-args =
+            pkgs.runCommand "deploy-args-test" {
               nativeBuildInputs = [pkgs.python3 package];
             } ''
-              cd ${./packaging}
-              python3 -B prod/test_compose_args.py
+              cd ${./deploy}
+              python3 -B test_compose_args.py
               touch $out
             '';
 

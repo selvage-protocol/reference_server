@@ -6,29 +6,28 @@ two-client harness that gates it in CI.
 
 ## Get it working
 
-`selvaged` is one binary with no configuration file, and the flags below are the whole of
-its surface. The shortest route to a running server is the published image:
+`selvaged` is one binary with no configuration file, and the flags below are the
+whole of its surface. The shortest route to a running server is the published
+image:
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:0.4.6
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:latest
 ```
 
-The GHCR package is public, so a pull needs no account and no `docker login`. `0.4.6` is
-the current release; `0.1.2` was the first built separately for each architecture, and
-`0.1.0` and `0.1.1` carry the amd64 binary in their `linux/arm64` leg.
-`packaging/README.md` owns the full tag list and what each tag contains.
+The GHCR package is public, so a pull needs no account and no `docker login`.
 
 ### From a checkout
 
-With Nix, `cargo` and `rustc` come from the flake, so run cargo through the dev shell:
+With Nix, `cargo` and `rustc` come from the flake, so run cargo through the dev
+shell:
 
 ```sh
 nix develop . -c cargo run -p selvaged -- --listen 127.0.0.1:8080
 ```
 
-Without Nix, [install Rust via rustup](https://www.rust-lang.org/tools/install) (any
-recent stable works), and the same `cargo run` needs no other setup. For a binary to keep,
-build it release and run that:
+Without Nix, [install Rust via rustup](https://www.rust-lang.org/tools/install)
+(any recent stable works), and the same `cargo run` needs no other setup. For a
+binary to keep, build it release and run that:
 
 ```sh
 nix develop . -c cargo build --release --locked -p selvaged
@@ -44,33 +43,33 @@ docker buildx build --load -t selvaged:local .
 docker run --rm -p 127.0.0.1:8080:8080 selvaged:local
 ```
 
-`docker compose up` builds the same `Dockerfile` through `compose.yaml`, which runs the
-image read-only with every capability dropped. This is the route for an image you are
-changing, or one built from your own checkout.
+`docker compose up` builds the same `Dockerfile` through `compose.yaml`, which
+runs the image read-only with every capability dropped. This is the route for an
+image you are changing, or one built from your own checkout.
 
-The page is baked in, so a container needs no mount, and a page built elsewhere overrides
-it by mounting over `/page` — the image's own command already passes `--serve-page /page`:
+The page is baked in, so a container needs no mount, and a page built elsewhere
+overrides it by mounting over `/page` — the image's own command already passes
+`--serve-page /page`:
 
 ```sh
 docker run --rm -p 127.0.0.1:8080:8080 -v "$PWD/page:/page:ro" selvaged:local
 ```
 
-The container serves as UID `65532`. Mounted page files need read permission, and their
-directories need read and search permission for that UID, through ownership, group
-membership, or mode bits. Inaccessible files return `404`. With no page directory the
-server still answers `/meta` and `/session`, and `/` is `404`.
+The container serves as UID `65532`. Mounted page files need read permission,
+and their directories need read and search permission for that UID, through
+ownership, group membership, or mode bits. Inaccessible files return `404`. With
+no page directory the server still answers `/meta` and `/session`, and `/` is
+`404`.
 
-`packaging/README.md` is the rest of it: tags and version truthfulness, the multi-arch
-build, the FSL-1.1-MIT redistribution question, the systemd user unit, and the
-running deployment. The public demo is a tracked shape with a deploy script that box's
-CI user may run as root, `packaging/prod/`, dispatched by
-`.github/workflows/deploy-prod.yml`. Moving every artefact of a release together is the
-release runbook's job: `ai_notes/docs/runbook-release.md`.
+The public demo is a tracked shape with its own compose file and proxy in
+`deploy/`, and the deploy script `.github/workflows/deploy-prod.yml` runs on the
+box. The published image is built multi-arch and tagged by
+`.github/workflows/image.yml`.
 
 ### Nix
 
-The flake's default package is `selvaged`, so `nix run` builds the binary and starts it
-with the same flags:
+The flake's default package is `selvaged`, so `nix run` builds the binary and
+starts it with the same flags:
 
 ```sh
 nix run . -- --listen 0.0.0.0:8080
@@ -85,10 +84,10 @@ selvaged listening on ws://127.0.0.1:8080/session (meta at http://127.0.0.1:8080
 limits: 1024 connections, 1024 rooms, 128 peers per room, 32 MiB outbound per connection, 5 MiB inbound text envelope, 2 MiB/s inbound with a 64 MiB burst
 ```
 
-With the default bind it goes on to note that the address is loopback-only and how to
-widen it, how long rooms live after their last connection ends, and that a client mints
-the room. `--help` prints the usage line, a short description of the server, and every flag
-with its default.
+With the default bind it goes on to note that the address is loopback-only and
+how to widen it, how long rooms live after their last connection ends, and that
+a client mints the room. `--help` prints the usage line, a short description of
+the server, and every flag with its default.
 
 ```text
 usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]
@@ -97,64 +96,68 @@ usage: selvaged [--listen ADDR] [--room-grace-ms MS] [--serve-page DIR]
                 [--inbound-bytes-per-sec N] [--inbound-burst-bytes N]
 ```
 
-| Flag | What it does |
-|---|---|
-| `--listen ADDR` | bind `ADDR` (default `127.0.0.1:8080`) |
-| `--room-grace-ms MS` | how long a room survives its last connection ending, in milliseconds (default `30000`, printed as 30s) |
-| `--serve-page DIR` | serve the browser page from `DIR` on the same origin as `/session` and `/meta` |
-| `--max-connections N` | connections held at once, counted past the request head (default `1024`) |
-| `--max-rooms N` | rooms held at once; past it a room is not minted (default `1024`) |
-| `--max-peers-per-room N` | peers one room seats at once (default `128`) |
-| `--outbound-queue-bytes N` | payload bytes queued but unwritten for one connection before it is dropped as a peer that stopped reading (default `33554432`, 32 MiB; the command line refuses one that cannot hold one whole frame, which is the 8 MiB frame bound plus the 64 KiB of envelope headroom the floor counts, `8454144`) |
-| `--max-envelope-bytes N` | the largest inbound text envelope the server will parse, judged on the frame's length before `serde_json` sees it (default `5242880`, 5 MiB) |
-| `--inbound-bytes-per-sec N` | bytes one connection may send a second, refilled continuously (default `2097152`, 2 MiB) |
-| `--inbound-burst-bytes N` | how much of that rate one connection may spend at once (default `67108864`, 64 MiB) |
-| `--help`, `-h` | print the usage and the flags |
-| `--version` | print `selvaged/<version>` |
+| Flag                        | What it does                                                                                                                                                                                                                                                                                           |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--listen ADDR`             | bind `ADDR` (default `127.0.0.1:8080`)                                                                                                                                                                                                                                                                 |
+| `--room-grace-ms MS`        | how long a room survives its last connection ending, in milliseconds (default `30000`, printed as 30s)                                                                                                                                                                                                 |
+| `--serve-page DIR`          | serve the browser page from `DIR` on the same origin as `/session` and `/meta`                                                                                                                                                                                                                         |
+| `--max-connections N`       | connections held at once, counted past the request head (default `1024`)                                                                                                                                                                                                                               |
+| `--max-rooms N`             | rooms held at once; past it a room is not minted (default `1024`)                                                                                                                                                                                                                                      |
+| `--max-peers-per-room N`    | peers one room seats at once (default `128`)                                                                                                                                                                                                                                                           |
+| `--outbound-queue-bytes N`  | payload bytes queued but unwritten for one connection before it is dropped as a peer that stopped reading (default `33554432`, 32 MiB; the command line refuses one that cannot hold one whole frame, which is the 8 MiB frame bound plus the 64 KiB of envelope headroom the floor counts, `8454144`) |
+| `--max-envelope-bytes N`    | the largest inbound text envelope the server will parse, judged on the frame's length before `serde_json` sees it (default `5242880`, 5 MiB)                                                                                                                                                           |
+| `--inbound-bytes-per-sec N` | bytes one connection may send a second, refilled continuously (default `2097152`, 2 MiB)                                                                                                                                                                                                               |
+| `--inbound-burst-bytes N`   | how much of that rate one connection may spend at once (default `67108864`, 64 MiB)                                                                                                                                                                                                                    |
+| `--help`, `-h`              | print the usage and the flags                                                                                                                                                                                                                                                                          |
+| `--version`                 | print `selvaged/<version>`                                                                                                                                                                                                                                                                             |
 
 Every default is the reference value. The capacity flags are bounds on what one
-process holds in memory and only that process can enforce them; the envelope bound and
-the inbound budget are what one connection may send, and they are judged in-process
-because a front cannot see either one. *Sizing a box*, below, says which of a
-deployment's bounds belong where.
+process holds in memory and only that process can enforce them; the envelope
+bound and the inbound budget are what one connection may send, and they are
+judged in-process because a front cannot see either one. _Sizing a box_, below,
+says which of a deployment's bounds belong where.
 
 ### What happens at a limit
 
-Every limit refuses deterministically, and what a peer sees depends on the limit:
+Every limit refuses deterministically, and what a peer sees depends on the
+limit:
 
-| Limit reached | What the peer sees |
-|---|---|
-| `--max-connections` | a plain HTTP request is answered `503` with `retry-after`; a WebSocket upgrade is answered and then closed `1013` |
-| `--max-rooms` | a refusal, `session.error` with code `x.server_full`, then close `4000` |
-| `--max-peers-per-room` | `x.room_full` on the join, then close `4000` |
-| `--max-envelope-bytes` | a seated connection gets `session.error` `bad_message` naming the bound and the frame's size; the connection stays open. Before the handshake the same refusal closes `4000` |
+| Limit reached                                       | What the peer sees                                                                                                                                                                                                                           |
+| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--max-connections`                                 | a plain HTTP request is answered `503` with `retry-after`; a WebSocket upgrade is answered and then closed `1013`                                                                                                                            |
+| `--max-rooms`                                       | a refusal, `session.error` with code `x.server_full`, then close `4000`                                                                                                                                                                      |
+| `--max-peers-per-room`                              | `x.room_full` on the join, then close `4000`                                                                                                                                                                                                 |
+| `--max-envelope-bytes`                              | a seated connection gets `session.error` `bad_message` naming the bound and the frame's size; the connection stays open. Before the handshake the same refusal closes `4000`                                                                 |
 | `--inbound-bytes-per-sec` / `--inbound-burst-bytes` | `session.error` `x.rate_limited` naming the budget, then close `1013`; the room is told `peer.left` and a reconnect starts with a fresh budget. Before the handshake the same refusal closes `4000`, since every fault before seating closes |
-| `--outbound-queue-bytes` | the peer is disconnected as one that stopped reading, and the room is told `peer.left` |
+| `--outbound-queue-bytes`                            | the peer is disconnected as one that stopped reading, and the room is told `peer.left`                                                                                                                                                       |
 
-The rate limit is charged per inbound frame — the handshake's frames included, which is
-where a peer can send frames nobody answers — at its payload size or one kilobyte,
-whichever is larger: a flood of one-byte frames costs a kilobyte of budget each, because
-that is closer to what a frame costs the server than its payload is. Frames the session
-never parses — relayed document and awareness payloads — are charged too, since a relay is
-copied once per peer. A refusal is written before the socket closes; a peer that is still
-writing when the server closes it can lose that refusal to a reset its own writes bring,
-which is the same drop `PROTOCOL.md` §2.1 describes for an over-bound frame.
+The rate limit is charged per inbound frame — the handshake's frames included,
+which is where a peer can send frames nobody answers — at its payload size or
+one kilobyte, whichever is larger: a flood of one-byte frames costs a kilobyte
+of budget each, because that is closer to what a frame costs the server than its
+payload is. Frames the session never parses — relayed document and awareness
+payloads — are charged too, since a relay is copied once per peer. A refusal is
+written before the socket closes; a peer that is still writing when the server
+closes it can lose that refusal to a reset its own writes bring, which is the
+same drop `PROTOCOL.md` §2.1 describes for an over-bound frame.
 
 ### Sizing a box
 
-A small host should size the process rather than trust the defaults, which are the
-reference values and assume headroom. `max_connections` multiplies the per-connection
-outbound queue, so `connections × outbound-queue-bytes` is the outbound ceiling the
-process can reach (at the defaults, 32 GiB), and `--max-connections` is what a small box
-lowers first. The inbound budget bounds what one connection can spend of the CPU.
+A small host should size the process rather than trust the defaults, which are
+the reference values and assume headroom. `max_connections` multiplies the
+per-connection outbound queue, so `connections × outbound-queue-bytes` is the
+outbound ceiling the process can reach (at the defaults, 32 GiB), and
+`--max-connections` is what a small box lowers first. The inbound budget bounds
+what one connection can spend of the CPU.
 
-The queue is also the floor under every frame the server sends, and it is refused at
-startup if it cannot hold one. The largest frame is a relayed payload (the frame bound,
-8 MiB), the floor counts the envelope headroom around it as well, and what is counted is
-the frame's wire bytes: the two together are `8454144`, which is the smallest value the
-command line accepts. A queue below that does not bound memory, it breaks sessions — a
-handshake frame nobody can queue seats nobody — so the command line refuses the
-combination and says which flag to move.
+The queue is also the floor under every frame the server sends, and it is
+refused at startup if it cannot hold one. The largest frame is a relayed payload
+(the frame bound, 8 MiB), the floor counts the envelope headroom around it as
+well, and what is counted is the frame's wire bytes: the two together are
+`8454144`, which is the smallest value the command line accepts. A queue below
+that does not bound memory, it breaks sessions — a handshake frame nobody can
+queue seats nobody — so the command line refuses the combination and says which
+flag to move.
 
 For a 1 GiB box with something else running on it, these are a defensible set:
 
@@ -164,27 +167,28 @@ selvaged --listen 0.0.0.0:8080 --serve-page /page \
   --outbound-queue-bytes 8454144
 ```
 
-That is an outbound ceiling of 258 MiB, not a figure anything reaches in a session: it is
-every one of 32 connections holding a full queue of unwritten frames at once, which is what
-the queue's own cap ejects. The two inbound bounds keep their defaults here: 5 MiB is well
-above the largest sealed frame a peer sends, and 2 MiB/s is already far above what an
-editor does.
-Lowering `--inbound-bytes-per-sec` below a few tens of kilobytes a second will exile a peer
-for traffic it did not choose to send: a client publishes presence on a timer, and each of
-those frames costs a kilobyte of budget.
+That is an outbound ceiling of 258 MiB, not a figure anything reaches in a
+session: it is every one of 32 connections holding a full queue of unwritten
+frames at once, which is what the queue's own cap ejects. The two inbound bounds
+keep their defaults here: 5 MiB is well above the largest sealed frame a peer
+sends, and 2 MiB/s is already far above what an editor does. Lowering
+`--inbound-bytes-per-sec` below a few tens of kilobytes a second will exile a
+peer for traffic it did not choose to send: a client publishes presence on a
+timer, and each of those frames costs a kilobyte of budget.
 
-`selvaged` does not implement an idle deadline, and `PROTOCOL.md` §2.1 forbids closing a
-seated session for silence: a connection that answers its pings is never closed for being
-quiet. A deployment that needs one puts it in front, and the half of it that is in-process
-already is `head_timeout` (5 s): a connection that does not finish sending its request head
-inside that is closed, which is what reclaims a half-open socket before it is ever counted
-against `--max-connections`.
+`selvaged` does not implement an idle deadline, and `PROTOCOL.md` §2.1 forbids
+closing a seated session for silence: a connection that answers its pings is
+never closed for being quiet. A deployment that needs one puts it in front, and
+the half of it that is in-process already is `head_timeout` (5 s): a connection
+that does not finish sending its request head inside that is closed, which is
+what reclaims a half-open socket before it is ever counted against
+`--max-connections`.
 
 ### The first room
 
-The server mints nothing to share. It holds rooms in memory and waits for a connection;
-the client that hosts mints the room and prints the invite link. The invite is the
-permission, and the whole of it:
+The server mints nothing to share. It holds rooms in memory and waits for a
+connection; the client that hosts mints the room and prints the invite link. The
+invite is the permission, and the whole of it:
 
 ```text
 ws://HOST:PORT/session?room=<room>&token=<token>
@@ -193,27 +197,29 @@ ws://HOST:PORT/session?room=<room>&token=<token>
 Anyone holding that link can join until the room dies. Host from an editor with
 [`vscode_client`](https://github.com/selvage-protocol/vscode_client) or
 [`nvim_client`](https://github.com/selvage-protocol/nvim_client); the
-[`web_client`](https://github.com/selvage-protocol/web_client) page joins one as a guest.
-A client connected to your server is what mints a room for a friend, not the harness
-transcript.
+[`web_client`](https://github.com/selvage-protocol/web_client) page joins one as
+a guest. A client connected to your server is what mints a room for a friend,
+not the harness transcript.
 
 ### Letting someone else in
 
-The default binds loopback, so only your own machine reaches it. For a friend to join, bind
-an address they can reach and hand them a URL that names your machine:
+The default binds loopback, so only your own machine reaches it. For a friend to
+join, bind an address they can reach and hand them a URL that names your
+machine:
 
 ```sh
 nix develop . -c cargo run -p selvaged -- --listen 0.0.0.0:8080
 ```
 
-A free tunnel that forwards to your port works for a first test. Beyond that you want a
-machine with a public address (a small VPS, and the right firewall rules).
+A free tunnel that forwards to your port works for a first test. Beyond that you
+want a machine with a public address (a small VPS, and the right firewall
+rules).
 
-Plain `ws://` and `http://` is plaintext: the invite token travels in the clear, so it is
-for a tailnet, a VPN or loopback. The protocol's transport security is the deployer's to
-supply; put a TLS terminator in front (`tailscale serve`, caddy, or your edge) and hand
-out the `https://` or `wss://` URL. There is no TLS inside `selvaged`, and none is
-claimed.
+Plain `ws://` and `http://` is plaintext: the invite token travels in the clear,
+so it is for a tailnet, a VPN or loopback. The protocol's transport security is
+the deployer's to supply; put a TLS terminator in front (`tailscale serve`,
+caddy, or your edge) and hand out the `https://` or `wss://` URL. There is no
+TLS inside `selvaged`, and none is claimed.
 
 ### The checks worth running
 
@@ -224,12 +230,13 @@ nix develop . -c cargo run -p selvage-harness                  # the whole slice
 nix develop . -c cargo test                                    # unit tests and every integration suite
 ```
 
-`cargo run -p selvage-harness` runs a scripted demo transcript: it starts a server, mints
-a room, prints the invite link, walks two clients through it, and exits. `selvaged` waits
-for a client to connect instead, and a client's output carries the invite link.
+`cargo run -p selvage-harness` runs a scripted demo transcript: it starts a
+server, mints a room, prints the invite link, walks two clients through it, and
+exits. `selvaged` waits for a client to connect instead, and a client's output
+carries the invite link.
 
-`scripts/ci-local.sh` runs the same commands as `.github/workflows/ci.yml` on this machine,
-one flake check per step, and needs `nix`:
+`scripts/ci-local.sh` runs the same commands as `.github/workflows/ci.yml` on
+this machine, one flake check per step, and needs `nix`:
 
 ```sh
 scripts/ci-local.sh all        # the whole gate, and what the `checks` job runs
@@ -239,200 +246,223 @@ scripts/ci-local.sh image      # the nix-built image smoke, no Docker needed
 scripts/ci-local.sh container  # docker build, docker run and a room join (needs Docker)
 ```
 
-`all` is what the `checks` job runs; `nightly` is opt-in because it is slow. The `image`
-workflow's two buildx jobs have no step here, since this host has no Docker, let alone
-buildx; a pull request's checks are where they run.
+`all` is what the `checks` job runs; `nightly` is opt-in because it is slow. The
+`image` workflow's two buildx jobs have no step here, since this host has no
+Docker, let alone buildx; a pull request's checks are where they run.
 
-`checks`, `nightly` and `image` refuse to run when the working tree differs from `HEAD`,
-because what they build is the tracked tree at its working-tree content and CI checks out the
-committed ref: an untracked file — a new test, a new vector — is invisible to the build, so its
-green run would be of a smaller suite than CI's. Commit, or stash, before running them.
+`checks`, `nightly` and `image` refuse to run when the working tree differs from
+`HEAD`, because what they build is the tracked tree at its working-tree content
+and CI checks out the committed ref: an untracked file — a new test, a new
+vector — is invisible to the build, so its green run would be of a smaller suite
+than CI's. Commit, or stash, before running them.
 
 ## What lives here
 
-| Path | What it is |
-|---|---|
-| `crates/protocol` | the `selvage/2` session envelope, method/event/error vocabulary, invite URLs. No I/O. |
-| `crates/selvaged` | the server: rooms, membership, payload-opaque relay, `GET /meta` |
-| `crates/client` | the `selvage/2` client: the sealed frame (`sealed.rs`), the peer session (`peer.rs`), the host's producer half (`host.rs`) and the relay that puts a session on a socket (`relay.rs`) |
-| `crates/harness` | one server and the waits the integration tests share; the wire corpus's replay over `vectors/`, the runnable transcript (`cargo run -p selvage-harness`), the peer layer's two suites, and `selvage-subject`, the client the corpus's decision layer drives |
-| `vectors/` | the wire vectors and the peer corpus, vendored from the specification; `scripts/sync-vectors.sh` refreshes them |
+| Path              | What it is                                                                                                                                                                                                                                                  |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/protocol` | the `selvage/2` session envelope, method/event/error vocabulary, invite URLs. No I/O.                                                                                                                                                                       |
+| `crates/selvaged` | the server: rooms, membership, payload-opaque relay, `GET /meta`                                                                                                                                                                                            |
+| `crates/client`   | the `selvage/2` client: the sealed frame (`sealed.rs`), the peer session (`peer.rs`), the host's producer half (`host.rs`) and the relay that puts a session on a socket (`relay.rs`)                                                                       |
+| `crates/harness`  | one server and the waits the integration tests share; the wire corpus's replay over `vectors/`, the runnable transcript (`cargo run -p selvage-harness`), the peer layer's two suites, and `selvage-subject`, the client the corpus's decision layer drives |
+| `vectors/`        | the wire vectors and the peer corpus, vendored from the specification; `scripts/sync-vectors.sh` refreshes them                                                                                                                                             |
 
 ## The server's shape
 
-`selvaged` serves `ws://HOST:PORT/session` and `http://HOST:PORT/meta` on one listener. It
-keeps nothing on disk: the rooms are in memory, so keep the process running, because Ctrl-C
-ends all of them and a restart ends every room. A room outlives its **last** connection by
-the grace period (`--room-grace-ms`, 30 seconds by default); rejoining with the same invite
-link inside that window keeps the room.
+`selvaged` serves `ws://HOST:PORT/session` and `http://HOST:PORT/meta` on one
+listener. It keeps nothing on disk: the rooms are in memory, so keep the process
+running, because Ctrl-C ends all of them and a restart ends every room. A room
+outlives its **last** connection by the grace period (`--room-grace-ms`, 30
+seconds by default); rejoining with the same invite link inside that window
+keeps the room.
 
-A room holds its membership — a `peer_id`, a display name and an awareness client id per
-connection — and nothing else. It holds nothing about what those peers say: no part of the
-server reads a document payload or an awareness payload, and the relay between peers is
-opaque to both. The invite token is the permission, and the room is removed after the grace
-period with nobody in it. There are no accounts and no file access.
+A room holds its membership — a `peer_id`, a display name and an awareness
+client id per connection — and nothing else. It holds nothing about what those
+peers say: no part of the server reads a document payload or an awareness
+payload, and the relay between peers is opaque to both. The invite token is the
+permission, and the room is removed after the grace period with nobody in it.
+There are no accounts and no file access.
 
 ### One wire version
 
 The protocol is `selvage/2`. The server records membership and holds no host, no
 open-document set, no grant and no document of any kind; its method surface is
-`session.hello` and `session.rename`, and a `doc.*` request is `unknown_method` with the
-connection left open. A binary frame is a sealed frame the server relays byte for byte and
-cannot read, and no frame it authors carries a path, a role or a document name. The room's
-life is its last connection: the grace timer arms when the room's last connection ends, and
-the destruction has no recipient, so it is silent and the next connection that names the id
-is told `room_unknown`.
+`session.hello` and `session.rename`, and a `doc.*` request is `unknown_method`
+with the connection left open. A binary frame is a sealed frame the server
+relays byte for byte and cannot read, and no frame it authors carries a path, a
+role or a document name. The room's life is its last connection: the grace timer
+arms when the room's last connection ends, and the destruction has no recipient,
+so it is silent and the next connection that names the id is told
+`room_unknown`.
 
-The peer side — the sealed frame, the room state, the holds and the client's own rules — is
-specified in `PROTOCOL.md` §7.1 and §13. This server's part of it is only the relay and the
-membership.
+The peer side — the sealed frame, the room state, the holds and the client's own
+rules — is specified in `PROTOCOL.md` §7.1 and §13. This server's part of it is
+only the relay and the membership.
 
-The client's part of it is `crates/client/src/peer.rs`: `crates/client/src/sealed.rs` is
-`CANONICAL.md` §6.1's bytes, and `peer.rs` is `PROTOCOL.md` §13 on top of them — the session
-keypair and its announcement, the order of operations at a join, what may be published
-before and after a state commits the connection's key, attribution by the key that verified,
-the holds and their lease, and the two windows that end a session. It holds no socket: a
-frame goes in, the decisions come out, and every clock is a value the caller passes in, which
-is what lets the corpus drive it.
+The client's part of it is `crates/client/src/peer.rs`:
+`crates/client/src/sealed.rs` is `CANONICAL.md` §6.1's bytes, and `peer.rs` is
+`PROTOCOL.md` §13 on top of them — the session keypair and its announcement, the
+order of operations at a join, what may be published before and after a state
+commits the connection's key, attribution by the key that verified, the holds
+and their lease, and the two windows that end a session. It holds no socket: a
+frame goes in, the decisions come out, and every clock is a value the caller
+passes in, which is what lets the corpus drive it.
 
-Around it are the two halves it was written to be handed. `host.rs` is §7.1's producer — the
-room state's listing, roles and `issued` series, and the `HostStore` a host that means to keep
-hosting keeps its key and its series in — and `relay.rs` is the connection: it opens the
-WebSocket, says `session.hello` at `selvage/2`, seats the session from
-`room.created`/`room.joined`, hands every binary frame to it and every frame it produced to the
-socket, and runs its clocks on a timer of its own. §5.1's two invite forms are one reading:
-`relay::RelaySession::join` hands the link to `peer::PeerInvite::parse`, which reads the room
-and token from the query and `k` and `h` from the fragment, and the socket URL it dials has
-the fragment stripped. A fragment that is present but is not both keys is refused where the
-link is read, in this client's own words, rather than dialled: without both, the session can
-neither read a frame nor verify one. `crates/harness/tests/relay_selvaged.rs` is that pair
-against a real `selvaged`.
+Around it are the two halves it was written to be handed. `host.rs` is §7.1's
+producer — the room state's listing, roles and `issued` series, and the
+`HostStore` a host that means to keep hosting keeps its key and its series in —
+and `relay.rs` is the connection: it opens the WebSocket, says `session.hello`
+at `selvage/2`, seats the session from `room.created`/`room.joined`, hands every
+binary frame to it and every frame it produced to the socket, and runs its
+clocks on a timer of its own. §5.1's two invite forms are one reading:
+`relay::RelaySession::join` hands the link to `peer::PeerInvite::parse`, which
+reads the room and token from the query and `k` and `h` from the fragment, and
+the socket URL it dials has the fragment stripped. A fragment that is present
+but is not both keys is refused where the link is read, in this client's own
+words, rather than dialled: without both, the session can neither read a frame
+nor verify one. `crates/harness/tests/relay_selvaged.rs` is that pair against a
+real `selvaged`.
 
-Two suites hold that layer. `crates/harness/tests/peer_vectors.rs` replays the corpus's
-nineteen **frame** vectors against the sealed layer, and `crates/harness/tests/decisions.rs`
-drives its seven **decision** vectors against the client through `selvage-subject`, the binary
-that speaks the corpus's subject protocol
-(`cargo run -p selvage-harness --bin selvage-subject`). Six of the seven are about what a client
-did with a frame it was handed; the other is about the decision a link carries before any
-frame at all — §5.1's half-copied fragment — which the subject answers as a refusal in its own
-words, decided by the client library's own rule rather than by a copy of it. The
-specification's own runner can drive the same binary:
+Two suites hold that layer. `crates/harness/tests/peer_vectors.rs` replays the
+corpus's nineteen **frame** vectors against the sealed layer, and
+`crates/harness/tests/decisions.rs` drives its seven **decision** vectors
+against the client through `selvage-subject`, the binary that speaks the
+corpus's subject protocol
+(`cargo run -p selvage-harness --bin selvage-subject`). Six of the seven are
+about what a client did with a frame it was handed; the other is about the
+decision a link carries before any frame at all — §5.1's half-copied fragment —
+which the subject answers as a refusal in its own words, decided by the client
+library's own rule rather than by a copy of it. The specification's own runner
+can drive the same binary:
 
 ```
 python3 runner/run_peer.py --subject <checkout>/reference_server/target/debug/selvage-subject
 ```
 
-All seven decision vectors pass, and each goes red under the guard it declares it catches: the
-same suite removes the one guard a vector names and shows the vector fail, so a rule vector
-cannot pass by asserting nothing.
+All seven decision vectors pass, and each goes red under the guard it declares
+it catches: the same suite removes the one guard a vector names and shows the
+vector fail, so a rule vector cannot pass by asserting nothing.
 
 ## The client library and the harness
 
-`crates/client` is the `selvage/2` session: `sealed.rs` is `CANONICAL.md` §6.1's bytes,
-`peer.rs` is `PROTOCOL.md` §13's decisions on top of them, `host.rs` is §7.1's producer half
-and `relay.rs` puts a session on a socket. It reads no `/meta` before dialling: a link carries
-everything a join needs.
+`crates/client` is the `selvage/2` session: `sealed.rs` is `CANONICAL.md` §6.1's
+bytes, `peer.rs` is `PROTOCOL.md` §13's decisions on top of them, `host.rs` is
+§7.1's producer half and `relay.rs` puts a session on a socket. It reads no
+`/meta` before dialling: a link carries everything a join needs.
 `crates/harness` puts one server beside the tests that drive it, and it is also
 where the runnable transcript and the vector replay live.
 
 ## GET /meta
 
-`GET /meta` answers a JSON body with the server string (`selvaged/<version>`, the same one
-`--version` prints), the wire versions it speaks (`selvage/2`), its capabilities, and the
-keepalive and room-grace values it is configured with.
+`GET /meta` answers a JSON body with the server string (`selvaged/<version>`,
+the same one `--version` prints), the wire versions it speaks (`selvage/2`), its
+capabilities, and the keepalive and room-grace values it is configured with.
 
 ## Serving the page
 
-`selvaged --serve-page DIR` serves the browser page from the same origin as `/session` and
-`/meta`. One process, one port, one origin: the page's `/meta` read is same-origin, so it
-needs no CORS proxy, and its socket is `ws://` or `wss://` on the page's own host, so there
-is no cross-origin dial. The guest link is then a page link,
-`http://HOST:PORT/?room=<room>&token=<token>`, with no `server=` parameter.
+`selvaged --serve-page DIR` serves the browser page from the same origin as
+`/session` and `/meta`. One process, one port, one origin: the page's `/meta`
+read is same-origin, so it needs no CORS proxy, and its socket is `ws://` or
+`wss://` on the page's own host, so there is no cross-origin dial. The guest
+link is then a page link, `http://HOST:PORT/?room=<room>&token=<token>`, with no
+`server=` parameter.
 
-The page is the browser client's built `dist/`, which lives in the `web_client` repository;
-the image builds it from a pinned revision and serves it.
+The page is the browser client's built `dist/`, which lives in the `web_client`
+repository; the image builds it from a pinned revision and serves it.
 
 `web_client` also publishes the bundle as a page-only image,
-`ghcr.io/selvage-protocol/selvage-web`, whose own README owns the build, the tags and the
-runtime. It is for putting the editor on its own origin, or for one page in front of several
-servers. That second origin works because the page's socket is not CORS-bound and its
-`/meta` read is only advisory, but it costs a second port and a second thing to upgrade, and
-a link at that origin cannot reach a room's own page: the page reads the server from the
-link's own address and from nowhere else, so an invite handed to a guest there is the wire
-shape (`ws://HOST:PORT/session?room=…&token=…`), which fronting servers that serve no page
-of their own hand out anyway. One origin stays the default: this image, whose page, `/meta`
-and `/session` share one listener, and `--serve-page` from any deployment.
+`ghcr.io/selvage-protocol/selvage-web`, whose own README owns the build, the
+tags and the runtime. It is for putting the editor on its own origin, or for one
+page in front of several servers. That second origin works because the page's
+socket is not CORS-bound and its `/meta` read is only advisory, but it costs a
+second port and a second thing to upgrade, and a link at that origin cannot
+reach a room's own page: the page reads the server from the link's own address
+and from nowhere else, so an invite handed to a guest there is the wire shape
+(`ws://HOST:PORT/session?room=…&token=…`), which fronting servers that serve no
+page of their own hand out anyway. One origin stays the default: this image,
+whose page, `/meta` and `/session` share one listener, and `--serve-page` from
+any deployment.
 
 Served files carry the policy a browser needs: a media type from a pinned table,
-`Cache-Control: no-cache` for a stable name and `public, max-age=31536000, immutable` for a
-content-hashed one, `X-Content-Type-Options: nosniff`, a `Content-Security-Policy`, and
-`Referrer-Policy: no-referrer`, because an invite URL carries the room token and must not
-travel on in a `Referer` header.
+`Cache-Control: no-cache` for a stable name and
+`public, max-age=31536000, immutable` for a content-hashed one,
+`X-Content-Type-Options: nosniff`, a `Content-Security-Policy`, and
+`Referrer-Policy: no-referrer`, because an invite URL carries the room token and
+must not travel on in a `Referer` header.
 
-`scripts/container-smoke.sh` builds the image with Docker, runs it read-only with every
-capability dropped, asserts the page the image bakes, and joins a room in it with the
-harness's client engine; `scripts/ci-local.sh container` runs the same where a Docker daemon
-exists.
+`scripts/container-smoke.sh` builds the image with Docker, runs it read-only
+with every capability dropped, asserts the page the image bakes, and joins a
+room in it with the harness's client engine; `scripts/ci-local.sh container`
+runs the same where a Docker daemon exists.
 
 ## The vectors
 
 The wire protocol is described by the specification repository,
 [`selvage-protocol/specification`](https://github.com/selvage-protocol/specification):
-`PROTOCOL.md` is the prose, `CANONICAL.md` fixes the bytes of a frame, and `schema/` is the
-machine-readable model. This repository authors none of it.
+`PROTOCOL.md` is the prose, `CANONICAL.md` fixes the bytes of a frame, and
+`schema/` is the machine-readable model. This repository authors none of it.
 
-Its wire vectors are vendored here as `vectors/`, next to the harness that replays them, so
-that a plain `cargo test` and the Nix sandbox need no sibling checkout.
-`scripts/sync-vectors.sh` copies them in from a specification checkout when they change, and
-the specification remains the canonical source.
+Its wire vectors are vendored here as `vectors/`, next to the harness that
+replays them, so that a plain `cargo test` and the Nix sandbox need no sibling
+checkout. `scripts/sync-vectors.sh` copies them in from a specification checkout
+when they change, and the specification remains the canonical source.
 
-The replay reads `vectors/`, or `SELVAGE_VECTORS` when that is set. The Nix build cannot see
-outside the Cargo workspace, so `flake.nix` hands the directory in explicitly.
+The replay reads `vectors/`, or `SELVAGE_VECTORS` when that is set. The Nix
+build cannot see outside the Cargo workspace, so `flake.nix` hands the directory
+in explicitly.
 
-`crates/harness/tests/vectors.rs` is that replay: each of the corpus's 24 wire transcripts is
-driven against a server the harness starts, and every frame it answers with is compared to the
-bytes the vector writes. None of the 24 is skipped: a vector this server cannot answer is a
-defect to fix in the corpus or in the server, never a hole in the sweep. The specification's
-own runner (`runner/run_vectors.py`, against a built `selvaged`) replays the same files.
+`crates/harness/tests/vectors.rs` is that replay: each of the corpus's 24 wire
+transcripts is driven against a server the harness starts, and every frame it
+answers with is compared to the bytes the vector writes. None of the 24 is
+skipped: a vector this server cannot answer is a defect to fix in the corpus or
+in the server, never a hole in the sweep. The specification's own runner
+(`runner/run_vectors.py`, against a built `selvaged`) replays the same files.
 
 ## What this slice does not do
 
-No persistence, no accounts, no file access, no read-only guests, no E2EE, no editor
-integration. `PROTOCOL.md` §12 lists every decision the design record leaves open.
+No persistence, no accounts, no file access, no read-only guests, no E2EE, no
+editor integration. `PROTOCOL.md` §12 lists every decision the design record
+leaves open.
 
-`crates/client` hosts and joins a room over a socket (`relay.rs`, over `peer.rs` and
-`host.rs`), but no **editor adapter** drives one: the relay exposes the session's own
-observables and no editor surface, and the bridge that turns one into the other is not written
-here. Awareness is applied and not published — and not read back either — so a session shows
-no cursor, `select` is not something a driver can use, and the hello advertises
-`y-protocols/1` alone: §10 defines `awareness` as a statement that the peer publishes
-presence, so a client that advertises it while publishing none has told its peers to wait on
-cursors that never come. A dropped socket ends its session: `§9.1`'s return is unwired.
+`crates/client` hosts and joins a room over a socket (`relay.rs`, over `peer.rs`
+and `host.rs`), but no **editor adapter** drives one: the relay exposes the
+session's own observables and no editor surface, and the bridge that turns one
+into the other is not written here. Awareness is applied and not published — and
+not read back either — so a session shows no cursor, `select` is not something a
+driver can use, and the hello advertises `y-protocols/1` alone: §10 defines
+`awareness` as a statement that the peer publishes presence, so a client that
+advertises it while publishing none has told its peers to wait on cursors that
+never come. A dropped socket ends its session: `§9.1`'s return is unwired.
 
 ## Licence
 
 The server is licensed differently from everything beside it.
 
-| Path | Licence |
-|---|---|
+| Path                                                 | Licence                                                                                                         |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `crates/protocol`, `crates/client`, `crates/harness` | `MIT OR Apache-2.0`, the workspace default: [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE) |
-| `crates/selvaged` | `FSL-1.1-MIT`: [source-available, *not* open source](crates/selvaged/LICENSE) |
-| `vectors/` | vendored from the specification repository, whose material is `CC-BY-4.0` |
+| `crates/selvaged`                                    | `FSL-1.1-MIT`: [source-available, _not_ open source](crates/selvaged/LICENSE)                                   |
+| `vectors/`                                           | vendored from the specification repository, whose material is `CC-BY-4.0`                                       |
 
-`crates/selvaged/Cargo.toml` carries `publish = false`, and `cargo deny check licenses` is
-told about `FSL-1.1-MIT` for that one crate. The Functional Source License 1.1 is free for
-any non-competing purpose: a company self-hosting it internally is free, as are
-non-commercial education and research. It forbids making the software available to others in
-a commercial product or service that substitutes for it. `packaging/README.md` records what the owner accepted for this project's published
-image, and where that acceptance stops. Each release converts to MIT on the second
-anniversary of the date it was made available, irrevocably.
+`crates/selvaged/Cargo.toml` carries `publish = false`, and
+`cargo deny check licenses` is told about `FSL-1.1-MIT` for that one crate. The
+Functional Source License 1.1 is free for any non-competing purpose: a company
+self-hosting it internally is free, as are non-commercial education and
+research. It forbids making the software available to others in a commercial
+product or service that substitutes for it. The acceptance that governs this
+project's published image is stated where the image is built:
+`crates/selvaged/LICENSE` travels inside it, the
+`org.opencontainers.image.licenses` label names the licence, and `Dockerfile`
+and `.github/workflows/image.yml` record what was accepted and when. Each
+release converts to MIT on the second anniversary of the date it was made
+available, irrevocably.
 
-The harness links `selvaged`, so its own `MIT OR Apache-2.0` covers the crate while a
-redistributed `selvage-harness` binary carries FSL code with it. That redistribution must
-include the FSL terms or a link to them and retain the copyright notices; the harness's
-licence does not replace its dependency's FSL terms.
+The harness links `selvaged`, so its own `MIT OR Apache-2.0` covers the crate
+while a redistributed `selvage-harness` binary carries FSL code with it. That
+redistribution must include the FSL terms or a link to them and retain the
+copyright notices; the harness's licence does not replace its dependency's FSL
+terms.
 
 The vendored vectors are `CC-BY-4.0`
-([`selvage-protocol/specification`](https://github.com/selvage-protocol/specification)), which
-this repository does not author and redistributes with that repository as the source of the
-attribution.
+([`selvage-protocol/specification`](https://github.com/selvage-protocol/specification)),
+which this repository does not author and redistributes with that repository as
+the source of the attribution.

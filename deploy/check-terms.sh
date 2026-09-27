@@ -2,7 +2,7 @@
 #
 # The terms notice, read back out of the bytes the front serves.
 #
-#   packaging/prod/check-terms.sh
+#   deploy/check-terms.sh
 #
 # The notice lives in two places, and both are asserted here against a running
 # nginx rather than against the files that configure it:
@@ -16,9 +16,6 @@
 # a visitor receives it. A `/terms` location that 404s, a page container that
 # stops ending in `</body>`, or a licence that falls out of the notice in a
 # rewrite are all invisible to a grep of the configuration and all fail here.
-# `README.md` owns why the notice is the front's and not the page's; the
-# deployment's own isolated proof on the box is also in `README.md`, and this
-# script is the same proof's local half.
 #
 # No Docker: this host has none. The front's real configuration runs under
 # nginx from the host, or from nixpkgs when there is no nginx on `PATH`. Two
@@ -32,7 +29,7 @@
 set -euo pipefail
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-repo=$(cd -- "$here/../.." && pwd)
+repo=$(cd -- "$here/.." && pwd)
 proxy="$here/proxy"
 work="$repo/.tmp/proxy-check-terms"
 

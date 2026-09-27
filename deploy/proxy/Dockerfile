@@ -6,8 +6,8 @@
 # The image exists so that the proxy's only mount is its certificate. nginx's
 # configuration could be bind-mounted instead, but a mount is a view of the host
 # the container did not have to be given, and this deployment's stance is that
-# each container gets the fewest of those it can work with — `packaging/prod/
-# compose.yaml` names the one this service has.
+# each container gets the fewest of those it can work with — `deploy/compose.yaml`
+# names the one this service has.
 #
 # The base is pinned by the index digest the tag resolved to, not by the tag:
 # a tag is a name someone else can repoint, and this container terminates TLS

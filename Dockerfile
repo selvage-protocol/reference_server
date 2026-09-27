@@ -9,7 +9,7 @@
 # Fallback shape: the same static binary on distroless (`RUNTIME=distroless`).
 # If a future dependency ever breaks the musl build, compile a glibc binary
 # instead and keep the distroless runtime — the stage below already accepts
-# any binary at /selvaged. See packaging/README.md.
+# any binary at /selvaged.
 #
 # The image also serves the browser page: a `page` stage builds the
 # `web_client` bundle at the pinned revision below and copies it to /page,
@@ -36,7 +36,7 @@ ARG REVISION=unknown
 # is a revision of another repository, so it moves when that one releases, and a
 # wave that cuts the two together repins it before this image is cut. The image
 # records the revision it carries in `com.selvage.page.revision`.
-ARG WEB_CLIENT_SHA=d1bdb1161699c0289a46bf803d68b9a78f27b573
+ARG WEB_CLIENT_SHA=ecd07aa5daabdcc224f892784202b156b4c5f6a7
 
 # One cross-toolchain image per target, always run natively on the build host:
 # each stage cross-compiles its target triple, so building arm64 needs no
@@ -126,7 +126,7 @@ ARG WEB_CLIENT_SHA
 # The FSL-1.1-MIT licence travels inside the image (see /LICENSE) and in its
 # annotations. Pushing this image anywhere is redistribution of the binary;
 # the owner accepted GHCR distribution, and re-hosts of the published image,
-# as permitted redistribution on 2026-09-19 — see packaging/README.md.
+# as permitted redistribution on 2026-09-19.
 LABEL org.opencontainers.image.title="selvaged" \
       org.opencontainers.image.description="Memory-only reference server for the Selvage Session Protocol, serving the browser client's built page" \
       org.opencontainers.image.source="https://github.com/selvage-protocol/reference_server" \
