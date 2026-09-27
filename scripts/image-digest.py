@@ -4,8 +4,9 @@
     scripts/image-digest.py ghcr.io/selvage-protocol/selvaged:0.2.1
     sha256:87e13601f5b491fd9a4957237d037893cb78d7feeffd394682e370b3c32a35fe
 
-The deploy workflow resolves each version this way before it touches the box, and
-writes `ghcr.io/selvage-protocol/<repo>@<digest>` into `/etc/selvage/.env`. A
+The Pi's deploy workflow (`deploy-pi.yml`) resolves each version this way before
+it touches the box, and writes `ghcr.io/selvage-protocol/<repo>@<digest>` into
+the Pi's `.env`. The public demo follows tags instead (`packaging/prod/`). A
 digest rather than the tag, because a tag is a name the publisher can repoint:
 the deployment's record of what runs has to survive that, and a rollback has to
 be reproducible.

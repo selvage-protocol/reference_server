@@ -255,7 +255,8 @@
           # The guard around `packaging/prod/deploy.py`, which is the whole of the
           # public demo's privilege model: `/usr/local/sbin/selvage-deploy` is the
           # only root command the CI user on that box may run. Nothing else in this
-          # repository can see what its request grammar refuses.
+          # repository can see what its request grammar refuses, or that the compose
+          # file and the update unit agree with it.
           prod-deploy =
             pkgs.runCommand "prod-deploy-test" {
               nativeBuildInputs = [pkgs.python3];
@@ -265,16 +266,13 @@
               touch $out
             '';
 
-          # The same guard for `packaging/pi/deploy.py`, the Pi's copy of the
-          # request grammar that is the only lever a CI credential has on that
-          # box. The properties are asserted once, in `packaging/prod/test_deploy.py`,
-          # and the Pi's own test file runs that suite against this box's module;
-          # so this check needs both directories, not just the one it runs in.
+          # The same guard for `packaging/pi/deploy.py`, the Pi's request
+          # grammar, which is the only lever a CI credential has on that box.
           pi-deploy =
             pkgs.runCommand "pi-deploy-test" {
               nativeBuildInputs = [pkgs.python3];
             } ''
-              cd ${./packaging}/pi
+              cd ${./packaging/pi}
               python3 -B test_deploy.py
               touch $out
             '';

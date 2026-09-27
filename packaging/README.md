@@ -6,7 +6,7 @@ Five shapes, for five audiences:
 |---|---|---|
 | `pi/` | The live Pi demo, exactly as it runs | The two-service compose file for the tailnet, the environment file that names both images by digest, and the deploy script that box's CI user may run as root |
 | `pi-demo/` | The Pi's native shape, retired 2026-09-21 | The TLS front and the user units it ran — tracked here so a deployment artefact is reviewable, and left on the machine as the rollback recipe |
-| `prod/` | The live public demo, exactly as it runs | The TLS front, the router and the three-service compose file for one public origin — the Pi's container pattern plus a front that terminates TLS and routes — plus the deploy script that box's CI user may run as root |
+| `prod/` | The live public demo, exactly as it runs | The TLS front, the router and the three-service compose file for one public origin — the Pi's container pattern plus a front that terminates TLS and routes — plus the update timer that follows the image tags, and the deploy script that box's CI user may run as root |
 | `systemd/` | A self-hoster on their own machine | A user unit plus install docs — the proven path, generalized, with no front |
 | `Dockerfile` + `compose.yaml` | Strangers self-hosting on their own machines | A multi-arch image and a one-service compose file — never the Pi |
 The server is memory-only under all five: restarts end all rooms, and
@@ -48,7 +48,8 @@ What the acceptance stands on, all of it in the artefacts themselves:
   links `selvaged`, so a redistributed harness binary carries FSL code — the
   top-level README already says so, and the image never ships one.)
 - A published tag names the revision it was built from (`<version>-<sha>`); the
-  moving `<version>` and `latest` aliases follow only a release.
+  moving `<version>` alias follows only a release, and `latest` only a release
+  that is not a prerelease (no `-` suffix): the public demo follows it.
 - Nothing here says a *service* built on the software is permitted: a
   commercial product or service that substitutes for it is the Competing Use
   the licence still forbids.
@@ -197,9 +198,10 @@ reachable address explicitly.
 
 Image tags are `<cargo-version>-<short-sha>` (e.g. `0.1.0-e617d81`), computed
 by `scripts/image-tag.sh`, plus moving `<version>`/`latest` aliases only on
-published releases; `scripts/release-tags.sh` computes the same identity for
-the two buildx jobs and refuses a release tag whose name is not the Cargo
-version, so a tag cut from the wrong commit cannot publish a mismatch.
+published releases (`latest` never on a prerelease); `scripts/release-tags.sh`
+computes the same identity for the two buildx jobs and refuses a release tag
+whose name is not the Cargo version, so a tag cut from the wrong commit cannot
+publish a mismatch.
 `--version`, `/meta`, and `CARGO_PKG_VERSION` are already
 wired together in code (`Meta::reference`, test-enforced by
 `version_matches_what_meta_serves`); `scripts/check-server-version.sh`

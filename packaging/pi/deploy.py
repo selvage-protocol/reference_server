@@ -12,16 +12,10 @@ instead — `COMPOSE_SHA256` plus one or both image references — and every val
 may carry is matched against a fixed pattern before anything else happens. The
 argument refusal below is the second lock on that door, not the first.
 
-This is `packaging/prod/deploy.py` with this box's shape: the same grammar, the
-same staging (`.env.deploy` read by `pull`, `up` and the checks; `.env` written
-last), the same convergence assertion. What differs is the directory the box keeps
-its files in, that the two services are the page and the server with no front
-among them, and that nothing here builds an image: compose on this box has no
-`pull_policy: build` service, so there is no per-build image id to hold still and
-no `BUILDX_NO_DEFAULT_ATTESTATIONS`.
-`packaging/pi/test_deploy.py` runs the public demo's guard against this module,
-so the two copies cannot drift apart in what they refuse; the properties are
-asserted once, in `packaging/prod/test_deploy.py`.
+The request is staged in `.env.deploy`, which `pull`, `up` and the checks read,
+and `.env` is written last, once the containers have converged.
+`packaging/pi/test_deploy.py` runs the guard in `request_guard.py` against this
+module.
 
 What a request can and cannot do, because that is the whole security argument:
 

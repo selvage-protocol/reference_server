@@ -4,9 +4,23 @@ name: deploy-prod
 #
 # One job, behind the `prod` environment, which is what makes this safe to have
 # at all: the environment's required reviewer is the approval, and the
-# environment's secrets are unreadable until that approval passes. So between
-# deploys there is nothing anywhere for a compromised release workflow, a
-# compromised third-party action or a stolen repository secret to use.
+# environment's secrets are unreadable until that approval passes. So a change
+# **CI initiates** reaches the box only through an approved run: between deploys
+# a compromised workflow, a compromised third-party action or a stolen
+# repository secret has no credential for the box.
+#
+# That approval gates CI-initiated changes only. The box's update timer follows
+# the tags `/srv/selvage/.env` names, and while `.env` names `latest`, whatever
+# is published to `latest` reaches production **unapproved, within one
+# five-minute tick**, and a new `selvaged` ends every room. That means any `v*`
+# release tag of this repository (`image.yml` keeps a prerelease off `latest`),
+# any `v*` tag of `web_client`, prerelease included, since its image workflow
+# still moves `latest` for one, and anything else holding `packages: write` on
+# the organisation's GHCR, a compromised publish step or action included.
+# Pinning a version in `.env` is what puts a service back behind this approval
+# for releases. A version tag is mutable too, so a GHCR writer who overwrites
+# the pinned tag is still followed; only a digest would close that, and the
+# owner chose tags.
 #
 # How it reaches the box: `tailscale/github-action` joins the tailnet as an
 # **ephemeral** node tagged `tag:ci`, using Tailscale workload identity
@@ -30,19 +44,22 @@ name: deploy-prod
 # is proved there rather than claimed here.
 #
 # What a run may change, which is the whole of what CI can do to production:
-# **which of two already-published images runs**. The request carries two
-# digest-pinned references — resolved from the versions this dispatch names —
-# and the sha256 of `packaging/prod/compose.yaml`. The box's copy of the compose
-# file is *verified* against that hash and never written, so a run cannot add a
-# port, drop a capability, mount a certificate or raise a memory limit. An input
-# this dispatch leaves empty means "leave that service exactly as it is".
+# **which tag of two already-published images `/srv/selvage/.env` names**. The
+# request carries one tag reference per image this dispatch names, the box
+# rewrites those lines of `.env` and nothing else, and pulls and ups. The compose
+# file is the owner's to edit by hand and a run never writes it, so a run cannot
+# add a port, drop a capability, mount a certificate or raise a memory limit. An
+# input this dispatch leaves empty means "leave that line exactly as it is". The
+# box's update timer follows whatever tag `.env` names, so a dispatch is how a
+# service is pinned to a version, moved back to `latest`, or moved at once.
 #
 # What a run cannot do to a live session: the page container is separate and the
 # server's state is memory-only, so this is where that cost is written down —
 # **replacing `selvaged` ends every room on the instance.** There is no
 # drain and no room count; `/meta` is the only read besides `/session`. That is
-# why there is a human on the approval and why the dispatch is deliberate rather
-# than a tag push.
+# why a dispatch has a human on the approval and is deliberate rather than a tag
+# push. A service `.env` leaves on `latest` pays that cost on every release with
+# no approval at all (above).
 #
 # `workflow_dispatch` only: no `pull_request` and no `push` event can reach this
 # file, so no branch can deploy itself. The deploy workflow that runs is the
@@ -63,11 +80,11 @@ on:
   workflow_dispatch:
     inputs:
       server_version:
-        description: 'selvaged version to deploy (e.g. 0.4.6). Empty leaves the running one alone.'
+        description: 'selvaged tag to deploy: a version (e.g. 0.4.6) or latest. Empty leaves it alone.'
         required: false
         default: ''
       web_version:
-        description: 'selvage-web version to deploy (e.g. 0.4.6). Empty leaves the running one alone.'
+        description: 'selvage-web tag to deploy: a version (e.g. 0.4.6) or latest. Empty leaves it alone.'
         required: false
         default: ''
 
@@ -96,31 +113,34 @@ jobs:
         with:
           persist-credentials: false
 
-      # The request is built here, before the tailnet is joined and before
-      # anything reaches the box: every version is resolved to the digest the
-      # registry reports for it, so what runs is a digest and not a tag a
-      # publisher can repoint later. An input that is empty means "leave that
-      # service as it is" and its line is simply absent.
-      - name: resolve the versions to digests
+      # The request is built and checked against the box's own grammar here,
+      # before the tailnet is joined, so a malformed tag fails without touching
+      # anything. It stays a tag: the box pulls it and its deploy log names the
+      # digest the tag resolved to there, which is the record of what ran. An
+      # input that is empty means "leave that line as it is" and is simply absent.
+      - name: build the request
         env:
           SERVER_VERSION: ${{ inputs.server_version }}
           WEB_VERSION: ${{ inputs.web_version }}
         run: |
           set -euo pipefail
           request="$RUNNER_TEMP/deploy-request"
-          echo "COMPOSE_SHA256=$(sha256sum packaging/prod/compose.yaml | cut -d' ' -f1)" >"$request"
+          : >"$request"
           if [ -n "$SERVER_VERSION" ]; then
-            digest=$(scripts/image-digest.py "ghcr.io/selvage-protocol/selvaged:$SERVER_VERSION")
-            echo "SELVAGED_IMAGE=ghcr.io/selvage-protocol/selvaged@$digest" >>"$request"
+            echo "SELVAGED_IMAGE=ghcr.io/selvage-protocol/selvaged:$SERVER_VERSION" >>"$request"
           fi
           if [ -n "$WEB_VERSION" ]; then
-            digest=$(scripts/image-digest.py "ghcr.io/selvage-protocol/selvage-web:$WEB_VERSION")
-            echo "SELVAGE_WEB_IMAGE=ghcr.io/selvage-protocol/selvage-web@$digest" >>"$request"
+            echo "SELVAGE_WEB_IMAGE=ghcr.io/selvage-protocol/selvage-web:$WEB_VERSION" >>"$request"
           fi
-          if [ "$(wc -l <"$request")" -lt 2 ]; then
-            echo "nothing to deploy: name server_version, web_version or both" >&2
-            exit 1
-          fi
+          python3 -B - "$request" <<'EOF'
+          import sys
+          sys.path.insert(0, "packaging/prod")
+          import deploy
+          try:
+              deploy.parse_request(open(sys.argv[1], "rb").read())
+          except deploy.Refused as refusal:
+              sys.exit(f"refused: {refusal}")
+          EOF
           cat "$request"
 
       # `ping` and the loop below are the plan's answer to the tailnet being
@@ -157,8 +177,8 @@ jobs:
       # The only privileged thing this job does, and it is one argument-free
       # command line: `deployci` may run nothing else as root. The request goes
       # in on stdin because the sudoers rule deliberately has no argument
-      # wildcard, and the script refuses every value that is not one of the two
-      # digest-pinned images or the compose file's own sha256.
+      # wildcard, and the script refuses every value that is not a tag of one of
+      # the two images.
       - name: deploy
         run: |
           set -euo pipefail
@@ -173,7 +193,11 @@ jobs:
       # `https://127.0.0.1/meta` and the page, both naming the demo's own `Host`,
       # because the front is the server for that name and closes the connection
       # for any other one — and the run fails unless it reports the version this
-      # dispatch asked for.
+      # dispatch asked for. `/meta` reports the Cargo version, so a commit-stamped
+      # tag (`0.4.6-97ff967`) is compared by its version and a prerelease
+      # (`1.0.0-rc.1`) as it is. A tag that names no version (`latest`) has none
+      # to compare, so `/meta` is read and not compared, as it is for a page-only
+      # dispatch.
       #
       # The *public* URL is read in three shapes, and only one of them decides the
       # run. Cloudflare serves a managed challenge to a programmatic client on a
@@ -200,7 +224,11 @@ jobs:
         run: |
           set -euo pipefail
           args=(--ssh-target deployci@selvage-protocol-prod)
-          if [ -n "$SERVER_VERSION" ]; then
-            args+=(--expect-version "$SERVER_VERSION")
+          expected=$SERVER_VERSION
+          if [[ $expected =~ ^(.+)-[0-9a-f]{7,40}$ ]]; then
+            expected=${BASH_REMATCH[1]}
+          fi
+          if [[ $expected =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            args+=(--expect-version "$expected")
           fi
           scripts/verify_deploy.py "${args[@]}"

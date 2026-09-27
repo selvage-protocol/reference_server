@@ -2,7 +2,8 @@ name: deploy-pi
 
 # The button that redeploys the Pi demo, `lumi-raspberrypi` on the tailnet.
 #
-# This is `deploy-prod.yml`'s shape for the second deployment: one job, behind
+# This is the shape `deploy-prod.yml` had before the public demo moved to tags
+# and an update timer, kept for the second deployment: one job, behind
 # the `prod` environment, which is the only tailnet credential this project has.
 # The federated identity Tailscale issues the runner is constrained to
 # `repo:selvage-protocol@328844633/reference_server@1368869493:environment:prod`

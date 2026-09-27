@@ -1,0 +1,27 @@
+# Pulls the tags `/srv/selvage/.env` names and brings the deployment up to them.
+# `up -d` recreates only a service whose image or configuration changed, and the
+# front is never pulled: it is built on the box. Pruning drops the images a
+# recreation left dangling, which is what keeps the disk from filling.
+#
+# The lock is the one `/usr/local/sbin/selvage-deploy` holds for a CI deploy, so
+# the two never run compose at once; a tick that finds it taken does nothing.
+#
+# A tick runs `up -d`, so it undoes a hand `docker compose stop` or `down`: stop
+# the timer first. `Requisite=` fails a tick while Docker is stopped rather than
+# starting it again, as `Requires=` would.
+#
+# `selvage` is in the `docker` group, which is root-equivalent, so no sandboxing
+# here would bound anything. Installs to `/etc/systemd/system/`.
+[Unit]
+Description=Pull and apply the Selvage demo's images
+Wants=network-online.target
+After=network-online.target docker.service
+Requisite=docker.service
+
+[Service]
+Type=oneshot
+User=selvage
+WorkingDirectory=/srv/selvage
+ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 0 /srv/selvage/.update.lock \
+  /bin/sh -c 'docker compose pull --ignore-buildable --quiet && docker compose up -d && docker image prune --force'
+TimeoutStartSec=15min

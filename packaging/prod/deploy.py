@@ -1,62 +1,63 @@
 #!/usr/bin/env python3
-"""Deploy the public demo to two digest-pinned images.
+"""Point the public demo at published image tags, and bring it up to them.
 
 Installed by hand as `/usr/local/sbin/selvage-deploy`, root-owned and mode 0755,
 and the only command the `deployci` user may run through sudo
 (`packaging/prod/deployci.sudoers`, whose line ends in `""` so that sudo permits
 no argument at all rather than any). That confinement is why this takes **no
 arguments**: an argument to a script that reaches `docker compose` is a root shell
-with extra steps, and leaving the argument list to this program alone would put the
-entire bound inside one `sys.argv` check. The request arrives on stdin instead —
-`COMPOSE_SHA256` plus one or both image references — and every value it may carry
-is matched against a fixed pattern before anything else happens. The argument
-refusal below is the second lock on that door, not the first.
+with extra steps. The request arrives on stdin instead — one or both image
+references — and every value it may carry is matched against a fixed pattern
+before anything else happens. The argument refusal below is the second lock on
+that door, not the first.
 
 What a request can and cannot do, because that is the whole security argument:
 
-* it names published `ghcr.io/selvage-protocol/` images **by digest** and nothing
-  else — no path, no flag, no shell word, no other repository;
-* it may omit an image, which leaves that service exactly as it is;
-* it cannot edit the shape: the compose file is *verified* against the hash the
-  caller names and a mismatch stops the deploy before a container is touched. So
-  a caller cannot add a port, drop a capability, mount a certificate it should
-  not have or raise a memory limit.
+* it names a tag of one of the two published `ghcr.io/selvage-protocol/` images
+  and nothing else — no path, no flag, no shell word, no other repository;
+* it may omit an image, which leaves that line of `.env` exactly as it is;
+* it rewrites those lines of `/srv/selvage/.env` and nothing else. The compose
+  file, `proxy/` and `tls/` are the owner's to edit by hand and are never written
+  here, so a request cannot add a port, drop a capability or mount a file.
 
-A run that fails leaves the box as it found it. The references it is deploying go
-into `/etc/selvage/.env.deploy`, which is what `pull` and `up` read; `/etc/selvage/.env`,
-the intent for the next `up -d`, is written only once the containers are up and
-converged on the digests that were asked for. One bad release therefore cannot
-leave a box that reproduces it on the next `up -d`, hand or automated.
+A run that fails leaves `.env` as it found it. The new file is staged as
+`.env.deploy`, which `pull`, `up` and the convergence check read, and `.env` is
+written only once the containers run what was asked for. All of it happens under
+the lock `selvage-update.service` takes, so a timer tick cannot run compose in the
+middle of a deploy, and the first tick after a failed one brings the box back to
+what `.env` still names.
 
 The residual, plainly: a deploy request is a deployment. Whoever can send one
-chooses which of the published releases runs, ends every live room by replacing
-the server, and can downgrade the deployment to an older published release. That
-influence is the point of the thing and is the largest thing it can do.
+chooses which published tag runs, ends every live room by replacing the server,
+and can move the deployment to an older release. The content behind a tag is the
+publisher's; following tags rather than digests is the owner's choice.
 
-`README.md` beside this file owns the box's shape and its hand-install.
+`README.md` beside this file owns the box's layout and its hand-install.
 """
 
-import hashlib
+import fcntl
 import os
 import re
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
-ETC = Path("/etc/selvage")
-COMPOSE = ETC / "compose.yaml"
-ENV_FILE = ETC / ".env"
-ENV_PREV = ETC / ".env.prev"
-# Where a run stages the references it is about to deploy. `pull`, `up` and the
-# convergence check read this rather than `.env`, so a run that fails leaves the
-# persistent file naming the images that are known to work.
-ENV_STAGED = ETC / ".env.deploy"
+SRV = Path("/srv/selvage")
+ENV_FILE = SRV / ".env"
+ENV_PREV = SRV / ".env.prev"
+ENV_STAGED = SRV / ".env.deploy"
+# Shared with `selvage-update.service`, which names the same path.
+LOCK = SRV / ".update.lock"
+# A timer tick holds the lock for as long as its pull takes.
+LOCK_WAIT_SECONDS = 600.0
 
-# The two variables the compose file interpolates: which image repository each
-# may name, and which compose service it lands on.
+# The two variables the compose file interpolates, and the image repository each
+# may name, which is also the compose service it lands on.
 PINS = {
-    "SELVAGED_IMAGE": ("selvaged", "selvaged"),
-    "SELVAGE_WEB_IMAGE": ("selvage-web", "selvage-web"),
+    "SELVAGED_IMAGE": "selvaged",
+    "SELVAGE_WEB_IMAGE": "selvage-web",
 }
 SERVICES = ("proxy", "selvaged", "selvage-web")
 
@@ -64,25 +65,23 @@ SERVICES = ("proxy", "selvaged", "selvage-web")
 # is here so a caller cannot make a root process read for as long as it likes.
 MAX_REQUEST_BYTES = 4096
 
-_HEX64 = "[0-9a-f]{64}"
+# The OCI tag grammar: a version, `latest`, or a commit-stamped `<version>-<sha>`.
+_TAG = r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}"
 IMAGE_PATTERN = {
-    key: re.compile(rf"^ghcr\.io/selvage-protocol/{repo}@sha256:{_HEX64}$")
-    for key, (repo, _service) in PINS.items()
+    key: re.compile(rf"^ghcr\.io/selvage-protocol/{name}:{_TAG}$") for key, name in PINS.items()
 }
-SHA256_PATTERN = re.compile(rf"^{_HEX64}$")
-KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 class Refused(Exception):
-    """The request is not one this box acts on. Nothing has been changed."""
+    """The request is not one this box acts on, or the deploy did not converge."""
 
 
 def parse_request(data: bytes) -> dict:
     """The request, or `Refused` naming what about it is not allowed.
 
-    The grammar is deliberately narrow: `KEY=VALUE` lines, upper-case keys, no
-    blank line, no control character, no duplicate, and each value matched
-    against the one fixed shape its key admits. Nothing here is a path, and
+    The grammar is deliberately narrow: `KEY=VALUE` lines, one of the `PINS`
+    keys each, no blank line, no control character, no duplicate, and each value
+    matched against the one fixed shape its key admits. Nothing here is a path, and
     nothing here reaches a shell.
     """
     if len(data) > MAX_REQUEST_BYTES:
@@ -105,212 +104,200 @@ def parse_request(data: bytes) -> dict:
         key, separator, value = line.partition("=")
         if not separator:
             raise Refused(f"request line is not KEY=VALUE: {line!r}")
-        if not KEY_PATTERN.match(key):
-            raise Refused(f"request key is not an upper-case word: {key!r}")
+        if key not in IMAGE_PATTERN:
+            raise Refused(f"{key!r} is not a key this box acts on")
         if key in request:
             raise Refused(f"{key} appears twice")
-        if key == "COMPOSE_SHA256":
-            if not SHA256_PATTERN.match(value):
-                raise Refused(f"COMPOSE_SHA256 is not a lowercase sha256 digest: {value!r}")
-        elif key in IMAGE_PATTERN:
-            if not IMAGE_PATTERN[key].match(value):
-                raise Refused(
-                    f"{key} is not a digest-pinned "
-                    f"ghcr.io/selvage-protocol/{PINS[key][0]} reference: {value!r}"
-                )
-        else:
-            raise Refused(f"{key} is not a key this box acts on")
+        if not IMAGE_PATTERN[key].match(value):
+            raise Refused(f"{key} is not a ghcr.io/selvage-protocol/{PINS[key]}:<tag> reference: {value!r}")
         request[key] = value
 
-    if "COMPOSE_SHA256" not in request:
-        raise Refused(
-            "COMPOSE_SHA256 is required: the deploy verifies the shape rather than writing it"
-        )
-    if not any(key in request for key in PINS):
+    if not request:
         raise Refused("no image named: send SELVAGED_IMAGE, SELVAGE_WEB_IMAGE or both")
     return request
 
 
-def read_env(text: str) -> dict:
-    """The pins in an `.env` file. Anything else in the file is not this box's business."""
-    pins = {}
-    for line in text.split("\n"):
-        key, separator, value = line.strip().partition("=")
-        if separator and key in PINS:
-            pins[key] = value.strip()
-    return pins
+def rewrite_env(text: str, requested: dict) -> str:
+    """`text` with each requested key's line replaced, and every other line kept.
 
-
-def resolve_pins(current: dict, requested: dict) -> dict:
-    """The two references the next `up` runs: what was asked for, else what is there."""
-    pins = {}
-    for key in PINS:
-        value = requested.get(key, current.get(key))
-        if value is None:
-            raise Refused(f"{key} is in neither the request nor {ENV_FILE}")
-        if not IMAGE_PATTERN[key].match(value):
-            raise Refused(
-                f"{key} in {ENV_FILE} is not a reference this box deploys, and a request that "
-                f"leaves it alone cannot fix that: {value!r}"
-            )
-        pins[key] = value
-    return pins
-
-
-def render_env(pins: dict) -> str:
-    return (
-        "# Generated by /usr/local/sbin/selvage-deploy: the two published images the next\n"
-        "# `docker compose up -d` runs. Digests, not tags, because a tag is a name the\n"
-        "# publisher can repoint. The file this replaced is .env.prev; the explained copy is\n"
-        "# .env.example, and README.md beside it owns the shape.\n"
-        + "".join(f"{key}={pins[key]}\n" for key in PINS)
-    )
-
-
-def compose_environment() -> dict:
-    """`docker compose`'s environment, and the one variable that must be in it.
-
-    Compose rebuilds `proxy` on every `up` — its `pull_policy` is `build`, which
-    is what makes a change to `proxy/` reach the running container. With
-    BuildKit's default attestations the resulting manifest, and so the image ID,
-    is stamped per build even when the content is byte-identical, and compose
-    recreates any container whose image ID moved. Without this, every deploy
-    replaces the front and drops the WebSockets through it, a deploy that
-    changed nothing included. The front's image is local only and nothing is
-    published from it, so the attestations are worth nothing here.
+    A key the file does not have is appended. Comments, blank lines and anything
+    the owner added by hand come through byte for byte.
     """
-    environment = dict(os.environ)
-    environment["BUILDX_NO_DEFAULT_ATTESTATIONS"] = "1"
-    return environment
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    seen = set()
+    for index, line in enumerate(lines):
+        key = line.strip().partition("=")[0].strip()
+        if key in requested:
+            lines[index] = f"{key}={requested[key]}"
+            seen.add(key)
+    lines.extend(f"{key}={value}" for key, value in requested.items() if key not in seen)
+    return "".join(f"{line}\n" for line in lines)
+
+
+def read_env() -> str:
+    """The current `.env`, never through a link."""
+    try:
+        descriptor = os.open(ENV_FILE, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return ""
+    with os.fdopen(descriptor, encoding="utf-8") as handle:
+        try:
+            return handle.read()
+        except UnicodeDecodeError as error:
+            raise Refused(f"{ENV_FILE} is not UTF-8, so it is not rewritten: {error}") from error
+
+
+def atomic_write(path: Path, text: str) -> None:
+    """Replace `path` with `text`, mode 0600, owned by whoever owns the directory.
+
+    The file is created fresh beside its target and renamed over it, so an
+    existing link at `path` is replaced rather than followed. The directory's
+    owner is `selvage`, whose compose and timer read these files.
+    """
+    owner = os.stat(path.parent)
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            os.fchown(handle.fileno(), owner.st_uid, owner.st_gid)
+            handle.write(text)
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def record(request: dict) -> bool:
+    """Write the requested lines into `.env`, keeping the file it replaces as `.env.prev`.
+
+    Called only once the containers have converged. `.env` is read again here
+    rather than reused from the start of the deploy, because hand commands do not
+    take the lock: an edit made to it while `pull` and `up` ran survives, and
+    `.env.prev` is the file actually replaced. A no-op leaves both files alone, so
+    `.env.prev` keeps naming the last real previous state.
+    """
+    current = read_env()
+    text = rewrite_env(current, request)
+    if text == current:
+        return False
+    atomic_write(ENV_PREV, current)
+    atomic_write(ENV_FILE, text)
+    return True
+
+
+def take_lock() -> int:
+    """Hold the lock the update timer takes, waiting out a tick in progress."""
+    descriptor = os.open(LOCK, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return descriptor
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(descriptor)
+                raise Refused(
+                    f"{LOCK} is still held after {LOCK_WAIT_SECONDS:.0f}s; "
+                    f"`systemctl status selvage-update.service` shows what holds it"
+                ) from None
+            time.sleep(1)
 
 
 def compose_argv(env_file: Path, *arguments: str) -> list[str]:
-    """The project's own command line, spelled once.
+    """The project's command line, run in `SRV` as the timer and every hand command are.
 
-    `--project-directory /etc/selvage` is what makes the front's relative build
-    context resolve, and the compose file's `name:` is what names the project, so
-    nothing here needs `-p`. `--env-file` is explicit and is the caller's: a
-    deploy reads the staged file, and everything else reads the persistent one.
+    No `-f`: Compose finds `compose.yaml` in the working directory, and a
+    `compose.override.yaml` beside it too, so a deploy runs the same shape the
+    next tick does. `--env-file` replaces `.env`, which is how the staged file is
+    read instead.
     """
-    return [
-        "docker",
-        "compose",
-        "--project-directory",
-        str(ETC),
-        "-f",
-        str(COMPOSE),
-        "--env-file",
-        str(env_file),
-        *arguments,
-    ]
+    return ["docker", "compose", "--env-file", str(env_file), *arguments]
 
 
 def compose(env_file: Path, *arguments: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        compose_argv(env_file, *arguments), env=compose_environment(), text=True, check=False
-    )
+    return subprocess.run(compose_argv(env_file, *arguments), cwd=SRV, text=True, check=False)
 
 
 def run(argv: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, text=True, capture_output=True, check=False)
+    return subprocess.run(argv, cwd=SRV, text=True, capture_output=True, check=False)
 
 
 def image_id(reference: str) -> str:
     return run(["docker", "image", "inspect", "--format", "{{.Id}}", reference]).stdout.strip()
 
 
-def service_state(service: str, env_file: Path = ENV_FILE) -> dict:
-    """The container this service is running, or `{}` when there is none.
+def repo_digest(reference: str) -> str:
+    """What the tag named when this box pulled it: the record of what was deployed."""
+    listed = run(
+        ["docker", "image", "inspect", "--format", '{{join .RepoDigests " "}}', reference]
+    )
+    return listed.stdout.strip() or "-"
 
-    The env file only decides which *image references* compose would use; `ps`
-    finds the project's containers either way, because the project's name comes
-    from the compose file.
-    """
+
+def service_state(service: str, env_file: Path) -> tuple[str, str]:
+    """The image and status of the container this service runs, or `("", "")`."""
     listed = run(compose_argv(env_file, "ps", "-q", "--all", service))
     container = listed.stdout.strip().split("\n")[0].strip()
     if not container:
-        return {}
-    inspected = run(
-        [
-            "docker",
-            "inspect",
-            "--format",
-            "{{.Id}}|{{.State.StartedAt}}|{{.Image}}|{{.State.Status}}",
-            container,
-        ]
-    )
+        return "", ""
+    inspected = run(["docker", "inspect", "--format", "{{.Image}}|{{.State.Status}}", container])
     if inspected.returncode != 0:
-        return {}
-    identifier, started, image, status = inspected.stdout.strip().split("|")
-    return {"id": identifier, "started": started, "image": image, "status": status}
+        return "", ""
+    image, _, status = inspected.stdout.strip().partition("|")
+    return image, status
 
 
-def verdict(before: dict, after: dict) -> str:
-    """What `up` did to one service, which is the thing the run has to report."""
-    if not before:
-        return "created" if after else "absent"
-    if not after:
-        return "removed"
-    if before["id"] != after["id"]:
-        return "recreated"
-    if before["started"] != after["started"]:
-        return "restarted"
-    return "unchanged"
+def assert_converged(request: dict, env_file: Path) -> None:
+    """Every service runs, and each requested one runs the image its tag pulled."""
+    for service in SERVICES:
+        _image, status = service_state(service, env_file)
+        if status != "running":
+            raise Refused(f"{service} is {status or 'missing'} after `up -d`, not running")
+    for key, reference in request.items():
+        pulled = image_id(reference)
+        if not pulled:
+            raise Refused(f"{reference} is not in the local image store after `pull`")
+        image, _status = service_state(PINS[key], env_file)
+        if image != pulled:
+            raise Refused(f"{PINS[key]} runs {image} but {reference} is {pulled}")
 
 
-def atomic_write(path: Path, text: str) -> None:
-    temporary = path.with_name(path.name + ".new")
-    temporary.write_text(text, encoding="utf-8")
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
+def deploy(request: dict) -> None:
+    named = [PINS[key] for key in PINS if key in request]
 
+    print("=== request ===")
+    for key in PINS:
+        if key in request:
+            print(f"{key}={request[key]}")
 
-def record(pins: dict, written: str) -> bool:
-    """Write the references into `.env`, keeping the file it replaces as `.env.prev`.
+    atomic_write(ENV_STAGED, rewrite_env(read_env(), request))
 
-    The previous file is the box's own record of what the deploy moved off, so
-    that a rollback is a hand edit against a file that exists rather than a
-    reconstruction from a log. It is written only when the content actually
-    changes, so a no-op deploy does not overwrite the last real previous state.
+    print(f"=== pull {' '.join(named)} ===")
+    if compose(ENV_STAGED, "pull", *named).returncode != 0:
+        raise Refused(f"`docker compose pull {' '.join(named)}` failed; {ENV_FILE} was not written")
 
-    This is called **after** the new containers are up and converged, never
-    before: the file is the deployment's intent for the *next* `up -d`, and a run
-    that failed must leave it naming the images that are known to work rather
-    than the ones that just failed to come up.
-    """
-    rendered = render_env(pins)
-    if rendered == written:
-        return False
-    ENV_PREV.write_bytes(written.encode("utf-8"))
-    os.chmod(ENV_PREV, 0o600)
-    atomic_write(ENV_FILE, rendered)
-    return True
+    print("=== up -d ===")
+    if compose(ENV_STAGED, "up", "-d").returncode != 0:
+        raise Refused(
+            f"`docker compose up -d` failed; {ENV_FILE} was not written, and the next "
+            f"update tick goes back to what it names"
+        )
 
+    assert_converged(request, ENV_STAGED)
 
-def stage(pins: dict) -> None:
-    """Put the references where this run's `pull`, `up` and checks will read them."""
-    atomic_write(ENV_STAGED, render_env(pins))
+    if record(request):
+        print(f"wrote {ENV_FILE}; the file it replaced is {ENV_PREV}")
+    else:
+        print(f"{ENV_FILE} already named these")
+    ENV_STAGED.unlink(missing_ok=True)
 
-
-def short(identifier: str) -> str:
-    """Enough of a container or image id to read; the comparison is on the whole thing."""
-    return identifier.replace("sha256:", "")[:12] or "-"
-
-
-def assert_converged(pins: dict, env_file: Path = ENV_FILE) -> None:
-    for key, (repository, service) in PINS.items():
-        wanted = image_id(pins[key])
-        state = service_state(service, env_file)
-        if not wanted:
-            raise Refused(f"{pins[key]} is not in the local image store after `pull`")
-        if not state:
-            raise Refused(f"{service} has no container after `up -d`")
-        if state["image"] != wanted:
-            raise Refused(
-                f"{service} runs {state['image']} but {repository} {pins[key]} is {wanted}"
-            )
-        if state["status"] != "running":
-            raise Refused(f"{service} is {state['status']} after `up -d`, not running")
+    print("=== deployed ===")
+    for key in PINS:
+        if key in request:
+            print(f"{request[key]} = {repo_digest(request[key])}")
+    compose(ENV_FILE, "ps")
 
 
 def main(argv: list[str]) -> int:
@@ -323,67 +310,11 @@ def main(argv: list[str]) -> int:
 
     try:
         request = parse_request(sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1))
-        written = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.exists() else ""
-        current = read_env(written)
-        pins = resolve_pins(current, request)
-
-        actual = hashlib.sha256(COMPOSE.read_bytes()).hexdigest()
-        if actual != request["COMPOSE_SHA256"]:
-            raise Refused(
-                f"{COMPOSE} is not the shape the request names: it is {actual}, the request "
-                f"says {request['COMPOSE_SHA256']}. The deploy verifies the shape and never "
-                f"writes it; a shape change is a hand install"
-            )
-
-        named = [PINS[key][1] for key in PINS if key in request]
-        print("=== request ===")
-        print(f"COMPOSE_SHA256={request['COMPOSE_SHA256']}  ({COMPOSE})")
-        for key in PINS:
-            change = "requested" if key in request else "left as it is"
-            print(f"{key}={pins[key]}  ({change})")
-
-        before = {service: service_state(service) for service in SERVICES}
-
-        # The references this run is about to deploy go into their own file, and
-        # `pull`, `up` and every check below read that one. `.env` is written only
-        # once they are up and converged, so a run that fails leaves the box's own
-        # record of its intent naming the images that are known to work — and the
-        # next `up -d`, hand or automated, goes back to them.
-        stage(pins)
-
-        print(f"=== pull {' '.join(named)} ===")
-        pulled = compose(ENV_STAGED, "pull", *named)
-        if pulled.returncode != 0:
-            raise Refused(
-                f"`docker compose pull {' '.join(named)}` failed; {ENV_STAGED} holds the "
-                f"references that were being deployed and {ENV_FILE} was not written"
-            )
-
-        print("=== up -d ===")
-        if compose(ENV_STAGED, "up", "-d").returncode != 0:
-            raise Refused(
-                f"`docker compose up -d` failed; {ENV_STAGED} holds the references that "
-                f"were being deployed and {ENV_FILE} was not written"
-            )
-
-        assert_converged(pins, ENV_STAGED)
-
-        if record(pins, written):
-            print(f"wrote {ENV_FILE}; the file it replaced is {ENV_PREV}")
-        else:
-            print(f"{ENV_FILE} already records both references")
-        ENV_STAGED.unlink(missing_ok=True)
-
-        print("=== containers ===")
-        for service in SERVICES:
-            was, now = before[service], service_state(service)
-            print(
-                f"{service:12} {verdict(was, now):10} "
-                f"status={now.get('status', 'absent'):9} "
-                f"started {was.get('started', '-')} -> {now.get('started', '-')}  "
-                f"image {short(was.get('image', ''))} -> {short(now.get('image', ''))}"
-            )
-        print("=== deployed ===")
+        lock = take_lock()
+        try:
+            deploy(request)
+        finally:
+            os.close(lock)
         return 0
     except Refused as refusal:
         print(f"refused: {refusal}", file=sys.stderr)
