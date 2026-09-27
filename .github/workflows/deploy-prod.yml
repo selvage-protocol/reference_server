@@ -1,24 +1,38 @@
 name: deploy-prod
 
-# The button that redeploys the public demo, `selvage-demo.dontblameme.dev`.
+# The button that redeploys the public demo, `selvage-demo.dontblameme.dev`, from
+# what is already published.
 #
-# One job, behind the `prod` environment, which is what makes this safe to have
-# at all: the environment's required reviewer is the approval, and the
-# environment's secrets are unreadable until that approval passes. So a change
-# **CI initiates** reaches the box only through an approved run: between deploys
-# a compromised workflow, a compromised third-party action or a stolen
-# repository secret has no credential for the box.
+# **There is no approval gate on it.** This job used to declare
+# `environment: prod`, whose required reviewer was the owner; that environment has
+# been deleted, and the credential below is bound to the **ref** instead. The
+# tailnet's federated identity is constrained to exactly
+# `repo:selvage-protocol@328844633/reference_server@1368869493:ref:refs/heads/main` —
+# the immutable form, with the owner's and the repository's numeric ids, because
+# this organisation has ID-based OIDC subject claims enabled, and the plain form is
+# rejected with a 403 at the exchange. So this workflow runs on `main` and nowhere
+# else, and the *credential* is what enforces it: a dispatch at a tag or another
+# branch presents `…:ref:refs/heads/<other>` and is refused at the exchange. A job
+# that **declares an environment** is refused as well, which is why no such line
+# is left in this file: it would present `…:environment:prod`, and nothing in the
+# console matches that any more.
 #
-# That approval gates CI-initiated changes only. The box's update timer follows
-# the tags `/srv/selvage/.env` names, and while `.env` names `latest`, whatever
-# is published to `latest` reaches production **unapproved, within one
+# What the deleted environment used to bound, written down because it is no longer
+# a bound: a change **CI initiates** now reaches the box with no human in the loop.
+# A compromised workflow, a compromised third-party action or a stolen repository
+# secret has a credential for the box. What is left is the box's own bound — the
+# two argument-free root commands below — and how little this dispatch can express.
+#
+# The box's update timer is unaffected by any of that, and remains the second way
+# production moves. It follows the tags `/srv/selvage/.env` names, and while `.env`
+# names `latest`, whatever is published to `latest` reaches production **within one
 # five-minute tick**, and a new `selvaged` ends every room. That means any `v*`
 # release tag of this repository (`image.yml` keeps a prerelease off `latest`),
 # any `v*` tag of `web_client`, prerelease included, since its image workflow
 # still moves `latest` for one, and anything else holding `packages: write` on
 # the organisation's GHCR, a compromised publish step or action included.
-# Pinning a version in `.env` is what puts a service back behind this approval
-# for releases. A version tag is mutable too, so a GHCR writer who overwrites
+# Pinning a version in `.env` is what makes a release a deliberate change rather
+# than a tick. A version tag is mutable too, so a GHCR writer who overwrites
 # the pinned tag is still followed; only a digest would close that, and the
 # owner chose tags.
 #
@@ -26,16 +40,9 @@ name: deploy-prod
 # **ephemeral** node tagged `tag:ci`, using Tailscale workload identity
 # federation — a client id and an audience, which Tailscale's own documentation
 # says are not secrets, exchanged for a short-lived node together with a
-# GitHub-signed OIDC token whose `sub` claim carries this job's environment. The
-# tailnet's federated identity is constrained to exactly
-# `repo:selvage-protocol@328844633/reference_server@1368869493:environment:prod` —
-# the immutable form, with the owner's and the repository's numeric ids, because
-# this organisation has ID-based OIDC subject claims enabled; the plain form is
-# rejected with a 403 at the exchange. That is why the
-# `environment:` line below matters: a job without it is still issued a token, but
-# the claim names the ref rather than the environment, so that rule rejects the
-# exchange. With the line, the approval gate and the credential's scope are the
-# same condition and cannot drift apart.
+# GitHub-signed OIDC token whose `sub` claim carries this run's ref. With the
+# environment gone, the pair lives in this repository's secrets rather than in an
+# environment's, and the ref above is the whole of what the exchange checks.
 #
 # Then Tailscale SSH as `deployci`, a local user on the box with no password, no
 # key and two permitted root commands — `/usr/local/sbin/selvage-deploy`, whose
@@ -45,24 +52,31 @@ name: deploy-prod
 # policy's `ssh` rules have no `cmd` field), so the bound lives on the box and
 # is proved there rather than claimed here.
 #
-# What a run may change, and the whole of what this dispatch can do to
-# production: **which tag of two already-published images `/srv/selvage/.env`
-# names**. The
-# request carries one tag reference per image this dispatch names, the box
-# rewrites those lines of `.env` and nothing else, and pulls and ups. The compose
-# file is not in this request and a run never writes it, so a run cannot
-# add a port, drop a capability, mount a certificate or raise a memory limit. An
-# input this dispatch leaves empty means "leave that line exactly as it is". The
-# box's update timer follows whatever tag `.env` names, so a dispatch is how a
-# service is pinned to a version, moved back to `latest`, or moved at once.
+# What a run may change, and the whole of what this dispatch can do to production.
+# Two halves, and the second is opt-in:
+#
+#   * **which tag of two already-published images `/srv/selvage/.env` names**. The
+#     request carries one tag reference per image this dispatch names, the box
+#     rewrites those lines of `.env` and nothing else, and pulls and ups. An input
+#     this dispatch leaves empty means "leave that line exactly as it is". The
+#     box's update timer follows whatever tag `.env` names, so a dispatch is how a
+#     service is pinned to a version, moved back to `latest`, or moved at once.
+#   * **the box's shape**, and only with `install_shape=true`: `compose.yaml` and
+#     `proxy/` as this run's own ref carries them, installed by
+#     `selvage-install-shape` and read back against the tracked files afterwards.
+#     That is a bigger lever than the request above — `compose.yaml` is where a
+#     published port, a capability, a mount and a memory limit live — and it is the
+#     tracked, reviewed pair on `main` or nothing, because the archive is taken
+#     from the ref this run is on. The release workflow sets this input when a
+#     release moved `deploy/`, which is the half of a shape change CI can do for
+#     itself; the two scripts and their sudoers lines stay hand work.
 #
 # What a run cannot do to a live session: the page container is separate and the
 # server's state is memory-only, so this is where that cost is written down —
 # **replacing `selvaged` ends every room on the instance.** There is no
 # drain and no room count; `/meta` is the only read besides `/session`. That is
-# why a dispatch has a human on the approval and is deliberate rather than a tag
-# push. A service `.env` leaves on `latest` pays that cost on every release with
-# no approval at all (above).
+# why a dispatch is deliberate rather than a tag push, and why it is the release
+# workflow that reaches for it rather than a tag doing it on its own.
 #
 # `workflow_dispatch` only: no `pull_request` and no `push` event can reach this
 # file, so no branch can deploy itself. The deploy workflow that runs is the
@@ -90,9 +104,15 @@ on:
         description: 'selvage-web tag to deploy: a version (e.g. 0.4.6) or latest. Empty leaves it alone.'
         required: false
         default: ''
+      install_shape:
+        description: "Install the box's shape (compose.yaml and proxy/) from this run's ref, then deploy"
+        required: false
+        default: false
+        type: boolean
 
-# Two deploys never interleave, and a queued one is not silently dropped: an
-# approval gate in front of a run that another run cancels is a gate that lies.
+# Two deploys never interleave, and a queued one is not silently dropped: a run that
+# another run cancelled would leave the box wherever it had got to, with no record
+# of what it had already changed.
 concurrency:
   group: deploy-prod
   cancel-in-progress: false
@@ -104,10 +124,9 @@ jobs:
   deploy:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    environment: prod
     # `id-token: write` is what mints the OIDC token the Tailscale federated
-    # identity exchange needs, and it is only obtainable because this job names
-    # the environment above. Nothing here needs a write to the repository.
+    # identity exchange needs; its `sub` claim names this run's ref, which is the
+    # subject the console holds. Nothing here needs a write to the repository.
     permissions:
       contents: read
       id-token: write
@@ -177,7 +196,57 @@ jobs:
             sleep 5
           done
 
-      # The only privileged thing this job does, and it is one argument-free
+      # The box's shape, and only when one is owed — the release workflow sets this
+      # input when `deploy/` moved since the previous release. `git archive` takes the
+      # two tracked paths from **this run's ref**, which is `main`, and the stream goes
+      # in on stdin because the sudoers line permits no argument at all. The installer
+      # is idempotent, so a stream the box already holds writes nothing and restarts
+      # nothing, and a bad entry is refused with the box untouched.
+      - name: install the box's shape from this ref
+        if: inputs.install_shape
+        env:
+          SHAPE_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git archive --format=tar "$SHAPE_REF:deploy" compose.yaml proxy \
+            | ssh -o BatchMode=yes -o ConnectTimeout=10 \
+                deployci@selvage-protocol-prod \
+                '/usr/bin/sudo /usr/local/sbin/selvage-install-shape'
+
+      # Nothing checks the installed shape against the tracked one — neither the
+      # deploy nor the timer ever writes it — so this does, by the runbook's own
+      # comparison (`docs/runbook-prod-demo.md`, *Changing the shape*): each file's
+      # digest here against its digest there. Only the two entries the installer
+      # owns are compared, because `.env` is the box's and is not installed.
+      - name: read the installed shape back
+        if: inputs.install_shape
+        run: |
+          set -euo pipefail
+          box=deployci@selvage-protocol-prod
+          mapfile -t names < <(git ls-files deploy/compose.yaml deploy/proxy | sed 's|^deploy/||')
+          paths=()
+          for name in "${names[@]}"; do
+            paths+=("/srv/selvage/$name")
+          done
+          installed=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$box" "sha256sum ${paths[*]}")
+          agreed=1
+          for name in "${names[@]}"; do
+            tracked=$(sha256sum "deploy/$name" | cut -d' ' -f1)
+            there=$(printf '%s\n' "$installed" | awk -v p="/srv/selvage/$name" '$2 == p { print $1 }')
+            if [ "$tracked" = "$there" ]; then
+              echo "same: $name"
+            else
+              agreed=0
+              echo "differs: $name (tracked $tracked, installed ${there:-unreadable})" >&2
+            fi
+          done
+          if [ "$agreed" != 1 ]; then
+            echo "the installed shape is not the tracked one; a proxy/ left half-installed goes on serving the configuration from before" >&2
+            exit 1
+          fi
+          echo "the installed shape agrees with $GITHUB_REF_NAME for ${#names[@]} files"
+
+      # The other privileged thing this job does, and it is one argument-free
       # command line: `deployci` may run nothing else as root. The request goes
       # in on stdin because the sudoers rule deliberately has no argument
       # wildcard, and the script refuses every value that is not a tag of one of
