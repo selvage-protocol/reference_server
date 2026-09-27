@@ -8,15 +8,15 @@
 # Needs a Docker daemon with the compose plugin and the dev shell's cargo (the
 # join is a real client, not a hand-written frame): `.github/workflows/image.yml`
 # runs it on a runner that has all of them. Proves, in order: `docker build`
-# succeeds; `compose.yaml` carries the hardened run a self-hoster gets; the
-# container actually runs that way (read-only root filesystem, every capability
-# dropped, no-new-privileges, nothing mounted); the container's own binary and
-# `/meta` report the version and wire version `Cargo.toml` names; the page baked
-# into the image is served with the headers the static handler pins, a
-# content-hashed name being immutable and a stable one revalidating; the client
-# engine mints a room in that container, joins it as a guest, and converges on
-# an edit over the container's socket; and a mounted page still overrides the
-# baked one.
+# succeeds; `compose.yaml` carries the hardened two-container run a self-hoster
+# gets; the container actually runs that way (read-only root filesystem, every
+# capability dropped, no-new-privileges, nothing mounted); the container's own
+# binary and `/meta` report the version and wire version `Cargo.toml` names; the
+# image carries no page, so its root answers `404`; the client engine mints a room
+# in that container, joins it as a guest, and converges on an edit over the
+# container's socket; and a page directory mounted over the server's page root
+# and handed to `--serve-page` is served with the headers the static handler
+# pins, a content-hashed name being immutable and a stable one revalidating.
 set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -88,47 +88,68 @@ import json
 import os
 import sys
 
-service = json.loads(os.environ["COMPOSE_JSON"])["services"]["selvaged"]
+services = json.loads(os.environ["COMPOSE_JSON"])["services"]
 failures = []
 
-if service.get("read_only") is not True:
-    failures.append(f"read_only is {service.get('read_only')!r}, want true")
-if service.get("cap_drop") != ["ALL"]:
-    failures.append(f"cap_drop is {service.get('cap_drop')!r}, want ['ALL']")
-if not any(
-    opt.startswith("no-new-privileges")
-    for opt in service.get("security_opt", [])
-):
+if set(services) != {"selvaged", "selvage-web"}:
     failures.append(
-        f"security_opt is {service.get('security_opt')!r}, "
-        "want no-new-privileges among it"
+        f"services are {sorted(services)!r}, want the server and the page"
     )
-# Nothing mounted: no host socket — a Docker socket above all — and no writable
-# path, because the image carries the page and the server keeps nothing on disk.
-if service.get("volumes"):
+
+for name, service in sorted(services.items()):
+    if service.get("read_only") is not True:
+        failures.append(f"{name}: read_only is {service.get('read_only')!r}, want true")
+    if service.get("cap_drop") != ["ALL"]:
+        failures.append(f"{name}: cap_drop is {service.get('cap_drop')!r}, want ['ALL']")
+    if not any(
+        opt.startswith("no-new-privileges")
+        for opt in service.get("security_opt", [])
+    ):
+        failures.append(
+            f"{name}: security_opt is {service.get('security_opt')!r}, "
+            "want no-new-privileges among it"
+        )
+    # Nothing mounted: no host socket — a Docker socket above all — and no writable
+    # path, because the server keeps nothing on disk and the page travels in its
+    # own image.
+    if service.get("volumes"):
+        failures.append(
+            f"{name}: volumes is {service['volumes']!r}, want none: nothing on the "
+            "host is bound into a public deployment's container"
+        )
+    if service.get("privileged"):
+        failures.append(f"{name}: privileged is set, want it unset")
+    for key in ("network_mode", "pid", "ipc"):
+        if service.get(key) == "host":
+            failures.append(f"{name}: {key} is host, want the container's own")
+
+# The page is the one published port, on loopback: the server is reached from the
+# page's container and from nowhere else. A self-hoster who wants a client to dial
+# the server directly adds that port deliberately.
+if services.get("selvaged", {}).get("ports"):
+    failures.append(f"selvaged publishes {services['selvaged']['ports']!r}, want none")
+published = [
+    (str(port.get("published")), port.get("target"), port.get("host_ip"))
+    for port in services.get("selvage-web", {}).get("ports") or []
+]
+if published != [("8080", 8080, "127.0.0.1")]:
     failures.append(
-        f"volumes is {service['volumes']!r}, want none: nothing on the host is "
-        "bound into a public deployment's container"
+        f"selvage-web publishes {published!r}, want 8080 on 127.0.0.1 and nothing else"
     )
-if service.get("privileged"):
-    failures.append("privileged is set, want it unset")
-for key in ("network_mode", "pid", "ipc"):
-    if service.get(key) == "host":
-        failures.append(f"{key} is host, want the container's own")
 
 if failures:
     print("\n".join(failures), file=sys.stderr)
     sys.exit(1)
 print(
-    "compose OK: read-only root filesystem, all capabilities dropped, "
-    "no-new-privileges, nothing mounted"
+    "compose OK: both services read-only, all capabilities dropped, "
+    "no-new-privileges, nothing mounted; only the page publishes a port, on loopback"
 )
 EOF
 
 echo "=== build: docker build of the repository's Dockerfile ==="
 docker build --tag "$image" .
 
-echo "=== run: the hardened container, its own command, the page baked in ==="
+echo "=== run: the hardened container, its own command ==="
 docker run --detach --name "$name" "${hardening[@]}" \
   --publish "127.0.0.1:$port:8080" \
   "$image"
@@ -180,45 +201,16 @@ EOF
 image_version="$(docker run --rm "${hardening[@]}" "$image" --version)"
 scripts/check-server-version.sh "http://127.0.0.1:$port" "$version" "$image_version"
 
-echo "=== page: the page baked into the image, served with no mount ==="
+# No page in the image: the root answers 404, and only `/meta` and `/session` are
+# served. A page is a directory an operator mounts and names with `--serve-page`,
+# which the override below exercises.
 base="http://127.0.0.1:$port"
-baked="$report_dir/baked"
-mkdir -p "$baked"
-curl -sS --fail --max-time 10 -D "$baked/index.headers" \
-  -o "$baked/index.html" "$base/"
-curl -sS --fail --max-time 10 -D "$baked/app.headers" \
-  -o "$baked/app.js" "$base/app.js"
-curl -sS --fail --max-time 10 -D "$baked/manifest.headers" \
-  -o "$baked/site.webmanifest" "$base/site.webmanifest"
-
-require_header "$baked/index.headers" "HTTP/1.1 200 OK"
-require_header "$baked/index.headers" "content-type: text/html; charset=utf-8"
-require_header "$baked/index.headers" "cache-control: no-cache"
-require_header "$baked/index.headers" "referrer-policy: no-referrer"
-require_header "$baked/index.headers" "x-content-type-options: nosniff"
-require_header "$baked/index.headers" "content-security-policy: default-src 'none'"
-require_body "$baked/index.html" "<title>Selvage"
-require_header "$baked/app.headers" "content-type: text/javascript; charset=utf-8"
-require_header "$baked/app.headers" "cache-control: no-cache"
-# The served bundle must name the wire this server seats: the page the image
-# bakes is built from the `WEB_CLIENT_SHA` the Dockerfile pins, and one built
-# from a revision that names another wire cannot join the container beside it.
-require_body "$baked/app.js" "selvage/2"
-require_header "$baked/manifest.headers" "content-type: application/manifest+json; charset=utf-8"
-
-# A content-hashed chunk, named by the bundle the image carries rather than by
-# this script: its name is the hash of its bytes, so it can never change under
-# that name and the policy may pin it. An extraction that found nothing would
-# otherwise report the page clean without having read it.
-chunk="$(grep -o 'lang-[A-Za-z0-9_-]\{8,\}\.js' "$baked/app.js" | head -n 1)"
-if [ -z "$chunk" ]; then
-  echo "the baked bundle names no content-hashed chunk, so it is not the bundler's output" >&2
+root_status="$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' "$base/")"
+if [ "$root_status" != 404 ]; then
+  echo "the image's own root answered $root_status, want 404: the image carries no page" >&2
   exit 1
 fi
-curl -sS --fail --max-time 10 -D "$baked/chunk.headers" -o "$baked/chunk.js" "$base/$chunk"
-require_header "$baked/chunk.headers" "content-type: text/javascript; charset=utf-8"
-require_header "$baked/chunk.headers" "cache-control: public, max-age=31536000, immutable"
-echo "baked page OK: $chunk served from the image, typed, cached by name and hardened"
+echo "no page OK: the image's own root is 404"
 
 echo "=== join: a client engine mints a room in the container and joins it ==="
 nix develop . -c cargo run --quiet -p selvage-harness --example join_room \
@@ -227,15 +219,15 @@ nix develop . -c cargo run --quiet -p selvage-harness --example join_room \
 echo "=== the container's own transcript ==="
 docker logs "$name"
 
-echo "=== override: a mounted page replaces the baked one ==="
-# No command override: the image's own command already serves `--serve-page
-# /page`, so the mount is the whole override — the same one compose.yaml
-# documents for a page built elsewhere.
+echo "=== override: a mounted page, handed to --serve-page ==="
+# The image's own command names no page, so this run replaces it: the mount alone
+# is not the override any more. `--serve-page` is what the reference server keeps
+# for an operator who supplies a page directory.
 docker rm -f "$name" >/dev/null
 docker run --detach --name "$name" "${hardening[@]}" \
   --publish "127.0.0.1:$port:8080" \
   --volume "$page_dir:/page:ro" \
-  "$image"
+  "$image" --listen 0.0.0.0:8080 --serve-page /page
 
 override="$report_dir/override"
 mkdir -p "$override"
@@ -255,6 +247,6 @@ require_header "$override/hashed.headers" "content-type: text/javascript; charse
 require_header "$override/hashed.headers" "cache-control: public, max-age=31536000, immutable"
 require_header "$override/hashed.headers" "content-security-policy: default-src 'none'"
 require_body "$override/hashed.js" "export const smoke = 1;"
-echo "override OK: the mount replaced the baked page, typed and cached the same way"
+echo "override OK: --serve-page served the mounted directory, typed and cached the same way"
 
-echo "container smoke OK: $image built, ran hardened, served its baked page and a mounted one, and joined a room"
+echo "container smoke OK: $image built, ran hardened, answered /meta and joined a room, and served a mounted page under --serve-page"

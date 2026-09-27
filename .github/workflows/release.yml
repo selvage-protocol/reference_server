@@ -11,15 +11,12 @@ name: release
 # carried on would compute the version *after* it, tag that and publish a number
 # nobody chose; the refusal says what to do instead.
 #
-# Then it resolves the page revision `web_client` last released and moves that into
-# `Dockerfile` in the same commit as the version (`scripts/bump-version.sh
-# --page-sha`), so the pin stays committed — a build from the tree is reproducible
-# — while a release moves it, so it stops lagging the page repository. It runs
-# this repository's own gate on the commit it is about to push, pushes it and its
-# tag in **one atomic push**, and asks `image.yml` to run against the tag. It does
-# not itself touch GHCR or create a GitHub Release — those stay in `image.yml`'s
-# `publish` and `release` jobs, gated on the ref being a `v*` tag, which this
-# workflow can only satisfy by creating a tag that names the exact commit it pushed.
+# Then it runs this repository's own gate on the commit it is about to push, pushes
+# it and its tag in **one atomic push**, and asks `image.yml` to run against the
+# tag. It does not itself touch GHCR or create a GitHub Release — those stay in
+# `image.yml`'s `publish` and `release` jobs, gated on the ref being a `v*` tag,
+# which this workflow can only satisfy by creating a tag that names the exact
+# commit it pushed.
 #
 # **The bump is pushed to `main` directly, and the gate runs in this job.** GitHub
 # does not start a workflow run for an event a workflow produced with its own
@@ -40,9 +37,9 @@ name: release
 # red deploy. `deploy-prod.yml` does its own verification of what the box serves;
 # this workflow reads the run's conclusion and does not repeat it.
 #
-# `dry_run` stops before the first write — before the page is resolved, the tree is
-# touched, the gate runs, anything is pushed or anything is dispatched — and prints
-# the whole plan. A path this long should be rehearsable before its first run.
+# `dry_run` stops before the first write — before the tree is touched, the gate
+# runs, anything is pushed or anything is dispatched — and prints the whole plan. A
+# path this long should be rehearsable before its first run.
 #
 # **Every step after the plan carries `if: inputs.dry_run != true`.** That is the whole
 # of what makes the plan's promise true: a condition on the plan step alone leaves every
@@ -161,12 +158,10 @@ jobs:
           cat <<EOF
           dry run: the guards above ran — this dispatch is at main, Cargo.toml's $CURRENT is
           released as v$CURRENT, and v$NEXT is free — and every step below this one is
-          skipped. Nothing below was resolved, written, committed, tagged, pushed or
-          dispatched, and no image was waited for.
-            bump:      scripts/bump-version.sh $BUMP --page-sha <sha> would move $CURRENT to
-                       $NEXT in Cargo.toml, move Cargo.lock with it, and set Dockerfile's
-                       ARG WEB_CLIENT_SHA= to the revision scripts/page-revision.sh names
-                       from web_client's latest release (that resolution did not run)
+          skipped. Nothing below was written, committed, tagged, pushed or dispatched,
+          and no image was waited for.
+            bump:      scripts/bump-version.sh $BUMP would move $CURRENT to $NEXT in
+                       Cargo.toml and move Cargo.lock with it
             commit:    'chore(bump): release $NEXT', authored
                        DontBlameMe <dontblameme@noreply.codeberg.org> and pushed to main
             gate:      scripts/ci-local.sh checks, on that commit, before anything is pushed
@@ -180,23 +175,11 @@ jobs:
                        if deploy/ changed since v$CURRENT
           EOF
 
-      - name: resolve the page revision web_client last released
-        if: inputs.dry_run != true
-        id: page
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          sha=$(scripts/page-revision.sh)
-          echo "sha=$sha" >>"$GITHUB_OUTPUT"
-          echo "web_client's latest release is at $sha"
-
-      - name: bump the version and the page revision this release carries
+      - name: bump the version this release carries
         if: inputs.dry_run != true
         env:
           BUMP: ${{ inputs.bump }}
-          PAGE_SHA: ${{ steps.page.outputs.sha }}
-        run: scripts/bump-version.sh "$BUMP" --page-sha "$PAGE_SHA"
+        run: scripts/bump-version.sh "$BUMP"
 
       # The bump is committed *before* the gate runs because `scripts/ci-local.sh`
       # refuses a tree that differs from HEAD: the gate is what CI would run on a
