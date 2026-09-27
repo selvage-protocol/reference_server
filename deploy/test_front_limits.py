@@ -155,7 +155,7 @@ def harness_configs(work, listen_port, stub_port, default_text=None):
             default_text = handle.read()
     root = re.search(r"^\s*root (.*);$", default_text, re.M)
     if not root:
-        bad(f"no root directive in {DEFAULT_CONF}: the harness has nothing to point /terms at")
+        bad(f"no root directive in {DEFAULT_CONF}: the harness cannot point the not-found page at anything")
     pairs = [
         ("listen 8080 ssl;", f"listen 127.0.0.1:{listen_port};"),
         ("http://selvaged:8080", f"http://{LOOPBACK}:{stub_port}"),
@@ -378,7 +378,7 @@ def phase_header_posture(port, label, host, expect_sts):
     for the wrong reason, and every path asked for has to answer with a media
     type before its silence about HSTS means anything.
     """
-    asked = (("/", "page"), ("/terms", "the front's own file"), ("/meta", "the server's JSON"))
+    asked = (("/", "page"), ("/404.html", "the front's own not-found page"), ("/meta", "the server's JSON"))
     silent = []
     sent = []
     for path, what in asked:
@@ -431,7 +431,7 @@ def wait_ready(port, host, deadline=15.0):
     while time.monotonic() < end:
         try:
             conn = source_conn(port, "127.0.0.9", timeout=2)
-            answer = get(conn, "/terms", host)
+            answer = get(conn, "/", host)
             conn.close()
             if answer == 200:
                 return True
