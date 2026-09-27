@@ -345,6 +345,27 @@
               python3 -B test_page_revision.py
               touch $out
             '';
+
+          # The guard around a workflow's `dry_run` input. `release.yml` printed a
+          # plan promising that nothing was resolved, written or dispatched and then
+          # resolved, wrote, committed, pushed and dispatched everything, because the
+          # plan step was the only step carrying a condition. `actionlint` lints that
+          # file clean — every step it does have is a valid expression, and the defect
+          # is the steps that have none — so this reads the workflows back and refuses
+          # one where a step after the plan can still run on a dry run. The suite
+          # covers the condition spellings and the residual it does not read; the
+          # second command is this repository's own workflows.
+          dry-run-gating =
+            pkgs.runCommand "dry-run-gating-test" {
+              nativeBuildInputs = [
+                (pkgs.python3.withPackages (ps: [ps.pyyaml]))
+              ];
+            } ''
+              cd ${./scripts}
+              python3 -B test_check_dry_run_gating.py
+              python3 -B check_dry_run_gating.py ${./.github/workflows}
+              touch $out
+            '';
         };
 
         devShells.default = craneLib.devShell {

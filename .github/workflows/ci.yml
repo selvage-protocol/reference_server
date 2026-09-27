@@ -133,6 +133,14 @@ jobs:
       - name: the page revision
         run: nix build .#checks.x86_64-linux.page-revision --no-link --print-build-logs
 
+      # The guard around a workflow's `dry_run` input (`scripts/check_dry_run_gating.py`):
+      # `release.yml` printed a plan promising that nothing would be resolved, written or
+      # dispatched and then did all of it, because the plan step was the only step carrying
+      # a condition. Unknown actions, bad expressions and shell mistakes are the step
+      # below; *which* steps carry no condition at all is not, and lints clean.
+      - name: the release workflow's dry_run gating
+        run: nix build .#checks.x86_64-linux.dry-run-gating --no-link --print-build-logs
+
       # Unknown actions, bad expressions and shell mistakes, caught before the run.
       - name: lint the workflows
         run: nix develop . -c actionlint

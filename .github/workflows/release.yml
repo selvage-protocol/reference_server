@@ -39,6 +39,13 @@ name: release
 # `dry_run` stops before the first write — before the page is resolved, the tree is
 # touched, the gate runs, anything is pushed or anything is dispatched — and prints
 # the whole plan. A path this long should be rehearsable before its first run.
+#
+# **Every step after the plan carries `if: inputs.dry_run != true`.** That is the whole
+# of what makes the plan's promise true: a condition on the plan step alone leaves every
+# step after it free to do exactly what the plan says was not done, which is what a
+# `dry_run: true` dispatch did once. `scripts/check_dry_run_gating.py` reads this file
+# back and refuses a workflow where a step after the plan can still run on a dry run,
+# because no other check can see it: every such step is a valid expression.
 on:
   workflow_dispatch:
     inputs:
@@ -148,16 +155,21 @@ jobs:
           BUMP: ${{ inputs.bump }}
         run: |
           cat <<EOF
-          dry run: nothing was resolved, written, committed, pushed or dispatched.
-            bump:      $CURRENT -> $NEXT (scripts/bump-version.sh $BUMP)
-            page:      scripts/page-revision.sh would name web_client's latest release
-            commit:    scripts/bump-version.sh $BUMP --page-sha <sha> would move Cargo.toml,
-                       Cargo.lock and Dockerfile, committed as
-                       'chore(bump): release $NEXT' by DontBlameMe
-            gate:      scripts/ci-local.sh checks, on that commit
-            push:      the bump, to main directly — a bump pull request would carry no checks,
-                       because an event this workflow creates with its own token starts no run
-            publish:   v$NEXT created and pushed, image.yml dispatched at it, then
+          dry run: the guards above ran — this dispatch is at main, Cargo.toml's $CURRENT is
+          released as v$CURRENT, and v$NEXT is free — and every step below this one is
+          skipped. Nothing below was resolved, written, committed, tagged, pushed or
+          dispatched, and no image was waited for.
+            bump:      scripts/bump-version.sh $BUMP --page-sha <sha> would move $CURRENT to
+                       $NEXT in Cargo.toml, move Cargo.lock with it, and set Dockerfile's
+                       ARG WEB_CLIENT_SHA= to the revision scripts/page-revision.sh names
+                       from web_client's latest release (that resolution did not run)
+            commit:    'chore(bump): release $NEXT', authored
+                       DontBlameMe <dontblameme@noreply.codeberg.org> and pushed to main
+            gate:      scripts/ci-local.sh checks, on that commit, before anything is pushed
+            push:      the bump to main and the tag v$NEXT in one atomic push — a bump pull
+                       request would carry no checks, because an event this workflow creates
+                       with its own token starts no run
+            publish:   image.yml dispatched at v$NEXT, then
                        ghcr.io/selvage-protocol/selvaged:$NEXT waited for (an anonymous read,
                        polled with a 45-minute deadline)
             deploy:    deploy-prod.yml at main with server_version=$NEXT, and install_shape=true
@@ -165,6 +177,7 @@ jobs:
           EOF
 
       - name: resolve the page revision web_client last released
+        if: inputs.dry_run != true
         id: page
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -175,6 +188,7 @@ jobs:
           echo "web_client's latest release is at $sha"
 
       - name: bump the version and the page revision this release carries
+        if: inputs.dry_run != true
         env:
           BUMP: ${{ inputs.bump }}
           PAGE_SHA: ${{ steps.page.outputs.sha }}
@@ -185,6 +199,7 @@ jobs:
       # commit, and an uncommitted bump is not one. Nothing is pushed until the
       # gate is green, so the commit that reaches main is still the validated one.
       - name: commit the bump as the repository's author
+        if: inputs.dry_run != true
         env:
           VERSION: ${{ steps.next.outputs.version }}
         run: |
@@ -197,10 +212,12 @@ jobs:
       # The same toolchain and store cache the `ci` workflow uses, so a release
       # pays for the flake once and a warm store on the next one.
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        if: inputs.dry_run != true
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: restore and save the Nix store
+        if: inputs.dry_run != true
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
@@ -209,9 +226,11 @@ jobs:
       # `scripts/ci-local.sh checks` is the `checks` job of `ci.yml`, command for
       # command, and it is the whole of why this workflow pushes to main itself.
       - name: this repository's own gate, as CI runs it
+        if: inputs.dry_run != true
         run: scripts/ci-local.sh checks
 
       - name: push the bump and its tag, and run image.yml at it
+        if: inputs.dry_run != true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.next.outputs.version }}
@@ -237,6 +256,7 @@ jobs:
       # registry by then. So this waits on the registry itself, anonymously, and a
       # deadline that cannot pass says what it last saw rather than looking hung.
       - name: wait for the image this release published
+        if: inputs.dry_run != true
         env:
           VERSION: ${{ steps.next.outputs.version }}
         run: |
@@ -279,6 +299,7 @@ jobs:
       # and installs the box's shape when this release moved one. It verifies the
       # origin itself, so nothing here re-reads `/meta`.
       - name: hand the release to the public demo
+        if: inputs.dry_run != true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.next.outputs.version }}

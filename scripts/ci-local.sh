@@ -5,8 +5,8 @@
 #
 #   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval, the public
 #                                 # demo's deploy guard, front limits and command line, the version
-#                                 # bump and page revision, the deploy workflow's verification,
-#                                 # lint, typos
+#                                 # bump, the page revision, the deploy workflow's verification,
+#                                 # the release workflow's dry_run gating, lint, typos
 #   scripts/ci-local.sh nightly   # coverage, the rest of cargo-deny and cargo-audit (slow)
 #   scripts/ci-local.sh lint      # actionlint over the workflow files, on its own
 #   scripts/ci-local.sh image     # the `image` workflow's smoke: nix-built image,
@@ -113,6 +113,13 @@ job_checks() {
   # that answers a datacenter client with a challenge).
   say "checks: the deploy workflow's verification"
   nix build .#checks.x86_64-linux.deploy-verify --no-link --print-build-logs
+  # The guard around a workflow's `dry_run` input: `release.yml` printed a plan
+  # promising that nothing would be resolved, written or dispatched, and then did
+  # all of it, because the plan step was the only step carrying a condition.
+  # `actionlint` lints that file clean, so this reads the workflows back and refuses
+  # one where a step after the plan can still run on a dry run.
+  say "checks: the release workflow's dry_run gating"
+  nix build .#checks.x86_64-linux.dry-run-gating --no-link --print-build-logs
   say "checks: lint the workflows"
   nix develop . -c actionlint
   # The same check the pre-commit hook runs: a commit made outside the dev shell cannot
