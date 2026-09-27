@@ -1,16 +1,11 @@
 # The public demo's shape
 
 The exact files that run `selvage-demo.dontblameme.dev`, tracked here so the
-deployment's shape is a reviewable artefact in a repository. `pi/` beside this
-directory is the same idea for the Pi, and `pi-demo/` is the native shape that
-one replaced.
+deployment's shape is a reviewable artefact in a repository.
 
-The two shapes differ in where the front is, and the Pi's is where it is not.
-Neither runs a front now: the Pi is tailnet-only and publishes each container's own
-port, so nothing routes and nothing terminates anything. Here the origin is public
-and the owner's decision of 2026-09-21 was a page container of its own, so this
-front terminates TLS *and* routes, and `selvaged` serves `/session` and `/meta`
-alone.
+The origin is public and the owner's decision of 2026-09-21 was a page container
+of its own, so this front terminates TLS *and* routes, and `selvaged` serves
+`/session` and `/meta` alone.
 
 The live state — the host, the images running, the network security group, the
 upgrade procedure — is `ai_notes/docs/runbook-prod-demo.md` (the project's own

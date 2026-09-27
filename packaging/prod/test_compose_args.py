@@ -13,12 +13,10 @@ The authority on what the binary accepts is the binary. This file restates no
 rule and no number: it reads the `command:` each tracked shape declares, hands
 it to `selvaged`, and fails if the server does not come up.
 
-Both compose shapes are read, because the rule is one binary's and both files
-are deployed: `packaging/prod/compose.yaml` (the public demo) and
-`packaging/pi/compose.yaml` (the Pi demo, being retired, whose tracked shape
-still has to run). The shapes are listed rather than globbed, and a shape that
-declares no `command:` fails instead of being skipped, so one cannot drop out of
-this guard without a reader seeing it.
+The deployed compose shape is read: `packaging/prod/compose.yaml`, the public
+demo. The shapes are listed rather than globbed, and a shape that declares no
+`command:` fails instead of being skipped, so one cannot drop out of this guard
+without a reader seeing it.
 
 The one flag replaced is the bind address: `--listen` is the container's own
 boundary rather than a limit, and a guard that took `0.0.0.0:8080` would fight
@@ -48,7 +46,7 @@ REPO = HERE.parent.parent
 
 # The tracked shapes that hand `selvaged` a command line, in the order the tests
 # below name them, and the flag the defect that wrote this guard was carried on.
-SHAPES = (HERE / "compose.yaml", HERE.parent / "pi" / "compose.yaml")
+SHAPES = (HERE / "compose.yaml",)
 QUEUE_FLAG = "--outbound-queue-bytes"
 
 # The banner `selvaged` prints once it is bound and serving. The address is a free
@@ -260,9 +258,6 @@ class ComposeCommandTest(unittest.TestCase):
 
     def test_the_public_demo_command_line_starts_the_server(self):
         self.assert_starts(SHAPES[0])
-
-    def test_the_pi_command_line_starts_the_server(self):
-        self.assert_starts(SHAPES[1])
 
     def assert_starts(self, path: Path) -> None:
         """`path`'s command line, run: the server comes up, or this says why not."""

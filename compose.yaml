@@ -1,7 +1,5 @@
 # Self-host for someone evaluating selvage on their own machine. The other
-# deployment shapes are in packaging/README.md; the Pi's two are under
-# packaging/pi/ (what runs there now) and packaging/pi-demo/ (the native shape it
-# replaced).
+# deployment shapes are in packaging/README.md.
 #
 # No volumes: the image carries the browser page it serves, and the server is
 # memory-only, so there is nothing to persist and nothing to mount. The `./page`

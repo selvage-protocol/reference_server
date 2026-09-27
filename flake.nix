@@ -240,18 +240,6 @@
             inherit src;
           };
 
-          # The TLS front's idle logic (`packaging/pi-demo/tls-proxy.py`): a quiet half
-          # of a tunnel is not a dead one, and nothing else in this repository can see
-          # that. Stdlib Python only, so it needs neither the Pi nor a certificate.
-          tls-proxy =
-            pkgs.runCommand "tls-proxy-test" {
-              nativeBuildInputs = [pkgs.python3];
-            } ''
-              cd ${./packaging/pi-demo}
-              python3 -B test_tls_proxy.py
-              touch $out
-            '';
-
           # The guard around `packaging/prod/deploy.py`, which is the whole of the
           # public demo's privilege model: `/usr/local/sbin/selvage-deploy` is the
           # only root command the CI user on that box may run. Nothing else in this
@@ -262,17 +250,6 @@
               nativeBuildInputs = [pkgs.python3];
             } ''
               cd ${./packaging/prod}
-              python3 -B test_deploy.py
-              touch $out
-            '';
-
-          # The same guard for `packaging/pi/deploy.py`, the Pi's request
-          # grammar, which is the only lever a CI credential has on that box.
-          pi-deploy =
-            pkgs.runCommand "pi-deploy-test" {
-              nativeBuildInputs = [pkgs.python3];
-            } ''
-              cd ${./packaging/pi}
               python3 -B test_deploy.py
               touch $out
             '';
@@ -294,8 +271,7 @@
           # The command lines the tracked compose shapes give the server, run
           # against the binary that runs them: a value it refuses is a container
           # that exits 2 and restart-loops, which takes the front beside it down
-          # with it. Both shapes are read here, the public demo's and the Pi's,
-          # so one check covers both packaging trees.
+          # with it.
           packaging-args =
             pkgs.runCommand "packaging-args-test" {
               nativeBuildInputs = [pkgs.python3 package];

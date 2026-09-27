@@ -3,7 +3,7 @@
 # Runs the steps of .github/workflows/ci.yml on this machine, without containers (this host
 # has no Docker or Podman, so `act` cannot run here).
 #
-#   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval, the TLS front, the public
+#   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval, the public
 #                                 # demo's deploy guard and front limits, the packaging command lines, the deploy
 #                                 # workflow's verification, lint, typos
 #   scripts/ci-local.sh nightly   # coverage, the rest of cargo-deny and cargo-audit (slow)
@@ -77,19 +77,11 @@ job_checks() {
   nix develop . -c cargo deny check licenses
   say "checks: evaluate every check"
   nix flake check --no-build .
-  # The TLS front's idle logic, stdlib Python and no Pi: the one check that is not a
-  # Cargo target.
-  say "checks: the TLS front's idle logic"
-  nix build .#checks.x86_64-linux.tls-proxy --no-link --print-build-logs
   # The guard around the public demo's deploy script, which is the whole of that
   # box's privilege model: one request grammar, and a shape the deploy verifies
   # rather than writes.
   say "checks: the public demo's deploy guard"
   nix build .#checks.x86_64-linux.prod-deploy --no-link --print-build-logs
-  # The same guard for the Pi's copy of the deploy script, which is that box's
-  # privilege model: the same request grammar, against the Pi's module.
-  say "checks: the Pi's deploy guard"
-  nix build .#checks.x86_64-linux.pi-deploy --no-link --print-build-logs
   # The public demo's front under a real nginx: that a source is refused, and that
   # one metered endpoint cannot spend another's budget. Both are about a running
   # proxy, so neither can be read out of the configuration.
@@ -97,8 +89,7 @@ job_checks() {
   nix build .#checks.x86_64-linux.prod-front --no-link --print-build-logs
   # The command lines the tracked compose shapes give the server, run against the
   # binary: a value it refuses is a container that exits 2 and restart-loops,
-  # which took the public demo's front down with it. Both packaging trees are
-  # read, so the Pi's shape cannot carry a value its own image would refuse.
+  # which took the public demo's front down with it.
   say "checks: the packaging command lines"
   nix build .#checks.x86_64-linux.packaging-args --no-link --print-build-logs
   # The deploy workflow's verification: what it asserts (the origin, on the box

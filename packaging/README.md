@@ -1,15 +1,13 @@
 # Packaging and deployment
 
-Five shapes, for five audiences:
+Three shapes, for three audiences:
 
 | Path | Who it is for | What it is |
 |---|---|---|
-| `pi/` | The live Pi demo, exactly as it runs | The two-service compose file for the tailnet, the environment file that names both images by digest, and the deploy script that box's CI user may run as root |
-| `pi-demo/` | The Pi's native shape, retired 2026-09-21 | The TLS front and the user units it ran — tracked here so a deployment artefact is reviewable, and left on the machine as the rollback recipe |
-| `prod/` | The live public demo, exactly as it runs | The TLS front, the router and the three-service compose file for one public origin — the Pi's container pattern plus a front that terminates TLS and routes — plus the update timer that follows the image tags, and the deploy script that box's CI user may run as root |
-| `systemd/` | A self-hoster on their own machine | A user unit plus install docs — the proven path, generalized, with no front |
-| `Dockerfile` + `compose.yaml` | Strangers self-hosting on their own machines | A multi-arch image and a one-service compose file — never the Pi |
-The server is memory-only under all five: restarts end all rooms, and
+| `prod/` | The live public demo, exactly as it runs | The TLS front, the router and the three-service compose file for one public origin, plus the update timer that follows the image tags, and the deploy script that box's CI user may run as root |
+| `systemd/` | A self-hoster on their own machine | A user unit plus install docs, with no front |
+| `Dockerfile` + `compose.yaml` | Strangers self-hosting on their own machines | A multi-arch image and a one-service compose file |
+The server is memory-only under all three: restarts end all rooms, and
 there is nothing to persist — hence no data volume anywhere here. The image
 carries its page; the mounts are the optional read-only page override, which the
 server only ever reads, and the public demo's origin certificate, which is what
@@ -54,31 +52,9 @@ What the acceptance stands on, all of it in the artefacts themselves:
   commercial product or service that substitutes for it is the Competing Use
   the licence still forbids.
 
-## The Pi demo's shapes (`pi/`, `pi-demo/`)
-
-`pi/` is what the Pi runs now, tracked file for file: the two-service compose
-file for the tailnet (the page on 80, the server on 8080), the environment file
-that names both images by digest, the deploy script `deployci` may run as root,
-and the pin that bounds the host's image updater. `pi-demo/` beside it is the
-native shape this replaced — the `selvaged` user unit, the stdlib TLS front in
-front of it, the front's unit and the front's environment documented — stopped on
-2026-09-21 and left in place as the rollback recipe. Both are deployment records
-as much as recipes: each `README.md` says what every file installs to and how to
-roll back, and `ai_notes/docs/runbook-pi-demo.md` owns the live state.
-
-**The native shape is not the container path.** The container's port mapping is
-its boundary, so it binds `0.0.0.0:8080` and needs no front; the Pi's boundary is
-the tailnet, so the native shape bound the tailnet address with a TLS terminator
-in front of it because `selvaged` speaks no TLS. What runs there now needs no
-terminator: the two images publish the tailnet address themselves, and one of
-them is the page, so nothing routes. Nor is `pi-demo/` the `systemd/` unit above,
-which is the same binary with no front — a self-hoster supplies TLS with
-`tailscale serve`, caddy or their own edge.
-
 ## systemd user unit
 
-`systemd/selvaged.service` is the Pi's hand-written unit, generalized for any
-machine: absolute binary path, explicit `--listen`, explicit `--room-grace-ms`,
+`systemd/selvaged.service` is a hand-written unit for any machine: absolute binary path, explicit `--listen`, explicit `--room-grace-ms`,
 `Restart=always`, linger, and file-append logging. `%h` expands to the
 installing user's home, so the file installs as-is.
 
@@ -122,9 +98,8 @@ systemctl --user restart selvaged          # rooms die; the process returns in s
 ```
 
 Logs: the unit appends stdout to `~/selvage/selvaged.log`, and that file is
-the record. The demo Pi's journal keeps no user-unit output at all, and
-enabling journal persistence for user units needs root — which this path
-never takes. Expect the startup lines (`selvaged listening on …`, the grace
+the record. Not every host's journal keeps user-unit output, and enabling
+journal persistence for user units needs root — which this path never takes. Expect the startup lines (`selvaged listening on …`, the grace
 note) re-logged after every restart.
 
 Memory-only semantics: `restart`, a kill, or a reboot ends **all** rooms
@@ -145,7 +120,7 @@ curl -sS http://<your-address>:8080/meta
 ```
 
 After every upgrade the log must show the startup lines and `--version` and
-`/meta` must agree; record the new source SHA the way the Pi runbook does.
+`/meta` must agree; record the new source SHA.
 
 ### Provenance notes
 
@@ -153,16 +128,14 @@ After every upgrade the log must show the startup lines and `--version` and
   substitution (verified with `%h` pointed at a scratch home containing the
   expected paths). Unsubstituted, its only finding is that the binary is not
   installed yet — the expected state on a machine without an install.
-- Reboot recovery is proven on the demo Pi (linger on, unit enabled) but that
-  proof belongs to the Pi's own session, not to this file: a fresh machine
-  should close it the same way (`sudo reboot`, then `/meta` and `is-active`
-  with no session held).
+- Reboot recovery (linger on, unit enabled) is not proven by this file: a
+  fresh machine should close it with `sudo reboot`, then `/meta` and
+  `is-active` with no session held.
 
 ## Container image
 
-Multi-arch (`linux/amd64` + `linux/arm64`): the arm64 variant is for other
-people's Pis and ARM VPSes, not for this Pi, which already runs a native
-binary. Build locally — the build fetches the page's pinned `web_client`
+Multi-arch (`linux/amd64` + `linux/arm64`): the arm64 variant is for ARM
+single-board computers and ARM VPSes. Build locally — the build fetches the page's pinned `web_client`
 revision, so it needs network, and running it needs no mount:
 
 ```sh
@@ -287,10 +260,9 @@ or not that tag is pullable yet.
 `/session` and `/meta` (see the root README). The image bakes the page at
 `/page` and its default command passes `--serve-page /page`, so one container
 and one port answer the page, the meta document and the socket, and a
-self-hoster needs no CORS proxy and no second page server. The Pi's native shape
-did the same thing behind its TLS front (`pi-demo/`). Neither deployed shape does
-it: `prod/` and `pi/` each run the page as its own container and turn the baked
-page off, which is why both name a page image beside the server image.
+self-hoster needs no CORS proxy and no second page server. The deployed shape
+does not do it: `prod/` runs the page as its own container and turns the baked
+page off, which is why it names a page image beside the server image.
 
 **The page is built into the image.** The `web_client` bundle is not vendored
 here: the `Dockerfile`'s `page` stage clones that repository at the revision in

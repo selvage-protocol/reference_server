@@ -1,8 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# selvaged — multi-arch static image for strangers and VPS self-hosters,
-# never for the Pi (which runs the native binary under the user unit in
-# packaging/systemd/).
+# selvaged — multi-arch static image for strangers and VPS self-hosters.
 #
 # Primary shape: a musl-static binary on scratch. The lockfile carries no TLS
 # C shims (no openssl/ring/aws-lc-sys — only libc/mio as OS shims), so the
