@@ -20,9 +20,8 @@ docker run -d --rm --name selvaged -p 127.0.0.1:8080:8080 \
 
 That is re-runnable: the removal clears the name a previous run left, and
 `--rm` takes the container with it when it stops. This container serves the
-session protocol and no page, so a browser that opens it meets the server's own
-answer rather than an editor: for a room you can open in a browser, run the two
-containers the Run card prints, at
+session protocol and no page, so a client is what joins it; for a room you can
+open in a browser, run the two containers the Run card prints, at
 <https://selvage.dontblameme.dev/#try>. The page image is `web_client`'s and its
 README owns that image's configuration and its tags. Both GHCR packages are
 public, so a pull needs no account and no `docker login`.
