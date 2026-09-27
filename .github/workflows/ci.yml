@@ -99,6 +99,13 @@ jobs:
       - name: the public demo's deploy guard
         run: nix build .#checks.x86_64-linux.prod-deploy --no-link --print-build-logs
 
+      # The other root command the CI user on that box may run
+      # (`deploy/install_shape.py`): the shape arrives on stdin, only `compose.yaml`
+      # and `proxy/` are accepted, and every other name, link, device and
+      # traversing path is refused with the box untouched.
+      - name: the public demo's shape installer
+        run: nix build .#checks.x86_64-linux.prod-shape --no-link --print-build-logs
+
       # The public demo's front, under its real configuration and a real nginx: that a
       # source is refused, and that one metered endpoint cannot spend another's budget.
       # Both are about a running proxy, so neither is readable from the configuration.
@@ -110,6 +117,13 @@ jobs:
       # restart-loops, which took the public demo's front down with it.
       - name: the deployed command line
         run: nix build .#checks.x86_64-linux.deploy-args --no-link --print-build-logs
+
+      # The command the release coordinator runs before it commits a version
+      # (`scripts/bump-version.sh`): the version and the `web_client` revision in
+      # the three files that carry them and nowhere else, with a bad argument or a
+      # cargo that fails leaving the tree as it was.
+      - name: the version bump
+        run: nix build .#checks.x86_64-linux.bump-version --no-link --print-build-logs
 
       # Unknown actions, bad expressions and shell mistakes, caught before the run.
       - name: lint the workflows

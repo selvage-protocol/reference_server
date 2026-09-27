@@ -254,6 +254,22 @@
               touch $out
             '';
 
+          # The guard around `deploy/install_shape.py`, the second root command
+          # the CI user on that box may run: the box's shape — `compose.yaml` and
+          # `proxy/` — arrives as a tar stream on stdin, and every other name,
+          # absolute or traversing path, link, device and fifo is refused with the
+          # box untouched. Nothing else in this repository can see what it refuses,
+          # or that a step is resolved inside the descriptor the step before it
+          # found rather than checked and then used.
+          prod-shape =
+            pkgs.runCommand "prod-shape-test" {
+              nativeBuildInputs = [pkgs.python3];
+            } ''
+              cd ${./deploy}
+              INSTALL_SHAPE_WORKDIR="''${TMPDIR:-/build}/install-shape" python3 -B test_install_shape.py
+              touch $out
+            '';
+
           # The public demo's front, under its real configuration and a real nginx:
           # whether a source is refused at all, and whether one metered endpoint can
           # spend another's budget. Both are questions about a running proxy, and the
@@ -278,6 +294,21 @@
             } ''
               cd ${./deploy}
               python3 -B test_compose_args.py
+              touch $out
+            '';
+
+          # The guard around `scripts/bump-version.sh`, the command the release
+          # coordinator runs before it commits a version: the version and the
+          # `web_client` revision move in the three files that carry them and in no
+          # other, and a version, a sha or an argument that is not one this takes
+          # writes nothing at all. It reaches cargo through `PATH`, so this runs it
+          # against a stand-in and needs no toolchain.
+          bump-version =
+            pkgs.runCommand "bump-version-test" {
+              nativeBuildInputs = [pkgs.python3];
+            } ''
+              cd ${./scripts}
+              python3 -B test_bump_version.py
               touch $out
             '';
 

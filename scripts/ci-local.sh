@@ -82,6 +82,11 @@ job_checks() {
   # rather than writes.
   say "checks: the public demo's deploy guard"
   nix build .#checks.x86_64-linux.prod-deploy --no-link --print-build-logs
+  # The other root command the CI user on that box may run: the box's shape —
+  # `compose.yaml` and `proxy/` — arrives as a tar stream, and every other name,
+  # link, device and traversing path is refused with the box untouched.
+  say "checks: the public demo's shape installer"
+  nix build .#checks.x86_64-linux.prod-shape --no-link --print-build-logs
   # The public demo's front under a real nginx: that a source is refused, and that
   # one metered endpoint cannot spend another's budget. Both are about a running
   # proxy, so neither can be read out of the configuration.
@@ -92,6 +97,11 @@ job_checks() {
   # which took the public demo's front down with it.
   say "checks: the deployed command line"
   nix build .#checks.x86_64-linux.deploy-args --no-link --print-build-logs
+  # The version bump the release coordinator runs before it commits: the version
+  # and the `web_client` revision move in the three files that carry them and
+  # nowhere else, and a bad argument writes nothing.
+  say "checks: the version bump"
+  nix build .#checks.x86_64-linux.bump-version --no-link --print-build-logs
   # The deploy workflow's verification: what it asserts (the origin, on the box
   # through the front) and what it only reports (the public URL, behind an edge
   # that answers a datacenter client with a challenge).
