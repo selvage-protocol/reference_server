@@ -38,10 +38,10 @@ RUN rm -f /etc/nginx/conf.d/*.conf
 COPY --chown=101:101 nginx.conf /etc/nginx/nginx.conf
 COPY --chown=101:101 conf.d/ /etc/nginx/conf.d/
 
-# The terms of this instance, served from disk by the `/terms` location in
-# `conf.d/default.conf`. It is the image's only content rather than
-# configuration: a page of prose is a file, not a directive, and a file is what
-# a reviewer can read and edit.
+# The instance's own not-found page, served from disk by the `/404.html`
+# location in `conf.d/default.conf`. It is the image's only content rather than
+# configuration: a page is a file, not a directive, and a file is what a
+# reviewer can read and edit.
 COPY --chown=101:101 www/ /usr/share/selvage/www/
 
 # Straight to nginx, past the base image's `/docker-entrypoint.sh`. Those scripts
