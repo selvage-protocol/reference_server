@@ -488,6 +488,13 @@ def run(ngx, work, stub_port, label, host, default_text=None, expect_refusal=Fal
 
 def main():
     ngx = nginx_binary()
+
+    # nginx reads `NGINX` as the list of sockets a socket-activated parent handed it, the one
+    # environment variable it does not ignore. A value that is not a socket number is logged
+    # and passed over, but its *presence* is what nginx acts on: it takes itself for
+    # inherited and skips daemonising, so the start below would run a master in the
+    # foreground and block here for good rather than answering. An inherited value is dropped.
+    os.environ.pop("NGINX", None)
     root = work_root()
     stub, stub_port = start_stub()
 
