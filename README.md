@@ -13,18 +13,27 @@ the pair is printed by the landing page's Run card, which owns the
 reader-facing command with the tags inside it and the teardown under it.
 
 ```sh
-docker rm -f selvaged 2>/dev/null
-docker run -d --rm --name selvaged -p 127.0.0.1:8080:8080 \
+docker rm -f selvaged-solo 2>/dev/null
+docker run -d --rm --name selvaged-solo -p 127.0.0.1:8081:8080 \
   ghcr.io/selvage-protocol/selvaged:latest
 ```
 
 That is re-runnable: the removal clears the name a previous run left, and
-`--rm` takes the container with it when it stops. This container serves the
-session protocol and no page, so a client is what joins it; for a room you can
-open in a browser, run the two containers the Run card prints, at
-<https://selvage.dontblameme.dev/#try>. The page image is `web_client`'s and its
-README owns that image's configuration and its tags. Both GHCR packages are
-public, so a pull needs no account and no `docker login`.
+`--rm` takes the container with it when it stops. Stopping it later, and taking
+it with its logs, is a command of its own:
+
+```sh
+docker rm -f selvaged-solo
+```
+
+The name and the host port above are this example's own, so it and the card's
+pair can be up at once: the card's server runs as `selvaged` and its page
+publishes `8080`, and neither its teardown nor this one touches the other's
+container. This container serves the session protocol and no page, so a client
+is what joins it; for a room you can open in a browser, run the two containers
+the Run card prints, at <https://selvage.dontblameme.dev/#try>. The page image is
+`web_client`'s and its README owns that image's configuration and its tags. Both
+GHCR packages are public, so a pull needs no account and no `docker login`.
 
 ### From a checkout
 
