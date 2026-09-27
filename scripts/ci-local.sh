@@ -4,7 +4,7 @@
 # has no Docker or Podman, so `act` cannot run here).
 #
 #   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval, the public
-#                                 # demo's deploy guard, front limits and command line, the version
+#                                 # demo's deploy guard, front and command line, the version
 #                                 # bump, the page revision, the deploy workflow's verification,
 #                                 # the release's wait for its deploy, the release workflow's
 #                                 # dry_run gating, lint, typos
@@ -89,10 +89,13 @@ job_checks() {
   # link, device and traversing path is refused with the box untouched.
   say "checks: the public demo's shape installer"
   nix build .#checks.x86_64-linux.prod-shape --no-link --print-build-logs
-  # The public demo's front under a real nginx: that a source is refused, and that
-  # one metered endpoint cannot spend another's budget. Both are about a running
-  # proxy, so neither can be read out of the configuration.
-  say "checks: the public demo's front limits"
+  # The public demo's front under a real nginx, in both halves: that a source is
+  # refused and that one metered endpoint cannot spend another's budget
+  # (`test_front_limits.py`), and that a missing path is answered with this
+  # instance's own not-found page and a request naming another host is closed
+  # (`check-front.sh`). Every one is about a running proxy, so none can be read
+  # out of the configuration.
+  say "checks: the public demo's front"
   nix build .#checks.x86_64-linux.prod-front --no-link --print-build-logs
   # The command lines the tracked compose shapes give the server, run against the
   # binary: a value it refuses is a container that exits 2 and restart-loops,

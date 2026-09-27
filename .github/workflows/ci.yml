@@ -106,10 +106,15 @@ jobs:
       - name: the public demo's shape installer
         run: nix build .#checks.x86_64-linux.prod-shape --no-link --print-build-logs
 
-      # The public demo's front, under its real configuration and a real nginx: that a
-      # source is refused, and that one metered endpoint cannot spend another's budget.
-      # Both are about a running proxy, so neither is readable from the configuration.
-      - name: the public demo's front limits
+      # The public demo's front, under its real configuration and a real nginx, in
+      # both halves: `test_front_limits.py` measures whether a source is refused and
+      # whether one metered endpoint can spend another's budget, and `check-front.sh`
+      # reads the front's own answers back out of the bytes it serves — a missing
+      # path answered with this instance's not-found page where the page container's
+      # 404 would otherwise arrive, and a request naming a host this front is not the
+      # server for closed rather than served. Every one is about a running proxy, and
+      # none is readable from the configuration.
+      - name: the public demo's front
         run: nix build .#checks.x86_64-linux.prod-front --no-link --print-build-logs
 
       # The command lines the tracked compose shapes give the server, run against

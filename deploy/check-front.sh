@@ -24,14 +24,19 @@
 # one is asserted below, so a change to the front's shape cannot be silently
 # masked by the harness.
 #
-# Everything written stays under `.tmp/` in this checkout: `/tmp` is a
-# RAM-backed tmpfs on some hosts, and building there has taken a machine down.
+# Everything written stays under `.tmp/` in this checkout — `/tmp` is a
+# RAM-backed tmpfs on some hosts, and building there has taken a machine down —
+# unless `CHECK_FRONT_WORKDIR` moves it, which a derivation has to do.
 set -euo pipefail
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd -- "$here/.." && pwd)
 proxy="$here/proxy"
-work="$repo/.tmp/proxy-check-front"
+
+# The same escape hatch `test_front_limits.py` takes as `FRONT_LIMITS_WORKDIR`, for
+# the same reason: `${./deploy}` inside a derivation is a store path, so `$repo` is
+# `/nix/store` and the default below cannot be written to.
+work=${CHECK_FRONT_WORKDIR:-$repo/.tmp/proxy-check-front}
 
 server_conf="$proxy/nginx.conf"
 default_conf="$proxy/conf.d/default.conf"

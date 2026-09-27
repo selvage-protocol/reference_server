@@ -276,16 +276,19 @@
             '';
 
           # The public demo's front, under its real configuration and a real nginx:
-          # whether a source is refused at all, and whether one metered endpoint can
-          # spend another's budget. Both are questions about a running proxy, and the
-          # second is the reason the front's zones are one per location; nothing else
-          # in this repository can see either.
+          # whether a source is refused at all, whether one metered endpoint can
+          # spend another's budget, whether a missing path is answered with this
+          # instance's own not-found page, and whether a request naming another
+          # host is closed rather than served. All four are questions about a
+          # running proxy, and the second is the reason the front's zones are one
+          # per location; nothing else in this repository can see any of them.
           prod-front =
             pkgs.runCommand "prod-front-test" {
-              nativeBuildInputs = [pkgs.python3 pkgs.nginx];
+              nativeBuildInputs = [pkgs.python3 pkgs.nginx pkgs.curl];
             } ''
               cd ${./deploy}
               FRONT_LIMITS_WORKDIR="''${TMPDIR:-/build}/front-limits" python3 -B test_front_limits.py
+              CHECK_FRONT_WORKDIR="''${TMPDIR:-/build}/check-front" bash check-front.sh
               touch $out
             '';
 
