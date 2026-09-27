@@ -7,23 +7,24 @@ two-client harness that gates it in CI.
 ## Get it working
 
 `selvaged` is one binary with no configuration file, and the flags below are the
-whole of its surface. The published image is the server alone: a page is a second
-image that relays to it, so the shortest route to a room you can open in a
-browser is two containers.
+whole of its surface. The published image is the server alone, and a server
+alone is enough for a client to join a room; the page is a second container, and
+the pair is printed by the landing page's Run card, which owns the
+reader-facing command with the tags inside it and the teardown under it.
 
 ```sh
-docker network create selvage
-docker run --rm -d --name selvaged --network selvage \
+docker rm -f selvaged 2>/dev/null
+docker run -d --rm --name selvaged -p 127.0.0.1:8080:8080 \
   ghcr.io/selvage-protocol/selvaged:latest
-docker run --rm -d --name selvage-web --network selvage \
-  -p 127.0.0.1:8080:8080 -e SELVAGE_SERVER=selvaged:8080 \
-  ghcr.io/selvage-protocol/selvage-web:latest
 ```
 
-Open `http://127.0.0.1:8080`; `docker rm -f selvaged selvage-web` ends the run.
-The page image is `web_client`'s and its README owns its configuration and its
-tags. Both GHCR packages are public, so a pull needs no account and no
-`docker login`.
+That is re-runnable: the removal clears the name a previous run left, and
+`--rm` takes the container with it when it stops. This container serves the
+session protocol and no page, so a client is what joins it; for a room you can
+open in a browser, run the two containers the Run card prints, at
+<https://selvage.dontblameme.dev/#try>. The page image is `web_client`'s and its
+README owns that image's configuration and its tags. Both GHCR packages are
+public, so a pull needs no account and no `docker login`.
 
 ### From a checkout
 
