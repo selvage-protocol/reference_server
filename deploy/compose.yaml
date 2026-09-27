@@ -129,20 +129,20 @@ services:
     # is the same shape with the two things added that the one-origin deployment
     # needs: it is only reachable through the front, and it has a memory limit.
     #
-    # The page image keeps an nginx access log on its stdout, and an invite link is
-    # a page link — `/?room=…&token=…` — so every guest who opens one writes the
-    # room token into this container's log. `PROTOCOL.md` §12 makes "a deployment
-    # MUST NOT log request URLs" a MUST, and the token is the room's whole
-    # permission, so the channel is closed here rather than filtered: the `none`
-    # driver discards this container's output outright, which holds whatever the
-    # image's own configuration does and cannot silently come back when the image
-    # is bumped. This container's errors are discarded too, which is small: it is a
-    # static file server whose failures the front and the server beside it already
-    # show, and the front's own log is silent by design for the same reason.
+    # An invite link is a page link — `/?room=…&token=…` — so a request line
+    # carries the room token, which `PROTOCOL.md` §12 makes "a deployment MUST
+    # NOT log request URLs" a MUST: the token is the room's whole permission.
     #
-    # The fix that would let the driver come back is `web_client` turning its own
-    # access log off, or shortening the format to `$uri`; until it does, this is
-    # the deployment's own guarantee rather than the image's.
+    # The page image has turned its own request log off — `web_client`'s
+    # `packaging/nginx.conf` sets `access_log off` and keeps its error log at
+    # `crit`, above every level at which nginx logs something request-scoped —
+    # and the channel is closed here as well rather than filtered: the `none`
+    # driver discards this container's output outright, so this is the
+    # deployment's own guarantee rather than the image's, and a later image that
+    # logs again still reaches no log this box keeps. This container's errors are
+    # discarded too, which is small: it is a static file server whose failures
+    # the front and the server beside it already show, and the front's own log is
+    # silent by design for the same reason.
     logging:
       driver: "none"
     read_only: true
