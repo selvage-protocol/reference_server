@@ -70,12 +70,15 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then arch=aarch64; machine=183; else arch=x8
 
 # The page: the browser client's built `dist/`, cloned at the pinned revision
 # and bundled here so a container serves one with no mount. It is built from
-# that revision's source rather than from the `dist/` committed there — at
-# this pin the two are byte-identical (a clone built with `npm ci && npm run
-# build` leaves `git status` clean), so the image carries the reviewed bytes
-# and the page cannot fall behind its source. `--platform=$BUILDPLATFORM`: the
-# bundle is the same on every architecture, so this stage runs natively on the
-# build host instead of once per target under emulation.
+# that revision's source inside this stage rather than copied from the `dist/`
+# committed there, so the result is not guaranteed byte-identical to those
+# committed bytes: the sized icons are re-rendered here by whatever ImageMagick
+# this image installs, whose output the client's own build warns is not the same
+# in every release. The scripts, styles, markup and fonts are the revision's;
+# the icons may differ from the committed `dist/` and from the page-only image,
+# which copies it. `--platform=$BUILDPLATFORM`: the bundle is the same on every
+# architecture, so this stage runs natively on the build host instead of once
+# per target under emulation.
 # Two things in this base are the stage's own: trixie for ImageMagick 7's
 # `magick`, which the client's build shells out to for the sized icons
 # (bookworm's imagemagick is 6.x and installs `convert` only), and an explicit
