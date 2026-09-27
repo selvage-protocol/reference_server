@@ -11,10 +11,6 @@
 # instead and keep the distroless runtime — the stage below already accepts
 # any binary at /selvaged.
 #
-# The image also serves the browser page: a `page` stage builds the
-# `web_client` bundle at the pinned revision below and copies it to /page,
-# which the runtime's default command hands to `--serve-page`. Serving a page
-# needs no mount; the override is a mount (see compose.yaml).
 # No default: buildx supplies this per platform automatically, and giving it
 # one here — even just for a plain, non-buildx `docker build .` fallback —
 # shadows that per-platform value for every later `${TARGETARCH}`, including
@@ -27,18 +23,6 @@ ARG TARGETARCH
 ARG RUNTIME=scratch
 ARG VERSION=dev
 ARG REVISION=unknown
-# The browser client revision the baked page is built from: a commit on
-# `selvage-protocol/web_client`, as a full SHA (a shallow fetch by revision
-# demands one). The page it builds must speak the wire this server seats, so the
-# pin names a revision whose bundle names `selvage/2`: a revision that names
-# another wire builds a page that cannot join the container beside it, and
-# `scripts/container-smoke.sh` asserts that string of the served bundle. **A
-# release moves it, rather than a hand**: `scripts/page-revision.sh` names
-# `web_client`'s latest release and `scripts/bump-version.sh --page-sha` writes it
-# here in the same commit as the version, so the value in the tree is what the
-# last release baked and a build from the tree stays reproducible. The image
-# records the revision it carries in `com.selvage.page.revision`.
-ARG WEB_CLIENT_SHA=ecd07aa5daabdcc224f892784202b156b4c5f6a7
 
 # One cross-toolchain image per target, always run natively on the build host:
 # each stage cross-compiles its target triple, so building arm64 needs no
@@ -70,39 +54,6 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then arch=aarch64; machine=183; else arch=x8
     && [ "$(od -An -tu1 -j18 -N1 /selvaged | tr -d ' ')" = "$machine" ] \
     && /selvaged --version
 
-# The page: the browser client's built `dist/`, cloned at the pinned revision
-# and bundled here so a container serves one with no mount. It is built from
-# that revision's source inside this stage rather than copied from the `dist/`
-# committed there, so the result is not guaranteed byte-identical to those
-# committed bytes: the sized icons are re-rendered here by whatever ImageMagick
-# this image installs, whose output the client's own build warns is not the same
-# in every release. The scripts, styles, markup and fonts are the revision's;
-# the icons may differ from the committed `dist/` and from the page-only image,
-# which copies it. `--platform=$BUILDPLATFORM`: the bundle is the same on every
-# architecture, so this stage runs natively on the build host instead of once
-# per target under emulation.
-# Two things in this base are the stage's own: trixie for ImageMagick 7's
-# `magick`, which the client's build shells out to for the sized icons
-# (bookworm's imagemagick is 6.x and installs `convert` only), and an explicit
-# `ca-certificates`, because the official node images install it and then purge
-# it as auto-removable in the same layer — no layer of `node:22-trixie-slim`
-# holds an `/etc/ssl` path. Node carries its own trusted roots and works
-# without it; git, which fetches the pinned revision over HTTPS here, does not.
-FROM --platform=$BUILDPLATFORM node:22-trixie-slim AS page
-ARG WEB_CLIENT_SHA
-WORKDIR /web_client
-# hadolint ignore=DL3008
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git imagemagick \
-    && rm -rf /var/lib/apt/lists/*
-RUN git init -q . \
-    && git remote add origin https://github.com/selvage-protocol/web_client.git \
-    && git fetch --depth 1 origin "$WEB_CLIENT_SHA" \
-    && git checkout -q --detach FETCH_HEAD \
-    && test "$(git rev-parse HEAD)" = "$WEB_CLIENT_SHA" \
-    && npm ci --no-audit --no-fund \
-    && npm run build
-
 # `scratch` takes no tag and `runtime-*` is an internal stage, so DL3006
 # (always tag the image) is unactionable here by design. hadolint
 # directives cannot go on these FROM lines themselves: Docker parses
@@ -110,32 +61,28 @@ RUN git init -q . \
 FROM scratch AS runtime-scratch
 COPY --from=builder /selvaged /selvaged
 COPY crates/selvaged/LICENSE /LICENSE
-COPY --from=page /web_client/dist /page
 USER 65532
 EXPOSE 8080
 ENTRYPOINT ["/selvaged"]
-CMD ["--listen", "0.0.0.0:8080", "--serve-page", "/page"]
+CMD ["--listen", "0.0.0.0:8080"]
 
 FROM gcr.io/distroless/static:nonroot AS runtime-distroless
 COPY --from=builder /selvaged /selvaged
 COPY crates/selvaged/LICENSE /LICENSE
-COPY --from=page /web_client/dist /page
 EXPOSE 8080
 ENTRYPOINT ["/selvaged"]
-CMD ["--listen", "0.0.0.0:8080", "--serve-page", "/page"]
+CMD ["--listen", "0.0.0.0:8080"]
 
 FROM runtime-${RUNTIME} AS final
 ARG VERSION
 ARG REVISION
-ARG WEB_CLIENT_SHA
 # The FSL-1.1-MIT licence travels inside the image (see /LICENSE) and in its
 # annotations. Pushing this image anywhere is redistribution of the binary;
 # the owner accepted GHCR distribution, and re-hosts of the published image,
 # as permitted redistribution on 2026-09-19.
 LABEL org.opencontainers.image.title="selvaged" \
-      org.opencontainers.image.description="Memory-only reference server for the Selvage Session Protocol, serving the browser client's built page" \
+      org.opencontainers.image.description="Memory-only reference server for the Selvage Session Protocol" \
       org.opencontainers.image.source="https://github.com/selvage-protocol/reference_server" \
       org.opencontainers.image.licenses="FSL-1.1-MIT" \
       org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${REVISION}" \
-      com.selvage.page.revision="${WEB_CLIENT_SHA}"
+      org.opencontainers.image.revision="${REVISION}"

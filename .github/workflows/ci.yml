@@ -125,18 +125,10 @@ jobs:
 
       # The command this repository's release workflow runs before it commits a
       # version (`scripts/bump-version.sh`): a bump word in, the next version on the
-      # last line of stdout, the page revision it was handed moved into the
-      # Dockerfile with it, and a refusal that writes nothing for a word, an
+      # last line of stdout, and a refusal that writes nothing for a word, an
       # argument or a manifest it cannot compute from.
       - name: the version bump
         run: nix build .#checks.x86_64-linux.bump-version --no-link --print-build-logs
-
-      # The command that names the page the server image bakes
-      # (`scripts/page-revision.sh`): `web_client`'s latest release, peeled from its
-      # tag to the commit the page stage fetches, and a refusal when there is
-      # nothing to name.
-      - name: the page revision
-        run: nix build .#checks.x86_64-linux.page-revision --no-link --print-build-logs
 
       # The deploy workflow's verification (`scripts/verify_deploy.py`): the origin,
       # read on the box through the front over the SSH path the deploy itself used,

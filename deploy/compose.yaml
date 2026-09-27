@@ -79,12 +79,11 @@ services:
 
   selvaged:
     image: ${SELVAGED_IMAGE:?set SELVAGED_IMAGE in .env}
-    # The image's own command serves a page from `/page` on one listener. This
-    # deployment splits the page into its own container, so the page flag is
-    # gone and the limits are the ones sized for this box; the short form is that
-    # `--max-connections × --outbound-queue-bytes` is the server's own outbound
-    # ceiling, and 32 × 8454144 is 258 MiB, the largest one this host can be
-    # surprised by.
+    # The image's own command is the server alone, and the page is the `selvage-web`
+    # container below; the limits here are the ones sized for this box. The short
+    # form is that `--max-connections × --outbound-queue-bytes` is the server's own
+    # outbound ceiling, and 32 × 8454144 is 258 MiB, the largest one this host can
+    # be surprised by.
     #
     # 8454144 is the smallest queue `selvaged` accepts at all: the 8 MiB frame
     # bound plus the 64 KiB envelope headroom its own `smallest_queue_bytes`

@@ -7,14 +7,23 @@ two-client harness that gates it in CI.
 ## Get it working
 
 `selvaged` is one binary with no configuration file, and the flags below are the
-whole of its surface. The shortest route to a running server is the published
-image:
+whole of its surface. The published image is the server alone: a page is a second
+image that relays to it, so the shortest route to a room you can open in a
+browser is two containers.
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/selvage-protocol/selvaged:latest
+docker network create selvage
+docker run --rm -d --name selvaged --network selvage \
+  ghcr.io/selvage-protocol/selvaged:latest
+docker run --rm -d --name selvage-web --network selvage \
+  -p 127.0.0.1:8080:8080 -e SELVAGE_SERVER=selvaged:8080 \
+  ghcr.io/selvage-protocol/selvage-web:latest
 ```
 
-The GHCR package is public, so a pull needs no account and no `docker login`.
+Open `http://127.0.0.1:8080`; `docker rm -f selvaged selvage-web` ends the run.
+The page image is `web_client`'s and its README owns its configuration and its
+tags. Both GHCR packages are public, so a pull needs no account and no
+`docker login`.
 
 ### From a checkout
 
@@ -36,7 +45,7 @@ nix develop . -c cargo build --release --locked -p selvaged
 
 ### Build the image from this checkout
 
-One image serves the page and the server on one port:
+The image is the server alone, on one port:
 
 ```sh
 docker buildx build --load -t selvaged:local .
@@ -44,15 +53,16 @@ docker run --rm -p 127.0.0.1:8080:8080 selvaged:local
 ```
 
 `docker compose up` builds the same `Dockerfile` through `compose.yaml`, which
-runs the image read-only with every capability dropped. This is the route for an
-image you are changing, or one built from your own checkout.
+runs it beside the published page image, both read-only with every capability
+dropped. This is the route for an image you are changing, or one built from your
+own checkout.
 
-The page is baked in, so a container needs no mount, and a page built elsewhere
-overrides it by mounting over `/page` — the image's own command already passes
-`--serve-page /page`:
+To serve a page from that container, mount a directory and name it with
+`--serve-page`: the image carries none, and its own command passes no such flag.
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 -v "$PWD/page:/page:ro" selvaged:local
+docker run --rm -p 127.0.0.1:8080:8080 -v "$PWD/page:/page:ro" \
+  selvaged:local --listen 0.0.0.0:8080 --serve-page /page
 ```
 
 The container serves as UID `65532`. Mounted page files need read permission,
@@ -162,7 +172,7 @@ flag to move.
 For a 1 GiB box with something else running on it, these are a defensible set:
 
 ```sh
-selvaged --listen 0.0.0.0:8080 --serve-page /page \
+selvaged --listen 0.0.0.0:8080 \
   --max-connections 32 --max-rooms 64 --max-peers-per-room 8 \
   --outbound-queue-bytes 8454144
 ```
@@ -359,28 +369,22 @@ capabilities, and the keepalive and room-grace values it is configured with.
 
 ## Serving the page
 
-`selvaged --serve-page DIR` serves the browser page from the same origin as
-`/session` and `/meta`. One process, one port, one origin: the page's `/meta`
-read is same-origin, so it needs no CORS proxy, and its socket is `ws://` or
-`wss://` on the page's own host, so there is no cross-origin dial. The guest
-link is then a page link, `http://HOST:PORT/?room=<room>&token=<token>`, with no
-`server=` parameter.
-
 The page is the browser client's built `dist/`, which lives in the `web_client`
-repository; the image builds it from a pinned revision and serves it.
+repository and is published as its own image,
+`ghcr.io/selvage-protocol/selvage-web`. That image is the one-origin story: it
+serves the page, and it relays `/session` and `/meta` to the server it is
+configured with, so the page's `/meta` read is same-origin and its socket is
+`ws://` or `wss://` on the page's own host, with no cross-origin dial and no CORS
+proxy. The guest link is then a page link,
+`http://HOST:PORT/?room=<room>&token=<token>`, with no `server=` parameter. A
+self-host run is that image beside this server, which is what `compose.yaml`
+writes; `web_client`'s README owns the image, its configuration and its tags.
 
-`web_client` also publishes the bundle as a page-only image,
-`ghcr.io/selvage-protocol/selvage-web`, whose own README owns the build, the
-tags and the runtime. It is for putting the editor on its own origin, or for one
-page in front of several servers. That second origin works because the page's
-socket is not CORS-bound and its `/meta` read is only advisory, but it costs a
-second port and a second thing to upgrade, and a link at that origin cannot
-reach a room's own page: the page reads the server from the link's own address
-and from nowhere else, so an invite handed to a guest there is the wire shape
-(`ws://HOST:PORT/session?room=…&token=…`), which fronting servers that serve no
-page of their own hand out anyway. One origin stays the default: this image,
-whose page, `/meta` and `/session` share one listener, and `--serve-page` from
-any deployment.
+`selvaged --serve-page DIR` serves a page you supply from the same origin as
+`/session` and `/meta`, which is one process, one port and one origin with no
+second container: mount the directory and name it on the command line, as the
+section above does. The published image carries no page of its own and its own
+command passes no page flag, so supplying one is the whole of that route.
 
 Served files carry the policy a browser needs: a media type from a pinned table,
 `Cache-Control: no-cache` for a stable name and
@@ -390,9 +394,10 @@ Served files carry the policy a browser needs: a media type from a pinned table,
 must not travel on in a `Referer` header.
 
 `scripts/container-smoke.sh` builds the image with Docker, runs it read-only
-with every capability dropped, asserts the page the image bakes, and joins a
-room in it with the harness's client engine; `scripts/ci-local.sh container`
-runs the same where a Docker daemon exists.
+with every capability dropped, asserts the version it answers `/meta` and
+`/session` with, and joins a room in it with the harness's client engine; it then
+runs it again with a page directory mounted and `--serve-page` naming it.
+`scripts/ci-local.sh container` runs the same where a Docker daemon exists.
 
 ## The vectors
 

@@ -133,7 +133,7 @@ jobs:
     # GitHub-hosted `ubuntu-24.04` ships Docker and reaches the whole network.
     # No buildx and nothing pushed: one architecture, a plain local build of
     # the repository's own Dockerfile, and scripts/container-smoke.sh, which
-    # runs the container hardened and asserts the page the image bakes.
+    # runs the container hardened, reads its version back and joins a room in it.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -167,8 +167,7 @@ jobs:
           df -h /
 
       # The Dockerfile needs no nix: its builder stage is Docker's own
-      # cross-toolchain image and its page stage is node's. The dev shell is
-      # here for the client engine.
+      # cross-toolchain image. The dev shell is here for the client engine.
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}

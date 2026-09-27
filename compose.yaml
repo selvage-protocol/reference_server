@@ -1,9 +1,9 @@
-# Self-host for someone evaluating selvage on their own machine: one container
-# on loopback. The public demo's shape is in `deploy/`.
+# Self-host for someone evaluating selvage on their own machine: two containers
+# on loopback — the server, and the page image relaying to it. The public demo's
+# shape is in `deploy/`.
 #
-# No volumes: the image carries the browser page it serves, and the server is
-# memory-only, so there is nothing to persist and nothing to mount. The `./page`
-# override at the bottom is the one mount here, and it is commented out.
+# No volumes: the server is memory-only and the page is served from the page
+# image, so there is nothing to persist and nothing to mount.
 #
 # The run is hardened: read-only root filesystem, every capability dropped, no
 # process able to gain one, and no host socket mounted.
@@ -11,32 +11,38 @@ services:
   selvaged:
     build: .
     image: ghcr.io/selvage-protocol/selvaged:latest
-    ports:
-      # Loopback by default: a stranger evaluating locally reaches it, and
-      # nothing else does. To serve other machines, rebind deliberately, e.g.
-      # "8080:8080".
-      - "127.0.0.1:8080:8080"
-    # Inside the container the wildcard is correct: the port mapping supplies
-    # the boundary. The image's own command is
-    # `--listen 0.0.0.0:8080 --serve-page /page`; override per host, e.g.
-    # `--listen 0.0.0.0:9000` with a matching ports entry.
+    # No `ports:`. The page container beside it reaches the server on this
+    # project's own network and nothing else does. Publish a port here only to
+    # let a client dial `/session` and `/meta` directly, without the page.
     #
-    # One container, one port: the page, /session and /meta share an origin, so
-    # the guest link is a page link (`/` with the room and token in the query)
-    # and nothing needs a CORS proxy. The server needs no database and no TLS
-    # proxy beyond the operator's own edge.
+    # Inside the container the wildcard is correct: the network supplies the
+    # boundary. The image's own command is `--listen 0.0.0.0:8080`; override per
+    # host, e.g. `--listen 0.0.0.0:9000`.
     read_only: true
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
-    #
-    # Override: serve a page built from another `web_client` revision (or one
-    # you are working on) by mounting it over the baked copy — the image's own
-    # command already points `--serve-page` at /page, so the mount is the whole
-    # override. Compose has no conditional mount, so an uncommented `./page`
-    # that does not exist replaces the baked page with an empty directory:
-    # uncomment it only when the directory is there.
-    # volumes:
-    #   - ./page:/page:ro
+
+  selvage-web:
+    image: ghcr.io/selvage-protocol/selvage-web:latest
+    ports:
+      # Loopback by default: a stranger evaluating locally reaches it, and
+      # nothing else does. To serve other machines, rebind deliberately, e.g.
+      # "8080:8080".
+      - "127.0.0.1:8080:8080"
+    environment:
+      # The server's address on this network, as `host:port` or an `http://`
+      # base: the page relays the session and `/meta` to it, so one origin still
+      # serves the page and the room. The variable's name is `web_client`'s to
+      # settle; rename this line alone if its image publishes a different one.
+      SELVAGE_SERVER: selvaged:8080
+    depends_on:
+      - selvaged
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
