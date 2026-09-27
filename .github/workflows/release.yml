@@ -15,11 +15,11 @@ name: release
 # `Dockerfile` in the same commit as the version (`scripts/bump-version.sh
 # --page-sha`), so the pin stays committed — a build from the tree is reproducible
 # — while a release moves it, so it stops lagging the page repository. It runs
-# this repository's own gate on the commit it is about to push, pushes it, creates
-# and pushes the tag, and asks `image.yml` to run against it. It does not itself
-# touch GHCR or create a GitHub Release — those stay in `image.yml`'s `publish` and
-# `release` jobs, gated on the ref being a `v*` tag, which this workflow can only
-# satisfy by creating a tag that names the exact commit it pushed.
+# this repository's own gate on the commit it is about to push, pushes it and its
+# tag in **one atomic push**, and asks `image.yml` to run against the tag. It does
+# not itself touch GHCR or create a GitHub Release — those stay in `image.yml`'s
+# `publish` and `release` jobs, gated on the ref being a `v*` tag, which this
+# workflow can only satisfy by creating a tag that names the exact commit it pushed.
 #
 # **The bump is pushed to `main` directly, and the gate runs in this job.** GitHub
 # does not start a workflow run for an event a workflow produced with its own
@@ -211,22 +211,25 @@ jobs:
       - name: this repository's own gate, as CI runs it
         run: scripts/ci-local.sh checks
 
-      - name: push the bump to main
-        run: |
-          set -euo pipefail
-          # Directly: see the header. The gate above is the check a pull request
-          # would not have got.
-          git push origin HEAD:main
-
-      - name: tag the bump and run image.yml at it
+      - name: push the bump and its tag, and run image.yml at it
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.next.outputs.version }}
         run: |
           set -euo pipefail
           tag="v$VERSION"
+          # Directly to main: see the header. The gate above is the check a pull
+          # request would not have got.
           git tag "$tag"
-          git push origin "$tag"
+          # Both refs in one push. A commit that landed whose tag then failed to
+          # push would leave the tree carrying a version with no tag on the remote,
+          # which is the state the guard at the top refuses until someone creates
+          # the tag by hand; `--atomic` lands both or neither, so the way out of a
+          # failed push here is simply to dispatch the release again.
+          git push --atomic origin HEAD:main "refs/tags/$tag"
+          # The tag push starts no run of its own — an event this workflow creates
+          # with its own token is exempt from triggering workflows — so the image is
+          # asked for by name, which is the event that rule does exempt.
           gh workflow run image.yml --ref "$tag"
 
       # A green `publish` job is not the image existing: the run is queued before
