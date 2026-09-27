@@ -38,16 +38,19 @@ name: deploy-prod
 # same condition and cannot drift apart.
 #
 # Then Tailscale SSH as `deployci`, a local user on the box with no password, no
-# key and exactly one permitted root command — `/usr/local/sbin/selvage-deploy`,
-# with no argument wildcard. Tailscale SSH cannot restrict the command (the
+# key and two permitted root commands — `/usr/local/sbin/selvage-deploy`, whose
+# request names which image tags run, and `/usr/local/sbin/selvage-install-shape`,
+# which installs the box's shape from a stream on stdin — each with no argument
+# wildcard. Tailscale SSH cannot restrict the command (the
 # policy's `ssh` rules have no `cmd` field), so the bound lives on the box and
 # is proved there rather than claimed here.
 #
-# What a run may change, which is the whole of what CI can do to production:
-# **which tag of two already-published images `/srv/selvage/.env` names**. The
+# What a run may change, and the whole of what this dispatch can do to
+# production: **which tag of two already-published images `/srv/selvage/.env`
+# names**. The
 # request carries one tag reference per image this dispatch names, the box
 # rewrites those lines of `.env` and nothing else, and pulls and ups. The compose
-# file is the owner's to edit by hand and a run never writes it, so a run cannot
+# file is not in this request and a run never writes it, so a run cannot
 # add a port, drop a capability, mount a certificate or raise a memory limit. An
 # input this dispatch leaves empty means "leave that line exactly as it is". The
 # box's update timer follows whatever tag `.env` names, so a dispatch is how a
