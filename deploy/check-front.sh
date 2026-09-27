@@ -4,18 +4,22 @@
 #
 #   deploy/check-front.sh
 #
-# The front answers two things itself, and both are asserted here against a
-# running nginx rather than against the files that configure it:
+# The front answers three things itself, and all three are asserted here against
+# a running nginx rather than against the files that configure it:
 #
 #   - the not-found page, `proxy/www/404.html`, which the `/404.html` location
 #     serves in place of the page container's own 404;
+#   - the notice `proxy/conf.d/default.conf` substitutes into the page
+#     container's own HTML before `</body>`, which pages served from the
+#     not-found page's location do not carry;
 #   - the host guard, which closes a request naming a name this block is not the
 #     server for.
 #
 # What matters is not that a string is in a file this repository owns, but that
-# a visitor receives it. A missing path the front stops answering with this
-# instance's own page, a `root` that moves, or a `www/` the image stops
-# installing are all invisible to a grep of the configuration and all fail here.
+# a visitor receives it. A substitution that stops matching, a missing path the
+# front stops answering with this instance's own page, a `root` that moves, or a
+# `www/` the image stops installing are all invisible to a grep of the
+# configuration and all fail here.
 #
 # No Docker: this host has none. The front's real configuration runs under
 # nginx from the host, or from nixpkgs when there is no nginx on `PATH`. Two
@@ -248,6 +252,33 @@ else
     bad "/404.html answers ${answer%% *}, want 404"
 fi
 
+say "the notice, as substituted into the page's own bytes"
+
+# The instance's one sentence about itself, out of the response for the page
+# rather than out of the configuration: a substitution that stops matching, or a
+# page container that stops ending in `</body>`, is a notice nobody receives and
+# nothing in the configuration shows.
+fetch "http://127.0.0.1:$listen_port/" "$work/served-page.html" >/dev/null
+while IFS= read -r fact; do
+    if grep -qF -- "$fact" "$work/served-page.html"; then
+        ok "the page carries: $fact"
+    else
+        bad "the page no longer carries: $fact"
+    fi
+done <<'NOTICE'
+<aside
+This is the Selvage demo instance, for trying Selvage out. It is not a service to rely on.
+NOTICE
+
+# The not-found page fetched above is the other half of the same claim: the
+# substitution is in `location /`, and `/404.html` is a location of its own, so a
+# missing path is answered without passing through it.
+if grep -qF -- 'This is the Selvage demo instance' "$work/served-missing.html"; then
+    bad 'the not-found page carries the notice: the substitution reached /404.html'
+else
+    ok "the front's own not-found page carries no notice"
+fi
+
 say "the name the front is the server for"
 
 # The front's block is the only one on its port, so nginx would otherwise make it
@@ -269,7 +300,7 @@ fi
 
 say "result"
 if [ "$failures" = 0 ]; then
-    printf "  a missing path answered with this instance's own page, and the front served only its own name\n"
+    printf "  the page carried the notice, a missing path answered with this instance's own page, and the front served only its own name\n"
 else
     printf '  %s assertion(s) failed\n' "$failures" >&2
 fi
