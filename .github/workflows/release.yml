@@ -33,8 +33,12 @@ name: release
 # tag push starts nothing either and the two dispatches below are explicit:
 # `gh workflow run image.yml --ref "v<version>"` is the event the loop-prevention
 # rule exempts, and `deploy-prod.yml` is asked for by name once the image it names
-# actually exists on GHCR. `deploy-prod.yml` does its own verification of what the
-# box serves; this workflow does not repeat it.
+# actually exists on GHCR. That last dispatch is watched: `gh workflow run` prints
+# no run id, so `scripts/wait_for_deploy.py` reads the workflow's runs, dispatches,
+# and waits for the run the dispatch created — a release that says the demo moved
+# fails unless that run concludes `success`, rather than standing green beside a
+# red deploy. `deploy-prod.yml` does its own verification of what the box serves;
+# this workflow reads the run's conclusion and does not repeat it.
 #
 # `dry_run` stops before the first write — before the page is resolved, the tree is
 # touched, the gate runs, anything is pushed or anything is dispatched — and prints
@@ -296,9 +300,13 @@ jobs:
 
       # The bump is pushed and the image exists; what is left is the public demo.
       # `deploy-prod.yml` changes the tag `/srv/selvage/.env` names for `selvaged`,
-      # and installs the box's shape when this release moved one. It verifies the
-      # origin itself, so nothing here re-reads `/meta`.
-      - name: hand the release to the public demo
+      # and installs the box's shape when this release moved one. `gh workflow run`
+      # prints no run id, so `scripts/wait_for_deploy.py` reads the workflow's runs,
+      # dispatches, and waits for the run this dispatch created: this step fails
+      # unless that run concludes `success`, which is what keeps a green release from
+      # standing beside a red deploy. The deploy verifies the origin itself, so
+      # nothing here re-reads `/meta`.
+      - name: hand the release to the public demo, and fail when the deploy fails
         if: inputs.dry_run != true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -314,4 +322,4 @@ jobs:
             args+=(-f install_shape=true)
             echo "deploy/ changed since v$PREVIOUS; the box's shape is installed as part of the deploy"
           fi
-          gh workflow run deploy-prod.yml --ref main "${args[@]}"
+          scripts/wait_for_deploy.py --dispatch --workflow deploy-prod.yml --ref main "${args[@]}"

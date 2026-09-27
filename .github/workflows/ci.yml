@@ -133,6 +133,26 @@ jobs:
       - name: the page revision
         run: nix build .#checks.x86_64-linux.page-revision --no-link --print-build-logs
 
+      # The deploy workflow's verification (`scripts/verify_deploy.py`): the origin,
+      # read on the box through the front over the SSH path the deploy itself used,
+      # is the assertion — a version other than the one asked for, or a page that
+      # stops answering, fails the run — while the public read is only reported,
+      # because an edge answers a programmatic client on a datacenter address with a
+      # managed challenge. The suite drives the poll loops with injected reads and
+      # the `ssh`/`curl`-facing edges against stand-ins on `PATH`, so it needs no
+      # network, no token and no live deploy.
+      - name: the deploy workflow's verification
+        run: nix build .#checks.x86_64-linux.deploy-verify --no-link --print-build-logs
+
+      # The watcher the release's last step runs (`scripts/wait_for_deploy.py`):
+      # `gh workflow run` prints no run id, so the run to wait on is the newest
+      # one of the workflow that is not the newest seen before the dispatch, and
+      # the release fails unless it concludes `success`. The suite drives the poll
+      # loops with injected reads and the `gh`-facing edges against a stand-in on
+      # `PATH`, so it needs no network, no token and no real run.
+      - name: the release's wait for its deploy
+        run: nix build .#checks.x86_64-linux.deploy-wait --no-link --print-build-logs
+
       # The guard around a workflow's `dry_run` input (`scripts/check_dry_run_gating.py`):
       # `release.yml` printed a plan promising that nothing would be resolved, written or
       # dispatched and then did all of it, because the plan step was the only step carrying
