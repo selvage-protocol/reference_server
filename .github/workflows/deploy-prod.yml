@@ -193,9 +193,11 @@ jobs:
       # `https://127.0.0.1/meta` and the page, both naming the demo's own `Host`,
       # because the front is the server for that name and closes the connection
       # for any other one — and the run fails unless it reports the version this
-      # dispatch asked for. A `server_version` that is not a release version
-      # (`latest`) has no version to compare, so `/meta` is read and not compared,
-      # as it is for a page-only dispatch.
+      # dispatch asked for. `/meta` reports the Cargo version, so a commit-stamped
+      # tag (`0.4.6-97ff967`) is compared by its version and a prerelease
+      # (`1.0.0-rc.1`) as it is. A tag that names no version (`latest`) has none
+      # to compare, so `/meta` is read and not compared, as it is for a page-only
+      # dispatch.
       #
       # The *public* URL is read in three shapes, and only one of them decides the
       # run. Cloudflare serves a managed challenge to a programmatic client on a
@@ -222,7 +224,11 @@ jobs:
         run: |
           set -euo pipefail
           args=(--ssh-target deployci@selvage-protocol-prod)
-          if [[ $SERVER_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            args+=(--expect-version "$SERVER_VERSION")
+          expected=$SERVER_VERSION
+          if [[ $expected =~ ^(.+)-[0-9a-f]{7,40}$ ]]; then
+            expected=${BASH_REMATCH[1]}
+          fi
+          if [[ $expected =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            args+=(--expect-version "$expected")
           fi
           scripts/verify_deploy.py "${args[@]}"
