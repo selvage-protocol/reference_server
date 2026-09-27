@@ -4,8 +4,9 @@
 # has no Docker or Podman, so `act` cannot run here).
 #
 #   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval, the public
-#                                 # demo's deploy guard, front limits and command line, the deploy
-#                                 # workflow's verification, lint, typos
+#                                 # demo's deploy guard, front limits and command line, the version
+#                                 # bump and page revision, the deploy workflow's verification,
+#                                 # lint, typos
 #   scripts/ci-local.sh nightly   # coverage, the rest of cargo-deny and cargo-audit (slow)
 #   scripts/ci-local.sh lint      # actionlint over the workflow files, on its own
 #   scripts/ci-local.sh image     # the `image` workflow's smoke: nix-built image,
@@ -102,6 +103,11 @@ job_checks() {
   # written for a word or a manifest it cannot compute from.
   say "checks: the version bump"
   nix build .#checks.x86_64-linux.bump-version --no-link --print-build-logs
+  # The revision the release pins the page stage to: `web_client`'s latest
+  # release, peeled from its tag to the commit the Dockerfile fetches, and a
+  # refusal when there is nothing to name.
+  say "checks: the page revision"
+  nix build .#checks.x86_64-linux.page-revision --no-link --print-build-logs
   # The deploy workflow's verification: what it asserts (the origin, on the box
   # through the front) and what it only reports (the public URL, behind an edge
   # that answers a datacenter client with a challenge).
