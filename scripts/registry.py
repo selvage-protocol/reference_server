@@ -1,4 +1,4 @@
-"""The anonymous registry reads that `scripts/`' image tools share.
+"""The anonymous registry reads behind `scripts/`' image tools.
 
 Both images are public on GHCR, so they are read the way `docker pull` reads
 them and with no credential: a bare manifest request, the `WWW-Authenticate`
@@ -7,9 +7,8 @@ challenge that comes back, a pull-scoped bearer token minted from
 dance, because it is the part that is easy to get subtly wrong and there is
 nothing in it specific to what a caller wants to do with the answer.
 
-`assert-multiarch-layers.py` uses `fetch_index`/`fetch_manifest`/`fetch_blob` to
-compare what each platform's manifest actually carries; `image-digest.py` uses
-`index_digest` to turn a release tag into the reference the deployment pins.
+`assert-multiarch-layers.py` builds `fetch_index`/`fetch_manifest`/`fetch_blob`
+on `registry_get` to compare what each platform's manifest actually carries.
 """
 
 import json
@@ -70,17 +69,3 @@ def registry_get(host, path, accept, token=None):
             new_token = fetch_token(e.headers.get("WWW-Authenticate", ""))
             return registry_get(host, path, accept, token=new_token)
         raise SystemExit(f"GET {url} failed: {e.code} {e.reason}") from e
-
-
-def index_digest(host, repo, tag):
-    """The digest of the image index a tag names, as the registry reports it.
-
-    The digest is the registry's own answer rather than a hash this recomputes:
-    it is what a pull resolves the tag against, and it is what makes the
-    deployment's pin immune to the tag being repointed later.
-    """
-    _, headers = registry_get(host, f"/v2/{repo}/manifests/{tag}", INDEX_ACCEPT)
-    digest = headers.get("Docker-Content-Digest")
-    if not digest:
-        raise SystemExit(f"{host}/{repo}:{tag} answered with no Docker-Content-Digest")
-    return digest
