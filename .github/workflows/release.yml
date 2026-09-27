@@ -127,7 +127,15 @@ jobs:
           # The last line of stdout is the version, and the only line on it.
           next=$(scripts/bump-version.sh "$BUMP" --dry-run | tail -n 1)
           if git ls-remote --exit-code --tags origin "refs/tags/v$next" >/dev/null 2>&1; then
-            echo "refusing: v$next already exists on the remote; nothing was written" >&2
+            {
+              echo "refusing: v$next already exists on the remote; nothing was written or pushed."
+              echo
+              echo "A release that reached its tag and stopped before it published leaves exactly"
+              echo "this state, and the way out is the step it would have taken rather than another"
+              echo "bump:"
+              echo
+              echo "  nix run nixpkgs#gh -- workflow run image.yml -R selvage-protocol/reference_server --ref v$next"
+            } >&2
             exit 1
           fi
           echo "version=$next" >>"$GITHUB_OUTPUT"
