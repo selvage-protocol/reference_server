@@ -92,10 +92,15 @@ server_port=$(free_port 18463 18482)
 page_port=$(free_port 18483 18502)
 
 stub_pid=''
+# The trap runs on the way out of a failed start as much as a good one, so nothing
+# in it may block. `kill`'s default TERM is a signal a child may catch or ignore,
+# and a `wait` for a child that never dies blocks the trap for good; KILL cannot
+# be caught, so the `wait` below cannot outlive it. The stand-in serves a
+# directory this script is about to delete; it has nothing to shut down gently.
 cleanup() {
     "$ngx" -c "$work/nginx.conf" -p "$work/prefix" -e "$work/error.log" -s stop >/dev/null 2>&1 || true
     if [ -n "$stub_pid" ]; then
-        kill "$stub_pid" 2>/dev/null || true
+        kill -KILL "$stub_pid" 2>/dev/null || true
         wait "$stub_pid" 2>/dev/null || true
     fi
 }
