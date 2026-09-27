@@ -1,0 +1,26 @@
+# The other root command the CI user on the public demo may run, and nothing else.
+#
+# `selvage-install-shape` installs the box's shape — `compose.yaml` and `proxy/` —
+# from a tar stream on stdin, then rebuilds the front from it. It is what makes a
+# release that changed `deploy/` installable with nobody at a keyboard; the
+# `deployci` account's other line is `selvage-deploy`, which moves which image
+# tags run and never writes a file of the shape. `deployci.sudoers` has the rest
+# of why this user exists at all (Tailscale SSH carries no command restriction, so
+# an SSH grant is a shell grant, and the box's own user has blanket sudo).
+#
+# There is deliberately **no argument wildcard**, and the trailing `""` is what
+# says so: `/usr/local/sbin/selvage-install-shape ""` permits that one program and
+# no argument at all, whereas the same line without the `""` would permit *any*
+# argument, because an empty argument list in sudoers means "any" rather than
+# "none". That distinction is the whole bound: a command named in sudoers without
+# an argument list permits any argument. It is also why the shape arrives on stdin,
+# and why the script refuses its own arguments as well: the marker is what sudo
+# enforces, and the script check is the second lock on the same door.
+#
+# The script is root-owned mode 0755 under `/usr/local/sbin` (root:root 0755), so
+# the user it is granted to cannot change what it does.
+#
+# Installs to `/etc/sudoers.d/selvage-install-shape`, root:root, mode 0440 — a
+# file per command, so each line's bound is one file and neither can be lost with
+# the other — and is read with `visudo -c -f` before it is put there.
+deployci ALL=(root) NOPASSWD: /usr/local/sbin/selvage-install-shape ""
