@@ -118,10 +118,10 @@ jobs:
       - name: the deployed command line
         run: nix build .#checks.x86_64-linux.deploy-args --no-link --print-build-logs
 
-      # The command the release coordinator runs before it commits a version
-      # (`scripts/bump-version.sh`): the version and the `web_client` revision in
-      # the three files that carry them and nowhere else, with a bad argument or a
-      # cargo that fails leaving the tree as it was.
+      # The command this repository's release workflow runs before it commits a
+      # version (`scripts/bump-version.sh`): a bump word in, the next version on the
+      # last line of stdout, and a refusal that writes nothing for a word or a
+      # manifest it cannot compute from.
       - name: the version bump
         run: nix build .#checks.x86_64-linux.bump-version --no-link --print-build-logs
 
