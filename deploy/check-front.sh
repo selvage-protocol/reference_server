@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 #
-# The terms notice, read back out of the bytes the front serves.
+# The front's own answers, read back out of the bytes it serves.
 #
-#   deploy/check-terms.sh
+#   deploy/check-front.sh
 #
-# The notice lives in two places, and both are asserted here against a running
-# nginx rather than against the files that configure it:
+# The front answers two things itself, and both are asserted here against a
+# running nginx rather than against the files that configure it:
 #
-#   - `proxy/www/terms.html`, which the `/terms` location serves, and which the
-#     banner on the page links to;
-#   - the banner `proxy/conf.d/default.conf` substitutes into the page's own
-#     HTML before `</body>`.
+#   - the not-found page, `proxy/www/404.html`, which the `/404.html` location
+#     serves in place of the page container's own 404;
+#   - the host guard, which closes a request naming a name this block is not the
+#     server for.
 #
 # What matters is not that a string is in a file this repository owns, but that
-# a visitor receives it. A `/terms` location that 404s, a page container that
-# stops ending in `</body>`, or a licence that falls out of the notice in a
-# rewrite are all invisible to a grep of the configuration and all fail here.
+# a visitor receives it. A missing path the front stops answering with this
+# instance's own page, a `root` that moves, or a `www/` the image stops
+# installing are all invisible to a grep of the configuration and all fail here.
 #
 # No Docker: this host has none. The front's real configuration runs under
 # nginx from the host, or from nixpkgs when there is no nginx on `PATH`. Two
@@ -31,7 +31,7 @@ set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd -- "$here/.." && pwd)
 proxy="$here/proxy"
-work="$repo/.tmp/proxy-check-terms"
+work="$repo/.tmp/proxy-check-front"
 
 server_conf="$proxy/nginx.conf"
 default_conf="$proxy/conf.d/default.conf"
@@ -54,6 +54,10 @@ bad() {
     failures=$((failures + 1))
 }
 say() { printf '\n=== %s ===\n' "$*"; }
+
+# One request, with the Host the front is the server for: the body to `$2`, and
+# `status content-type` on stdout.
+fetch() { curl -sS --max-time 5 -H "Host: $demo_host" -o "$2" -w '%{http_code} %{content_type}' "$1"; }
 
 # A free loopback port, asked of the kernel rather than assumed, so a run
 # beside another nginx cannot collide or fail for the wrong reason.
@@ -88,12 +92,12 @@ trap cleanup EXIT
 
 say "the harness"
 
-# The root the front serves the terms page from, read out of the configuration
-# rather than repeated here: the Dockerfile below is asserted to install it
-# there, so the two cannot drift apart in silence.
-# The terms page and the not-found page share it, so there is one to read.
-terms_root=$(sed -n 's/^[[:space:]]*root \(.*\);$/\1/p' "$default_conf" | sort -u)
-if [ -z "$terms_root" ] || [ "$(printf '%s\n' "$terms_root" | wc -l)" != 1 ]; then
+# The root the front serves its own not-found page from, read out of the
+# configuration rather than repeated here: the Dockerfile below is asserted to
+# install it there, so the two cannot drift apart in silence. The `/404.html`
+# location is the only one with a `root`, so there is exactly one to read.
+www_root=$(sed -n 's/^[[:space:]]*root \(.*\);$/\1/p' "$default_conf" | sort -u)
+if [ -z "$www_root" ] || [ "$(printf '%s\n' "$www_root" | wc -l)" != 1 ]; then
     printf 'not exactly one root in %s: the harness has nothing to point at\n' "$default_conf" >&2
     exit 2
 fi
@@ -125,7 +129,7 @@ sed \
     -e "/^ *ssl_certificate/d" \
     -e "s#http://selvaged:8080#http://127.0.0.1:$server_port#g" \
     -e "s#http://selvage-web:8080#http://127.0.0.1:$page_port#g" \
-    -e "s#^\( *\)root $terms_root;#\1root $proxy/www;#" \
+    -e "s#^\( *\)root $www_root;#\1root $proxy/www;#" \
     "$default_conf" >"$work/conf.d/default.conf"
 
 cp "$proxy/conf.d/cloudflare-ips.conf" "$work/conf.d/"
@@ -157,7 +161,7 @@ rewritten '/etc/nginx/conf.d/*.conf' 'nginx.conf'
 rewritten 'listen 8080 ssl;' 'conf.d/default.conf'
 rewritten 'http://selvaged:8080' 'conf.d/default.conf'
 rewritten 'http://selvage-web:8080' 'conf.d/default.conf'
-rewritten "root $terms_root;" 'conf.d/default.conf'
+rewritten "root $www_root;" 'conf.d/default.conf'
 
 # The certificate pair is dropped rather than rewritten, so it is counted: the
 # front terminates TLS and a copy of its configuration without a certificate is
@@ -170,18 +174,17 @@ if grep -q '^ *ssl_certificate' "$work/conf.d/default.conf"; then
     bad 'a ssl_certificate line survived into the harness'
 fi
 
-if grep -qF -- "www/ $terms_root" "$proxy/Dockerfile"; then
-    ok "the image installs www/ at $terms_root, where the /terms location reads it"
+if grep -qF -- "www/ $www_root" "$proxy/Dockerfile"; then
+    ok "the image installs www/ at $www_root, where the /404.html location reads it"
 else
-    bad "the image does not install www/ at $terms_root, so the /terms location would 404"
+    bad "the image does not install www/ at $www_root, so a missing path would not answer with this instance's own page"
 fi
 
 say "starting the front"
 
-# The page container's stand-in. It ends in `</body>`, which is the whole of
-# what the banner's substitution depends on, and it answers a sibling path so
-# that `/termsomething` can be shown to reach the page rather than the terms
-# file.
+# The page container's stand-in. It answers the root with 200, so the front can
+# be seen proxying to it, and a path it does not have with its own 404, which the
+# front must replace with this instance's page.
 cat >"$work/stub/index.html" <<'HTML'
 <!doctype html>
 <html lang="en">
@@ -189,7 +192,6 @@ cat >"$work/stub/index.html" <<'HTML'
   <body><p>the page container's stand-in</p></body>
 </html>
 HTML
-printf 'the page container answered this path\n' >"$work/stub/termsomething"
 
 python3 -m http.server "$page_port" --bind 127.0.0.1 --directory "$work/stub" \
     >"$work/page.log" 2>&1 &
@@ -198,9 +200,12 @@ stub_pid=$!
 "$ngx" -c "$work/nginx.conf" -p "$work/prefix" -e "$work/error.log"
 
 deadline=$((SECONDS + 15))
-until curl -sS -o /dev/null --max-time 2 -H "Host: $demo_host" "http://127.0.0.1:$listen_port/terms"; do
+# The predicate is the front answering `200`, not merely answering: the page
+# container's stand-in takes a moment to bind, and a `502` from the front before
+# it does is a response `curl` would otherwise call success.
+until [ "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 -H "Host: $demo_host" "http://127.0.0.1:$listen_port/")" = 200 ]; do
     if [ "$SECONDS" -ge "$deadline" ]; then
-        bad 'the front did not answer /terms within 15s'
+        bad 'the front did not answer / within 15s'
         printf '  front log:\n'
         sed 's/^/    /' "$work/error.log" || true
         printf '  page log:\n'
@@ -211,143 +216,10 @@ until curl -sS -o /dev/null --max-time 2 -H "Host: $demo_host" "http://127.0.0.1
 done
 ok "the front is listening on 127.0.0.1:$listen_port"
 
-say "the terms page, as served"
-
-fetch() { curl -sS --max-time 5 -H "Host: $demo_host" -o "$2" -w '%{http_code} %{content_type}' "$1"; }
-
-answer=$(fetch "http://127.0.0.1:$listen_port/terms" "$work/served-terms.html")
-code=${answer%% *}
-kind=${answer#* }
-if [ "$code" = 200 ]; then ok "/terms answers $code"; else bad "/terms answers $code"; fi
-case $kind in
-text/html*) ok "/terms is served as $kind" ;;
-*) bad "/terms is served as $kind, so a browser would show the page as source" ;;
-esac
-
-answer=$(fetch "http://127.0.0.1:$listen_port/terms/" "$work/served-terms-slash.html")
-if [ "${answer%% *}" = 200 ]; then
-    ok "/terms/ answers 200"
-else
-    bad "/terms/ answers ${answer%% *}: a link or a typed URL depends on the trailing slash"
-fi
-if cmp -s "$work/served-terms.html" "$work/served-terms-slash.html"; then
-    ok '/terms and /terms/ are the same bytes'
-else
-    bad '/terms and /terms/ answer differently'
-fi
-
-if cmp -s "$work/served-terms.html" "$proxy/www/terms.html"; then
-    ok 'the bytes served for /terms are the file in this repository'
-else
-    bad 'the bytes served for /terms are not www/terms.html'
-fi
-
-# The claims, in the text a reader sees. These are what the notice has to keep;
-# the prose around them is free to change.
-python3 - "$work/served-terms.html" >"$work/served-terms.txt" <<'PY'
-import html.parser
-import sys
-
-
-class Text(html.parser.HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.quiet = 0
-        self.parts = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag in ("style", "script", "title"):
-            self.quiet += 1
-
-    def handle_endtag(self, tag):
-        if tag in ("style", "script", "title") and self.quiet:
-            self.quiet -= 1
-
-    def handle_data(self, data):
-        if not self.quiet:
-            self.parts.append(data)
-
-
-reader = Text()
-with open(sys.argv[1], encoding="utf-8") as page:
-    reader.feed(page.read())
-print(" ".join(" ".join(reader.parts).split()))
-PY
-
-while IFS= read -r claim; do
-    if grep -qF -- "$claim" "$work/served-terms.txt"; then
-        ok "the page says: $claim"
-    else
-        bad "the page no longer says: $claim"
-    fi
-done <<'CLAIMS'
-non-commercial use only
-personal and evaluation
-not persisted
-reset at any time
-self-host
-build with Selvage
-MIT
-Apache-2.0
-FSL-1.1-MIT
-CC-BY-4.0
-selvage@dontblameme.dev
-CLAIMS
-
-# The links a reader of this page wants, by target. A dead one is worse than
-# none, which is why the target is asserted and not the anchor text.
-while IFS= read -r link; do
-    if grep -qF -- "href=\"$link\"" "$work/served-terms.html"; then
-        ok "the page links to $link"
-    else
-        bad "the page no longer links to $link"
-    fi
-done <<'LINKS'
-/
-https://github.com/selvage-protocol
-https://github.com/selvage-protocol/reference_server
-https://github.com/selvage-protocol/reference_server/blob/main/LICENSE-MIT
-https://github.com/selvage-protocol/reference_server/blob/main/LICENSE-APACHE
-https://github.com/selvage-protocol/reference_server/blob/main/crates/selvaged/LICENSE
-https://github.com/selvage-protocol/specification/blob/main/LICENSE
-https://selvage.dontblameme.dev
-mailto:selvage@dontblameme.dev
-LINKS
-
-say "the banner, as substituted into the page's own bytes"
-
-fetch "http://127.0.0.1:$listen_port/" "$work/served-page.html" >/dev/null
-while IFS= read -r fact; do
-    if grep -qF -- "$fact" "$work/served-page.html"; then
-        ok "the banner carries: $fact"
-    else
-        bad "the banner no longer carries: $fact"
-    fi
-done <<'BANNER'
-<aside
-non-commercial use only.
-Not a hosted product; rooms are not persisted and may be reset at any time.
-href="/terms"
-BANNER
-
-# The `location` is anchored, so a sibling path is the page's and not this
-# page. Both are asked for: the front must have proxied the request on, and it
-# must not have answered it with the terms page.
-fetch "http://127.0.0.1:$listen_port/termsomething" "$work/served-other.html" >/dev/null
-if cmp -s "$work/served-other.html" "$work/served-terms.html"; then
-    bad '/termsomething is answered with the terms page'
-fi
-if grep -q 'GET /termsomething' "$work/page.log"; then
-    ok 'a sibling path reaches the page container, not the terms file'
-else
-    bad '/termsomething did not reach the page container'
-fi
-
 say "the not-found page, in place of the page container's"
 
-# The stand-in answers a path it does not have with its own 404 page, which
-# ends in `</body>`: without the interception it would reach the visitor with
-# the banner substituted into it.
+# The stand-in answers a path it does not have with its own 404 page; without
+# the interception that page is what the visitor would receive.
 answer=$(fetch "http://127.0.0.1:$listen_port/no/such/path" "$work/served-missing.html")
 if [ "${answer%% *}" = 404 ]; then
     ok 'a missing path still answers 404'
@@ -359,7 +231,7 @@ text/html*) ok "the not-found page is served as ${answer#* }" ;;
 *) bad "the not-found page is served as ${answer#* }" ;;
 esac
 if cmp -s "$work/served-missing.html" "$proxy/www/404.html"; then
-    ok 'the bytes served for a missing path are www/404.html, with no banner'
+    ok 'the bytes served for a missing path are www/404.html as it is'
 else
     bad 'a missing path is not answered with www/404.html as it is'
 fi
@@ -367,11 +239,6 @@ if grep -q 'GET /no/such/path' "$work/page.log"; then
     ok 'the missing path was asked of the page container first'
 else
     bad 'the missing path never reached the page container'
-fi
-if grep -qF -- 'href="/terms"' "$work/served-missing.html"; then
-    ok 'the not-found page links to the terms'
-else
-    bad 'the not-found page no longer links to the terms'
 fi
 
 answer=$(fetch "http://127.0.0.1:$listen_port/404.html" "$work/served-direct.html")
@@ -393,7 +260,7 @@ say "the name the front is the server for"
 # read out of the configuration, and none of them could bring a body through if
 # that were not the name the front is the server for.
 answer=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
-    -H 'Host: selvage.dontblameme.dev' "http://127.0.0.1:$listen_port/terms" 2>/dev/null || true)
+    -H 'Host: selvage.dontblameme.dev' "http://127.0.0.1:$listen_port/" 2>/dev/null || true)
 if [ "$answer" = 000 ]; then
     ok 'a request naming another host is closed rather than served'
 else
@@ -402,7 +269,7 @@ fi
 
 say "result"
 if [ "$failures" = 0 ]; then
-    printf '  the notice reached the served bytes in every place it has to\n'
+    printf "  a missing path answered with this instance's own page, and the front served only its own name\n"
 else
     printf '  %s assertion(s) failed\n' "$failures" >&2
 fi

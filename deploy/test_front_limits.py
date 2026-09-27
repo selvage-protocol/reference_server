@@ -15,7 +15,7 @@ refused at the join.
 
 All of it is driven against the front's real `nginx.conf` and
 `conf.d/default.conf`, under nginx with the two upstream names answered on
-loopback and TLS off, exactly as `check-terms.sh` does it. Five claims cannot
+loopback and TLS off, exactly as `check-front.sh` does it. Five claims cannot
 be made by reading the files and are made by measuring:
 
   - a request naming a Host the front is not the server for is closed rather
@@ -183,8 +183,7 @@ def harness_configs(work, listen_port, stub_port, default_text=None):
 # ----------------------------------------------------------------- the stub
 #
 # Stands in for `selvaged` and `selvage-web` at once. It answers everything
-# `200 text/html` and ends in `</body>` so the banner's substitution has
-# something to substitute into. `/meta?slow=1` is held open for a moment, so
+# `200 text/html`. `/meta?slow=1` is held open for a moment, so
 # that concurrent connections genuinely overlap: `limit_conn` counts requests in
 # flight, and against a stub that answers instantly nothing ever is.
 
