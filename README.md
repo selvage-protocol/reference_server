@@ -40,12 +40,9 @@ The name and the host port above are this example's own, so it and the card's pa
 can be up at once: the card's server runs as `selvaged` and its page publishes
 `8080`, so stopping either pair leaves the other's container alone. A client reaches
 this container at `ws://127.0.0.1:8081` — the host port the mapping above publishes.
-[Deploying](docs/deploying.md) has the other addresses a client might be pointed at,
-and why they do not answer. This container serves the session protocol and no page,
-so a client is what joins it; for a room you can open in a browser, run the two
-containers the Run card prints, at <https://selvage.dontblameme.dev/#try>. The page
-image is `web_client`'s and its README owns that image's configuration and its tags.
 Both GHCR packages are public, so a pull needs no account and no `docker login`.
+[Deploying](docs/deploying.md) has the other addresses a client might be pointed at,
+and why they do not answer.
 
 ### From a checkout
 

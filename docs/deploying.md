@@ -12,8 +12,7 @@ card's server rather than this one — and answers nothing when the pair is down
 This container serves the session protocol and no page, so a client is what
 joins it; for a room you can open in a browser, run the two containers the Run
 card prints, at <https://selvage.dontblameme.dev/#try>. The page image is
-`web_client`'s and its README owns that image's configuration and its tags. Both
-GHCR packages are public, so a pull needs no account and no `docker login`.
+`web_client`'s and its README owns that image's configuration and its tags.
 
 ## Letting someone else in
 
