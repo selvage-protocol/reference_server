@@ -26,3 +26,8 @@ while a redistributed `selvage-harness` binary carries FSL code with it. That
 redistribution must include the FSL terms or a link to them and retain the
 copyright notices; the harness's licence does not replace its dependency's FSL
 terms.
+
+The vendored vectors are `CC-BY-4.0`
+([`selvage-protocol/specification`](https://github.com/selvage-protocol/specification)),
+which this repository does not author and redistributes with that repository as
+the source of the attribution.
