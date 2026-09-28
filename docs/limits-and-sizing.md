@@ -51,11 +51,15 @@ selvaged --listen 0.0.0.0:8080 \
 That is an outbound ceiling of 258 MiB, not a figure anything reaches in a
 session: it is every one of 32 connections holding a full queue of unwritten
 frames at once, which is what the queue's own cap ejects. The two inbound bounds
-keep their defaults here: 5 MiB is well above the largest sealed frame a peer
-sends, and 2 MiB/s is already far above what an editor does. Lowering
-`--inbound-bytes-per-sec` below a few tens of kilobytes a second will exile a
-peer for traffic it did not choose to send: a client publishes presence on a
-timer, and each of those frames costs a kilobyte of budget.
+keep their defaults here. `--max-envelope-bytes` bounds the text envelope alone,
+judged on the frame before the parser sees it, and at 5 MiB it sits below the
+8 MiB transport bound so that an over-bound envelope is refused as one rather
+than by ending the connection; a sealed frame is a binary frame, and the
+transport bound is what holds that. And 2 MiB/s is already far above what an
+editor does. Lowering `--inbound-bytes-per-sec` below a few tens of kilobytes a
+second will exile a peer for traffic it did not choose to send: a client
+publishes presence on a timer, and each of those frames costs a kilobyte of
+budget.
 
 `selvaged` does not implement an idle deadline, and `PROTOCOL.md` §2.1 forbids
 closing a seated session for silence: a connection that answers its pings is
