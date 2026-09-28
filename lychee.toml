@@ -2,6 +2,13 @@
 # that belong to a deployment say what they answer where that deployment runs;
 # none of them is a broken link.
 #
+# The gate over the reader-facing front matter — `scripts/ci-local.sh links` and the
+# `links` step of the workflow's `checks` job — runs this over `README.md` and
+# `docs/` and nothing else: that pair is this repository's own prose, not every
+# Markdown file a checkout might hold. The pre-commit `lychee` hook is handed every
+# staged text file instead and reads this same configuration, which is why the
+# entries above stay even though the gate's two directories carry none of them.
+#
 # `root_dir` is what lets a root-relative link be checked at all: without one,
 # lychee refuses to resolve `/...` out of a file on disk rather than trying. The
 # not-found page's way back to the demo is exactly that link — same-origin by

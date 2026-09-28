@@ -7,9 +7,10 @@
 #                                 # demo's deploy guard, front and command line, the version
 #                                 # bump, the deploy workflow's verification,
 #                                 # the release's wait for its deploy, the release workflow's
-#                                 # dry_run gating, lint, typos
+#                                 # dry_run gating, lint, typos, links
 #   scripts/ci-local.sh nightly   # coverage, the rest of cargo-deny and cargo-audit (slow)
 #   scripts/ci-local.sh lint      # actionlint over the workflow files, on its own
+#   scripts/ci-local.sh links     # lychee over the README and the docs tree
 #   scripts/ci-local.sh image     # the `image` workflow's smoke: nix-built image,
 #                                 # skopeo manifest/config checks, version
 #                                 # assertions — no Docker, runs anywhere nix does
@@ -131,6 +132,7 @@ job_checks() {
   # run the hooks, so a spelling error could only be caught on the pull request.
   say "checks: typos"
   nix develop . -c typos
+  job_links
 }
 
 job_nightly() {
@@ -148,6 +150,16 @@ job_lint() {
   nix develop . -c actionlint
 }
 
+job_links() {
+  say "links: lychee over the README and the docs tree"
+  # The scope is this repository's reader-facing front matter, not every Markdown
+  # file a checkout holds, and it is the same scope and the same arguments as the
+  # workflow's `links` step. The runner installs lychee 0.24.2 from the pinned
+  # release; the dev shell carries the same version through the git-hooks tool set,
+  # so the two runs are the same check.
+  nix develop . -c lychee --config lychee.toml --no-progress README.md docs
+}
+
 job_image() {
   inputs_clean
   say "image: nix-built image smoke without publishing"
@@ -163,11 +175,12 @@ case "${1:-all}" in
   checks) job_checks ;;
   nightly) job_nightly ;;
   lint) job_lint ;;
+  links) job_links ;;
   image) job_image ;;
   container) job_container ;;
   all) job_checks ;;
   *)
-    printf 'usage: %s [checks|nightly|lint|all|image|container]\n' "$0" >&2
+    printf 'usage: %s [checks|nightly|lint|links|all|image|container]\n' "$0" >&2
     exit 2
     ;;
 esac
