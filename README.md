@@ -113,8 +113,22 @@ with its default, and which of those bounds are per process and which are per
 connection.
 
 `--help` prints the usage line, a short description of the server, and every flag
-with its default; `--version` prints `selvaged/<version>`. The harness transcript
-and the checks are in [the checks worth running](docs/development.md).
+with its default. `--version` prints `selvaged/<version>`.
+
+`scripts/ci-local.sh` runs the same commands as `.github/workflows/ci.yml` on
+this machine, one flake check per step, and needs `nix`:
+
+```sh
+scripts/ci-local.sh all        # the whole gate, and what the `checks` job runs
+scripts/ci-local.sh nightly    # coverage, the rest of cargo-deny and cargo-audit (slow)
+scripts/ci-local.sh lint       # actionlint over the workflow files, on its own
+scripts/ci-local.sh image      # the nix-built image smoke, no Docker needed
+scripts/ci-local.sh container  # docker build, docker run and a room join (needs Docker)
+```
+
+`all` is what the `checks` job runs and `nightly` is opt-in because it is slow.
+The harness transcript, and what the gate asks of the tree it builds, are in
+[the checks worth running](docs/development.md).
 
 ## More
 

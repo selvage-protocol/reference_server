@@ -12,20 +12,10 @@ server, mints a room, prints the invite link, walks two clients through it, and
 exits. `selvaged` waits for a client to connect instead, and a client's output
 carries the invite link.
 
-`scripts/ci-local.sh` runs the same commands as `.github/workflows/ci.yml` on
-this machine, one flake check per step, and needs `nix`:
-
-```sh
-scripts/ci-local.sh all        # the whole gate, and what the `checks` job runs
-scripts/ci-local.sh nightly    # coverage, the rest of cargo-deny and cargo-audit (slow)
-scripts/ci-local.sh lint       # actionlint over the workflow files, on its own
-scripts/ci-local.sh image      # the nix-built image smoke, no Docker needed
-scripts/ci-local.sh container  # docker build, docker run and a room join (needs Docker)
-```
-
-`all` is what the `checks` job runs; `nightly` is opt-in because it is slow. The
-`image` workflow's two buildx jobs have no step here, since this host has no
-Docker, let alone buildx; a pull request's checks are where they run.
+The `image` workflow's two buildx jobs have no step in `scripts/ci-local.sh`,
+since this host has no Docker, let alone buildx; a pull request's checks are where
+they run. `checks` ends with the link check over `README.md` and this tree, which
+`scripts/ci-local.sh links` runs on its own.
 
 `checks`, `nightly` and `image` refuse to run when the working tree differs from
 `HEAD`, because what they build is the tracked tree at its working-tree content
