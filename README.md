@@ -10,7 +10,10 @@ two-client harness that gates it in CI.
 whole of its surface. The published image is the server alone, and a server
 alone is enough for a client to join a room; the page is a second container, and
 the pair is printed by the landing page's Run card, which owns the
-reader-facing command with the tags inside it and the teardown under it.
+reader-facing commands: the three steps it prints name the repositories bare,
+which docker reads as `:latest` — the tag the release publishes — and it prints
+no teardown, so stopping the pair is `docker stop` or `docker rm -f`, a step it
+leaves to the reader.
 
 ```sh
 docker rm -f selvaged-solo 2>/dev/null
@@ -28,8 +31,8 @@ docker rm -f selvaged-solo
 
 The name and the host port above are this example's own, so it and the card's
 pair can be up at once: the card's server runs as `selvaged` and its page
-publishes `8080`, and neither its teardown nor this one touches the other's
-container. A client reaches this container at `ws://127.0.0.1:8081` — the host
+publishes `8080`, so stopping either pair leaves the other's container alone.
+A client reaches this container at `ws://127.0.0.1:8081` — the host
 port the mapping above publishes. That is not the address the container's own
 startup line prints: that line names the interface and port it bound inside the
 container, `ws://0.0.0.0:8080/session`, and `0.0.0.0` is not an address to
