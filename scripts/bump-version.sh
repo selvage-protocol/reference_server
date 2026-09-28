@@ -14,7 +14,7 @@
 #
 #   Cargo.toml   `[workspace.package] version`, the string a release tag is
 #                asserted against (`scripts/release-tags.sh`). Which string each
-#                artefact keeps is `docs/runbook-release.md` §1's table.
+#                artefact keeps is the release runbook's table.
 #   Cargo.lock   regenerated with cargo (`update --workspace`), never edited by
 #                hand: the four local packages carry the workspace version, and a
 #                lock that disagrees with the manifest fails the build.
