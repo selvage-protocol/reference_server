@@ -130,9 +130,9 @@
             };
             comrak = {
               enable = true;
-              # The README is prose this project maintains by hand; a formatter must not
-              # rewrite it.
-              excludes = ["^README\\.md$"];
+              # The README and the `docs/` tree beside it are prose this project
+              # maintains by hand; a formatter must not rewrite them.
+              excludes = ["^(README\\.md|docs/)"];
             };
             ripsecrets.enable = true;
             typos.enable = true;
@@ -150,7 +150,9 @@
             check-symlinks.enable = true;
             trim-trailing-whitespace = {
               enable = true;
-              excludes = ["^README\\.md$"];
+              # Same reason as `comrak` above: the README and `docs/` are
+              # hand-maintained prose.
+              excludes = ["^(README\\.md|docs/)"];
             };
             shellcheck.enable = true;
 

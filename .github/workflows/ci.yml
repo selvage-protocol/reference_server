@@ -20,6 +20,11 @@ jobs:
   checks:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      # The lychee release the `links` step installs, and the one this repository's
+      # dev shell carries, so the run here and `scripts/ci-local.sh links` agree.
+      LYCHEE_VERSION: "0.24.2"
+      LYCHEE_SHA256: "1f4e0ef7f6554a6ed33dd7ac144fb2e1bbed98598e7af973042fc5cd43951c9a"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -166,3 +171,23 @@ jobs:
       # which is how a misspelling reached `main`, while a job sees every pull request.
       - name: typos
         run: nix develop . -c typos
+
+      # The runner's own lychee, from the pinned release: `scripts/ci-local.sh links`
+      # runs the same scope and the same arguments through the dev shell, which
+      # carries this version. `$RUNNER_TEMP` is the runner's temp directory, not a
+      # host's RAM-backed `/tmp`.
+      - name: install lychee
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/lychee.tar.gz" \
+            "https://github.com/lycheeverse/lychee/releases/download/lychee-v${LYCHEE_VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${LYCHEE_SHA256}  $RUNNER_TEMP/lychee.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/lychee.tar.gz" -C "$RUNNER_TEMP" --strip-components=1 lychee-x86_64-unknown-linux-gnu/lychee
+          sudo install -m 0755 "$RUNNER_TEMP/lychee" /usr/local/bin/lychee
+          lychee --version
+
+      # This repository's reader-facing front matter, `README.md` and `docs/`, not
+      # every Markdown file a checkout holds. A relative link in either is resolved
+      # against the file that carries it, so a moved paragraph's link is checked at
+      # its new depth.
+      - name: links over the README and the docs tree
+        run: lychee --config lychee.toml --no-progress README.md docs

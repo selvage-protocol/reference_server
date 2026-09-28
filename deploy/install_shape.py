@@ -20,7 +20,7 @@ it seeds, `/srv/selvage/.env`, is live — the deploy path rewrites its image li
 and the owner edits the rest — so this stays out of that pair entirely instead of
 holding a lever on the file beside it. `.env.example` is copied once by hand at a
 first install, the systemd units are installed by hand, and `tls/` is the box's
-own; `docs/runbook-prod-demo.md` owns all three.
+own; the production demo's runbook owns all three.
 
 What a stream can and cannot do, because that is the whole of the argument:
 

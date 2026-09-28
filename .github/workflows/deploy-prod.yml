@@ -215,8 +215,8 @@ jobs:
                 '/usr/bin/sudo /usr/local/sbin/selvage-install-shape'
 
       # Nothing checks the installed shape against the tracked one — neither the
-      # deploy nor the timer ever writes it — so this does, by the runbook's own
-      # comparison (`docs/runbook-prod-demo.md`, *Changing the shape*): each file's
+      # deploy nor the timer ever writes it — so this does, the comparison the
+      # production demo's runbook describes under *Changing the shape*: each file's
       # digest here against its digest there. Only the two entries the installer
       # owns are compared, because `.env` is the box's and is not installed.
       - name: read the installed shape back
