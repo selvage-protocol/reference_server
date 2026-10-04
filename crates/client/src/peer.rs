@@ -22,10 +22,13 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use yrs::block::ClientID;
-use yrs::sync::protocol::{DefaultProtocol, Protocol as YProtocol};
-use yrs::sync::{Awareness, Message as YMessage, SyncMessage};
+use yrs::sync::{Awareness, Message as YMessage, MessageReader, SyncMessage};
+use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-use yrs::{Doc, GetString, OffsetKind, Options, ReadTxn, Text, Transact};
+use yrs::{
+    Doc, GetString, OffsetKind, Options, ReadTxn, StateVector, Text, Transact,
+    Update,
+};
 
 use selvage_protocol as proto;
 
@@ -1071,12 +1074,7 @@ impl PeerSession {
         if !self.state_held() {
             return;
         }
-        let Ok(replies) =
-            DefaultProtocol.handle(&mut self.awareness, plaintext)
-        else {
-            // A stream no replica decodes is a sender's bug: dropped, and the session goes on.
-            return;
-        };
+        let replies = self.read_stream(plaintext);
         if self.role() == Some("viewer") {
             // §13.9: a `viewer` publishes its SyncStep1, its awareness and its holds, and
             // nothing else — a SyncStep2 is document content (§13.5) and is not its to send.
@@ -1090,6 +1088,64 @@ impl PeerSession {
             let bytes = encode_y_message(&reply);
             self.publish(Published::Sync, &bytes);
         }
+    }
+
+    /// §7's stream, read message by message and applied as it is read, with the replies it
+    /// owes. A message that cannot be read or applied ends the reading, and the messages
+    /// before it stand: a stream no replica decodes is a sender's bug, and the session goes on.
+    fn read_stream(&mut self, plaintext: &[u8]) -> Vec<YMessage> {
+        let mut decoder = DecoderV1::from(plaintext);
+        let mut replies = Vec::new();
+        let _ = MessageReader::new(&mut decoder)
+            .map_while(Result::ok)
+            .all(|message| self.read_message(message, &mut replies));
+        replies
+    }
+
+    /// One message of the stream. Returns whether the reading goes on.
+    ///
+    /// §8.3: an auth message is read and ignored, a denial included. A message type §7 does
+    /// not define ends the reading.
+    fn read_message(
+        &mut self,
+        message: YMessage,
+        replies: &mut Vec<YMessage>,
+    ) -> bool {
+        match message {
+            YMessage::Sync(SyncMessage::SyncStep1(vector)) => {
+                self.answer(&vector, replies);
+                true
+            }
+            YMessage::Sync(
+                SyncMessage::SyncStep2(bytes) | SyncMessage::Update(bytes),
+            ) => self.apply_update(&bytes),
+            YMessage::Awareness(update) => {
+                self.awareness.apply_update(update).is_ok()
+            }
+            YMessage::AwarenessQuery => {
+                replies
+                    .extend(self.awareness.update().map(YMessage::Awareness));
+                true
+            }
+            YMessage::Auth(_) => true,
+            YMessage::Custom(..) => false,
+        }
+    }
+
+    /// §7: a `SyncStep1` is answered with the `SyncStep2` its state vector asks for.
+    fn answer(&self, vector: &StateVector, replies: &mut Vec<YMessage>) {
+        let txn = self.awareness.doc().transact();
+        let diff = txn.encode_state_as_update_v1(vector);
+        replies.push(YMessage::Sync(SyncMessage::SyncStep2(diff)));
+    }
+
+    /// One update applied to the session document. Returns whether it was read and applied.
+    fn apply_update(&self, bytes: &[u8]) -> bool {
+        let Ok(update) = Update::decode_v1(bytes) else {
+            return false;
+        };
+        let mut txn = self.awareness.doc().transact_mut();
+        txn.apply_update(update).is_ok()
     }
 
     /// §13.7: only an accepted holds message renews a lease, and nothing else from the same
@@ -1702,6 +1758,11 @@ mod tests {
 
     /// A `kind = 0` frame carrying a real Update, which is document content.
     fn content(signer: &SessionKey, counter: u64, text: &str) -> Vec<u8> {
+        frame(signer, 0, counter, &update_message(text))
+    }
+
+    /// One sync Update message inserting `text` at the start of `README.md`.
+    fn update_message(text: &str) -> Vec<u8> {
         let doc = Doc::new();
         let handle = doc.get_or_insert_text("README.md");
         {
@@ -1712,9 +1773,25 @@ mod tests {
             let txn = doc.transact();
             txn.encode_state_as_update_v1(&yrs::StateVector::default())
         };
-        let message =
-            encode_y_message(&YMessage::Sync(SyncMessage::Update(update)));
-        frame(signer, 0, counter, &message)
+        encode_y_message(&YMessage::Sync(SyncMessage::Update(update)))
+    }
+
+    /// A guest session whose state commits its own key and `peer()`'s, both as `guest`, with
+    /// the handshake that state draws already taken off its queue.
+    fn beside_a_guest() -> PeerSession {
+        let mut session = session(&["p-peer"]);
+        session.tick(Duration::ZERO);
+        let committing = state(
+            &host(),
+            1,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-peer")],
+        );
+        assert_eq!(
+            session.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        session
     }
 
     /// Whether a published frame carries document content: a `kind = 0` plaintext whose
@@ -2685,6 +2762,21 @@ mod tests {
             }
         );
         assert_eq!(session.ending(), None);
+    }
+
+    #[test]
+    fn a_denied_auth_message_costs_the_frame_its_other_messages_nothing() {
+        // §8.3: an auth message is read and ignored, a denial included, and the Update behind
+        // it in the same frame is applied.
+        let mut session = beside_a_guest();
+        let mut plaintext =
+            encode_y_message(&YMessage::Auth(Some("denied".to_string())));
+        plaintext.extend(update_message("hello"));
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &plaintext)),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(session.text("README.md"), "hello");
     }
 
     fn invite(room: RoomKey, fragment: &str) -> String {
