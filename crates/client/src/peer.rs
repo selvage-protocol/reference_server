@@ -580,6 +580,20 @@ impl PeerSession {
         self.awareness.client_id().get()
     }
 
+    /// The awareness client ids this replica holds a state for, ascending: the ones a peer
+    /// published and nothing has removed since.
+    #[must_use]
+    pub fn awareness_clients(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .awareness
+            .iter()
+            .filter(|(_, state)| state.data.is_some())
+            .map(|(id, _)| id.get())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// The role the applied state gives this connection's own key (§13.4), or `None` while no
     /// state commits it — the state is the only source of a role in this version.
     #[must_use]
@@ -1478,6 +1492,24 @@ impl PeerSession {
         }
     }
 
+    /// Drops the awareness state published under `client_id`, which §8.4 asks for when the
+    /// peer that last claimed the id has left and no seated peer still claims it. The caller
+    /// holds the claims (the roster's `PeerInfo`), so it is the caller that decides which id.
+    ///
+    /// The state is removed the way y-protocols removes one, with its clock moved past the
+    /// last one seen, so a stale copy still in flight does not bring it back. This
+    /// connection's own id is never dropped, and an id with no state is left as it is.
+    pub fn forget_awareness(&mut self, client_id: u64) {
+        let id = ClientID::new(client_id);
+        let held = self
+            .awareness
+            .iter()
+            .any(|(client, state)| client == id && state.data.is_some());
+        if held && id != self.awareness.client_id() {
+            self.awareness.remove_state(id);
+        }
+    }
+
     /// The host's listing changed, from whatever watches its working tree (§7.1).
     ///
     /// A listing is replaced wholesale by every state, so this is the one thing a host's
@@ -1687,6 +1719,7 @@ mod tests {
     use crate::sealed::{Envelope, RoomKey, encode_key, opens, read_varuint};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+    use yrs::sync::awareness::{AwarenessUpdate, AwarenessUpdateEntry};
     use yrs::{Doc, Text, Transact};
 
     /// A room, a host keypair and a session keypair, all derived from constants: these are
@@ -2821,6 +2854,57 @@ mod tests {
             opens(&room_key().frame_key(ROOM), ROOM, &envelope).unwrap();
         assert_eq!(answer.first(), Some(&0), "message type 0: sync");
         assert_eq!(read_varuint(&answer, 1).unwrap().0, 1, "SyncStep2");
+    }
+
+    /// One awareness message carrying `json` for each client id, at `clock`.
+    fn awareness_message(ids: &[u64], clock: u32, json: &str) -> Vec<u8> {
+        let clients = ids
+            .iter()
+            .map(|id| {
+                let entry = AwarenessUpdateEntry {
+                    clock,
+                    json: Arc::from(json),
+                };
+                (ClientID::new(*id), entry)
+            })
+            .collect();
+        encode_y_message(&YMessage::Awareness(AwarenessUpdate { clients }))
+    }
+
+    #[test]
+    fn a_forgotten_awareness_state_stays_gone_and_its_neighbours_stay() {
+        let mut session = beside_a_guest();
+        let states = awareness_message(&[41, 42], 1, "{\"cursor\":null}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &states));
+        assert_eq!(session.awareness_clients(), [41, 42]);
+
+        session.forget_awareness(41);
+        assert_eq!(session.awareness_clients(), [42]);
+
+        // A copy of the old state still in flight is older than the removal.
+        let stale = awareness_message(&[41], 1, "{\"cursor\":null}");
+        let _ = session.deliver(millis(3), &frame(&peer(), 0, 2, &stale));
+        assert_eq!(session.awareness_clients(), [42], "no resurrection");
+    }
+
+    #[test]
+    fn forgetting_an_id_with_no_state_leaves_its_first_state_welcome() {
+        let mut session = beside_a_guest();
+        session.forget_awareness(43);
+        let first = awareness_message(&[43], 1, "{}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &first));
+        assert_eq!(session.awareness_clients(), [43]);
+    }
+
+    #[test]
+    fn this_connections_own_awareness_id_is_never_forgotten() {
+        let mut session = beside_a_guest();
+        let own = session.awareness_client_id();
+        let states = awareness_message(&[own], 1, "{}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &states));
+        assert_eq!(session.awareness_clients(), [own]);
+        session.forget_awareness(own);
+        assert_eq!(session.awareness_clients(), [own]);
     }
 
     fn invite(room: RoomKey, fragment: &str) -> String {
