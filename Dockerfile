@@ -14,11 +14,9 @@
 # No default: buildx supplies this per platform automatically, and giving it
 # one here — even just for a plain, non-buildx `docker build .` fallback —
 # shadows that per-platform value for every later `${TARGETARCH}`, including
-# the `FROM builder-${TARGETARCH}` line below, which is exactly how both
-# legs of 0.1.0 and 0.1.1 built from the amd64 stage regardless of platform.
-# A plain `docker build .` still gets a correct value: Docker populates it
-# from the build machine's own architecture when there is no buildx platform
-# to draw it from.
+# the `FROM builder-${TARGETARCH}` line below. A plain `docker build .` still
+# gets a correct value: Docker populates it from the build machine's own
+# architecture when there is no buildx platform to draw it from.
 ARG TARGETARCH
 ARG RUNTIME=scratch
 ARG VERSION=dev
@@ -79,7 +77,7 @@ ARG REVISION
 # The FSL-1.1-MIT licence travels inside the image (see /LICENSE) and in its
 # annotations. Pushing this image anywhere is redistribution of the binary;
 # the owner accepted GHCR distribution, and re-hosts of the published image,
-# as permitted redistribution on 2026-09-19.
+# as permitted redistribution.
 LABEL org.opencontainers.image.title="selvaged" \
       org.opencontainers.image.description="Memory-only reference server for the Selvage Session Protocol" \
       org.opencontainers.image.source="https://github.com/selvage-protocol/reference_server" \

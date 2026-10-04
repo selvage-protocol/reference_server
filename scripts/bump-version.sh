@@ -27,8 +27,8 @@
 # can compute the tag before it has decided to cut it.
 #
 # Nothing is written for a refusal. Exit 2 refuses the arguments — a word that is
-# not one of the three (including the `X.Y.Z` form this used to take), a second
-# word, an unknown option, and a second `--dry-run` — and exit 1 refuses the tree:
+# not one of the three, a second word, an unknown option, and a second
+# `--dry-run` — and exit 1 refuses the tree:
 # a manifest that does not carry a plain `X.Y.Z` (fewer than three parts, a
 # prerelease, a leading zero) has no next version to compute, and a file that is
 # not there has none either. A failure after an edit restores what it had touched,

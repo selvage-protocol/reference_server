@@ -61,8 +61,7 @@ jobs:
           # `image.yml`'s arm leg saves, which is useless on this runner.
           restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
 
-      # These three are the ones that were left behind when the monorepo was split, and
-      # none of them has a home in `ci.yml`. The vectors are read from the checkout's
+      # None of these three has a home in `ci.yml`. The vectors are read from the checkout's
       # `vectors/`, so no `SELVAGE_VECTORS` is needed here (the sandbox check sets it).
       - name: coverage
         run: nix develop . -c cargo tarpaulin --engine llvm --fail-under 80

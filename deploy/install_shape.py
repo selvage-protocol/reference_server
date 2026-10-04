@@ -89,8 +89,8 @@ REBUILD_ARGV = [*UP_ARGV, "--build", FRONT]
 FILE_MODE = 0o644
 DIRECTORY_MODE = 0o755
 
-# The shape is 41 KB today; the bound is here so a caller cannot make a root
-# process read for as long as it likes, the same reasoning as `deploy.py`'s
+# The bound is here so a caller cannot make a root process read for as long as it
+# likes, the same reasoning as `deploy.py`'s
 # request bound, with room for whatever the page brings with it.
 MAX_STREAM_BYTES = 8 * 1024 * 1024
 

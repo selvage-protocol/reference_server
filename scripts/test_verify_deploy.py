@@ -71,7 +71,6 @@ def origin(page="200", version="0.2.1", error=""):
 
 
 class TheChallengeTest(unittest.TestCase):
-    """The half that turned a healthy deploy red once."""
 
     def test_the_recorded_challenge_is_a_challenge(self):
         verdict, detail = verify.classify_public(public("403", CHALLENGE_BODY, CHALLENGE_HEADERS), "0.2.1")

@@ -4,10 +4,7 @@ A command line this server refuses is a deployment that never starts. The box's
 copy of `compose.yaml` is installed from the file tracked here, so `docker
 compose up` with a refused line is a container that exits 2 and restart-loops
 under `restart: unless-stopped`, and a front that upstreams to it is down with
-it. The defect this file was written for was exactly that and it reached
-production: `--outbound-queue-bytes 8388608` was below the floor, which is
-`net::MAX_FRAME_BYTES` plus the envelope headroom the queue needs, and the value
-had been argued from the frame bound in prose rather than run.
+it.
 
 The authority on what the binary accepts is the binary. This file restates no
 rule and no number: it reads the `command:` each tracked shape declares, hands
@@ -45,7 +42,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 
 # The tracked shapes that hand `selvaged` a command line, in the order the tests
-# below name them, and the flag the defect that wrote this guard was carried on.
+# below name them.
 SHAPES = (HERE / "compose.yaml",)
 QUEUE_FLAG = "--outbound-queue-bytes"
 
@@ -238,7 +235,7 @@ class ComposeCommandTest(unittest.TestCase):
                 )
 
     def test_a_guarded_shape_still_names_the_flag_this_guard_is_for(self):
-        """The queue is the flag the defect was on; dropping it is a decision.
+        """The queue flag is this guard's subject; dropping it is a decision.
 
         A shape that stops naming it takes the server's own default, which is
         above the floor, so nothing here is broken by that — but a guard whose
