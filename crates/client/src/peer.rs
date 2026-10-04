@@ -263,6 +263,14 @@ pub struct PeerOptions {
 /// relay dropped still stops well short of it.
 pub const FRAME_BUDGET: u64 = 1 << 31;
 
+/// How many `SyncStep1` messages one `kind = 0` frame is answered for.
+///
+/// A frame is a stream of messages with no count (`PROTOCOL.md` §7), and the answer to a
+/// `SyncStep1` is a diff of the whole document, so a frame of them answered one by one would
+/// cost the room a document per four bytes. A conforming peer asks once per frame, so past the
+/// first the state vector is read and dropped and its diff is never computed.
+const MAX_REPLIES_PER_FRAME: usize = 1;
+
 /// The same rule as [`PeerInvite`]'s: the room key, the host key and the two private seeds are
 /// not printed. A session's options are built from an invite, and §5.1 forbids what they carry
 /// from reaching a log as much as it forbids it reaching a request.
@@ -1104,8 +1112,9 @@ impl PeerSession {
 
     /// One message of the stream. Returns whether the reading goes on.
     ///
-    /// §8.3: an auth message is read and ignored, a denial included. A message type §7 does
-    /// not define ends the reading.
+    /// §8.3: an auth message is read and ignored, a denial included, and an awareness query
+    /// is dropped rather than answered. A `SyncStep1` is answered once per frame
+    /// ([`MAX_REPLIES_PER_FRAME`]), and a message type §7 does not define ends the reading.
     fn read_message(
         &mut self,
         message: YMessage,
@@ -1122,21 +1131,19 @@ impl PeerSession {
             YMessage::Awareness(update) => {
                 self.awareness.apply_update(update).is_ok()
             }
-            YMessage::AwarenessQuery => {
-                replies
-                    .extend(self.awareness.update().map(YMessage::Awareness));
-                true
-            }
-            YMessage::Auth(_) => true,
+            YMessage::Auth(_) | YMessage::AwarenessQuery => true,
             YMessage::Custom(..) => false,
         }
     }
 
-    /// §7: a `SyncStep1` is answered with the `SyncStep2` its state vector asks for.
+    /// §7: a `SyncStep1` is answered with the `SyncStep2` its state vector asks for, while the
+    /// frame has answers left.
     fn answer(&self, vector: &StateVector, replies: &mut Vec<YMessage>) {
-        let txn = self.awareness.doc().transact();
-        let diff = txn.encode_state_as_update_v1(vector);
-        replies.push(YMessage::Sync(SyncMessage::SyncStep2(diff)));
+        if replies.len() < MAX_REPLIES_PER_FRAME {
+            let txn = self.awareness.doc().transact();
+            let diff = txn.encode_state_as_update_v1(vector);
+            replies.push(YMessage::Sync(SyncMessage::SyncStep2(diff)));
+        }
     }
 
     /// One update applied to the session document. Returns whether it was read and applied.
@@ -2777,6 +2784,43 @@ mod tests {
             Outcome::Applied { kind: 0 }
         );
         assert_eq!(session.text("README.md"), "hello");
+    }
+
+    #[test]
+    fn a_frame_of_awareness_queries_draws_no_answer() {
+        // §8.3: a query message is one byte, so a frame of them would otherwise draw one
+        // reply each. This client answers none.
+        let mut session = beside_a_guest();
+        let published = session.published();
+        let plaintext = vec![3u8; 4096];
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &plaintext)),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(session.take_outbound().len(), 0, "no answer at all");
+        assert_eq!(session.published(), published);
+    }
+
+    #[test]
+    fn a_frame_of_sync_step1_messages_draws_one_answer() {
+        // The answer to a SyncStep1 is a whole diff of the document, so one frame is answered
+        // once however many it carries.
+        let mut session = beside_a_guest();
+        let ask = encode_y_message(&YMessage::Sync(SyncMessage::SyncStep1(
+            yrs::StateVector::default(),
+        )));
+        let plaintext = ask.repeat(64);
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &plaintext)),
+            Outcome::Applied { kind: 0 }
+        );
+        let answers = session.take_outbound();
+        assert_eq!(answers.len(), 1, "one SyncStep2 for the whole frame");
+        let envelope = Envelope::parse(&answers[0]).unwrap();
+        let answer =
+            opens(&room_key().frame_key(ROOM), ROOM, &envelope).unwrap();
+        assert_eq!(answer.first(), Some(&0), "message type 0: sync");
+        assert_eq!(read_varuint(&answer, 1).unwrap().0, 1, "SyncStep2");
     }
 
     fn invite(room: RoomKey, fragment: &str) -> String {
