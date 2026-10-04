@@ -65,8 +65,9 @@ pub const CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// `awareness` is deliberately not here. §10 defines the name as "the peer publishes
 /// presence", and this session publishes none: it takes an awareness frame in and applies it
 /// (`crate::peer::PeerSession::deliver`), and publishes no state of its own, renews none and
-/// forgets none (§8.2's `MUST`s). An advertisement is a claim a peer may size its UI on, so
-/// the honest list is the one capability this client does speak — §7's document sync. Adding
+/// lets none expire (§8.2's `MUST`s): a remote state goes only with the peer that left
+/// (§8.4). An advertisement is a claim a peer may size its UI on, so the honest list is the
+/// one capability this client does speak — §7's document sync. Adding
 /// the name back owes §8's producer half: publish a state, renew it every
 /// `keepalive.awareness_renew_ms`, forget a remote state not renewed inside
 /// `keepalive.awareness_expire_ms`, and republish on a `peer.joined` (§8.3's step 2).
@@ -1031,7 +1032,11 @@ impl RelayState {
             .and_then(|record| record.get("peer_id"))
             .and_then(serde_json::Value::as_str);
         let Some(departed) = named else { return };
+        let forgotten = departed_claim(&self.peers, departed);
         self.peers.retain(|held| held.peer_id != departed);
+        if let Some(id) = forgotten {
+            self.session.forget_awareness(id);
+        }
         self.session.seat_left(clock, departed);
     }
 
@@ -1050,6 +1055,21 @@ impl RelayState {
             display_name.clone_into(&mut held.display_name);
         }
     }
+}
+
+/// `PROTOCOL.md` §8.4: the awareness id whose state goes with a seat that left — the one the
+/// seat last claimed, which is the one its roster record carries (a `peer.joined` replaces the
+/// record whole), and only while no other seated peer claims it too. This connection's own id
+/// is the session's to keep ([`PeerSession::forget_awareness`]).
+fn departed_claim(peers: &[RelayPeer], departed: &str) -> Option<u64> {
+    let claimed = peers
+        .iter()
+        .find(|peer| peer.peer_id == departed)?
+        .awareness_client_id?;
+    let still_claimed = peers.iter().any(|peer| {
+        peer.peer_id != departed && peer.awareness_client_id == Some(claimed)
+    });
+    (!still_claimed).then_some(claimed)
 }
 
 /// What a session's state says now, as the events a change of it produces.
@@ -1360,8 +1380,9 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{
-        RelayHostOptions, RelayJoinOptions, RelaySession, RelaySessionInfo,
-        clock_period, hello, lock, session_base, start,
+        RelayHostOptions, RelayJoinOptions, RelayPeer, RelaySession,
+        RelaySessionInfo, RelayState, clock_period, hello, lock, session_base,
+        start,
     };
     use crate::host::{HostOptions, ListingSource};
     use crate::peer::{PeerOptions, PeerSession};
@@ -1369,6 +1390,10 @@ mod tests {
         Envelope, KeyId, Recipe, RoomKey, SessionKey, encode_key, seal,
     };
     use crate::session::KeepaliveConfig;
+    use yrs::block::ClientID;
+    use yrs::sync::Message as YMessage;
+    use yrs::sync::awareness::{AwarenessUpdate, AwarenessUpdateEntry};
+    use yrs::updates::encoder::Encode;
 
     const ROOM: &str = "r-1";
     const SEAT: &str = "p-self";
@@ -2126,5 +2151,118 @@ mod tests {
         );
         names_no_key(&refused.to_string(), &keys);
         Ok(())
+    }
+
+    /// A seat in the roster and the awareness client id it claimed.
+    fn claim(seat: &str, id: u64) -> RelayPeer {
+        RelayPeer {
+            peer_id: seat.to_string(),
+            display_name: seat.to_string(),
+            awareness_client_id: Some(id),
+        }
+    }
+
+    /// A relay's state with no socket under it, seated beside `peers`, whose session holds a
+    /// state committing its own key and a sender's, and an awareness state for each of `ids`
+    /// from that sender. §8.4 is the roster's and the session's business, and none of it is
+    /// on the wire.
+    fn unwired(peers: Vec<RelayPeer>, ids: &[u64]) -> RelayState {
+        let sender = SessionKey::from_seed([11; 32]);
+        let mut session =
+            PeerSession::new(&options(keepalive(), None)).expect("a session");
+        let mut members = serde_json::Map::new();
+        members.insert(
+            SessionKey::from_seed(OWN_SEED).public().encode(),
+            serde_json::json!({"peer_id": SEAT, "role": "guest"}),
+        );
+        members.insert(
+            sender.public().encode(),
+            serde_json::json!({"peer_id": "p-sender", "role": "guest"}),
+        );
+        let payload =
+            serde_json::json!({"issued": 1, "listing": [], "peers": members});
+        let host = SessionKey::from_seed(HOST_SEED);
+        let state = serde_json::to_vec(&payload).expect("a state encodes");
+        let _ = session.deliver(Duration::ZERO, &sealed(1, 1, &host, &state));
+        let clients = ids
+            .iter()
+            .map(|id| {
+                let entry = AwarenessUpdateEntry {
+                    clock: 1,
+                    json: Arc::from("{}"),
+                };
+                (ClientID::new(*id), entry)
+            })
+            .collect();
+        let message = YMessage::Awareness(AwarenessUpdate { clients });
+        let awareness = sealed(0, 1, &sender, &message.encode_v1());
+        let _ = session.deliver(Duration::ZERO, &awareness);
+        assert_eq!(session.awareness_clients(), ids, "the states arrived");
+        let info = RelaySessionInfo {
+            room_id: ROOM.to_string(),
+            token: None,
+            seat: SEAT.to_string(),
+            peers: peers.clone(),
+            capabilities: Vec::new(),
+            keepalive: keepalive(),
+            base_url: "ws://127.0.0.1:1".to_string(),
+        };
+        RelayState {
+            session,
+            info,
+            start: Instant::now(),
+            peers: peers.clone(),
+            invite: None,
+            ending: None,
+            fault: None,
+            destroyed: false,
+            request_id: 1,
+            last_listing: Vec::new(),
+            last_documents: Vec::new(),
+            last_peers: peers,
+        }
+    }
+
+    fn left(state: &mut RelayState, seat: &str) {
+        let params = serde_json::json!({"peer_id": seat});
+        state.hear_left(Duration::ZERO, Some(&params));
+    }
+
+    #[test]
+    fn a_departed_peers_awareness_state_goes_unless_a_seated_peer_claims_its_id()
+     {
+        // §8.4: the state for the id the peer claimed, and only while no other seated peer
+        // still claims that id.
+        let roster = vec![claim("p-a", 41), claim("p-b", 42), claim("p-c", 42)];
+        let mut state = unwired(roster, &[41, 42]);
+        left(&mut state, "p-a");
+        assert_eq!(state.session.awareness_clients(), [42]);
+        left(&mut state, "p-b");
+        assert_eq!(
+            state.session.awareness_clients(),
+            [42],
+            "p-c still claims 42"
+        );
+        left(&mut state, "p-c");
+        assert!(state.session.awareness_clients().is_empty());
+    }
+
+    #[test]
+    fn only_the_id_a_departed_peer_last_claimed_is_dropped() {
+        let mut state = unwired(vec![claim("p-a", 41)], &[41, 44]);
+        // The roster's record for a seat is replaced whole by a later `peer.joined`.
+        let joined = serde_json::json!({"peer": {
+            "peer_id": "p-a", "display_name": "p-a", "awareness_client_id": 44,
+        }});
+        state.hear_joined(Duration::ZERO, Some(&joined));
+        left(&mut state, "p-a");
+        assert_eq!(state.session.awareness_clients(), [41]);
+    }
+
+    #[test]
+    fn a_departed_peer_that_claimed_this_connections_id_leaves_it_alone() {
+        let mut state = unwired(vec![claim("p-a", 7)], &[7]);
+        left(&mut state, "p-a");
+        assert_eq!(state.session.awareness_clients(), [7]);
     }
 }

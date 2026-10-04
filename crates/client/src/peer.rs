@@ -22,14 +22,17 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use yrs::block::ClientID;
-use yrs::sync::protocol::{DefaultProtocol, Protocol as YProtocol};
-use yrs::sync::{Awareness, Message as YMessage, SyncMessage};
+use yrs::sync::{Awareness, Message as YMessage, MessageReader, SyncMessage};
+use yrs::updates::decoder::DecoderV1;
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-use yrs::{Doc, GetString, OffsetKind, Options, ReadTxn, Text, Transact};
+use yrs::{
+    Doc, GetString, OffsetKind, Options, ReadTxn, StateVector, Text, Transact,
+};
 
 use selvage_protocol as proto;
 
 use crate::host::{HostOptions, HostProducer, HostReason};
+use crate::nesting::decode_update;
 use crate::sealed::{
     Announcement, FrameKey, Guard, KeyId, Payload, PublicKey, Reader, Recipe,
     RoomKey, SealedError, SessionKey, Verdict, fresh_nonce, seal,
@@ -259,6 +262,14 @@ pub struct PeerOptions {
 /// nonces, which is the room's and not one sender's, so that a client that missed frames the
 /// relay dropped still stops well short of it.
 pub const FRAME_BUDGET: u64 = 1 << 31;
+
+/// How many `SyncStep1` messages one `kind = 0` frame is answered for.
+///
+/// A frame is a stream of messages with no count (`PROTOCOL.md` §7), and the answer to a
+/// `SyncStep1` is a diff of the whole document, so a frame of them answered one by one would
+/// cost the room a document per four bytes. A conforming peer asks once per frame, so past the
+/// first the state vector is read and dropped and its diff is never computed.
+const MAX_REPLIES_PER_FRAME: usize = 1;
 
 /// The same rule as [`PeerInvite`]'s: the room key, the host key and the two private seeds are
 /// not printed. A session's options are built from an invite, and §5.1 forbids what they carry
@@ -567,6 +578,20 @@ impl PeerSession {
     #[must_use]
     pub fn awareness_client_id(&self) -> u64 {
         self.awareness.client_id().get()
+    }
+
+    /// The awareness client ids this replica holds a state for, ascending: the ones a peer
+    /// published and nothing has removed since.
+    #[must_use]
+    pub fn awareness_clients(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .awareness
+            .iter()
+            .filter(|(_, state)| state.data.is_some())
+            .map(|(id, _)| id.get())
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// The role the applied state gives this connection's own key (§13.4), or `None` while no
@@ -1071,12 +1096,7 @@ impl PeerSession {
         if !self.state_held() {
             return;
         }
-        let Ok(replies) =
-            DefaultProtocol.handle(&mut self.awareness, plaintext)
-        else {
-            // A stream no replica decodes is a sender's bug: dropped, and the session goes on.
-            return;
-        };
+        let replies = self.read_stream(plaintext);
         if self.role() == Some("viewer") {
             // §13.9: a `viewer` publishes its SyncStep1, its awareness and its holds, and
             // nothing else — a SyncStep2 is document content (§13.5) and is not its to send.
@@ -1090,6 +1110,66 @@ impl PeerSession {
             let bytes = encode_y_message(&reply);
             self.publish(Published::Sync, &bytes);
         }
+    }
+
+    /// §7's stream, read message by message and applied as it is read, with the replies it
+    /// owes. A message that cannot be read or applied ends the reading, and the messages
+    /// before it stand: a stream no replica decodes is a sender's bug, and the session goes on.
+    fn read_stream(&mut self, plaintext: &[u8]) -> Vec<YMessage> {
+        let mut decoder = DecoderV1::from(plaintext);
+        let mut replies = Vec::new();
+        let _ = MessageReader::new(&mut decoder)
+            .map_while(Result::ok)
+            .all(|message| self.read_message(message, &mut replies));
+        replies
+    }
+
+    /// One message of the stream. Returns whether the reading goes on.
+    ///
+    /// §8.3: an auth message is read and ignored, a denial included, and an awareness query
+    /// is dropped rather than answered. A `SyncStep1` is answered once per frame
+    /// ([`MAX_REPLIES_PER_FRAME`]), and a message type §7 does not define ends the reading.
+    fn read_message(
+        &mut self,
+        message: YMessage,
+        replies: &mut Vec<YMessage>,
+    ) -> bool {
+        match message {
+            YMessage::Sync(SyncMessage::SyncStep1(vector)) => {
+                self.answer(&vector, replies);
+                true
+            }
+            YMessage::Sync(
+                SyncMessage::SyncStep2(bytes) | SyncMessage::Update(bytes),
+            ) => self.apply_update(&bytes),
+            YMessage::Awareness(update) => {
+                self.awareness.apply_update(update).is_ok()
+            }
+            YMessage::Auth(_) | YMessage::AwarenessQuery => true,
+            YMessage::Custom(..) => false,
+        }
+    }
+
+    /// §7: a `SyncStep1` is answered with the `SyncStep2` its state vector asks for, while the
+    /// frame has answers left.
+    fn answer(&self, vector: &StateVector, replies: &mut Vec<YMessage>) {
+        if replies.len() < MAX_REPLIES_PER_FRAME {
+            let txn = self.awareness.doc().transact();
+            let diff = txn.encode_state_as_update_v1(vector);
+            replies.push(YMessage::Sync(SyncMessage::SyncStep2(diff)));
+        }
+    }
+
+    /// One update applied to the session document. Returns whether it was read and applied.
+    ///
+    /// The reader has already refused a frame holding an update nested past the bound, and
+    /// this decode is bounded too, so no path hands `yrs` one to recurse into.
+    fn apply_update(&self, bytes: &[u8]) -> bool {
+        let Ok(update) = decode_update(bytes) else {
+            return false;
+        };
+        let mut txn = self.awareness.doc().transact_mut();
+        txn.apply_update(update).is_ok()
     }
 
     /// §13.7: only an accepted holds message renews a lease, and nothing else from the same
@@ -1415,6 +1495,24 @@ impl PeerSession {
         }
     }
 
+    /// Drops the awareness state published under `client_id`, which §8.4 asks for when the
+    /// peer that last claimed the id has left and no seated peer still claims it. The caller
+    /// holds the claims (the roster's `PeerInfo`), so it is the caller that decides which id.
+    ///
+    /// The state is removed the way y-protocols removes one, with its clock moved past the
+    /// last one seen, so a stale copy still in flight does not bring it back. This
+    /// connection's own id is never dropped, and an id with no state is left as it is.
+    pub fn forget_awareness(&mut self, client_id: u64) {
+        let id = ClientID::new(client_id);
+        let held = self
+            .awareness
+            .iter()
+            .any(|(client, state)| client == id && state.data.is_some());
+        if held && id != self.awareness.client_id() {
+            self.awareness.remove_state(id);
+        }
+    }
+
     /// The host's listing changed, from whatever watches its working tree (§7.1).
     ///
     /// A listing is replaced wholesale by every state, so this is the one thing a host's
@@ -1621,9 +1719,11 @@ mod tests {
     use crate::host::{
         ABSENCE_CHARGE, HostStore, ListingSource, PersistedHost,
     };
+    use crate::nesting::MAX_ANY_DEPTH;
     use crate::sealed::{Envelope, RoomKey, encode_key, opens, read_varuint};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+    use yrs::sync::awareness::{AwarenessUpdate, AwarenessUpdateEntry};
     use yrs::{Doc, Text, Transact};
 
     /// A room, a host keypair and a session keypair, all derived from constants: these are
@@ -1702,6 +1802,11 @@ mod tests {
 
     /// A `kind = 0` frame carrying a real Update, which is document content.
     fn content(signer: &SessionKey, counter: u64, text: &str) -> Vec<u8> {
+        frame(signer, 0, counter, &update_message(text))
+    }
+
+    /// One sync Update message inserting `text` at the start of `README.md`.
+    fn update_message(text: &str) -> Vec<u8> {
         let doc = Doc::new();
         let handle = doc.get_or_insert_text("README.md");
         {
@@ -1712,9 +1817,25 @@ mod tests {
             let txn = doc.transact();
             txn.encode_state_as_update_v1(&yrs::StateVector::default())
         };
-        let message =
-            encode_y_message(&YMessage::Sync(SyncMessage::Update(update)));
-        frame(signer, 0, counter, &message)
+        encode_y_message(&YMessage::Sync(SyncMessage::Update(update)))
+    }
+
+    /// A guest session whose state commits its own key and `peer()`'s, both as `guest`, with
+    /// the handshake that state draws already taken off its queue.
+    fn beside_a_guest() -> PeerSession {
+        let mut session = session(&["p-peer"]);
+        session.tick(Duration::ZERO);
+        let committing = state(
+            &host(),
+            1,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-peer")],
+        );
+        assert_eq!(
+            session.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        session
     }
 
     /// Whether a published frame carries document content: a `kind = 0` plaintext whose
@@ -2685,6 +2806,169 @@ mod tests {
             }
         );
         assert_eq!(session.ending(), None);
+    }
+
+    #[test]
+    fn a_denied_auth_message_costs_the_frame_its_other_messages_nothing() {
+        // §8.3: an auth message is read and ignored, a denial included, and the Update behind
+        // it in the same frame is applied.
+        let mut session = beside_a_guest();
+        let mut plaintext =
+            encode_y_message(&YMessage::Auth(Some("denied".to_string())));
+        plaintext.extend(update_message("hello"));
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &plaintext)),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(session.text("README.md"), "hello");
+    }
+
+    #[test]
+    fn a_frame_of_awareness_queries_draws_no_answer() {
+        // §8.3: a query message is one byte, so a frame of them would otherwise draw one
+        // reply each. This client answers none.
+        let mut session = beside_a_guest();
+        let published = session.published();
+        let plaintext = vec![3u8; 4096];
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &plaintext)),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(session.take_outbound().len(), 0, "no answer at all");
+        assert_eq!(session.published(), published);
+    }
+
+    #[test]
+    fn a_frame_of_sync_step1_messages_draws_one_answer() {
+        // The answer to a SyncStep1 is a whole diff of the document, so one frame is answered
+        // once however many it carries.
+        let mut session = beside_a_guest();
+        let ask = encode_y_message(&YMessage::Sync(SyncMessage::SyncStep1(
+            yrs::StateVector::default(),
+        )));
+        let plaintext = ask.repeat(64);
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &plaintext)),
+            Outcome::Applied { kind: 0 }
+        );
+        let answers = session.take_outbound();
+        assert_eq!(answers.len(), 1, "one SyncStep2 for the whole frame");
+        let envelope = Envelope::parse(&answers[0]).unwrap();
+        let answer =
+            opens(&room_key().frame_key(ROOM), ROOM, &envelope).unwrap();
+        assert_eq!(answer.first(), Some(&0), "message type 0: sync");
+        assert_eq!(read_varuint(&answer, 1).unwrap().0, 1, "SyncStep2");
+    }
+
+    /// One awareness message carrying `json` for each client id, at `clock`.
+    fn awareness_message(ids: &[u64], clock: u32, json: &str) -> Vec<u8> {
+        let clients = ids
+            .iter()
+            .map(|id| {
+                let entry = AwarenessUpdateEntry {
+                    clock,
+                    json: Arc::from(json),
+                };
+                (ClientID::new(*id), entry)
+            })
+            .collect();
+        encode_y_message(&YMessage::Awareness(AwarenessUpdate { clients }))
+    }
+
+    #[test]
+    fn a_forgotten_awareness_state_stays_gone_and_its_neighbours_stay() {
+        let mut session = beside_a_guest();
+        let states = awareness_message(&[41, 42], 1, "{\"cursor\":null}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &states));
+        assert_eq!(session.awareness_clients(), [41, 42]);
+
+        session.forget_awareness(41);
+        assert_eq!(session.awareness_clients(), [42]);
+
+        // A copy of the old state still in flight is older than the removal.
+        let stale = awareness_message(&[41], 1, "{\"cursor\":null}");
+        let _ = session.deliver(millis(3), &frame(&peer(), 0, 2, &stale));
+        assert_eq!(session.awareness_clients(), [42], "no resurrection");
+    }
+
+    #[test]
+    fn forgetting_an_id_with_no_state_leaves_its_first_state_welcome() {
+        let mut session = beside_a_guest();
+        session.forget_awareness(43);
+        let first = awareness_message(&[43], 1, "{}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &first));
+        assert_eq!(session.awareness_clients(), [43]);
+    }
+
+    #[test]
+    fn this_connections_own_awareness_id_is_never_forgotten() {
+        let mut session = beside_a_guest();
+        let own = session.awareness_client_id();
+        let states = awareness_message(&[own], 1, "{}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &states));
+        assert_eq!(session.awareness_clients(), [own]);
+        session.forget_awareness(own);
+        assert_eq!(session.awareness_clients(), [own]);
+    }
+
+    /// A sync Update whose one item is an `Any` opening `depth` one-element arrays inside one
+    /// another around a `null`. It is built by hand because no document holds such a value:
+    /// one client's group of one struct, client 1 at clock 0, an `Any` item (info 8) under the
+    /// root named `x` carrying one value, then an empty delete set.
+    fn nested_any_update(depth: usize) -> Vec<u8> {
+        let mut update = vec![1, 1, 1, 0, 8, 1, 1, b'x', 1];
+        for _ in 0..depth {
+            update.extend([117, 1]);
+        }
+        update.extend([126, 0]);
+        encode_y_message(&YMessage::Sync(SyncMessage::Update(update)))
+    }
+
+    #[test]
+    fn an_update_nested_past_any_stack_is_refused_and_the_session_goes_on() {
+        // Two bytes a level: a million levels is two megabytes, and no thread's stack holds a
+        // recursive reader that deep.
+        let mut session = beside_a_guest();
+        let hostile = frame(&peer(), 0, 1, &nested_any_update(1 << 20));
+        assert_eq!(
+            session.deliver(millis(2), &hostile),
+            Outcome::Dropped {
+                reason: "bad_payload".to_string()
+            }
+        );
+        assert_eq!(
+            session.deliver(millis(3), &content(&peer(), 2, "after")),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(session.text("README.md"), "after");
+    }
+
+    #[test]
+    fn a_frame_carrying_a_nested_update_is_refused_whole() {
+        // The refusal is the frame's, before anything in it is applied: an edit ahead of the
+        // hostile update in the same stream is not applied either.
+        let mut session = beside_a_guest();
+        let mut plaintext = update_message("hello");
+        plaintext.extend(nested_any_update(MAX_ANY_DEPTH + 1));
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &plaintext)),
+            Outcome::Dropped {
+                reason: "bad_payload".to_string()
+            }
+        );
+        assert_eq!(session.text("README.md"), "");
+    }
+
+    #[test]
+    fn an_update_nested_to_the_bound_is_applied() {
+        let mut session = beside_a_guest();
+        let mut plaintext = nested_any_update(MAX_ANY_DEPTH);
+        plaintext.extend(update_message("hello"));
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &plaintext)),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(session.text("README.md"), "hello");
     }
 
     fn invite(room: RoomKey, fragment: &str) -> String {
