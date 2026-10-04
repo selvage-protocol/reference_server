@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Full image smoke without publishing and without Docker. Builds the image
-# with nix/dockerTools (the CI runners cannot execute buildx builds but run nix
-# reliably), verifies the
-# manifest and container config with skopeo, extracts the exact binary from
-# the image layers, and asserts `--version` and `GET /meta` truthfulness
-# against it. Takes the expected Go architecture (amd64/arm64; defaults to
-# the build host). Used by .github/workflows/image.yml and ci-local.sh.
+# Full image smoke without publishing or Docker. Builds the image with
+# nix/dockerTools, then verifies the manifest and container config with skopeo,
+# extracts the exact binary from the image layers, and asserts `--version` and
+# `GET /meta` truthfulness against it. Takes the expected Go architecture
+# (amd64/arm64; defaults to the build host). Used by .github/workflows/image.yml
+# and ci-local.sh.
 set -euo pipefail
 
 want_arch="${1:-$(if [ "$(uname -m)" = "aarch64" ]; then echo arm64; else echo amd64; fi)}"
