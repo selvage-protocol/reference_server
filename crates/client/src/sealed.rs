@@ -27,6 +27,8 @@ use yrs::sync::{
 };
 use yrs::updates::decoder::DecoderV1;
 
+use crate::nesting::nests_too_deep;
+
 /// The five kinds this version defines, in the order `CANONICAL.md` §6.1 gives them.
 pub const KINDS: [u64; 5] = [0, 1, 2, 3, 4];
 
@@ -1001,15 +1003,21 @@ impl Reader {
     }
 }
 
-/// Step 8 for a frame whose plaintext is one of the four JSON payloads.
+/// Step 8: the plaintext is a payload this reader reads.
 ///
-/// A `kind = 0` plaintext is the y-protocols stream of `PROTOCOL.md` §7 and not JSON: the
-/// receiver that applies it is the one that decodes it, so this layer carries it whole.
+/// A `kind = 1` to `4` plaintext is one of the four JSON payloads. A `kind = 0` plaintext is
+/// the y-protocols stream of `PROTOCOL.md` §7 and not JSON: the receiver that applies it is
+/// the one that decodes it, so this layer carries it whole, except that a stream holding an
+/// update whose `Any` nests past [`MAX_ANY_DEPTH`](crate::nesting::MAX_ANY_DEPTH) is refused here, since no decoder of it
+/// could finish (`crate::nesting`).
 fn read_payload(
     kind: u64,
     plaintext: &[u8],
 ) -> Result<Option<Payload>, &'static str> {
     if kind == 0 {
+        if nests_too_deep(plaintext) {
+            return Err("bad_payload");
+        }
         return Ok(Some(Payload::Content));
     }
     let value: Value =

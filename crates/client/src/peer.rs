@@ -23,16 +23,16 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use yrs::block::ClientID;
 use yrs::sync::{Awareness, Message as YMessage, MessageReader, SyncMessage};
-use yrs::updates::decoder::{Decode, DecoderV1};
+use yrs::updates::decoder::DecoderV1;
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{
     Doc, GetString, OffsetKind, Options, ReadTxn, StateVector, Text, Transact,
-    Update,
 };
 
 use selvage_protocol as proto;
 
 use crate::host::{HostOptions, HostProducer, HostReason};
+use crate::nesting::decode_update;
 use crate::sealed::{
     Announcement, FrameKey, Guard, KeyId, Payload, PublicKey, Reader, Recipe,
     RoomKey, SealedError, SessionKey, Verdict, fresh_nonce, seal,
@@ -1161,8 +1161,11 @@ impl PeerSession {
     }
 
     /// One update applied to the session document. Returns whether it was read and applied.
+    ///
+    /// The reader has already refused a frame holding an update nested past the bound, and
+    /// this decode is bounded too, so no path hands `yrs` one to recurse into.
     fn apply_update(&self, bytes: &[u8]) -> bool {
-        let Ok(update) = Update::decode_v1(bytes) else {
+        let Ok(update) = decode_update(bytes) else {
             return false;
         };
         let mut txn = self.awareness.doc().transact_mut();
@@ -1716,6 +1719,7 @@ mod tests {
     use crate::host::{
         ABSENCE_CHARGE, HostStore, ListingSource, PersistedHost,
     };
+    use crate::nesting::MAX_ANY_DEPTH;
     use crate::sealed::{Envelope, RoomKey, encode_key, opens, read_varuint};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -2905,6 +2909,66 @@ mod tests {
         assert_eq!(session.awareness_clients(), [own]);
         session.forget_awareness(own);
         assert_eq!(session.awareness_clients(), [own]);
+    }
+
+    /// A sync Update whose one item is an `Any` opening `depth` one-element arrays inside one
+    /// another around a `null`. It is built by hand because no document holds such a value:
+    /// one client's group of one struct, client 1 at clock 0, an `Any` item (info 8) under the
+    /// root named `x` carrying one value, then an empty delete set.
+    fn nested_any_update(depth: usize) -> Vec<u8> {
+        let mut update = vec![1, 1, 1, 0, 8, 1, 1, b'x', 1];
+        for _ in 0..depth {
+            update.extend([117, 1]);
+        }
+        update.extend([126, 0]);
+        encode_y_message(&YMessage::Sync(SyncMessage::Update(update)))
+    }
+
+    #[test]
+    fn an_update_nested_past_any_stack_is_refused_and_the_session_goes_on() {
+        // Two bytes a level: a million levels is two megabytes, and no thread's stack holds a
+        // recursive reader that deep.
+        let mut session = beside_a_guest();
+        let hostile = frame(&peer(), 0, 1, &nested_any_update(1 << 20));
+        assert_eq!(
+            session.deliver(millis(2), &hostile),
+            Outcome::Dropped {
+                reason: "bad_payload".to_string()
+            }
+        );
+        assert_eq!(
+            session.deliver(millis(3), &content(&peer(), 2, "after")),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(session.text("README.md"), "after");
+    }
+
+    #[test]
+    fn a_frame_carrying_a_nested_update_is_refused_whole() {
+        // The refusal is the frame's, before anything in it is applied: an edit ahead of the
+        // hostile update in the same stream is not applied either.
+        let mut session = beside_a_guest();
+        let mut plaintext = update_message("hello");
+        plaintext.extend(nested_any_update(MAX_ANY_DEPTH + 1));
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &plaintext)),
+            Outcome::Dropped {
+                reason: "bad_payload".to_string()
+            }
+        );
+        assert_eq!(session.text("README.md"), "");
+    }
+
+    #[test]
+    fn an_update_nested_to_the_bound_is_applied() {
+        let mut session = beside_a_guest();
+        let mut plaintext = nested_any_update(MAX_ANY_DEPTH);
+        plaintext.extend(update_message("hello"));
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &plaintext)),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(session.text("README.md"), "hello");
     }
 
     fn invite(room: RoomKey, fragment: &str) -> String {
