@@ -416,7 +416,7 @@ impl RelaySession {
     }
 
     /// The room's open-document set as §13.7 makes it: the union of the live holds, this
-    /// connection's included. It is what a version-1 room's `documents` used to be.
+    /// connection's included.
     #[must_use]
     pub fn open_documents(&self) -> Vec<String> {
         let state = self.read();
@@ -1700,7 +1700,7 @@ mod tests {
         }
     }
 
-    /// M1: a frame's counter is assigned under the state lock, so the order the socket's queue
+    /// A frame's counter is assigned under the state lock, so the order the socket's queue
     /// takes the frames in has to be that same order. Two tasks editing one connection
     /// interleave inside that lock, and what leaves must be the order the session numbered the
     /// frames in: a reordered pair costs the earlier edit until §13.6's re-sync repairs it.
@@ -1710,13 +1710,8 @@ mod tests {
     /// widens it: the editors run on threads of their own and the test burns a core per core
     /// while they do, because on a machine with a core to spare the publisher always reaches
     /// its push first and the arrangement under test — the push after the lock — would pass.
-    /// What it measures is the wire order, which is what a peer's mark is kept on.
-    ///
-    /// That load is the whole reproduction, and what it buys is worth stating: with the push
-    /// moved back to after the lock this test passed every run on a quiet host (0 red of 10)
-    /// and failed every run with one spinner per core added (10 of 10), and a failing run
-    /// carried 60–105 inversions in 5,500–7,000 frames, of which the first is the one reported.
-    /// The producers here are two callers and the clock; the socket task's own path is the test
+    /// What it measures is the wire order, which is what a peer's mark is kept on. The
+    /// producers here are two callers and the clock; the socket task's own path is the test
     /// below.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_editors_frames_leave_in_the_order_they_were_numbered()
@@ -1818,7 +1813,7 @@ mod tests {
         Ok(())
     }
 
-    /// M1, the socket task's half: a report `deliver` publishes is handed to the socket under
+    /// The socket task's half: a report `deliver` publishes is handed to the socket under
     /// the guard that numbered its frames, exactly as a caller's own edit is.
     ///
     /// The report is a guest's whole held-back set. §13.1's step 4 keeps every edit made before
@@ -1828,15 +1823,6 @@ mod tests {
     /// editors above race each other; this races an editor against that report, and the
     /// property is the same: a frame the report numbered must not arrive behind one the editor
     /// numbered later.
-    ///
-    /// **The race is the same race, with a wider window.** Reverting `delivered` alone — the
-    /// report drained under the guard and handed over after it — leaves the editors' test above
-    /// green and turns this one red on a quiet host: fifteen failing runs in fifteen, the
-    /// failure the first counter inversion, which lands between frame 3,400 and frame 10,700 of
-    /// runs of 9,700–14,900. The window is the loop the report's frames leave in, thousands of
-    /// pushes wide, where a report of one frame leaves a window a function call wide and the
-    /// machine's mood decides it: at half this report, that revert was caught in 8 runs of 10.
-    /// With the fix it is green, ten runs in ten.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reports_frames_are_handed_over_under_the_lock_that_numbered_them()
     -> Result<(), Box<dyn StdError>> {
@@ -1876,7 +1862,7 @@ mod tests {
         Ok(())
     }
 
-    /// m1: the clock task ends with the session it belongs to. A socket that closed or errored
+    /// The clock task ends with the session it belongs to. A socket that closed or errored
     /// ends the session as `room-gone` without destroying it, and a clock that watched only
     /// `destroyed` would tick into an ended session for the rest of the process, holding the
     /// relay, its state and its event channel alive while publishing nothing.
@@ -1920,7 +1906,7 @@ mod tests {
         Ok(())
     }
 
-    /// m4: `interval` panics on a zero period, and that period is either the room's advertised
+    /// `interval` panics on a zero period, and that period is either the room's advertised
     /// keepalive — which `PROTOCOL.md` §8.2 lets a server write however it likes — or the
     /// caller's own override, so it is floored before it is used. The assertion is that the
     /// session keeps moving: a spawned panic is not a failed test, and a clock that died is a
@@ -1948,7 +1934,7 @@ mod tests {
         Ok(())
     }
 
-    /// m3: §13.7 asks a holder to re-announce *at once* when its held set changes, and the
+    /// §13.7 asks a holder to re-announce *at once* when its held set changes, and the
     /// session's tick is the room's own `awareness_renew_ms` — fifteen seconds at the reference
     /// defaults. The renewal here is a minute, so a holds frame that reaches the server end
     /// inside [`WAIT`] of the call is the change and not the clock task.
@@ -2005,7 +1991,7 @@ mod tests {
         assert_eq!(session_base("ws://h:8080#k=cd8"), None);
     }
 
-    /// M1: an advertised capability is a claim a peer may act on, and §10 defines `awareness`
+    /// An advertised capability is a claim a peer may act on, and §10 defines `awareness`
     /// as "the peer publishes presence". This session publishes none — no state of its own, no
     /// renewal, no expiry — so the hello carries the one name it does speak.
     #[test]
@@ -2093,7 +2079,7 @@ mod tests {
         Ok(format!("ws://{addr}"))
     }
 
-    /// R1: a refusal names the address, never the link. §5.1 forbids the fragment leaving a
+    /// A refusal names the address, never the link. §5.1 forbids the fragment leaving a
     /// client, and these are the two refusals a caller reaches with an ordinary paste — a base
     /// that carries a whole link, and a server that seats the connection somewhere else.
     #[tokio::test]

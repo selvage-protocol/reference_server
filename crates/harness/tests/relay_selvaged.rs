@@ -3,9 +3,9 @@
 //! sees a file name or a byte of either replica.
 //!
 //! This is the proof that the version's two halves (`PROTOCOL.md` §7.1 and §13) can be handed a
-//! socket and a room and come out the other side agreeing, which is the wiring the Rust client
-//! was written without. Every wait here polls a real predicate with a deadline: a test that slept
-//! and hoped would pass on a machine that happened to be fast enough and prove nothing.
+//! socket and a room and come out the other side agreeing. Every wait here polls a real predicate
+//! with a deadline: a test that slept and hoped would pass on a machine that happened to be fast
+//! enough and prove nothing.
 
 use std::error::Error as StdError;
 use std::sync::{Arc, Mutex};

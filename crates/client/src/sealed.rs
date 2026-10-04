@@ -1336,7 +1336,7 @@ mod tests {
         assert_eq!(at, 2);
     }
 
-    /// n2: `PROTOCOL.md` §13.3's `MAY`. A peer that holds the room key can announce keys
+    /// `PROTOCOL.md` §13.3's `MAY`. A peer that holds the room key can announce keys
     /// without bound, and a mark per key is state a receiver carries for the life of the room.
     #[test]
     fn the_marks_kept_for_keys_no_state_commits_are_capped() {

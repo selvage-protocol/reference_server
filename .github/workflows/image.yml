@@ -292,8 +292,8 @@ jobs:
     # Release tags only. `publish-rehearsal` above has just run this job's
     # buildx steps on this same commit without pushing anywhere, so a tag is
     # not permission to assume the release path works — it is the one run where
-    # the image is redistributed, which the owner accepted for FSL-1.1-MIT on
-    # 2026-09-19. The gate is the ref, not the event:
+    # the image is redistributed, which the owner accepted for FSL-1.1-MIT.
+    # The gate is the ref, not the event:
     # a pull request's ref is never a tag, and this workflow's own
     # `workflow_dispatch` reaches here only when it is run against a ref that
     # already is one — which `release.yml` is the one path that creates.

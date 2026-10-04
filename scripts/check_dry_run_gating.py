@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """The guard around what a workflow's `dry_run` input promises.
 
-`.github/workflows/release.yml` gained a `dry_run` input and a step carrying
-`if: inputs.dry_run` that printed a plan ending "nothing was resolved, written,
-committed, pushed or dispatched". **Not one step after it was conditioned on the
-input**, so a `dry_run: true` dispatch printed that plan and then cut the release:
-bumped `Cargo.toml`, committed to `main`, created the tag, dispatched `image.yml`
-and dispatched `deploy-prod.yml`. The plan text was a lie about the run it was part
-of, and the flag is only worth having if it cannot become one again.
+A workflow that declares a `dry_run` input prints a plan, and the flag is only
+worth having if that plan cannot become a lie about the run it is part of: a
+`dry_run: true` dispatch must not write, commit, push or dispatch anything.
 
-`actionlint` cannot see this. Every step in that file is syntactically valid, every
+`actionlint` cannot see this. Every step in such a workflow is syntactically valid, every
 `if:` is a well-formed expression and the file lints clean; the defect is *which
 steps do not carry one*. So the rule here is positional, and it judges a step by
 where it stands rather than by its name:

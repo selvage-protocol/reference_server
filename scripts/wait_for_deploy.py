@@ -3,9 +3,8 @@
 
 `gh workflow run` prints no run id, so a release that dispatches `deploy-prod.yml`
 and looks away cannot tell a deploy that succeeded from one that never started or
-one that failed — which is how a green release has stood beside a red deploy and a
-demo still on the previous version. This dispatches and then watches the run the
-dispatch created, and exits non-zero unless that run concludes `success`.
+one that failed. This dispatches and then watches the run the dispatch created,
+and exits non-zero unless that run concludes `success`.
 
 The run to watch is the newest run of the workflow that is not the newest one seen
 before the dispatch; `gh run list` is read before the dispatch and polled after it.

@@ -59,8 +59,8 @@ PINS = {
 }
 SERVICES = ("proxy", "selvaged", "selvage-web")
 
-# A request is two hundred bytes; anything past this is not one, and the bound
-# is here so a caller cannot make a root process read for as long as it likes.
+# A request is a few hundred bytes at most; the bound is here so a caller cannot
+# make a root process read for as long as it likes.
 MAX_REQUEST_BYTES = 4096
 
 # The OCI tag grammar: a version, `latest`, or a commit-stamped `<version>-<sha>`.

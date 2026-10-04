@@ -58,8 +58,7 @@ async fn replay_all(vectors: &[runner::Vector]) -> Vec<String> {
 #[tokio::test]
 async fn a_transcript_that_stops_reading_early_does_not_hold() {
     // Vector 016 ends by reading the `session.error` its own id-less `session.rename`
-    // is answered with; without that step the frame sits on the connection, which is
-    // the omission the specification runner caught in four transcripts. The replay
+    // is answered with; without that step the frame sits on the connection. The replay
     // must fail naming the connection and the frame it still holds.
     let vectors = runner::load().expect("the vector directory is readable");
     let vector = vectors

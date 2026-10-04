@@ -3,10 +3,9 @@ name: deploy-prod
 # The button that redeploys the public demo, `selvage-demo.dontblameme.dev`, from
 # what is already published.
 #
-# **There is no approval gate on it.** This job used to declare
-# `environment: prod`, whose required reviewer was the owner; that environment has
-# been deleted, and the credential below is bound to the **ref** instead. The
-# tailnet's federated identity is constrained to exactly
+# **There is no approval gate on it.** The credential below is bound to the
+# **ref**, not to an environment. The tailnet's federated identity is constrained
+# to exactly
 # `repo:selvage-protocol@328844633/reference_server@1368869493:ref:refs/heads/main` —
 # the immutable form, with the owner's and the repository's numeric ids, because
 # this organisation has ID-based OIDC subject claims enabled, and the plain form is
@@ -15,11 +14,9 @@ name: deploy-prod
 # branch presents a subject naming the ref it ran at — `…:ref:refs/tags/<tag>` or
 # `…:ref:refs/heads/<branch>` — rather than `refs/heads/main`, and is refused at
 # the exchange. A job that **declares an environment** is refused as well, which is
-# why no such line is left in this file: it would present `…:environment:prod`, and
-# nothing in the console matches that any more.
+# why no such line is in this file: it would present `…:environment:prod`.
 #
-# What the deleted environment used to bound, written down because it is no longer
-# a bound: a change **CI initiates** now reaches the box with no human in the loop.
+# A change **CI initiates** reaches the box with no human in the loop.
 # A compromised workflow, a compromised third-party action or a stolen repository
 # secret has a credential for the box. What is left is the box's own bound — the
 # two argument-free root commands below — and how little this dispatch can express.
@@ -41,9 +38,9 @@ name: deploy-prod
 # **ephemeral** node tagged `tag:ci`, using Tailscale workload identity
 # federation — a client id and an audience, which Tailscale's own documentation
 # says are not secrets, exchanged for a short-lived node together with a
-# GitHub-signed OIDC token whose `sub` claim carries this run's ref. With the
-# environment gone, the pair lives in this repository's secrets rather than in an
-# environment's, and the ref above is the whole of what the exchange checks.
+# GitHub-signed OIDC token whose `sub` claim carries this run's ref. The pair
+# lives in this repository's secrets, and the ref above is the whole of what the
+# exchange checks.
 #
 # Then Tailscale SSH as `deployci`, a local user on the box with no password, no
 # key and two permitted root commands — `/usr/local/sbin/selvage-deploy`, whose

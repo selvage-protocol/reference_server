@@ -15,8 +15,7 @@
 #
 # `--version` prints a string baked into the binary at compile time, so it
 # reads the same regardless of which architecture actually compiled it — a
-# binary built for the wrong platform still passes that check, which is
-# exactly how a mislabelled arm64 leg shipped undetected before. The ELF
+# binary built for the wrong platform still passes that check. The ELF
 # check reads the binary's own header (byte 18: 62 is x86-64, 183 is
 # AArch64) instead of trusting anything the image claims about itself, and it
 # is the only check run against the architecture that is not the runner's

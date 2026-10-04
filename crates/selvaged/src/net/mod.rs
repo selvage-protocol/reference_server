@@ -859,10 +859,7 @@ async fn respond_page(
     respond_file(tcp, &page::headers(&file), &body, &head.method).await
 }
 
-/// The one refusal a served page answers with: a path that leaves the root, a
-/// link that resolves out of it, a missing file and a file past the bound are
-/// deliberately the same bytes, so nothing about the host's disk can be probed
-/// by telling them apart.
+/// The refusal a served page answers with.
 async fn not_found_page(tcp: &mut TcpStream, method: &str) -> io::Result<()> {
     respond_status(tcp, Status::NotFound, PAGE_NOT_FOUND, method).await
 }

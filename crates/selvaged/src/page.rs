@@ -134,10 +134,10 @@ pub const FD_DIR: &str = "/proc/self/fd";
 /// per request, which is what makes a page root that is itself a link work.
 ///
 /// The descriptor's own path is read through [`FD_DIR`]. Validating the path and
-/// then reading it in a second step is what this replaces, and it is not offered
-/// as a fallback: a canonical path checked before the read is the check-then-use
-/// the deployment contract forbids, and it would be a guarantee that holds on one
-/// platform and not another.
+/// then reading it in a second step is not offered as a fallback: a canonical
+/// path checked before the read is the check-then-use the deployment contract
+/// forbids, and it would be a guarantee that holds on one platform and not
+/// another.
 pub(crate) async fn open_within(root: &Path, file: &Path) -> Option<fs::File> {
     let real_root = fs::canonicalize(root).await.ok()?;
     let opened = fs::File::open(file).await.ok()?;
@@ -186,8 +186,7 @@ pub(crate) fn content_type(file: &Path) -> &'static str {
         Some("css") => "text/css; charset=utf-8",
         Some("json" | "map") => "application/json; charset=utf-8",
         // The manifest has a media type of its own, and the page that links it asks
-        // for that one: the retired `serve.py` table answered this and the one-origin
-        // move grouped it with JSON, which changed the type without changing the file.
+        // for that one.
         Some("webmanifest") => "application/manifest+json; charset=utf-8",
         Some("wasm") => "application/wasm",
         Some("svg") => "image/svg+xml",

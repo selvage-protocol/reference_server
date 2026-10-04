@@ -24,7 +24,7 @@
 # from `scripts/release-tags.sh`, `scripts/assert-image-version.sh` and
 # `scripts/assert-multiarch-layers.py`, which those jobs and this script's container job share.
 # The last of those needs only network access to a registry, not Docker: run it by hand against
-# any published tag, e.g. `scripts/assert-multiarch-layers.py ghcr.io/selvage-protocol/selvaged:0.1.2`.
+# any published tag.
 #
 # Keep this in step with the workflow — it runs the same commands, so that a red job is found
 # here rather than on a runner. `lint` catches unknown actions, bad expressions and shell
@@ -48,8 +48,8 @@ say() { printf '\n=== %s ===\n' "$*"; }
 # stands. Either way the run is not the run CI would do — CI checks out the committed ref — so
 # the jobs that build refuse when the tree differs from HEAD, and say so. Commit, not just
 # stage: staged-but-uncommitted is visible to the local build and absent from CI. One thing
-# this guard is for, and it happened: an untracked test file that would have run the wire suite
-# was invisible to the build, which reported a green run of a smaller suite. The steps that run
+# this guard is for: an untracked test file that would run the wire suite is invisible to the
+# build, which then reports a green run of a smaller suite. The steps that run
 # in the dev shell (`cargo deny`, `actionlint`, `typos`) and the `container` job read the
 # working tree directly, so they carry no guard.
 inputs_clean() {
@@ -71,9 +71,9 @@ job_checks() {
   nix build .#checks.x86_64-linux.clippy --no-link --print-build-logs
   say "checks: tests"
   nix build .#checks.x86_64-linux.nextest --no-link --print-build-logs
-  # `packages.default` is what `nix run` hands back, and until this step existed nothing built
-  # it: `nix flake check --no-build` below only *evaluates* it, so it could be — and was —
-  # broken without any job noticing.
+  # `packages.default` is what `nix run` hands back, and nothing else here builds it:
+  # `nix flake check --no-build` below only *evaluates* it, so it can be broken without
+  # any job noticing.
   say "checks: the default package"
   nix build .#default --no-link --print-build-logs
   say "checks: licences"
@@ -99,8 +99,7 @@ job_checks() {
   say "checks: the public demo's front"
   nix build .#checks.x86_64-linux.prod-front --no-link --print-build-logs
   # The command lines the tracked compose shapes give the server, run against the
-  # binary: a value it refuses is a container that exits 2 and restart-loops,
-  # which took the public demo's front down with it.
+  # binary: a value it refuses is a container that exits 2 and restart-loops.
   say "checks: the deployed command line"
   nix build .#checks.x86_64-linux.deploy-args --no-link --print-build-logs
   # The version bump this repository's release workflow runs before it commits:
@@ -119,10 +118,9 @@ job_checks() {
   # injected reads and a stand-in `gh` on `PATH`.
   say "checks: the release waits for its deploy"
   nix build .#checks.x86_64-linux.deploy-wait --no-link --print-build-logs
-  # The guard around a workflow's `dry_run` input: `release.yml` printed a plan
-  # promising that nothing would be resolved, written or dispatched, and then did
-  # all of it, because the plan step was the only step carrying a condition.
-  # `actionlint` lints that file clean, so this reads the workflows back and refuses
+  # The guard around a workflow's `dry_run` input: a plan step prints what a real
+  # run would do, and every step after it has to be excluded from a dry run.
+  # `actionlint` lints those workflows clean, so this reads the workflows back and refuses
   # one where a step after the plan can still run on a dry run.
   say "checks: the release workflow's dry_run gating"
   nix build .#checks.x86_64-linux.dry-run-gating --no-link --print-build-logs

@@ -43,10 +43,10 @@ name: release
 #
 # **Every step after the plan carries `if: inputs.dry_run != true`.** That is the whole
 # of what makes the plan's promise true: a condition on the plan step alone leaves every
-# step after it free to do exactly what the plan says was not done, which is what a
-# `dry_run: true` dispatch did once. `scripts/check_dry_run_gating.py` reads this file
-# back and refuses a workflow where a step after the plan can still run on a dry run,
-# because no other check can see it: every such step is a valid expression.
+# step after it free to do exactly what the plan says was not done.
+# `scripts/check_dry_run_gating.py` reads this file back and refuses a workflow where a
+# step after the plan can still run on a dry run, because no other check can see it:
+# every such step is a valid expression.
 on:
   workflow_dispatch:
     inputs:

@@ -42,7 +42,7 @@ const ANY: &str = "$_";
 
 /// How long the unread check waits for one more frame before it believes a
 /// connection is quiet — the same window as `DRAIN_TIMEOUT` in the specification
-/// runner, which is what caught the transcripts that stopped reading early.
+/// runner.
 const DRAIN_WINDOW: Duration = Duration::from_millis(100);
 
 /// How long the unread check waits on one connection in total before it calls

@@ -291,8 +291,8 @@ pub struct PeerInfo {
     pub peer_id: String,
 }
 
-/// `room.created` / `room.joined` params: the members that carried the server's state
-/// are gone and nothing took their place (`PROTOCOL.md` §6.1).
+/// `room.created` / `room.joined` params. The server's room state is not carried here
+/// (`PROTOCOL.md` §6.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionParams {
     #[serde(default)]
@@ -828,7 +828,7 @@ mod tests {
         let repeated = [
             // The envelope itself, which `serde` catches as well.
             r#"{"v":"selvage/2","id":1,"method":"session.rename","params":{"display_name":"a"},"v":"selvage/2"}"#,
-            // A member of `params`: the shape a duplicate could silently win before.
+            // A member of `params`.
             r#"{"v":"selvage/2","id":1,"method":"session.rename","params":{"display_name":"a","display_name":"b"}}"#,
             // A member of an object nested below `params`.
             r#"{"v":"selvage/2","id":1,"method":"session.rename","params":{"display_name":"a","x":{"y":1,"y":2}}}"#,

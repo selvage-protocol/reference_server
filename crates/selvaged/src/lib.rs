@@ -77,7 +77,7 @@ pub struct ServerConfig {
     /// with a whole burst, so a newcomer syncing a room is not throttled before it has
     /// sent anything; a flooder that spends it is held to the rate.
     pub inbound_burst_bytes: usize,
-    /// Whether to serve a static page. See [`ServerConfig::page_root`].
+    /// Whether to serve a static page.
     pub page_root: Option<PathBuf>,
 }
 

@@ -1908,7 +1908,7 @@ mod tests {
         );
         assert_eq!(session.applied().len(), 1);
         assert_eq!(session.dropped().len(), 1);
-        // m2: §13.3's `SHOULD` — the second state at one edition is the divergence, and a
+        // §13.3's `SHOULD` — the second state at one edition is the divergence, and a
         // state *below* the mark is an ordinary stale state. The reason is the same for both.
         assert_eq!(session.conflicts(), [1]);
     }
@@ -2801,10 +2801,9 @@ mod tests {
             "the page reads back as the same connection address, fragment left off"
         );
         // §5.1: the fragment is the one part a request never carries, so the address is the
-        // whole of what `wire_address` hands back however it is called. This is the door the
-        // pre-fix reading came through: re-appending the fragment here and handing the result
-        // to `parse_session_url` glued `k` onto `token` and put the room key in the URL a
-        // socket is dialled on.
+        // whole of what `wire_address` hands back however it is called. Re-appending the
+        // fragment and handing the result to `parse_session_url` would glue `k` onto `token`
+        // and put the room key in the URL a socket is dialled on.
         let door = wire_address(&page);
         assert!(
             !door.contains('#')

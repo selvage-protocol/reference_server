@@ -99,9 +99,9 @@ enum Action {
     Version,
 }
 
-/// Reads `--listen ADDR` and `--room-grace-ms MS`, which default to localhost and the
-/// reference grace period. A vector that depends on the grace period is replayed by a
-/// process that can set it.
+/// Reads the command line into an `Action`: where to listen, which page to serve, and the
+/// limits the server enforces, which default to the reference value. A vector that
+/// depends on the grace period is replayed by a process that can set it.
 fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Action, String> {
     let mut addr: SocketAddr = DEFAULT_ADDRESS
         .parse()
@@ -214,7 +214,7 @@ fn demanded(
     Ok((value, default))
 }
 
-/// What `flag` defaults to, printed in the unit its own help line uses.
+/// What `flag` defaults to.
 fn default_for(flag: &str) -> String {
     let default = ServerConfig::default();
     match flag {

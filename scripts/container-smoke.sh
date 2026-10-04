@@ -220,9 +220,9 @@ echo "=== the container's own transcript ==="
 docker logs "$name"
 
 echo "=== override: a mounted page, handed to --serve-page ==="
-# The image's own command names no page, so this run replaces it: the mount alone
-# is not the override any more. `--serve-page` is what the reference server keeps
-# for an operator who supplies a page directory.
+# The image's own command names no page, so this run replaces it:
+# `--serve-page` is what the reference server keeps for an operator who supplies
+# a page directory.
 docker rm -f "$name" >/dev/null
 docker run --detach --name "$name" "${hardening[@]}" \
   --publish "127.0.0.1:$port:8080" \

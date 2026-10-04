@@ -55,10 +55,7 @@
           # `cleanCargoSource` copies the Cargo workspace and nothing else, so without this the
           # sandbox cannot see `vectors/` and `crates/harness/tests/vectors.rs`,
           # `peer_vectors.rs` and `decisions.rs` panic on the corpus instead of running. It
-          # belongs on the shared args
-          # rather than on one check: `nextest` and `tarpaulin` each carried their own copy,
-          # `packages.default` — which is `checks.build` — carried none, and that is why it
-          # failed to build from the day the vectors were vendored.
+          # belongs on the shared args rather than on one check.
           #
           # `doCheck = false` on the package was the alternative, leaving `checks.nextest` as
           # the only test gate. It is cheaper — `nix run` would not wait on the suite, and this
@@ -220,7 +217,7 @@
               # `cargo nextest`'s default target selection leaves examples out, and clippy's
               # `--all-targets` does not stand in for it: cargo checks an example as the binary
               # it ships, so the `#[cfg(test)]` module one carries — `interop_peer`'s command
-              # line — was built by nothing. It did not compile, and no suite could say so.
+              # line — is otherwise built by nothing.
               cargoNextestExtraArgs = "--all-targets";
               # The vectors sit outside this Cargo workspace, so the sandbox — which receives
               # only the workspace — is handed them explicitly.
@@ -324,9 +321,8 @@
           # read on the box through the front over the SSH path the deploy itself
           # used) and what it only reports (the public URL, behind an edge that
           # serves a managed challenge to a programmatic client on a datacenter
-          # address). The second half turned a healthy deploy red once, and the
-          # first is the half that has to fail when the box serves the wrong
-          # version; nothing else in this repository can see either.
+          # address). The first is the half that has to fail when the box serves
+          # the wrong version; nothing else in this repository can see either.
           deploy-verify =
             pkgs.runCommand "deploy-verify-test" {
               nativeBuildInputs = [pkgs.python3];
@@ -351,11 +347,10 @@
               touch $out
             '';
 
-          # The guard around a workflow's `dry_run` input. `release.yml` printed a
-          # plan promising that nothing was resolved, written or dispatched and then
-          # resolved, wrote, committed, pushed and dispatched everything, because the
-          # plan step was the only step carrying a condition. `actionlint` lints that
-          # file clean — every step it does have is a valid expression, and the defect
+          # The guard around a workflow's `dry_run` input: a plan step prints what a
+          # real run would do, and every step after it has to be excluded from a dry
+          # run. `actionlint` lints those
+          # workflows clean — every step it does have is a valid expression, and the defect
           # is the steps that have none — so this reads the workflows back and refuses
           # one where a step after the plan can still run on a dry run. The suite
           # covers the condition spellings and the residual it does not read; the

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Full image smoke without publishing and without Docker. Builds the image
-# with nix/dockerTools (the CI runners cannot execute buildx builds —
-# established over nine red rounds — but run nix reliably), verifies the
+# with nix/dockerTools (the CI runners cannot execute buildx builds but run nix
+# reliably), verifies the
 # manifest and container config with skopeo, extracts the exact binary from
 # the image layers, and asserts `--version` and `GET /meta` truthfulness
 # against it. Takes the expected Go architecture (amd64/arm64; defaults to
