@@ -28,15 +28,18 @@ and whatever it runs, which is the point of not keeping a list of commands here.
 
 A condition is judged by what it evaluates to, not by what it contains. Each `if:` is parsed as
 a GitHub Actions expression and evaluated twice, once with the input set and once with it
-clear, with every other context and every function call standing for a value that is not known.
-A step is gated when its condition is false on a dry run whatever those unknowns are; it is the
+clear, with every other context and every function call standing for a value that is not known,
+except `contains`, `startsWith` and `endsWith` over two values it does know. A step is gated when its condition is false on a dry run whatever those unknowns are; it is the
 plan when its condition is false on a real run and names the input. Reading it that way is what
 refuses `!(inputs.dry_run != true)`, which contains a gate and means its opposite, and the forms
 beside it: a double negation, `!inputs.dry_run != true` (the `!` binds first), a disjunction
 whose other half runs the step anyway, and a type mismatch. `inputs.dry_run` is a boolean and
 `github.event.inputs.dry_run` the same input as a string, and the expression language compares
 mismatched types as numbers, so `inputs.dry_run != 'true'` and
-`github.event.inputs.dry_run != true` are true whatever the input is.
+`github.event.inputs.dry_run != true` are true whatever the input is. Strings become numbers and
+values become strings by the runner's own rules (`ExpressionUtility.ParseNumber` and
+`EvaluationResult.ConvertToString` in `actions/runner`), so a quoted `'0x1'` is the number 1 there
+and here.
 
 Run it directly, against a repository's workflows or a copy of them:
 
@@ -91,7 +94,7 @@ UNRECOGNISED = "unrecognised"
 
 
 class Unknown:
-    """A value this check does not know: another context, or what a function returns."""
+    """A value this check does not know: another context, or what a function returns from one."""
 
     def __repr__(self):
         return "<unknown>"
@@ -107,7 +110,7 @@ class Unparsed(ValueError):
 TOKEN = re.compile(
     r"""
       (?P<space>\s+)
-    | (?P<number>-?(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?))
+    | (?P<number>0x[0-9a-fA-F]+|0o[0-7]+|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)
     | (?P<string>'(?:[^']|'')*')
     | (?P<operator>&&|\|\||==|!=|<=|>=|[!<>()\[\],.*])
     | (?P<name>[A-Za-z_][A-Za-z0-9_-]*)
@@ -215,6 +218,8 @@ class Parser:
             return tree
         self.position += 1
         if kind == "number":
+            if math.isnan(number(value)):
+                raise Unparsed(f"{value!r} is not a number")
             return ("literal", number(value))
         if kind == "string":
             return ("literal", value[1:-1].replace("''", "'"))
@@ -249,7 +254,12 @@ def path_of(tree):
 
 
 def number(value):
-    """The expression language's coercion, used whenever two operands' types differ."""
+    """The expression language's coercion, used whenever two operands' types differ.
+
+    A string is read as the runner's `ParseNumber` reads it: a decimal with an optional sign,
+    point and exponent; `0x` hexadecimal or `0o` octal with no sign, as a 32-bit integer; or
+    `Infinity` and `-Infinity`. Anything else is NaN, which equals nothing.
+    """
     if value is None:
         return 0.0
     if isinstance(value, bool):
@@ -260,11 +270,33 @@ def number(value):
         text = value.strip()
         if text == "":
             return 0.0
-        if re.fullmatch(r"-?0x[0-9a-fA-F]+", text):
-            return float(int(text, 16))
-        if re.fullmatch(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?", text):
+        if re.fullmatch(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?", text):
             return float(text)
+        for prefix, digits, base in (("0x", "[0-9a-fA-F]+", 16), ("0o", "[0-7]+", 8)):
+            if re.fullmatch(prefix + digits, text):
+                # Int32's parse: eight hex digits are a bit pattern, so `0xFFFFFFFF` is -1.
+                integer = int(text[2:], base)
+                if integer >= 1 << 32:
+                    return math.nan
+                return float(integer - (1 << 32) if integer >= 1 << 31 else integer)
+        if text in ("Infinity", "-Infinity"):
+            return float(text.lower())
     return math.nan
+
+
+def string(value):
+    """The expression language's conversion to a string, the runner's `ConvertToString`."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return f"{value:.15g}"
+    return value
 
 
 def truthy(value):
@@ -299,6 +331,23 @@ def compare(operator, left, right):
     return {"<": left < right, "<=": left <= right, ">": left > right, ">=": left >= right}[operator]
 
 
+TEXT_TESTS = {
+    "contains": lambda haystack, needle: needle in haystack,
+    "startswith": str.startswith,
+    "endswith": str.endswith,
+}
+
+
+def call(name, arguments):
+    """`contains`, `startsWith` or `endsWith` over two known values, compared as the runner does:
+    both as strings, ignoring case. Every other call, and these over anything unknown, is
+    UNKNOWN."""
+    test = TEXT_TESTS.get(name)
+    if test is None or len(arguments) != 2 or any(isinstance(value, Unknown) for value in arguments):
+        return UNKNOWN
+    return test(*(string(value).upper() for value in arguments))
+
+
 def evaluate(tree, dry_run):
     """The value of an expression on a run whose `dry_run` is `dry_run`, or UNKNOWN."""
     shape = tree[0]
@@ -310,7 +359,7 @@ def evaluate(tree, dry_run):
             return CONTEXTS[path][dry_run]
         return UNKNOWN
     if shape == "call":
-        return UNKNOWN
+        return call(tree[1], [evaluate(argument, dry_run) for argument in tree[2]])
     if shape == "not":
         value = truthy(evaluate(tree[1], dry_run))
         return UNKNOWN if isinstance(value, Unknown) else not value

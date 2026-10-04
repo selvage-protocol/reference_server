@@ -122,6 +122,21 @@ RUN_ON_A_DRY_RUN_ALL_THE_SAME = {
     "a disjunction after `== false`": "inputs.dry_run == false || always()",
     "a disjunction before `!`": "github.event_name == 'push' || !inputs.dry_run",
     "a gate that is not a whole expression": "${{ inputs.dry_run != true }} && true",
+    # The runner reads `0x` only unsigned, so `'-0x1'` is NaN, which equals nothing.
+    "the boolean compared with a signed hex string": "inputs.dry_run != '-0x1'",
+    "a text test that holds on a dry run": "!startsWith(inputs.dry_run, 'f')",
+}
+
+# Gates whose strings and calls the runner reads as numbers and text, and so does this check.
+EXCLUDE_A_DRY_RUN_BY_THE_RUNNER_S_RULES = {
+    "a quoted hex one": "inputs.dry_run != '0x1'",
+    "a quoted octal one": "inputs.dry_run != '0o1'",
+    "a signed one": "inputs.dry_run != '+1'",
+    "a one with a trailing point": "inputs.dry_run != ' 1. '",
+    "an unquoted octal one": "inputs.dry_run != 0o1",
+    # Contains, ignoring case, the text the boolean becomes.
+    "a text test on the boolean": "startsWith(inputs.dry_run, 'F')",
+    "a negated text test on the string": "!contains(github.event.inputs.dry_run, 'RUE')",
 }
 
 
@@ -224,6 +239,24 @@ class DryRunGatingTest(unittest.TestCase):
 
     def test_gating_beside_another_test_is_accepted(self):
         self.assert_accepted(self.gated_by("github.event_name == 'workflow_dispatch' && inputs.dry_run != true"))
+
+    def test_a_gate_read_by_the_runner_s_rules_is_accepted(self):
+        for shape, condition in EXCLUDE_A_DRY_RUN_BY_THE_RUNNER_S_RULES.items():
+            with self.subTest(shape, condition=condition):
+                self.assert_accepted(self.gated_by(condition))
+
+    def test_a_signed_hex_literal_is_refused_as_unparsed(self):
+        self.assert_refused(
+            self.gated_by("inputs.dry_run != -0x1"),
+            "names dry_run in an expression this check cannot parse",
+        )
+
+    def test_a_plan_that_is_false_on_a_dry_run_too_is_not_the_plan(self):
+        # `contains('a', 'z')` is false on any run, so this step never runs: there is no plan.
+        result = self.read_back(
+            release_yml=document(job("release", plan(condition="inputs.dry_run && contains('a', 'z')"), push()))
+        )
+        self.assert_refused(result, "no step is conditioned `inputs.dry_run`")
 
     def test_gating_beside_a_disjunction_of_other_tests_is_accepted(self):
         # The `||` here is between two other tests; the conjunction with the gate still excludes
