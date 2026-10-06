@@ -260,6 +260,23 @@ pub enum SeatError {
     RoomFull,
 }
 
+/// Whether `presented` is exactly `expected`, walked byte for byte with no
+/// data-dependent early return: the length difference and every byte of the fixed
+/// encoding are folded into one accumulator, so a guess that shares a prefix costs
+/// what any other guess does. The room's token is 32 hex digits (`PROTOCOL.md`
+/// §12), so the walk is over that fixed length; a shorter or longer guess is
+/// rejected by the folded length, not by stopping at the first difference.
+fn token_matches(expected: &str, presented: &str) -> bool {
+    let want = expected.as_bytes();
+    let got = presented.as_bytes();
+    let mut diff = want.len() ^ got.len();
+    for (index, byte) in want.iter().enumerate() {
+        let other = got.get(index).copied().unwrap_or(0);
+        diff |= usize::from(*byte ^ other);
+    }
+    diff == 0
+}
+
 #[derive(Default)]
 pub struct Registry {
     rooms: HashMap<String, Room>,
@@ -327,7 +344,10 @@ impl Registry {
             .rooms
             .get_mut(claim.room_id)
             .ok_or(SeatError::Unknown)?;
-        if Some(room.token.as_str()) != claim.token {
+        let admitted = claim
+            .token
+            .is_some_and(|presented| token_matches(&room.token, presented));
+        if !admitted {
             return Err(SeatError::TokenMismatch);
         }
         if room.peers.len() >= max_peers {
@@ -608,5 +628,97 @@ mod tests {
         assert!(registry.detach("r-1", "p-ada").is_some());
         assert!(registry.detach("r-1", "p-ada").is_none());
         assert!(registry.detach("r-1", "p-never-there").is_none());
+    }
+
+    /// A token is admitted only whole: the length and every byte are one decision, so
+    /// a correct prefix cut short, a correct prefix with anything behind it, and an
+    /// empty guess are all refused, and only the room's own encoding matches.
+    #[test]
+    fn a_token_matches_only_whole() {
+        let token = "0123456789abcdef0123456789abcdef";
+        assert!(token_matches(token, token));
+        assert!(!token_matches(token, "0123456789abcdef0123456789abcde"));
+        assert!(!token_matches(token, "0123456789abcdef0123456789abcdef0"));
+        assert!(!token_matches(token, "0123456789abcdef0123456789abcdee"));
+        assert!(!token_matches(token, "fedcba9876543210fedcba9876543210"));
+        assert!(!token_matches(token, ""));
+        assert!(!token_matches("", token));
+        assert!(token_matches("", ""));
+    }
+
+    /// Admission refuses a token of any wrong shape — a prefix, a superset, one that
+    /// differs at the last byte, one that differs at the first, the empty string, and
+    /// no token at all — and seats the room's own token.
+    #[test]
+    fn admission_refuses_a_token_of_any_wrong_shape() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let mut registry = Registry::default();
+        let (host, _leftovers) =
+            peer_channel(peer("p-host", "Host"), MAX_QUEUE_BYTES);
+        assert!(
+            registry
+                .create(
+                    NewRoom {
+                        id: "r-1".to_string(),
+                        token: token.to_string(),
+                        keepalive: Keepalive::default(),
+                    },
+                    host,
+                    usize::MAX,
+                )
+                .is_some(),
+            "the room is minted"
+        );
+
+        for guess in [
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789abcdef0123456789abcdee",
+            "fedcba9876543210fedcba9876543210",
+            "",
+        ] {
+            let (guest, _leftovers) =
+                peer_channel(peer("p-guest", "Guest"), MAX_QUEUE_BYTES);
+            assert_eq!(
+                registry.admit(
+                    Claim {
+                        room_id: "r-1",
+                        token: Some(guess),
+                    },
+                    guest,
+                    usize::MAX,
+                ),
+                Err(SeatError::TokenMismatch),
+                "the guess {guess:?} was refused"
+            );
+        }
+
+        let (missing, _leftovers) =
+            peer_channel(peer("p-none", "None"), MAX_QUEUE_BYTES);
+        assert_eq!(
+            registry.admit(
+                Claim {
+                    room_id: "r-1",
+                    token: None,
+                },
+                missing,
+                usize::MAX,
+            ),
+            Err(SeatError::TokenMismatch)
+        );
+
+        let (guest, _leftovers) =
+            peer_channel(peer("p-guest", "Guest"), MAX_QUEUE_BYTES);
+        assert_eq!(
+            registry.admit(
+                Claim {
+                    room_id: "r-1",
+                    token: Some(token),
+                },
+                guest,
+                usize::MAX,
+            ),
+            Ok(())
+        );
     }
 }

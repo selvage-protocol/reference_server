@@ -731,7 +731,7 @@ name = "selvaged"
 version = "0.5.6"
 dependencies = [
  "futures-util",
- "rand",
+ "getrandom 0.3.4",
  "selvage-protocol",
  "serde_json",
  "tokio",
