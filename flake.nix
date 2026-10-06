@@ -57,10 +57,15 @@
           # `peer_vectors.rs` and `decisions.rs` panic on the corpus instead of running. It
           # belongs on the shared args rather than on one check.
           #
+          # `crates/harness/tests/limits.json` is inside the workspace but not kept by
+          # `cleanCargoSource`, which copies only `.rs` and `.toml` files, so the vendored
+          # bounds are handed in the same way rather than read from a path that is not there.
+          #
           # `doCheck = false` on the package was the alternative, leaving `checks.nextest` as
           # the only test gate. It is cheaper — `nix run` would not wait on the suite, and this
           # line invalidates `cargoArtifacts` — but it answers a missing input by not testing.
           SELVAGE_VECTORS = ./vectors;
+          SELVAGE_LIMITS = ./crates/harness/tests/limits.json;
         };
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;

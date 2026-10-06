@@ -45,6 +45,15 @@ pub const CAPABILITIES: &[&str] = &["y-protocols/1", "awareness"];
 /// `str::len` (bytes) and `chars().count()` (code points) both answer the wrong question.
 pub const DISPLAY_NAME_MAX_UTF16: usize = 32;
 
+/// The deepest a canonical frame nests, counting the outermost object or array
+/// (`CANONICAL.md` §2.9).
+///
+/// The readers here do not walk the depth themselves: `serde_json`'s default recursion limit
+/// stops one container short of 128, so it reads exactly this many and refuses a deeper frame.
+/// The number is named because the specification publishes it as a bound an implementation
+/// carries, and because a library that moved its default must fail a test rather than a frame.
+pub const MAX_NESTING_DEPTH: usize = 127;
+
 /// Whether a `display_name` is longer than [`DISPLAY_NAME_MAX_UTF16`].
 #[must_use]
 pub fn display_name_over_limit(name: &str) -> bool {
@@ -1001,5 +1010,32 @@ mod tests {
         ] {
             assert!(!speaks(version), "{version} must be refused");
         }
+    }
+
+    /// A `session.rename` envelope whose `params` is an array nested so the whole frame opens
+    /// `depth` objects and arrays, counting the envelope.
+    fn nested_envelope(depth: usize) -> String {
+        let inner = depth.saturating_sub(1);
+        format!(
+            r#"{{"id":1,"method":"session.rename","params":{}0{},"v":"selvage/2"}}"#,
+            "[".repeat(inner),
+            "]".repeat(inner)
+        )
+    }
+
+    /// [`MAX_NESTING_DEPTH`] is the depth this crate's readers permit, not a number copied
+    /// beside them: a frame nested to the bound reads and one nested past it is refused.
+    #[test]
+    fn a_frame_nests_to_the_canonical_depth() {
+        let at = nested_envelope(MAX_NESTING_DEPTH);
+        let past = nested_envelope(MAX_NESTING_DEPTH.saturating_add(1));
+        assert!(
+            ClientMessage::from_text(&at).is_ok(),
+            "a frame nested {MAX_NESTING_DEPTH} deep is within the bound"
+        );
+        assert!(
+            ClientMessage::from_text(&past).is_err(),
+            "a frame nested one past {MAX_NESTING_DEPTH} is refused"
+        );
     }
 }

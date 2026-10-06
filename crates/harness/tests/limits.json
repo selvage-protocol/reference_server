@@ -1,0 +1,29 @@
+{
+  "description": "The numeric bounds Selvage owns, one entry each, with the unit the document writes and the section that owns it. Data beside the schemas, not a schema: `schema/validate.py`'s `check_limits` reads it, an implementation's own tests compare their constants against it, and the bounds `schema/common.json` and `schema/errors.json` also pin are cross-checked there. `PROTOCOL.md` §2.1's bounds are a reference server's configured policy rather than the protocol's numbers, and the table that carries them is informative; they are published here so that the numbers have one home an implementation can read.",
+  "limits": [
+    {"name": "http_request_head", "value": 16, "unit": "KiB", "section": "PROTOCOL.md §2.1"},
+    {"name": "http_head_timeout", "value": 5, "unit": "seconds", "section": "PROTOCOL.md §2.1"},
+    {"name": "hello_timeout", "value": 10, "unit": "seconds", "section": "PROTOCOL.md §2.1"},
+    {"name": "ws_ping_interval", "value": 30, "unit": "seconds", "section": "PROTOCOL.md §2.1"},
+    {"name": "ws_ping_unanswered_intervals", "value": 2, "unit": "intervals", "section": "PROTOCOL.md §2.1"},
+    {"name": "outbound_queue_frames", "value": 32, "unit": "frames", "section": "PROTOCOL.md §2.1"},
+    {"name": "outbound_queue_bytes", "value": 32, "unit": "MiB", "section": "PROTOCOL.md §2.1"},
+    {"name": "connection_cap", "value": 1024, "unit": "connections", "section": "PROTOCOL.md §2.1"},
+    {"name": "inbound_frame", "value": 8, "unit": "MiB", "section": "PROTOCOL.md §2.1"},
+    {"name": "inbound_message", "value": 8, "unit": "MiB", "section": "PROTOCOL.md §2.1"},
+    {"name": "inbound_text_envelope", "value": 5, "unit": "MiB", "section": "PROTOCOL.md §2.1"},
+    {"name": "room_cap", "value": 1024, "unit": "rooms", "section": "PROTOCOL.md §2.1"},
+    {"name": "peers_per_room", "value": 128, "unit": "peers", "section": "PROTOCOL.md §2.1"},
+    {"name": "inbound_rate", "value": 2, "unit": "MiB/s", "section": "PROTOCOL.md §2.1"},
+    {"name": "inbound_burst", "value": 64, "unit": "MiB", "section": "PROTOCOL.md §2.1"},
+    {"name": "inbound_frame_charge_floor", "value": 1, "unit": "KiB", "section": "PROTOCOL.md §2.1"},
+    {"name": "inbound_small_frame_ceiling", "value": 2048, "unit": "frames/s", "section": "PROTOCOL.md §2.1"},
+    {"name": "display_name_length", "value": 32, "unit": "UTF-16 code units", "section": "PROTOCOL.md §5"},
+    {"name": "close_code_min", "value": 4000, "unit": "close code", "section": "PROTOCOL.md §11"},
+    {"name": "close_code_max", "value": 4003, "unit": "close code", "section": "PROTOCOL.md §11"},
+    {"name": "nesting_depth", "value": 127, "unit": "objects and arrays", "section": "CANONICAL.md §2.9"},
+    {"name": "listing_path_bytes", "value": 4096, "unit": "bytes", "section": "PROTOCOL.md §13.3"},
+    {"name": "listing_paths", "value": 100000, "unit": "paths", "section": "PROTOCOL.md §13.3"},
+    {"name": "listing_path_bytes_total", "value": 4, "unit": "MiB", "section": "PROTOCOL.md §13.3"}
+  ]
+}
