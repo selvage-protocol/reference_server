@@ -17,7 +17,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand::RngExt;
 use selvage_protocol::Keepalive;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -174,9 +173,18 @@ impl Server {
     }
 }
 
+/// `bytes` random bytes as lowercase hex.
+///
+/// The platform's CSPRNG is the one source of a room's token (`PROTOCOL.md` §12),
+/// so there is no refusal to build when it cannot be read: a process that has no
+/// randomness has nothing to mint a room with.
+#[expect(
+    clippy::expect_used,
+    reason = "a platform with no CSPRNG has no token to mint and no refusal to send"
+)]
 pub(crate) fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    rand::rng().fill(buf.as_mut_slice());
+    getrandom::fill(&mut buf).expect("the platform CSPRNG is available");
     let mut out = String::with_capacity(bytes.saturating_mul(2));
     for byte in buf {
         let _ = write!(out, "{byte:02x}");
