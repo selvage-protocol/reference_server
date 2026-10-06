@@ -3,6 +3,7 @@
 .pre-commit-config.yaml
 result
 .tmp
+__pycache__
 
 # Sibling checkouts for parallel work on this repository.
 .worktrees/
