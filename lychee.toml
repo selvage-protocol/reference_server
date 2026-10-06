@@ -36,3 +36,8 @@ exclude = [
   # unsupported rather than checked.
   "^https?://h[:/]",
 ]
+# `vectors/` is vendored test data, not this repository's prose: the specification
+# authors it, and the hook is handed every staged text file, so a vector's prose may
+# carry a link written as an example. The gate still reads `README.md` and `docs/`,
+# which is the front matter this repository maintains by hand.
+exclude_path = ["^vectors/"]

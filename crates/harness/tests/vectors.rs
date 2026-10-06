@@ -16,7 +16,7 @@ mod runner;
 /// The wire layer's corpus: `vectors/*.json` and not `vectors/peer/`. A vector deleted from
 /// the corpus replays green on less, so the count is asserted here as the specification's
 /// `schema/validate.py` asserts it there.
-const WIRE_VECTORS: usize = 24;
+const WIRE_VECTORS: usize = 25;
 
 #[tokio::test]
 async fn every_vector_holds() {

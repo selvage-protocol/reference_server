@@ -1,12 +1,13 @@
 //! The peer corpus's decision layer, replayed against this client's `selvage/2` session.
 //!
-//! `specification/vectors/peer/151…157.json` are the seven vectors that are about what a client
-//! decided. Six of them (`151…156`) are about what it *did* with a frame it received — what it
-//! applied, what it dropped and why, what it published, whether it ended — and none of that is on
-//! a socket. The other (`157`) is about a decision a link carries **before a socket**:
-//! `PROTOCOL.md` §5.1's half-copied fragment. A client that holds the rule refuses the link
-//! locally, in its own words, so the step that asserts it is `expectRefusal` and the words are the
-//! subject's own.
+//! `specification/vectors/peer/151…157.json` and `159.json` are the eight vectors that are about
+//! what a client decided. Six of them (`151…156`) are about what it *did* with a frame it
+//! received — what it applied, what it dropped and why, what it published, whether it ended — and
+//! none of that is on a socket. The other two are about a decision a link carries **before a
+//! socket**: `157` is `PROTOCOL.md` §5.1's half-copied fragment, and `159` is its repeat rule —
+//! a `room`, `token`, `k` or `h` written twice in either form. A client that holds the rule
+//! refuses the link locally, in its own words, so the step that asserts it is `expectRefusal` and
+//! the words are the subject's own.
 //!
 //! The specification drives them through `specification/runner/subject.py` and
 //! `runner/run_peer.py --subject`; this drives the same files through the same subject binary,
@@ -212,11 +213,12 @@ fn decision_vector(path: &Path) -> Result<Option<Value>, String> {
 // --- the subject, as a child process --------------------------------------------
 
 /// The guards of `PROTOCOL.md` §13.11's table that a caller has to remove **before** the `join`
-/// that reads its link, under the name `specification/runner/subject.py` gives it
-/// (`LINK_MUTATIONS`): §5.1's fragment rule is decided about the link itself, so a subject asked
-/// for it after it was seated could not have refused the link anyway. Every other name is a
-/// session's guard and is removed once there is a session.
-const LINK_MUTATIONS: [&str; 1] = ["accept-partial-fragment"];
+/// that reads its link, under the names `specification/runner/subject.py` gives them
+/// (`LINK_MUTATIONS`): §5.1's fragment rule and its repeat rule are decided about the link
+/// itself, so a subject asked for one after it was seated could not have refused the link
+/// anyway. Every other name is a session's guard and is removed once there is a session.
+const LINK_MUTATIONS: [&str; 2] =
+    ["accept-partial-fragment", "accept-repeated-key"];
 
 /// The subject binary, driven over the line protocol `specification/runner/subject.py` fixes.
 struct Subject {
@@ -889,8 +891,9 @@ fn recipe_plaintext(where_: &str, recipe: &Value) -> Result<Vec<u8>, String> {
 
 // --- the vectors ----------------------------------------------------------------
 
-/// The seven decision vectors a conforming client passes.
-const PASSABLE: [&str; 7] = ["151", "152", "153", "154", "155", "156", "157"];
+/// The eight decision vectors a conforming client passes.
+const PASSABLE: [&str; 8] =
+    ["151", "152", "153", "154", "155", "156", "157", "159"];
 
 fn fixture() -> Result<Fixture, String> {
     Fixture::load(&vectors_root().join("fixture").join("keys.json"))
@@ -917,7 +920,7 @@ fn every_decision_vector_a_conforming_client_passes_holds() {
         assert!(count > 0, "vector {id} asserted nothing");
         assertions = assertions.saturating_add(count);
     }
-    // A sweep that read nothing reports a clean tree: the seven are named, not counted.
+    // A sweep that read nothing reports a clean tree: the eight are named, not counted.
     assert_eq!(ran, PASSABLE.len(), "every passable vector was replayed");
     println!("{ran} decision vectors replayed, {assertions} assertion steps");
 }

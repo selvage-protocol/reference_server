@@ -1,0 +1,84 @@
+{
+  "id": "159",
+  "title": "A link that repeats a join key is refused locally, by name of the parameter it repeats",
+  "spec": "PROTOCOL.md#51-room-and-token-in-the-connection-url",
+  "notes": "The rule: `room`, `token`, `k` and `h` each appear at most once, in either form, and a receiver **MUST NOT** take a value by the order it appears (§5.1). The page link `https://host/?room=…&token=…#k=…&h=…` has no server in it — the receiver derives the connection URL from it — so a repeat there, and a repeat in the fragment, are refused by the client itself, locally and before it opens a socket; the refusal names the parameter it repeats, and `expectRefusal` asserts that naming and not the sentence, because §5.1 leaves the sentence to the client. A repeat in the `wss://…/session?…` form is the server's refusal and is pinned on the wire by `vectors/037`. The refused legs are also the evidence that none of them seated anything: a subject left in a session after one would report itself seated for the next `start`. The last leg is the control — the whole link, which must join — because the other way to pass a corpus of refusals is to refuse everything, and the refusals above differ only in which parameter they must name. The failure this prevents is the one a rewrite that chose a value would ship: one link joining two different rooms in two clients, decided by the order its query was written in.",
+  "layer": "peer",
+  "kind": "decision",
+  "fixture": "fixture/keys.json",
+  "catches": "accept-repeated-key",
+  "scenario": {
+    "keepalive": {
+      "awareness_expire_ms": 900,
+      "awareness_renew_ms": 300,
+      "ping_interval_ms": 30000,
+      "room_grace_ms": 30000
+    }
+  },
+  "steps": [
+    {
+      "op": "start",
+      "conn": "peer",
+      "key": "guest-1",
+      "invite": "https://example.org/?room=$room&room=$room&token=$token#k=$room_key&h=$host_key"
+    },
+    {
+      "op": "expectRefusal",
+      "conn": "peer",
+      "names": ["`room`"]
+    },
+    {
+      "op": "start",
+      "conn": "peer",
+      "key": "guest-1",
+      "invite": "https://example.org/?room=$room&token=$token&token=$token#k=$room_key&h=$host_key"
+    },
+    {
+      "op": "expectRefusal",
+      "conn": "peer",
+      "names": ["`token`"]
+    },
+    {
+      "op": "start",
+      "conn": "peer",
+      "key": "guest-1",
+      "invite": "https://example.org/?room=$room&token=$token#k=$room_key&k=$room_key&h=$host_key"
+    },
+    {
+      "op": "expectRefusal",
+      "conn": "peer",
+      "names": ["`k`"]
+    },
+    {
+      "op": "start",
+      "conn": "peer",
+      "key": "guest-1",
+      "invite": "https://example.org/?room=$room&token=$token#k=$room_key&h=$host_key&h=$host_key"
+    },
+    {
+      "op": "expectRefusal",
+      "conn": "peer",
+      "names": ["`h`"]
+    },
+    {
+      "op": "start",
+      "conn": "peer",
+      "key": "guest-1",
+      "invite": "https://example.org/?room=$room&token=$token#k=$room_key&h=$host_key"
+    },
+    {
+      "op": "expectSubject",
+      "conn": "peer",
+      "applied": [],
+      "dropped": [],
+      "frames": 0,
+      "ended": false
+    },
+    {
+      "op": "stop",
+      "conn": "peer"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}

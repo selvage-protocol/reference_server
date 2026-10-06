@@ -40,11 +40,12 @@ use serde_json::{Map, Value, json};
 const TICK: Duration = Duration::from_millis(10);
 
 /// The guards of `PROTOCOL.md` §13.11's table that sit on the **link** rather than in a
-/// session, under the name `specification/runner/subject.py` gives it. A caller removes it
-/// **before** the `join` that reads its link, because a client reads its link before any
-/// session exists; every other name of the table is a session's guard and is handed to that
-/// session.
+/// session, under the names `specification/runner/subject.py` gives them (`LINK_MUTATIONS`).
+/// A caller removes one **before** the `join` that reads its link, because a client reads its
+/// link before any session exists; every other name of the table is a session's guard and is
+/// handed to that session.
 const ACCEPT_PARTIAL_FRAGMENT: &str = "accept-partial-fragment";
+const ACCEPT_REPEATED_KEY: &str = "accept-repeated-key";
 
 /// A running subject: one seat and the zero of the clock it reads.
 struct Running {
@@ -224,7 +225,9 @@ fn join(shared: &Shared, command: &Value) -> Result<Next, String> {
 /// The link this command joins with, or the client's own words for a link it refuses.
 ///
 /// `removed` is the guard on the link this run removed, if any: a client that reads a
-/// half-copied fragment as a join is the wrong implementation vector `157` is about.
+/// half-copied fragment as a join is the wrong implementation vector `157` is about, and one
+/// that resolves a repeated key to its first value is the wrong implementation vector `159` is
+/// about.
 fn invite_of(
     command: &Value,
     removed: Option<&str>,
@@ -239,6 +242,10 @@ fn invite_of(
                 // read from wherever they happen to be, and a link naming one of them
                 // seats a session that will fail to verify every frame.
                 PeerInvite::parse(&whole_fragment(link))
+            } else if removed == Some(ACCEPT_REPEATED_KEY) {
+                // §5.1: the wrong client takes the first value of a name written twice,
+                // which is exactly the order-dependence the rule forbids.
+                PeerInvite::parse(&first_of_each(link))
             } else {
                 Err(refusal)
             }
@@ -319,6 +326,48 @@ fn whole_fragment(link: &str) -> String {
     format!("{address}#{}", parts.join("&"))
 }
 
+/// A link with each of §5.1's four names kept once, the first the other way a caller could
+/// read it, for the one guard a run removes.
+///
+/// This is the wrong client vector `159` is about: it resolves a repeated `room`, `token`, `k`
+/// or `h` by taking the value that appears first, which is the order-dependence `PROTOCOL.md`
+/// §5.1 forbids. Only the two query names and the two fragment names are touched; every other
+/// parameter is left where it stands.
+fn first_of_each(link: &str) -> String {
+    let (address, fragment) = match link.split_once('#') {
+        Some((address, fragment)) => (address, Some(fragment)),
+        None => (link, None),
+    };
+    let (endpoint, query) = match address.split_once('?') {
+        Some((endpoint, query)) => (endpoint, Some(query)),
+        None => (address, None),
+    };
+    let mut rebuilt = endpoint.to_string();
+    if let Some(query_text) = query {
+        rebuilt.push('?');
+        rebuilt.push_str(&keep_first(query_text, &["room", "token"]));
+    }
+    if let Some(fragment_text) = fragment {
+        rebuilt.push('#');
+        rebuilt.push_str(&keep_first(fragment_text, &["k", "h"]));
+    }
+    rebuilt
+}
+
+/// One `&`-separated part with the first pair of each named one kept and the rest dropped.
+fn keep_first(part: &str, names: &[&str]) -> String {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut kept: Vec<&str> = Vec::new();
+    for pair in part.split('&') {
+        let name = pair.split_once('=').map_or(pair, |(name, _)| name);
+        if names.contains(&name) && !seen.insert(name) {
+            continue;
+        }
+        kept.push(pair);
+    }
+    kept.join("&")
+}
+
 /// The session's clock, which every `join` has to carry: it arrives on `room.created` in a real
 /// session and there is no frame here to carry it.
 fn keepalive_of(command: &Value) -> Result<&Value, String> {
@@ -381,7 +430,7 @@ fn announce(shared: &Shared, command: &Value) -> Result<Next, String> {
 fn mutate(shared: &Shared, command: &Value) -> Result<Next, String> {
     let name = text(command, "name")?.to_string();
     let mut state = lock(shared);
-    if name == ACCEPT_PARTIAL_FRAGMENT {
+    if name == ACCEPT_PARTIAL_FRAGMENT || name == ACCEPT_REPEATED_KEY {
         state.removed_on_the_link = Some(name);
         return state_report(&state).map(Next::Report);
     }
