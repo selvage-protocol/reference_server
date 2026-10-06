@@ -1,0 +1,75 @@
+{
+  "id": "037",
+  "title": "A join query that repeats `room` or `token` is refused before `session.hello`",
+  "spec": "PROTOCOL.md#51-room-and-token-in-the-connection-url",
+  "notes": "`room` and `token` each appear at most once, and a URL that repeats either is malformed and refused rather than resolved (§5.1): which room a link names must not depend on the order its query was written in. The server reads the query when the upgrade is done, so the refusal goes out before `session.hello` and this transcript begins with its `expect` and sends nothing, which is what holds the timing to the rule as well as the refusal. §11 has no code for a malformed URL, so the fault is a `session.error` event and close 4002, the join refusal `token_invalid` (§5.1, §B.25). The last join shows the room the two refusals did not disturb: both legs refuse before a seat exists, and the room's own token still seats a guest afterwards. The page link's repeat has no server to refuse it, so it is pinned in the peer layer instead (`vectors/peer/159`).",
+  "steps": [
+    {
+      "op": "open",
+      "conn": "host",
+      "target": "/session"
+    },
+    {
+      "op": "send",
+      "conn": "host",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Ada\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"room.created\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"},\"token\":\"$token\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "open",
+      "conn": "dup-room",
+      "target": "/session?room=$room&room=$room&token=$token"
+    },
+    {
+      "op": "expect",
+      "conn": "dup-room",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"token_invalid\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "dup-room",
+      "code": 4002
+    },
+    {
+      "op": "open",
+      "conn": "dup-token",
+      "target": "/session?room=$room&token=$token&token=$token"
+    },
+    {
+      "op": "expect",
+      "conn": "dup-token",
+      "text": "{\"event\":\"session.error\",\"params\":{\"code\":\"token_invalid\",\"message\":\"$_\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expectClose",
+      "conn": "dup-token",
+      "code": 4002
+    },
+    {
+      "op": "open",
+      "conn": "guest",
+      "target": "/session?room=$room&token=$token"
+    },
+    {
+      "op": "send",
+      "conn": "guest",
+      "text": "{\"id\":1,\"method\":\"session.hello\",\"params\":{\"display_name\":\"Bob\"},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "guest",
+      "text": "{\"event\":\"room.joined\",\"params\":{\"capabilities\":[\"y-protocols/1\",\"awareness\"],\"keepalive\":{\"awareness_expire_ms\":30000,\"awareness_renew_ms\":15000,\"ping_interval_ms\":30000},\"peers\":[{\"display_name\":\"Ada\",\"peer_id\":\"$host_peer\"}],\"room_id\":\"$room\",\"self\":{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\"}},\"v\":\"selvage/2\"}"
+    },
+    {
+      "op": "expect",
+      "conn": "host",
+      "text": "{\"event\":\"peer.joined\",\"params\":{\"peer\":{\"display_name\":\"Bob\",\"peer_id\":\"$guest_peer\"}},\"v\":\"selvage/2\"}"
+    }
+  ],
+  "selvage": "selvage/2",
+  "canonical": "SJ-C/1"
+}

@@ -79,6 +79,10 @@ impl PeerInvite {
     /// link, which names the same room, token and fragment over the scheme a browser speaks and
     /// is resolved to its connection address first ([`wire_address`]).
     ///
+    /// §5.1's repeat rule is a local refusal in either form. A page link has no server in it, so
+    /// a `room` or `token` written twice is refused here, and the refusal names the parameter —
+    /// the shape [`fragment_keys`] already takes for `k` and `h`.
+    ///
     /// # Errors
     ///
     /// Returns the client's own words for a link it cannot join with, which `PROTOCOL.md`
@@ -88,10 +92,9 @@ impl PeerInvite {
         let (address, fragment) = invite
             .split_once('#')
             .ok_or_else(|| MISSING_FRAGMENT.to_string())?;
-        let parsed = proto::parse_session_url(&wire_address(address))
-            .ok_or_else(|| {
-                format!("{address:?} does not address the session endpoint")
-            })?;
+        let socket_url = wire_address(address);
+        let parsed = proto::parse_session_url(&socket_url)
+            .ok_or_else(|| unreadable_address(address, &socket_url))?;
         let room = parsed
             .join
             .room
@@ -102,7 +105,7 @@ impl PeerInvite {
             .ok_or_else(|| "the invite carries no token".to_string())?;
         let (room_key, host_key) = fragment_keys(fragment)?;
         Ok(Self {
-            socket_url: wire_address(address),
+            socket_url,
             room,
             token,
             room_key,
@@ -131,6 +134,35 @@ pub fn wire_address(link: &str) -> String {
         .split_once('#')
         .map_or(link, |(address, _fragment)| address);
     page_to_endpoint(address).unwrap_or_else(|| address.to_string())
+}
+
+/// Why a connection address is not one a `PROTOCOL.md` §5.1 invite reads from: the join
+/// parameter it repeats, by name, or the plain fact that it addresses no session endpoint.
+///
+/// §5.1 has `room` and `token` appear at most once, in either form, and a receiver **MUST NOT**
+/// take a value by the order it appears. A page link has no server to refuse a repeat, so the
+/// receiver refuses it, and the reason names the parameter — the shape [`fragment_keys`] already
+/// takes for `k` and `h`.
+fn unreadable_address(address: &str, socket_url: &str) -> String {
+    repeated_join_name(socket_url).map_or_else(
+        || format!("{address:?} does not address the session endpoint"),
+        |name| format!("the invite names `{name}` twice"),
+    )
+}
+
+/// The join parameter a connection address repeats, if it repeats one.
+///
+/// §5.1's query rule, read through the parser the server uses: [`proto::parse_session_url`]
+/// folds a repeat into `None`, and this asks [`proto::parse_join_query`] which name it refused,
+/// so that a page link's refusal can say it instead of blaming the address. A genuine duplicate
+/// in the `wss://` form is refused by the server, and this is only what the client says about
+/// the link it was handed.
+fn repeated_join_name(address: &str) -> Option<&'static str> {
+    let query = address.split_once('?').map_or("", |(_, query)| query);
+    match proto::parse_join_query(query) {
+        Err(proto::JoinQueryError::Duplicate(name)) => Some(name),
+        Ok(_) => None,
+    }
 }
 
 /// The connection URL a page link names, or `None` when the address is not a page link.
@@ -3126,11 +3158,54 @@ mod tests {
 
         // A link that is already a connection URL is handed back exactly as it stands.
         assert_eq!(wire_address(&wire), wire);
-        assert!(PeerInvite::parse(&wire).unwrap_err().contains("fragment"));
+        assert!(
+            PeerInvite::parse(&wire).unwrap_err().contains("fragment"),
+            "a connection URL still carries no fragment"
+        );
         // And one this cannot read as either form is not silently rewritten.
         assert_eq!(
             wire_address("wss://h/other?room=r"),
             "wss://h/other?room=r"
+        );
+    }
+
+    /// §5.1: `room` and `token` each appear at most once, in either form. A page link has no
+    /// server in it, so the receiver refuses a repeat itself and names the parameter — the shape
+    /// the fragment's rule already takes for `k` and `h` — rather than reporting that the address
+    /// names no endpoint, which is what the reader of the old message was told.
+    #[test]
+    fn a_page_link_that_repeats_a_join_key_is_refused_by_name() {
+        let room = encode_key(&room_key().0);
+        let host_key = host().public().encode();
+        let twice_room = format!(
+            "https://h/?room=r-1&room=r-other&token=t-1#k={room}&h={host_key}"
+        );
+        assert_eq!(
+            PeerInvite::parse(&twice_room).unwrap_err(),
+            "the invite names `room` twice"
+        );
+        let twice_token = format!(
+            "https://h/?room=r-1&token=t-1&token=t-other#k={room}&h={host_key}"
+        );
+        assert_eq!(
+            PeerInvite::parse(&twice_token).unwrap_err(),
+            "the invite names `token` twice"
+        );
+        // The `wss://` form is read through the same query rule and names the repeat too.
+        let wire_repeat = format!(
+            "wss://h/session?room=r-1&room=r-other&token=t-1#k={room}&h={host_key}"
+        );
+        assert_eq!(
+            PeerInvite::parse(&wire_repeat).unwrap_err(),
+            "the invite names `room` twice"
+        );
+        // A link that genuinely names no endpoint keeps the generic refusal: a repeat is not
+        // what is wrong with it.
+        let elsewhere =
+            format!("wss://h/other?room=r-1&token=t-1#k={room}&h={host_key}");
+        assert_eq!(
+            PeerInvite::parse(&elsewhere).unwrap_err(),
+            "\"wss://h/other?room=r-1&token=t-1\" does not address the session endpoint"
         );
     }
 }
