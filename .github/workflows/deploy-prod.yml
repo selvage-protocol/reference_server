@@ -87,7 +87,7 @@ name: deploy-prod
 #
 # `ubuntu-24.04`: this job downloads a Tailscale tarball from
 # `pkgs.tailscale.com`, reads `ghcr.io` and speaks to the tailnet. It also has to
-# support Node.js 24, which `tailscale/github-action@v4.1.3` declares
+# support Node.js 24, which `tailscale/github-action@v4.2.0` declares
 # (`runs.using: node24`); the GitHub-hosted image does, and this repository
 # already runs `actions/checkout@v7.0.1` — also `node24` — on `ubuntu-24.04`
 # today.
