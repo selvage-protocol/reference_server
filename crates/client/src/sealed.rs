@@ -167,7 +167,7 @@ pub struct FrameKey([u8; 32]);
 
 impl FrameKey {
     fn cipher(&self) -> Aes256Gcm {
-        Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0))
+        Aes256Gcm::new(&Key::<Aes256Gcm>::from(self.0))
     }
 }
 
@@ -443,7 +443,7 @@ pub fn seal(
         .frame_key
         .cipher()
         .encrypt(
-            Nonce::from_slice(&recipe.nonce),
+            &Nonce::from(recipe.nonce),
             AeadPayload {
                 msg: plaintext,
                 aad: &aad,
@@ -482,7 +482,7 @@ pub fn opens(
     frame_key
         .cipher()
         .decrypt(
-            Nonce::from_slice(&envelope.nonce),
+            &Nonce::from(envelope.nonce),
             AeadPayload {
                 msg: &envelope.ciphertext,
                 aad: &aad,
