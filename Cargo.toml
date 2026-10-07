@@ -84,7 +84,7 @@ yrs = { version = "0.27", features = ["sync"] }
 aes-gcm = "0.11"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 getrandom = "0.4"
-hkdf = "0.12"
+hkdf = "0.13"
 sha2 = "0.11"
 
 [profile.test]
