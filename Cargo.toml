@@ -81,7 +81,7 @@ tokio-tungstenite = "0.30"
 yrs = { version = "0.27", features = ["sync"] }
 
 # `selvage/2`'s sealed frame (`CANONICAL.md` §6.1): AES-256-GCM, HKDF-SHA256 and Ed25519.
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 getrandom = "0.4"
 hkdf = "0.12"
