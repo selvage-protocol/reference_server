@@ -251,7 +251,7 @@ fn next_value(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use yrs::{Array, ArrayRef, Doc, Out, ReadTxn, Transact};
+    use yrs::{Array, ArrayRef, Doc, Number, Out, ReadTxn, Transact};
 
     /// An `Any` that opens `depth` one-element arrays inside one another around a `null`.
     fn nested(depth: usize) -> Any {
@@ -311,10 +311,12 @@ mod tests {
             Any::Null,
             Any::Bool(true),
             Any::Bool(false),
-            Any::Number(-7.0),
-            Any::Number(1.5),
-            Any::Number(0.1),
-            Any::BigInt(1 << 40),
+            Any::Number(Number::Int(-7)),
+            Any::Number(Number::Float(1.5)),
+            Any::Number(Number::Float(0.1)),
+            // Past what an `f32` and an `f64` hold exactly, which is the only way
+            // `yrs 0.28`'s `Number::Int` reaches the bigint tag.
+            Any::Number(Number::Int(9_007_199_254_740_993)),
             Any::String(Arc::from("uuuuvvvv")),
             Any::Buffer(Arc::from(vec![117u8, 117, 118, 118])),
             Any::from(HashMap::from([
