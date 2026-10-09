@@ -64,13 +64,13 @@ pub const CLOSE_GRACE: Duration = Duration::from_secs(5);
 ///
 /// `awareness` is deliberately not here. §10 defines the name as "the peer publishes
 /// presence", and this session publishes none: it takes an awareness frame in and applies it
-/// (`crate::peer::PeerSession::deliver`), and publishes no state of its own, renews none and
-/// lets none expire (§8.2's `MUST`s): a remote state goes only with the peer that left
-/// (§8.4). An advertisement is a claim a peer may size its UI on, so the honest list is the
-/// one capability this client does speak — §7's document sync. Adding
-/// the name back owes §8's producer half: publish a state, renew it every
-/// `keepalive.awareness_renew_ms`, forget a remote state not renewed inside
-/// `keepalive.awareness_expire_ms`, and republish on a `peer.joined` (§8.3's step 2).
+/// (`crate::peer::PeerSession::deliver`), and publishes no state of its own and renews none.
+/// The receiver half is owed without the advertisement (§10 gates nothing), and is done: a
+/// remote state not renewed inside `keepalive.awareness_expire_ms` is forgotten (§8.2), and a
+/// departed peer's goes at once (§8.4). An advertisement is a claim a peer may size its UI on,
+/// so the honest list is the one capability this client does speak — §7's document sync.
+/// Adding the name back owes §8's producer half: publish a state, renew it every
+/// `keepalive.awareness_renew_ms`, and republish on a `peer.joined` (§8.3's step 2).
 pub const CLIENT_CAPABILITIES: &[&str] = &["y-protocols/1"];
 
 /// A peer as `selvage/2` records it: `PROTOCOL.md` §6.1's `PeerInfo` without `role`.
@@ -2017,8 +2017,8 @@ mod tests {
     }
 
     /// An advertised capability is a claim a peer may act on, and §10 defines `awareness`
-    /// as "the peer publishes presence". This session publishes none — no state of its own, no
-    /// renewal, no expiry — so the hello carries the one name it does speak.
+    /// as "the peer publishes presence". This session publishes none — no state of its own and
+    /// no renewal — so the hello carries the one name it does speak.
     #[test]
     fn the_hello_advertises_only_what_this_client_speaks() {
         let client = "selvage-test/0.1.0".to_string();
