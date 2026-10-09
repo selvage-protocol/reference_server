@@ -1236,11 +1236,20 @@ impl PeerSession {
     /// the one this replica already holds for that id is ignored by y-protocols and renews
     /// nothing, so a peer that stops publishing is forgotten while a stale copy of its last
     /// state is still arriving.
+    ///
+    /// An entry whose clock is [`u32::MAX`] is refused rather than applied, and the rest of the
+    /// message is applied as usual. `yrs` steps a clock by one without checking in two places
+    /// this path reaches — applying §8.2's removal for the id this connection announced
+    /// (`Awareness::apply_update_internal`), and dropping a state the room is done with
+    /// (`Awareness::remove_state`, reached by §8.2's expiry and §8.4's departure) — and a clock
+    /// is the sender's to choose, so the one value that cannot be stepped never enters: no state
+    /// at the maximum is held, and no removal can step one that is.
     fn apply_awareness(
         &mut self,
         clock: Duration,
-        update: AwarenessUpdate,
+        mut update: AwarenessUpdate,
     ) -> bool {
+        update.clients.retain(|_, entry| entry.clock != u32::MAX);
         let Ok(summary) = self.awareness.apply_update_summary(update) else {
             return false;
         };
