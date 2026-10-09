@@ -112,21 +112,6 @@ connection.
 `--help` prints the usage line, a short description of the server, and every flag
 with its default. `--version` prints `selvaged/<version>`.
 
-`scripts/ci-local.sh` runs the same commands as `.github/workflows/ci.yml` on
-this machine, one flake check per step, and needs `nix`:
-
-```sh
-scripts/ci-local.sh all        # the whole gate, and what the `checks` job runs
-scripts/ci-local.sh nightly    # coverage, the rest of cargo-deny and cargo-audit (slow)
-scripts/ci-local.sh lint       # actionlint over the workflow files, on its own
-scripts/ci-local.sh image      # the nix-built image smoke, no Docker needed
-scripts/ci-local.sh container  # docker build, docker run and a room join (needs Docker)
-```
-
-`all` is what the `checks` job runs and `nightly` is opt-in because it is slow.
-The harness transcript, and what the gate asks of the tree it builds, are in
-[the checks worth running](docs/development.md).
-
 ## More
 
 - [What it prints, and its flags](docs/running.md): the startup line and the flag defaults.
@@ -135,10 +120,6 @@ The harness transcript, and what the gate asks of the tree it builds, are in
 - [The first room](docs/rooms.md): the invite link, and which clients host or join.
 - [Deploying](docs/deploying.md): the addresses a client dials, the bind and TLS.
 - [Serving the page](docs/serving-the-page.md): `--serve-page` and the served headers.
-- [The vectors](docs/the-vectors.md): where the corpus comes from and how it is replayed.
-- [The client library and the harness](docs/client-and-harness.md): what each crate is.
-- [The checks worth running](docs/development.md): the harness, the tests and `ci-local.sh`.
-- [What this slice does not do](docs/what-this-slice-does-not-do.md): the gaps in this release.
 - [Licence](docs/licence.md): what each path is under, and what the image carries.
 
 ## Licence
