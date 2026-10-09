@@ -1984,6 +1984,25 @@ mod tests {
             && read_varuint(&plaintext, 1).is_ok_and(|(tag, _)| tag == 2)
     }
 
+    /// Whether a published frame carries any y-protocols awareness message at all: §8.2's
+    /// renewal and §8.3's step 2 are the two ways this session would send one.
+    fn carries_awareness(frame: &[u8]) -> bool {
+        let Ok(envelope) = Envelope::parse(frame) else {
+            return false;
+        };
+        if envelope.kind != 0 {
+            return false;
+        }
+        let Ok(plaintext) = opens(&room_key().frame_key(ROOM), ROOM, &envelope)
+        else {
+            return false;
+        };
+        let mut decoder = DecoderV1::from(plaintext.as_slice());
+        MessageReader::new(&mut decoder)
+            .map_while(Result::ok)
+            .any(|message| matches!(message, YMessage::Awareness(_)))
+    }
+
     fn session(roster: &[&str]) -> PeerSession {
         let options = PeerOptions {
             room_id: ROOM.to_string(),
@@ -2459,6 +2478,161 @@ mod tests {
         session.mutate("no-lease").unwrap();
         session.tick(millis(10_000));
         assert_eq!(session.peer_holds().len(), 1);
+    }
+
+    #[test]
+    fn a_silent_peers_awareness_state_lapses_a_window_after_it_was_applied() {
+        let mut session = beside_a_guest();
+        let states = awareness_message(&[41], 1, "{\"cursor\":null}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &states));
+        assert_eq!(session.awareness_clients(), [41]);
+
+        session.tick(millis(2 + 899));
+        assert_eq!(session.awareness_clients(), [41], "not before the window");
+        session.tick(millis(2 + 900));
+        assert!(
+            session.awareness_clients().is_empty(),
+            "§8.2: a remote state not renewed inside `awareness_expire_ms` is forgotten"
+        );
+        assert_eq!(session.dropped().len(), 0, "an expiry is not a refusal");
+        assert_eq!(session.ending(), None, "and it is not a departure");
+    }
+
+    #[test]
+    fn a_renewed_awareness_state_is_not_forgotten() {
+        let mut session = beside_a_guest();
+        let first = awareness_message(&[41], 1, "{}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &first));
+        session.tick(millis(2 + 899));
+
+        let renewed = awareness_message(&[41], 2, "{}");
+        let _ =
+            session.deliver(millis(2 + 899), &frame(&peer(), 0, 2, &renewed));
+        session.tick(millis(2 + 899 + 899));
+        assert_eq!(
+            session.awareness_clients(),
+            [41],
+            "the renewal moved the window it is measured from"
+        );
+        session.tick(millis(2 + 899 + 900));
+        assert!(
+            session.awareness_clients().is_empty(),
+            "and it lapses from there"
+        );
+    }
+
+    #[test]
+    fn an_awareness_entry_below_the_clock_held_does_not_renew_it() {
+        let mut session = beside_a_guest();
+        let current = awareness_message(&[41], 7, "{}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &current));
+
+        // §8.2: an entry whose clock is not above the one held is ignored, and does not renew
+        // the state. A stale copy of a live peer's state must not hold its cursor open.
+        let replay = awareness_message(&[41], 4, "{}");
+        let _ =
+            session.deliver(millis(2 + 899), &frame(&peer(), 0, 2, &replay));
+        session.tick(millis(2 + 900));
+        assert!(
+            session.awareness_clients().is_empty(),
+            "the replay renewed nothing"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_expired_is_visible_again_above_its_tombstone() {
+        let mut session = beside_a_guest();
+        let states = awareness_message(&[41], 5, "{}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &states));
+        session.tick(millis(2 + 900));
+        assert!(session.awareness_clients().is_empty(), "forgotten");
+
+        // `yrs`'s removal leaves the id a tombstone one above the state it dropped
+        // (`NOTES.md` §A.11), so the publication at the dropped clock and the one above it are
+        // both ignored...
+        let dropped = awareness_message(&[41], 5, "{}");
+        let _ =
+            session.deliver(millis(2 + 900), &frame(&peer(), 0, 2, &dropped));
+        assert!(
+            session.awareness_clients().is_empty(),
+            "the dropped clock is a tombstone"
+        );
+        let next = awareness_message(&[41], 6, "{}");
+        let _ = session.deliver(millis(2 + 900), &frame(&peer(), 0, 3, &next));
+        assert!(
+            session.awareness_clients().is_empty(),
+            "and so is the one above it"
+        );
+
+        // ...and the renewal above both makes the peer visible again, with its window moved.
+        let above = awareness_message(&[41], 7, "{}");
+        let _ = session.deliver(millis(2 + 901), &frame(&peer(), 0, 4, &above));
+        assert_eq!(session.awareness_clients(), [41], "visible again");
+        session.tick(millis(2 + 901 + 900));
+        assert!(
+            session.awareness_clients().is_empty(),
+            "and it lapses from the renewal"
+        );
+    }
+
+    #[test]
+    fn a_departed_peers_awareness_state_goes_at_once_and_stays_gone() {
+        let mut session = beside_a_guest();
+        let states = awareness_message(&[41, 42], 1, "{}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &states));
+        assert_eq!(session.awareness_clients(), [41, 42]);
+
+        session.forget_awareness(41);
+        assert_eq!(
+            session.awareness_clients(),
+            [42],
+            "§8.4: a departed seat's state goes at once, not at the window"
+        );
+        session.tick(millis(2 + 899));
+        assert_eq!(
+            session.awareness_clients(),
+            [42],
+            "the expiry tick left the tombstone alone"
+        );
+
+        // If the expiry tick had stepped 41's tombstone a second time, this renewal would be
+        // swallowed and the id would stay gone.
+        let again = awareness_message(&[41], 3, "{}");
+        let _ = session.deliver(millis(2 + 899), &frame(&peer(), 0, 2, &again));
+        assert_eq!(
+            session.awareness_clients(),
+            [41, 42],
+            "the id is welcome back"
+        );
+    }
+
+    #[test]
+    fn this_client_publishes_no_awareness_state_of_its_own() {
+        let mut session = beside_a_guest();
+        let states = awareness_message(&[41], 1, "{}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &states));
+        let _ = session.take_outbound();
+        let published = session.published();
+        assert!(
+            !session
+                .awareness_clients()
+                .contains(&session.awareness_client_id()),
+            "§8.2: a client that publishes no state holds none of its own"
+        );
+
+        for clock in [302, 902, 1802, 1803] {
+            session.tick(millis(clock));
+            let sent = session.take_outbound();
+            assert!(
+                sent.iter().all(|frame| !carries_awareness(frame)),
+                "no state, renewal or query goes out at {clock}"
+            );
+        }
+        assert_eq!(
+            session.published(),
+            published,
+            "no tick published anything"
+        );
     }
 
     #[test]
