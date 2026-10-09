@@ -6,10 +6,11 @@ repository and is published as its own image,
 serves the page, and it relays `/session` and `/meta` to the server it is
 configured with, so the page's `/meta` read is same-origin and its socket is
 `ws://` or `wss://` on the page's own host, with no cross-origin dial and no CORS
-proxy. The guest link is then a page link,
-`http://HOST:PORT/?room=<room>&token=<token>`, with no `server=` parameter. A
-self-host run is that image beside this server, which is what `compose.yaml`
-writes; `web_client`'s README owns the image, its configuration and its tags.
+proxy. The guest link is then a page link — `PROTOCOL.md` §5.1's second form —
+with no `server=` parameter: a link whose page and server are two origins cannot
+be made into one. A self-host run is that image beside this server, which is
+what `compose.yaml` writes; `web_client`'s README owns the image, its
+configuration and its tags.
 
 `selvaged --serve-page DIR` serves a page you supply from the same origin as
 `/session` and `/meta`, which is one process, one port and one origin with no
@@ -30,10 +31,3 @@ Served files carry the policy a browser needs: a media type from a pinned table,
 `X-Content-Type-Options: nosniff`, a `Content-Security-Policy`, and
 `Referrer-Policy: no-referrer`, because an invite URL carries the room token and
 must not travel on in a `Referer` header.
-
-`scripts/container-smoke.sh` builds the image with Docker, runs it read-only
-with every capability dropped, asserts the version it answers `/meta` and
-`/session` with, and joins a room in it with the harness's client engine; it then
-runs it again with a page directory mounted and `--serve-page` naming it.
-[`scripts/ci-local.sh container`](../scripts/ci-local.sh) runs the same where a
-Docker daemon exists.

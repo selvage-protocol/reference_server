@@ -36,8 +36,9 @@ TLS inside `selvaged`, and none is claimed.
 
 ## The published image and the tracked shape
 
-The public demo is a tracked shape with its own compose file and proxy in
-[`deploy/`](../deploy), and the deploy script
-[`.github/workflows/deploy-prod.yml`](../.github/workflows/deploy-prod.yml) runs on
-the box. The published image is built multi-arch and tagged by
-[`.github/workflows/image.yml`](../.github/workflows/image.yml).
+The image is built multi-arch, so an arm64 host pulls the same tag as an amd64
+one, and it carries the server alone. The public demo is a tracked shape of its
+own in [`deploy/`](../deploy): a compose file, a proxy and an update timer.
+[`compose.yaml`](../compose.yaml) at the root is the self-host shape, and
+`docker compose up` runs the server beside the published page image, both
+read-only with every capability dropped.
