@@ -2578,8 +2578,14 @@ mod tests {
     #[test]
     fn a_departed_peers_awareness_state_goes_at_once_and_stays_gone() {
         let mut session = beside_a_guest();
-        let states = awareness_message(&[41, 42], 1, "{}");
+        let states = awareness_message(&[41], 1, "{}");
         let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &states));
+        // 42's state arrives a window later, so the two stamps do not coincide: the tick below
+        // is past 41's window and short of 42's. Stamped together they would both lapse there,
+        // and the tick would then test the window rather than the departure's own bookkeeping.
+        let neighbour = awareness_message(&[42], 1, "{}");
+        let _ =
+            session.deliver(millis(2 + 899), &frame(&peer(), 0, 2, &neighbour));
         assert_eq!(session.awareness_clients(), [41, 42]);
 
         session.forget_awareness(41);
@@ -2588,7 +2594,11 @@ mod tests {
             [42],
             "§8.4: a departed seat's state goes at once, not at the window"
         );
-        session.tick(millis(2 + 899));
+
+        // The first tick at or after 41's window. `forget_awareness` cleared its stamp, so
+        // there is nothing for the expiry to act on; without that clear this is the tick that
+        // steps 41's tombstone a second time.
+        session.tick(millis(2 + 900));
         assert_eq!(
             session.awareness_clients(),
             [42],
@@ -2598,7 +2608,7 @@ mod tests {
         // If the expiry tick had stepped 41's tombstone a second time, this renewal would be
         // swallowed and the id would stay gone.
         let again = awareness_message(&[41], 3, "{}");
-        let _ = session.deliver(millis(2 + 899), &frame(&peer(), 0, 2, &again));
+        let _ = session.deliver(millis(2 + 900), &frame(&peer(), 0, 3, &again));
         assert_eq!(
             session.awareness_clients(),
             [41, 42],
