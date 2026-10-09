@@ -8,18 +8,14 @@ The server is licensed differently from everything beside it.
 | `crates/selvaged`                                    | `FSL-1.1-MIT`: [source-available, _not_ open source](../crates/selvaged/LICENSE)                                   |
 | `vectors/`                                           | vendored from the specification repository, whose material is `CC-BY-4.0`                                       |
 
-`crates/selvaged/Cargo.toml` carries `publish = false`, and
-`cargo deny check licenses` is told about `FSL-1.1-MIT` for that one crate. The
-Functional Source License 1.1 is free for any non-competing purpose: a company
-self-hosting it internally is free, as are non-commercial education and
+The Functional Source License 1.1 is free for any non-competing purpose: a
+company self-hosting it internally is free, as are non-commercial education and
 research. It forbids making the software available to others in a commercial
-product or service that substitutes for it. The acceptance that governs this
-project's published image is stated where the image is built:
-`crates/selvaged/LICENSE` travels inside it, the
-`org.opencontainers.image.licenses` label names the licence, and `Dockerfile`
-and `.github/workflows/image.yml` record what was accepted and when. Each
-release converts to MIT on the second anniversary of the date it was made
-available, irrevocably.
+product or service that substitutes for it. The published image carries the
+licence: `crates/selvaged/LICENSE` travels inside it and its
+`org.opencontainers.image.licenses` label names the licence. Each release
+converts to MIT on the second anniversary of the date it was made available,
+irrevocably.
 
 The harness links `selvaged`, so its own `MIT OR Apache-2.0` covers the crate
 while a redistributed `selvage-harness` binary carries FSL code with it. That

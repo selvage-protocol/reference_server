@@ -1,17 +1,9 @@
 # selvage-reference-server
 
-A Rust workspace proving the Selvage session protocol end to end: a memory-only
-reference server, a client library with an editor-adapter seam, and a headless
-two-client harness that gates it in CI.
-
-The server is `crates/selvaged`, the Rust client is `crates/client` and the
-harness is `crates/harness`. This repository is the reference implementation of
-the Selvage session protocol.
-
-It works today: `selvaged` seats peers in a room and relays sealed frames it
-cannot read, and `crates/client` hosts and joins a room over a socket. The harness
-replays the specification's wire vectors against a server it starts and drives the
-client through that corpus's decision vectors; no editor adapter is written yet.
+A Rust workspace for the Selvage Session Protocol. `selvaged` is a memory-only
+reference server that seats peers in a room and relays sealed frames it cannot
+read; the client library the protocol is proved with lives beside it. This
+repository is the protocol's reference implementation.
 
 ## Get it working
 
@@ -117,7 +109,7 @@ with its default. `--version` prints `selvaged/<version>`.
 - [What it prints, and its flags](docs/running.md): the startup line and the flag defaults.
 - [What happens at a limit](docs/limits-and-sizing.md): what a peer sees, and how to size a box.
 - [The server's shape](docs/the-server.md): rooms in memory, the grace period and `/meta`.
-- [The first room](docs/rooms.md): the invite link, and which clients host or join.
+- [The first room](docs/rooms.md): who mints a room, and which clients host or join.
 - [Deploying](docs/deploying.md): the addresses a client dials, the bind and TLS.
 - [Serving the page](docs/serving-the-page.md): `--serve-page` and the served headers.
 - [Licence](docs/licence.md): what each path is under, and what the image carries.
