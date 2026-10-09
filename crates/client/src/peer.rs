@@ -3183,17 +3183,104 @@ mod tests {
 
     /// One awareness message carrying `json` for each client id, at `clock`.
     fn awareness_message(ids: &[u64], clock: u32, json: &str) -> Vec<u8> {
-        let clients = ids
+        let entries: Vec<(u64, u32, &str)> =
+            ids.iter().map(|id| (*id, clock, json)).collect();
+        awareness_entries(&entries)
+    }
+
+    /// One awareness message carrying each `(client id, clock, json)` entry as it stands.
+    fn awareness_entries(entries: &[(u64, u32, &str)]) -> Vec<u8> {
+        let clients = entries
             .iter()
-            .map(|id| {
+            .map(|(id, clock, json)| {
                 let entry = AwarenessUpdateEntry {
-                    clock,
-                    json: Arc::from(json),
+                    clock: *clock,
+                    json: Arc::from(*json),
                 };
                 (ClientID::new(*id), entry)
             })
             .collect();
         encode_y_message(&YMessage::Awareness(AwarenessUpdate { clients }))
+    }
+
+    #[test]
+    fn an_awareness_entry_at_the_maximum_clock_is_refused() {
+        let mut session = beside_a_guest();
+        let states = awareness_entries(&[(41, u32::MAX, "{}"), (42, 1, "{}")]);
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &states)),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(
+            session.awareness_clients(),
+            [42],
+            "the entry at the maximum is refused and the rest of the message applies"
+        );
+
+        // Nothing is held for 41, so its next publication is a first state whatever clock it
+        // carries, and the expiry has no clock at the maximum to step.
+        let first = awareness_entries(&[(41, 1, "{}")]);
+        let _ = session.deliver(millis(3), &frame(&peer(), 0, 2, &first));
+        assert_eq!(session.awareness_clients(), [41, 42]);
+        session.tick(millis(3 + 900));
+        assert!(
+            session.awareness_clients().is_empty(),
+            "the refused entry left no state and no stamp behind"
+        );
+    }
+
+    #[test]
+    fn the_messages_after_a_maximum_clock_entry_still_apply() {
+        let mut session = beside_a_guest();
+        let mut plaintext = awareness_entries(&[(41, u32::MAX, "{}")]);
+        plaintext.extend(update_message("hello"));
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &plaintext)),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(session.text("README.md"), "hello", "the stream went on");
+        assert!(
+            session.awareness_clients().is_empty(),
+            "41 was not entered at the maximum"
+        );
+    }
+
+    #[test]
+    fn a_state_at_the_maximum_clock_never_reaches_the_expiry_tick() {
+        let mut session = beside_a_guest();
+        let hostile = awareness_entries(&[(41, u32::MAX, "{}")]);
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &hostile));
+
+        // `Awareness::remove_state` steps the clock of the state it drops, unchecked, so a state
+        // entered at the maximum would step past it here. Refused, there is nothing to step.
+        session.tick(millis(2 + 900));
+        assert!(session.awareness_clients().is_empty(), "not held");
+        assert_eq!(session.ending(), None, "the session goes on");
+    }
+
+    #[test]
+    fn a_removal_of_this_connections_own_id_at_the_maximum_clock_is_refused() {
+        let mut session = beside_a_guest();
+        let own = session.awareness_client_id();
+        // A peer publishes a state under the id this connection announced (§8.4).
+        let claimed = awareness_entries(&[(own, 1, "{}")]);
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &claimed));
+        assert_eq!(session.awareness_clients(), [own]);
+
+        // §8.2: a removal for the receiver's own id is not applied, and the receiver takes the
+        // removal's clock plus one. At the maximum that step is the unchecked one, so the entry
+        // is refused instead and the state it named stands.
+        let hostile = awareness_entries(&[(own, u32::MAX, "null")]);
+        assert_eq!(
+            session.deliver(millis(3), &frame(&peer(), 0, 2, &hostile)),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(session.awareness_clients(), [own], "the state stands");
+
+        // The session goes on: a renewal above the clock the state actually holds is applied.
+        let renewed = awareness_entries(&[(own, 2, "{}")]);
+        let _ = session.deliver(millis(4), &frame(&peer(), 0, 3, &renewed));
+        assert_eq!(session.awareness_clients(), [own]);
     }
 
     #[test]
