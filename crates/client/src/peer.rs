@@ -22,7 +22,10 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use yrs::block::ClientID;
-use yrs::sync::{Awareness, Message as YMessage, MessageReader, SyncMessage};
+use yrs::sync::awareness::AwarenessUpdateSummary;
+use yrs::sync::{
+    Awareness, AwarenessUpdate, Message as YMessage, MessageReader, SyncMessage,
+};
 use yrs::updates::decoder::DecoderV1;
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::{
@@ -253,10 +256,12 @@ pub struct PeerOptions {
     /// verifies a `kind = 1` state or a `kind = 2` closing.
     pub host_key: PublicKey,
     /// `awareness_renew_ms` (`PROTOCOL.md` §8.2): the clock an uncommitted announcement is
-    /// re-sent on and a held set is renewed on, and the tick a lease is checked on (§13.7).
+    /// re-sent on and a held set is renewed on, and the tick a lease (§13.7) and an expired
+    /// remote awareness state (§8.2) are checked on.
     pub renew: Duration,
-    /// `awareness_expire_ms`: the host-away window (§13.8) and, read from the seat, the
-    /// no-state window (§13.3).
+    /// `awareness_expire_ms`: the window a remote awareness state is forgotten after
+    /// (§8.2), the host-away window (§13.8) and, read from the seat, the no-state window
+    /// (§13.3).
     pub expire: Duration,
     /// The seat this connection is shown under, from `room.created`/`room.joined`. It decides
     /// no attribution (§13.4) and is carried only because a person is shown it.
@@ -437,6 +442,13 @@ pub struct PeerSession {
     roster: BTreeSet<String>,
     reader: Reader,
     awareness: Awareness,
+    /// §8.2's receiver bookkeeping: the local monotone clock, the one every argument named
+    /// `clock` carries, at which each **remote** awareness client id's state was last
+    /// actually applied. A tick forgets an id whose stamp is `awareness_expire_ms` old, and an
+    /// entry that was ignored because its clock was not above the one held does not stamp.
+    ///
+    /// This connection's own id is never here: §8.2 has a client never expire itself.
+    awareness_seen: BTreeMap<ClientID, Duration>,
     outbound: VecDeque<Vec<u8>>,
     /// The paths this client has open: the whole set every holds message carries (§13.7).
     held: BTreeSet<String>,
@@ -539,6 +551,7 @@ impl PeerSession {
             roster,
             reader,
             awareness: Awareness::new(peer_doc(options.awareness_client_id)),
+            awareness_seen: BTreeMap::new(),
             outbound: VecDeque::new(),
             held: BTreeSet::new(),
             holds_sent: Vec::new(),
@@ -831,8 +844,8 @@ impl PeerSession {
         Outcome::Applied { kind }
     }
 
-    /// The clocks, on the caller's tick: §13.7's renewal and expiry, §13.8's host-away window
-    /// and §13.3's no-state window.
+    /// The clocks, on the caller's tick: §13.7's renewal and expiry, §8.2's awareness expiry,
+    /// §13.8's host-away window and §13.3's no-state window.
     ///
     /// The announcement of §13.1's step 4 goes out here too, at the first tick and whenever a
     /// state has not committed this key since — so a driver has one path to publish it and
@@ -842,6 +855,7 @@ impl PeerSession {
             host.flush_frames(clock);
         }
         self.expire_leases(clock);
+        self.expire_awareness(clock);
         self.refresh_host_away(clock, false);
         if self.ending.is_some() {
             return;
@@ -1021,7 +1035,9 @@ impl PeerSession {
             }
             Some(Payload::Closing(_)) => self.ending = Some(Ending::Closing),
             Some(Payload::Holds(_)) => self.renew_lease(clock, verdict.sender),
-            Some(Payload::Content) => self.apply_content(&verdict.plaintext),
+            Some(Payload::Content) => {
+                self.apply_content(clock, &verdict.plaintext);
+            }
             Some(Payload::Announcement(announcement)) => {
                 self.hear_announcement(clock, announcement);
             }
@@ -1124,11 +1140,12 @@ impl PeerSession {
     }
 
     /// §13.2 and §13.3: a `kind = 0` plaintext, applied to the session document and answered.
-    fn apply_content(&mut self, plaintext: &[u8]) {
+    /// An awareness message inside it is stamped on `clock`, the session's own, for §8.2.
+    fn apply_content(&mut self, clock: Duration, plaintext: &[u8]) {
         if !self.state_held() {
             return;
         }
-        let replies = self.read_stream(plaintext);
+        let replies = self.read_stream(clock, plaintext);
         if self.role() == Some("viewer") {
             // §13.9: a `viewer` publishes its SyncStep1, its awareness and its holds, and
             // nothing else — a SyncStep2 is document content (§13.5) and is not its to send.
@@ -1147,12 +1164,16 @@ impl PeerSession {
     /// §7's stream, read message by message and applied as it is read, with the replies it
     /// owes. A message that cannot be read or applied ends the reading, and the messages
     /// before it stand: a stream no replica decodes is a sender's bug, and the session goes on.
-    fn read_stream(&mut self, plaintext: &[u8]) -> Vec<YMessage> {
+    fn read_stream(
+        &mut self,
+        clock: Duration,
+        plaintext: &[u8],
+    ) -> Vec<YMessage> {
         let mut decoder = DecoderV1::from(plaintext);
         let mut replies = Vec::new();
         let _ = MessageReader::new(&mut decoder)
             .map_while(Result::ok)
-            .all(|message| self.read_message(message, &mut replies));
+            .all(|message| self.read_message(clock, message, &mut replies));
         replies
     }
 
@@ -1161,8 +1182,13 @@ impl PeerSession {
     /// §8.3: an auth message is read and ignored, a denial included, and an awareness query
     /// is dropped rather than answered. A `SyncStep1` is answered once per frame
     /// ([`MAX_REPLIES_PER_FRAME`]), and a message type §7 does not define ends the reading.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one message, its replies and the clock §8.2 stamps an awareness entry on"
+    )]
     fn read_message(
         &mut self,
+        clock: Duration,
         message: YMessage,
         replies: &mut Vec<YMessage>,
     ) -> bool {
@@ -1174,9 +1200,7 @@ impl PeerSession {
             YMessage::Sync(
                 SyncMessage::SyncStep2(bytes) | SyncMessage::Update(bytes),
             ) => self.apply_update(&bytes),
-            YMessage::Awareness(update) => {
-                self.awareness.apply_update(update).is_ok()
-            }
+            YMessage::Awareness(update) => self.apply_awareness(clock, update),
             YMessage::Auth(_) | YMessage::AwarenessQuery => true,
             YMessage::Custom(..) => false,
         }
@@ -1202,6 +1226,51 @@ impl PeerSession {
         };
         let mut txn = self.awareness.doc().transact_mut();
         txn.apply_update(update).is_ok()
+    }
+
+    /// §8.2: one awareness message, applied by its own clocks and stamped on this session's
+    /// clock for each id it actually applied. Returns whether it was read, which is the same
+    /// answer [`Awareness::apply_update`] gives.
+    ///
+    /// The stamp is the applied ids and not the message's: an entry whose clock is not above
+    /// the one this replica already holds for that id is ignored by y-protocols and renews
+    /// nothing, so a peer that stops publishing is forgotten while a stale copy of its last
+    /// state is still arriving.
+    fn apply_awareness(
+        &mut self,
+        clock: Duration,
+        update: AwarenessUpdate,
+    ) -> bool {
+        let Ok(summary) = self.awareness.apply_update_summary(update) else {
+            return false;
+        };
+        if let Some(applied) = summary {
+            self.stamp_awareness(&applied, clock);
+        }
+        true
+    }
+
+    /// §8.2: the local clock an awareness update's applied ids were last seen at. A removed id
+    /// is dropped from the bookkeeping with its state, so the expiry tick never steps a
+    /// tombstone a second time.
+    fn stamp_awareness(
+        &mut self,
+        summary: &AwarenessUpdateSummary,
+        clock: Duration,
+    ) {
+        let own = self.awareness.client_id();
+        let applied = summary
+            .added
+            .iter()
+            .chain(summary.updated.iter())
+            .copied()
+            .filter(|id| *id != own);
+        for id in applied {
+            let _ = self.awareness_seen.insert(id, clock);
+        }
+        for id in &summary.removed {
+            let _ = self.awareness_seen.remove(id);
+        }
     }
 
     /// §13.7: only an accepted holds message renews a lease, and nothing else from the same
@@ -1319,6 +1388,29 @@ impl PeerSession {
         for id in lapsed {
             let _ = self.leases.remove(&id);
             let _ = self.reader.holds.remove(&id);
+        }
+    }
+
+    /// §8.2's expiry, beside §13.7's: a remote awareness state whose last **applied** entry is
+    /// `awareness_expire_ms` old is forgotten. The renewal tick is where this is checked, so a
+    /// state is forgotten at the first tick after `last seen + awareness_expire_ms` and never
+    /// sooner, which is the `awareness_expire_ms + awareness_renew_ms` the text bounds it by.
+    ///
+    /// The removal is `yrs`'s own, which leaves the id a tombstone: a renewal at the clock the
+    /// dropped state carried and one at the clock above it are both ignored (`NOTES.md` §A.11),
+    /// and a renewal above both makes the peer visible again. An expiry is not a refusal and not
+    /// a departure — no frame is dropped, the peer is not gone — so the only observable is the
+    /// state going.
+    fn expire_awareness(&mut self, clock: Duration) {
+        let lapsed: Vec<ClientID> = self
+            .awareness_seen
+            .iter()
+            .filter(|(_, at)| clock.saturating_sub(**at) >= self.expire)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in lapsed {
+            let _ = self.awareness_seen.remove(&id);
+            self.awareness.remove_state(id);
         }
     }
 
@@ -1536,6 +1628,10 @@ impl PeerSession {
     /// connection's own id is never dropped, and an id with no state is left as it is.
     pub fn forget_awareness(&mut self, client_id: u64) {
         let id = ClientID::new(client_id);
+        // §8.4's drop and §8.2's expiry are the same bookkeeping: with the state gone there is
+        // nothing left for the expiry tick to notice, and stepping the tombstone twice would
+        // swallow one more renewal from the same id.
+        let _ = self.awareness_seen.remove(&id);
         let held = self
             .awareness
             .iter()
