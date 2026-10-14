@@ -555,6 +555,13 @@ pub struct Verdict {
     pub reason: Option<String>,
     /// The key id whose signature verified, or failed to.
     pub sender: Option<KeyId>,
+    /// The public key whose signature actually verified, when one did.
+    ///
+    /// §6.1 makes a `key_id` an index and not an identity: two keys can share one, so a caller
+    /// that must name *which* key sent a frame — §13.6's census keys on the full key — cannot
+    /// use `sender` or an id lookup. This is the key that verified, and its canonical spelling
+    /// is the way an applied state names it.
+    pub verified: Option<PublicKey>,
     pub kind: Option<u64>,
     pub counter: Option<u64>,
     pub plaintext: Vec<u8>,
@@ -572,6 +579,7 @@ impl Verdict {
             ok: false,
             reason: Some(reason.to_string()),
             sender: envelope.map(|e| e.key_id),
+            verified: None,
             kind: envelope.map(|e| e.kind),
             counter: envelope.map(|e| e.counter),
             plaintext: Vec::new(),
@@ -784,6 +792,7 @@ impl Reader {
             ok: true,
             reason: None,
             sender: Some(key.id()),
+            verified: Some(key),
             kind: Some(4),
             counter: Some(envelope.counter),
             plaintext,
@@ -863,7 +872,7 @@ impl Reader {
         {
             return Verdict::refused("unauthorised_content", Some(envelope));
         }
-        self.accept(envelope, key.id(), plaintext, payload)
+        self.accept(envelope, key, plaintext, payload)
     }
 
     fn replayed(&self, id: KeyId, counter: u64) -> bool {
@@ -930,10 +939,11 @@ impl Reader {
     fn accept(
         &mut self,
         envelope: &Envelope,
-        sender: KeyId,
+        verified: PublicKey,
         plaintext: Vec<u8>,
         payload: Option<Payload>,
     ) -> Verdict {
+        let sender = verified.id();
         if matches!(envelope.kind, 0 | 3) {
             self.mark(sender, envelope.counter);
         }
@@ -958,6 +968,7 @@ impl Reader {
             ok: true,
             reason: None,
             sender: Some(sender),
+            verified: Some(verified),
             kind: Some(envelope.kind),
             counter: Some(envelope.counter),
             plaintext,
