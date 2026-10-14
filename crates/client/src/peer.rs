@@ -38,7 +38,7 @@ use crate::host::{HostOptions, HostProducer, HostReason};
 use crate::nesting::decode_update;
 use crate::sealed::{
     Announcement, FrameKey, Guard, KeyId, Payload, PublicKey, Reader, Recipe,
-    RoomKey, SealedError, SessionKey, Verdict, fresh_nonce, seal,
+    RoomKey, SealedError, SessionKey, Verdict, fresh_nonce, read_varuint, seal,
 };
 
 /// An invite as `PROTOCOL.md` §5.1 writes one and §13.1's first step reads it.
@@ -390,6 +390,25 @@ enum Counted {
     Handshake,
 }
 
+/// One locally authored edit §13.1's step 4 is holding back, and whether it was made while no
+/// applied state had given this connection's key a role yet.
+///
+/// The deltas themselves and not a diff over the replica: a state that does not commit this key
+/// still lets its peers' content be applied (§13.2), so a vector taken at the first held-back
+/// edit would carry their changes out again under this connection's key.
+#[derive(Debug, Clone)]
+struct Unsent {
+    update: Vec<u8>,
+    speculative: bool,
+}
+
+/// The replies and the readiness one frame drew, accumulated as its messages are read.
+#[derive(Debug, Default)]
+struct ReadState {
+    replies: Vec<YMessage>,
+    requested: bool,
+}
+
 /// One frame a session applied, with the index of the frame it was handed as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Applied {
@@ -464,8 +483,30 @@ pub struct PeerSession {
     announced_at: Option<Duration>,
     /// The local edits this client made while §13.1's step 4 held its content back, in the
     /// order it made them: the deltas themselves, so that flushing them cannot carry a peer's
-    /// changes out under this connection's key.
-    unsent: Vec<Vec<u8>>,
+    /// changes out under this connection's key. `speculative` marks an edit made while no
+    /// applied state gave this key a role yet, which a `viewer` resolution discards.
+    unsent: Vec<Unsent>,
+    /// A clean replica, present only while UNKNOWN-role local edits need a rollback (§13.9).
+    ///
+    /// A genuine second document built from an encoded update, never `Doc::clone` (which is a
+    /// handle to the same store): this is what a `viewer` resolution adopts in place of the
+    /// replica that holds the speculative edits.
+    baseline: Option<Doc>,
+    /// A typed effect of the owned replica, for the relay's §13.5 text surface: bumped whenever
+    /// this session replaces the document a consumer was reading text from (§13.9's `viewer`
+    /// resolution adopting the clean baseline). A state-driven rollback can then be reported
+    /// even when the path set and listing are unchanged, without re-reading or comparing text.
+    replica_epoch: u64,
+    /// The committed writer keys whose first accepted `SyncStep1` this connection has served
+    /// with its own request (§13.6), by the full key that verified.
+    reciprocal_served: BTreeSet<PublicKey>,
+    /// The committed writer keys whose reciprocal request is owed and not yet sealed and queued.
+    reciprocal_pending: BTreeSet<PublicKey>,
+    /// Readiness owed for this local key's renewed continuous writer eligibility (§13.6).
+    local_readiness_pending: bool,
+    /// The role the last applied state gave this connection's own key, for continuous
+    /// eligibility: an already-handshaken key that re-enters writer eligibility owes one request.
+    role_seen: Option<String>,
     /// The clock of the first content frame this client refused since its last `SyncStep1`,
     /// which is §13.6's interval. `None` means there is nothing to re-sync about.
     resync_from: Option<Duration>,
@@ -560,6 +601,12 @@ impl PeerSession {
             departed: BTreeSet::new(),
             announced_at: None,
             unsent: Vec::new(),
+            baseline: None,
+            replica_epoch: 0,
+            reciprocal_served: BTreeSet::new(),
+            reciprocal_pending: BTreeSet::new(),
+            local_readiness_pending: false,
+            role_seen: None,
             resync_from: None,
             handshaken_at: None,
             state_issued: None,
@@ -596,6 +643,15 @@ impl PeerSession {
     #[must_use]
     pub fn session_key(&self) -> PublicKey {
         self.session.public()
+    }
+
+    /// The generation of the document this connection currently owns text in, for a caller that
+    /// watches the replica rather than its contents: it moves when §13.9's `viewer` resolution
+    /// replaces the replica, which is the one state-driven way text can change without a content
+    /// frame. Comparing it is how the relay reports that change without reading any text.
+    #[must_use]
+    pub const fn replica_epoch(&self) -> u64 {
+        self.replica_epoch
     }
 
     /// This connection's own seat, as a caller that needs to show it reads it.
@@ -783,7 +839,7 @@ impl PeerSession {
     /// and what two fully synced replicas agree on.
     #[must_use]
     pub fn state_vector(&self) -> Vec<(u64, u32)> {
-        let doc = self.awareness.doc();
+        let doc = self.publication_doc();
         let txn = doc.transact();
         let mut entries: Vec<(u64, u32)> = txn
             .state_vector()
@@ -961,6 +1017,15 @@ fn encode_y_message(message: &YMessage) -> Vec<u8> {
     encoder.to_vec()
 }
 
+/// Whether a `kind = 0` plaintext carries document content: a sync `Update` or `SyncStep2`, as
+/// opposed to the `SyncStep1` of §13.1's step 6, which shares the envelope's kind.
+///
+/// §13.5: content is a writer's to publish, and a `viewer` answers a request with nothing.
+fn is_content(plaintext: &[u8]) -> bool {
+    plaintext.first() == Some(&0)
+        && read_varuint(plaintext, 1).is_ok_and(|(tag, _)| tag == 1 || tag == 2)
+}
+
 /// A JSON value's canonical bytes. `CANONICAL.md` §2 writes an object with its members
 /// ascending, which `serde_json`'s own map does (it is a `BTreeMap`).
 ///
@@ -1036,7 +1101,7 @@ impl PeerSession {
             Some(Payload::Closing(_)) => self.ending = Some(Ending::Closing),
             Some(Payload::Holds(_)) => self.renew_lease(clock, verdict.sender),
             Some(Payload::Content) => {
-                self.apply_content(clock, &verdict.plaintext);
+                self.apply_content(clock, &verdict.plaintext, verdict.verified);
             }
             Some(Payload::Announcement(announcement)) => {
                 self.hear_announcement(clock, announcement);
@@ -1123,10 +1188,17 @@ impl PeerSession {
         }
         self.refresh_host_away(clock, true);
         self.drop_departed_holds();
+        // §13.6: the applied state is the room's writer set, so a revoked or demoted key's
+        // reciprocal accounting goes with its eligibility and a later promotion may arm again.
+        self.prune_reciprocal();
+        let role = self.role().map(String::from);
+        self.note_local_eligibility(role.as_deref());
+        self.role_seen = role;
         // §13.1's steps 6 and 4: a state that commits this key is where the handshake belongs,
         // and one that does not is what a re-announcement is for — the renewal clock alone would
         // wait a whole window for it.
         if self.commits_ours() {
+            self.resolve_speculation();
             self.handshake_once(clock);
             self.flush_held_back();
         } else {
@@ -1141,18 +1213,38 @@ impl PeerSession {
 
     /// §13.2 and §13.3: a `kind = 0` plaintext, applied to the session document and answered.
     /// An awareness message inside it is stamped on `clock`, the session's own, for §8.2.
-    fn apply_content(&mut self, clock: Duration, plaintext: &[u8]) {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the frame, the clock it is read on, the verified key and the replica are the whole of a content frame"
+    )]
+    fn apply_content(
+        &mut self,
+        clock: Duration,
+        plaintext: &[u8],
+        verified: Option<PublicKey>,
+    ) {
         if !self.state_held() {
             return;
         }
-        let replies = self.read_stream(clock, plaintext);
-        if self.role() == Some("viewer") {
-            // §13.9: a `viewer` publishes its SyncStep1, its awareness and its holds, and
-            // nothing else — a SyncStep2 is document content (§13.5) and is not its to send.
-            return;
+        // §13.9: a `viewer` publishes its SyncStep1, its awareness and its holds, and nothing
+        // else — a SyncStep2 is document content (§13.5) and is not its to send. An uncommitted
+        // key is the same: nothing it would answer with is publishable yet. The request is still
+        // recognised and the rest of the frame still applies.
+        let answers = self.may_publish() && self.is_writer();
+        // §13.9: while a speculative edit is held, the readiness and replies a peer draws must
+        // be computed from the clean replica and not the one carrying the speculation.
+        let publication = self.publication_doc().clone();
+        let (replies, requested) =
+            self.read_stream(clock, plaintext, &publication, answers);
+        if self.baseline.is_some() {
+            // Keep the ordinary replica's local view current without computing a second reply.
+            let ordinary = self.awareness.doc().clone();
+            let _ = self.read_stream(clock, plaintext, &ordinary, false);
         }
-        if !self.commits_ours() {
-            // §13.1's step 4: nothing but the announcement until a state commits this key.
+        if requested && let Some(key) = verified {
+            self.arm_reciprocal(key);
+        }
+        if !answers {
             return;
         }
         for reply in replies {
@@ -1164,17 +1256,25 @@ impl PeerSession {
     /// §7's stream, read message by message and applied as it is read, with the replies it
     /// owes. A message that cannot be read or applied ends the reading, and the messages
     /// before it stand: a stream no replica decodes is a sender's bug, and the session goes on.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the frame, the replica it is applied to and whether it may be answered are the whole of a read"
+    )]
     fn read_stream(
         &mut self,
         clock: Duration,
         plaintext: &[u8],
-    ) -> Vec<YMessage> {
+        doc: &Doc,
+        answer: bool,
+    ) -> (Vec<YMessage>, bool) {
         let mut decoder = DecoderV1::from(plaintext);
-        let mut replies = Vec::new();
-        let _ = MessageReader::new(&mut decoder)
-            .map_while(Result::ok)
-            .all(|message| self.read_message(clock, message, &mut replies));
-        replies
+        let mut state = ReadState::default();
+        let _ = MessageReader::new(&mut decoder).map_while(Result::ok).all(
+            |message| {
+                self.read_message(clock, message, doc, answer, &mut state)
+            },
+        );
+        (state.replies, state.requested)
     }
 
     /// One message of the stream. Returns whether the reading goes on.
@@ -1184,22 +1284,29 @@ impl PeerSession {
     /// ([`MAX_REPLIES_PER_FRAME`]), and a message type §7 does not define ends the reading.
     #[expect(
         clippy::too_many_arguments,
-        reason = "one message, its replies and the clock §8.2 stamps an awareness entry on"
+        reason = "one message, its target replica, whether it may be answered and the read it accumulates into"
     )]
     fn read_message(
         &mut self,
         clock: Duration,
         message: YMessage,
-        replies: &mut Vec<YMessage>,
+        doc: &Doc,
+        answer: bool,
+        state: &mut ReadState,
     ) -> bool {
         match message {
             YMessage::Sync(SyncMessage::SyncStep1(vector)) => {
-                self.answer(&vector, replies);
+                // §13.6: the request is read and past whatever the reply cap or the role does
+                // with it, so a caller still sees the obligation a `viewer` or an uncommitted
+                // key may not answer. The inner state vector was decoded by the reader already,
+                // so a malformed one never reaches here and neither arms nor consumes anything.
+                state.requested = true;
+                Self::answer(doc, answer, &vector, &mut state.replies);
                 true
             }
             YMessage::Sync(
                 SyncMessage::SyncStep2(bytes) | SyncMessage::Update(bytes),
-            ) => self.apply_update(&bytes),
+            ) => Self::apply_update(doc, &bytes),
             YMessage::Awareness(update) => self.apply_awareness(clock, update),
             YMessage::Auth(_) | YMessage::AwarenessQuery => true,
             YMessage::Custom(..) => false,
@@ -1207,24 +1314,35 @@ impl PeerSession {
     }
 
     /// §7: a `SyncStep1` is answered with the `SyncStep2` its state vector asks for, while the
-    /// frame has answers left.
-    fn answer(&self, vector: &StateVector, replies: &mut Vec<YMessage>) {
-        if replies.len() < MAX_REPLIES_PER_FRAME {
-            let txn = self.awareness.doc().transact();
-            let diff = txn.encode_state_as_update_v1(vector);
-            replies.push(YMessage::Sync(SyncMessage::SyncStep2(diff)));
+    /// frame has answers left and the caller permits one. `answer` is the §13.9 gate: a
+    /// `viewer` or an uncommitted key reads and drops the request instead of computing a diff.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the replica, whether a reply is permitted, the vector and the replies are one answer"
+    )]
+    fn answer(
+        doc: &Doc,
+        permitted: bool,
+        vector: &StateVector,
+        replies: &mut Vec<YMessage>,
+    ) {
+        if !permitted || replies.len() >= MAX_REPLIES_PER_FRAME {
+            return;
         }
+        let txn = doc.transact();
+        let diff = txn.encode_state_as_update_v1(vector);
+        replies.push(YMessage::Sync(SyncMessage::SyncStep2(diff)));
     }
 
-    /// One update applied to the session document. Returns whether it was read and applied.
+    /// One update applied to the chosen replica. Returns whether it was read and applied.
     ///
     /// The reader has already refused a frame holding an update nested past the bound, and
     /// this decode is bounded too, so no path hands `yrs` one to recurse into.
-    fn apply_update(&self, bytes: &[u8]) -> bool {
+    fn apply_update(doc: &Doc, bytes: &[u8]) -> bool {
         let Ok(update) = decode_update(bytes) else {
             return false;
         };
-        let mut txn = self.awareness.doc().transact_mut();
+        let mut txn = doc.transact_mut();
         txn.apply_update(update).is_ok()
     }
 
@@ -1309,6 +1427,149 @@ impl PeerSession {
     /// the ending is checked here rather than at each caller.
     fn may_publish(&self) -> bool {
         self.ending.is_none() && self.state_held() && self.commits_ours()
+    }
+
+    /// §13.6: whether the applied state begins a new continuous writer eligibility for this
+    /// connection's own key, which owes one coalesced readiness request.
+    ///
+    /// An already-handshaken key that re-enters writer eligibility — a `viewer` promotion or an
+    /// absent interval — owes one. The first commitment owes §13.1's immediate initial request
+    /// instead, which `handshake_once` sends, and an uninterrupted eligibility owes nothing.
+    /// Eligibility ending before the request is queued retires it, leaving unrelated remote
+    /// reciprocal and refusal obligations alone.
+    fn note_local_eligibility(&mut self, role: Option<&str>) {
+        if !matches!(role, Some("host" | "guest")) {
+            self.local_readiness_pending = false;
+            return;
+        }
+        if self.handshaken_at.is_some()
+            && !matches!(self.role_seen.as_deref(), Some("host" | "guest"))
+        {
+            self.local_readiness_pending = true;
+        }
+    }
+
+    /// §13.9: resolves UNKNOWN-role history before any request or reply is encoded, so a `viewer`
+    /// resolution never exports the speculation and a writer never answers from it. A writer
+    /// adopts it as room history; a `viewer` discards it outright.
+    fn resolve_speculation(&mut self) {
+        if self.role() == Some("viewer") {
+            self.discard_speculative();
+        } else if self.is_writer() {
+            self.accept_speculation();
+        }
+    }
+
+    /// Whether the applied state gives this connection's own key a publishing role (§13.4).
+    fn is_writer(&self) -> bool {
+        matches!(self.role(), Some("host" | "guest"))
+    }
+
+    /// Whether the applied state commits `key` as a writer (§13.6's eligibility).
+    fn is_writer_key(&self, key: PublicKey) -> bool {
+        matches!(self.reader.role_of_key(key), Some("host" | "guest"))
+    }
+
+    /// The replica publication is built from: the clean baseline while a speculative edit is
+    /// held, and this connection's own document otherwise (§13.9).
+    fn publication_doc(&self) -> &Doc {
+        self.baseline
+            .as_ref()
+            .unwrap_or_else(|| self.awareness.doc())
+    }
+
+    /// §13.6: arms one reciprocal request for the first accepted `SyncStep1` from a continuously
+    /// committed writer key.
+    ///
+    /// The identity is the full key whose signature verified, never its id (§6.1). A request
+    /// from a `viewer` is not one — a viewer sends no content, so reciprocating would solicit
+    /// nothing — and a key already served keeps its mark until its eligibility ends, which is
+    /// what stops the request from echoing for ever between two peers.
+    ///
+    /// Activation is the **remote** writer's eligibility and nothing local: a connection that is
+    /// itself uncommitted, or committed only as a `viewer`, still records the obligation, and the
+    /// publication gate withholds the request until it may publish. Gating activation on local
+    /// commitment would drop the obligation outright, which is not a delay.
+    fn arm_reciprocal(&mut self, verified: PublicKey) {
+        if !self.is_writer_key(verified) {
+            return;
+        }
+        if self.reciprocal_served.insert(verified) {
+            let _ = self.reciprocal_pending.insert(verified);
+        }
+    }
+
+    /// §13.6: retires the reciprocal accounting for keys the applied state no longer commits as
+    /// writers, so a later promotion of one may arm once more while a continuously committed key
+    /// keeps its served mark.
+    fn prune_reciprocal(&mut self) {
+        let writers: BTreeSet<PublicKey> = self
+            .reader
+            .committed
+            .values()
+            .filter(|peer| peer.role == "host" || peer.role == "guest")
+            .map(|peer| peer.key)
+            .collect();
+        self.reciprocal_served.retain(|key| writers.contains(key));
+        self.reciprocal_pending.retain(|key| writers.contains(key));
+    }
+
+    /// §13.9: captures a clean replica before the first UNKNOWN-role local mutation, so a later
+    /// `viewer` resolution can adopt history without the speculation.
+    ///
+    /// A genuinely separate `Doc` built from an encoded update, never `Doc::clone` (which is a
+    /// handle to the same store). The whole-doc update carries every pending struct and the
+    /// delete set, so the baseline is faithful.
+    fn begin_speculation(&mut self) {
+        if self.baseline.is_some() {
+            return;
+        }
+        let baseline = peer_doc(Some(self.awareness.client_id().get()));
+        let whole = {
+            let txn = self.awareness.doc().transact();
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+        let Ok(update) = decode_update(&whole) else {
+            return;
+        };
+        let mut txn = baseline.transact_mut();
+        let _ = txn.apply_update(update);
+        drop(txn);
+        self.baseline = Some(baseline);
+    }
+
+    /// §13.9: the speculative edits are room history after all — the state resolved the key as a
+    /// writer — so the clean baseline is dropped and the deltas are publishable.
+    fn accept_speculation(&mut self) {
+        self.baseline = None;
+        for entry in &mut self.unsent {
+            entry.speculative = false;
+        }
+    }
+
+    /// §13.9: adopts the clean baseline in place of the replica that holds the speculative edits.
+    ///
+    /// The replica is replaced rather than inverse-deleted, so no tombstone or dependency from
+    /// the disallowed history survives. The remote awareness states and their clocks are carried
+    /// onto the new owner, and this connection's announced awareness id is unchanged.
+    fn discard_speculative(&mut self) {
+        self.unsent.retain(|entry| !entry.speculative);
+        let Some(next) = self.baseline.take() else {
+            return;
+        };
+        // §8.2/§8.4: the removal clocks are as much a part of the inventory as the live states.
+        // `update()` would drop every tombstone, letting a stale entry resurrect a peer the room
+        // has forgotten, so the whole tracked set is carried by id — `update_with_clients` writes
+        // a removed id's clock with a null state — and reapplied, which preserves both.
+        let tracked: Vec<ClientID> =
+            self.awareness.iter().map(|(id, _)| id).collect();
+        let inventory = self.awareness.update_with_clients(tracked);
+        let mut adopted = Awareness::new(next);
+        if let Ok(carried) = inventory {
+            let _ = adopted.apply_update(carried);
+        }
+        self.awareness = adopted;
+        self.replica_epoch = self.replica_epoch.saturating_add(1);
     }
 
     /// §13.1's step 4: the session-key announcement, `kind = 4`, signed by the key it names.
@@ -1490,51 +1751,75 @@ impl PeerSession {
     /// republish.
     fn handshake_once(&mut self, clock: Duration) {
         if self.handshaken_at.is_none() {
-            self.sync_step1(clock);
+            // §13.6: only an actual seal-and-queue discharges a request. A failed attempt is not
+            // a publication, so the clock is not moved and the next due tick retries it.
+            let _ = self.sync_step1(clock);
         }
     }
 
     /// §13.1's step 6: a `SyncStep1` with this replica's state vector, so the room can tell a
     /// client that has been refusing frames from one that has been applying them.
-    fn sync_step1(&mut self, clock: Duration) {
+    ///
+    /// The vector is the publication replica's: §13.9 keeps a `viewer`'s own history out of it,
+    /// so the room is asked for what the room-safe history lacks. The shared clock and the
+    /// coalesced obligations move only when the frame was actually sealed and queued.
+    fn sync_step1(&mut self, clock: Duration) -> bool {
         let vector = {
-            let txn = self.awareness.doc().transact();
+            let txn = self.publication_doc().transact();
             txn.state_vector()
         };
         let message =
             encode_y_message(&YMessage::Sync(SyncMessage::SyncStep1(vector)));
-        self.publish(Published::Sync, &message);
+        if !self.publish(Published::Sync, &message) {
+            return false;
+        }
         self.handshaken_at = Some(clock);
+        self.resync_from = None;
+        self.reciprocal_pending.clear();
+        self.local_readiness_pending = false;
+        true
     }
 
-    /// §13.6: a client that refused a content frame re-syncs, and no more than once per renewal
-    /// interval however many it refused — the lower bound is what keeps a peer that floods
-    /// refused frames from being answered frame for frame.
+    /// §13.6: refusal, reciprocal and local readiness obligations share one clock — at most one
+    /// locally generated `SyncStep1` per renewal interval, measured from the last request
+    /// actually sealed and queued, whichever obligation asked for it. The initial request is
+    /// always due; an obligation too early to send is retained and served at the first due tick.
     fn resync(&mut self, clock: Duration) {
-        if self.resync_from.is_none() || !self.may_publish() {
+        if !self.may_publish() {
             return;
         }
-        let due = match self.handshaken_at {
-            None => true,
-            Some(at) => clock.saturating_sub(at) >= self.renew,
+        let Some(at) = self.handshaken_at else {
+            let _ = self.sync_step1(clock);
+            return;
         };
-        if due {
-            self.resync_from = None;
-            self.sync_step1(clock);
+        if self.resync_from.is_none()
+            && self.reciprocal_pending.is_empty()
+            && !self.local_readiness_pending
+        {
+            return;
+        }
+        if clock.saturating_sub(at) >= self.renew {
+            let _ = self.sync_step1(clock);
         }
     }
 
     /// One frame sealed under the frame key and signed by this connection's session key.
-    fn publish(&mut self, what: Published, plaintext: &[u8]) {
-        if self.room_frames >= self.frame_budget {
-            return;
+    ///
+    /// Returns whether the frame was sealed and put on this session's own outbound queue: the
+    /// §13.6 clock moves on that and never on an attempt. The socket's own queue is the relay's
+    /// ([`crate::relay`]), so a successful seal is not a claim of delivery.
+    fn publish(&mut self, what: Published, plaintext: &[u8]) -> bool {
+        if !self.may_queue(what, plaintext)
+            || self.room_frames >= self.frame_budget
+        {
+            return false;
         }
         let Ok(bytes) = self.sealed_frame(what.kind(), plaintext) else {
             // A CSPRNG that will not read, or an AEAD that refuses its own inputs. Neither
             // happens in practice, and a session that kept quiet about one would look like a
             // client with nothing to say.
             self.fault = Some(format!("a {what:?} frame could not be sealed"));
-            return;
+            return false;
         };
         self.count_frame();
         self.outbound.push_back(bytes);
@@ -1543,6 +1828,19 @@ impl PeerSession {
             Counted::Handshake => &mut self.handshake,
         };
         *tally = tally.saturating_add(1);
+        true
+    }
+
+    /// §13.6's publication gates, checked at the moment of queueing: an ended session publishes
+    /// nothing, a key no state commits publishes only its announcement, and document content is
+    /// a writer's alone (§13.5). The announcement keeps its deliberate precommit exception.
+    fn may_queue(&self, what: Published, plaintext: &[u8]) -> bool {
+        if self.ending.is_some() {
+            return false;
+        }
+        what == Published::Announcement
+            || (self.may_publish()
+                && (!is_content(plaintext) || self.is_writer()))
     }
 
     fn sealed_frame(
@@ -1753,8 +2051,9 @@ impl PeerSession {
 
     /// A local edit, published as the delta it produced and never as the whole document.
     ///
-    /// Returns whether anything went out: §13.5 and §13.9 have a `viewer` keep its edit and
-    /// not send it, and §13.1's step 4 has any peer keep it until a state commits its key.
+    /// Returns whether the delta was queued. A known `viewer` refuses the mutation outright and
+    /// an UNKNOWN-role edit is held until a state resolves its eligibility (§13.1's step 4,
+    /// §13.9).
     ///
     /// # Errors
     ///
@@ -1770,6 +2069,18 @@ impl PeerSession {
         index: u32,
         text: &str,
     ) -> Result<bool, SealedError> {
+        // §13.5 and §13.9: a known `viewer` never creates the CRDT history a later promotion
+        // could export, so the mutation is refused before it touches the replica.
+        if self.role() == Some("viewer") {
+            return Ok(false);
+        }
+        // §13.9: before any state gives this key a role, an edit is speculative — it goes into
+        // the replica for the local view, and a clean baseline is captured so a later `viewer`
+        // resolution can drop it without leaving a tombstone or a dependency behind.
+        let speculative = !self.is_writer();
+        if speculative {
+            self.begin_speculation();
+        }
         let before = {
             let txn = self.awareness.doc().transact();
             txn.state_vector()
@@ -1795,58 +2106,75 @@ impl PeerSession {
         if update.is_empty() {
             return Ok(false);
         }
-        if !self.may_publish() {
+        if !self.may_publish() || !self.is_writer() {
             // §13.1's step 4 holds content back until a state commits this key, and a client
-            // that dropped what it held back would leave the room without that edit for good:
-            // §13.1's step 6 is a `SyncStep1`, which asks the room for what this replica lacks,
-            // and nothing asks the room for what it lacks. What is kept is this edit's own
-            // delta and not a diff over the document: another peer's content can have arrived
-            // in the meantime, and a client that re-sent it would publish under its own key
-            // changes it did not make.
-            self.hold_back(update);
+            // that dropped what it held back would leave the room without that edit for good.
+            // What is kept is this edit's own delta and not a diff over the document: another
+            // peer's content can have arrived in the meantime, and a client that re-sent it
+            // would publish under its own key changes it did not make.
+            self.hold_back(update, speculative);
             return Ok(false);
         }
-        if self.role() == Some("viewer") {
-            // §13.5 and §13.9: a `viewer`'s edit is its own and never the room's, so there is
-            // nothing to send later either.
-            return Ok(false);
+        // The state resolved this key as a writer: the edit is room history, not speculation.
+        self.accept_speculation();
+        if self.send_update(&update) {
+            Ok(true)
+        } else {
+            // A failed seal is not a publication: keep the delta for the next flush.
+            self.hold_back(update, false);
+            Ok(false)
         }
-        self.send_update(update);
-        Ok(true)
     }
 
     /// Keeps one edit this connection may not publish yet (§13.1's step 4). §13.9's `viewer`
-    /// keeps its edit in its own replica and never publishes it, so nothing is kept for one,
-    /// and §13.10's ended session will publish nothing later either: keeping it would grow a
-    /// buffer nothing drains for as long as the session lives.
-    fn hold_back(&mut self, update: Vec<u8>) {
+    /// keeps no such edit — its mutation is refused — and §13.10's ended session will publish
+    /// nothing later either: keeping it would grow a buffer nothing drains for as long as the
+    /// session lives.
+    fn hold_back(&mut self, update: Vec<u8>, speculative: bool) {
         if self.role() != Some("viewer") && self.ending.is_none() {
-            self.unsent.push(update);
+            self.unsent.push(Unsent {
+                update,
+                speculative,
+            });
         }
     }
 
-    fn send_update(&mut self, update: Vec<u8>) {
-        let plaintext =
-            encode_y_message(&YMessage::Sync(SyncMessage::Update(update)));
-        self.publish(Published::Content, &plaintext);
+    fn send_update(&mut self, update: &[u8]) -> bool {
+        let plaintext = encode_y_message(&YMessage::Sync(SyncMessage::Update(
+            update.to_vec(),
+        )));
+        self.publish(Published::Content, &plaintext)
     }
 
     /// Publishes the edits this connection made before a state committed its key (§13.1's step
     /// 4), in the order they were made.
     ///
     /// §13.10 reaches this path too: a state that arrives after the session ended would
-    /// otherwise flush the whole held set into a room this connection has left.
+    /// otherwise flush the whole held set into a room this connection has left, so an ended
+    /// session drops the buffer rather than growing it.
     fn flush_held_back(&mut self) {
-        let held: Vec<Vec<u8>> = mem::take(&mut self.unsent);
-        if held.is_empty()
-            || self.role() == Some("viewer")
-            || self.ending.is_some()
-        {
+        if self.unsent.is_empty() {
             return;
         }
-        for update in held {
-            self.send_update(update);
+        if self.ending.is_some() {
+            self.unsent.clear();
+            return;
         }
+        if !self.is_writer() {
+            return;
+        }
+        self.accept_speculation();
+        let held: Vec<Unsent> = mem::take(&mut self.unsent);
+        if !self.may_publish() {
+            self.unsent = held;
+            return;
+        }
+        // A failed seal is not a publication: keep that delta for the next flush.
+        let retained: Vec<Unsent> = held
+            .into_iter()
+            .filter(|entry| !self.send_update(&entry.update))
+            .collect();
+        self.unsent = retained;
     }
 }
 
@@ -1884,6 +2212,11 @@ mod tests {
     /// A second peer's, committed as `guest` or `viewer` beside ours.
     fn peer() -> SessionKey {
         SessionKey::from_seed([11; 32])
+    }
+
+    /// A third peer's, so all three real sessions can be driven at once.
+    fn third() -> SessionKey {
+        SessionKey::from_seed([17; 32])
     }
 
     #[expect(
@@ -1925,6 +2258,15 @@ mod tests {
             .collect();
         let payload = json!({"issued": issued, "listing": ["README.md"], "peers": members});
         frame(signer, 1, 1, &serde_json::to_vec(&payload).unwrap())
+    }
+
+    /// A state committing this connection's own key as a `viewer` beside a committed writer.
+    fn viewer_beside_writer(issued: u64) -> Vec<u8> {
+        state(
+            &host(),
+            issued,
+            &[(&ours(), "viewer", "p-self"), (&peer(), "guest", "p-other")],
+        )
     }
 
     fn holds(signer: &SessionKey, counter: u64, paths: &[&str]) -> Vec<u8> {
@@ -2032,6 +2374,108 @@ mod tests {
 
     fn millis(count: u64) -> Duration {
         Duration::from_millis(count)
+    }
+
+    /// A second connection's session, fixed so a state can commit it beside ours.
+    fn second_session(roster: &[&str]) -> PeerSession {
+        let options = PeerOptions {
+            room_id: ROOM.to_string(),
+            room_key: room_key(),
+            host_key: host().public(),
+            renew: Duration::from_millis(300),
+            expire: Duration::from_millis(900),
+            seat: Some("p-other".to_string()),
+            roster: roster.iter().map(|seat| (*seat).to_string()).collect(),
+            fixed_session_key: Some([11; 32]),
+            declared_role: None,
+            awareness_client_id: None,
+            host: None,
+            frame_budget: None,
+        };
+        PeerSession::new(&options).unwrap()
+    }
+
+    /// A third connection's session, fixed so three real peers can be driven at once.
+    fn third_session(roster: &[&str]) -> PeerSession {
+        let options = PeerOptions {
+            room_id: ROOM.to_string(),
+            room_key: room_key(),
+            host_key: host().public(),
+            renew: Duration::from_millis(300),
+            expire: Duration::from_millis(900),
+            seat: Some("p-third".to_string()),
+            roster: roster.iter().map(|seat| (*seat).to_string()).collect(),
+            fixed_session_key: Some([17; 32]),
+            declared_role: None,
+            awareness_client_id: None,
+            host: None,
+            frame_budget: None,
+        };
+        PeerSession::new(&options).unwrap()
+    }
+
+    /// A room state with a chosen listing, which a listing-only edition needs.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a signer, an edition, the peers and the listing are the whole of a state"
+    )]
+    fn state_listing(
+        signer: &SessionKey,
+        issued: u64,
+        peers: &[(&SessionKey, &str, &str)],
+        listing: &[&str],
+    ) -> Vec<u8> {
+        let members: serde_json::Map<String, Value> = peers
+            .iter()
+            .map(|(key, role, seat)| {
+                (
+                    key.public().encode(),
+                    json!({"peer_id": seat, "role": role}),
+                )
+            })
+            .collect();
+        let payload =
+            json!({"issued": issued, "listing": listing, "peers": members});
+        frame(signer, 1, 1, &serde_json::to_vec(&payload).unwrap())
+    }
+
+    /// One sync `SyncStep1` message with an empty state vector: what a peer asks with.
+    fn step1() -> Vec<u8> {
+        encode_y_message(&YMessage::Sync(SyncMessage::SyncStep1(
+            StateVector::default(),
+        )))
+    }
+
+    /// The sync subtype of a published `kind = 0` frame: 0 is a `SyncStep1`, 1 a `SyncStep2`.
+    fn sync_subtype(frame: &[u8]) -> Option<u64> {
+        let envelope = Envelope::parse(frame).ok()?;
+        if envelope.kind != 0 {
+            return None;
+        }
+        let plaintext =
+            opens(&room_key().frame_key(ROOM), ROOM, &envelope).ok()?;
+        if plaintext.first() != Some(&0) {
+            return None;
+        }
+        read_varuint(&plaintext, 1).ok().map(|(tag, _)| tag)
+    }
+
+    /// The `README.md` text a published `SyncStep2` carries, applied to a fresh replica.
+    fn step2_text(frame: &[u8]) -> String {
+        let envelope = Envelope::parse(frame).unwrap();
+        let plaintext =
+            opens(&room_key().frame_key(ROOM), ROOM, &envelope).unwrap();
+        let mut decoder = DecoderV1::from(plaintext.as_slice());
+        let Some(Ok(YMessage::Sync(SyncMessage::SyncStep2(update)))) =
+            MessageReader::new(&mut decoder).next()
+        else {
+            return String::new();
+        };
+        let doc = Doc::new();
+        let handle = doc.get_or_insert_text("README.md");
+        let mut txn = doc.transact_mut();
+        txn.apply_update(decode_update(&update).unwrap()).unwrap();
+        handle.get_string(&txn)
     }
 
     #[test]
@@ -2303,7 +2747,7 @@ mod tests {
     }
 
     #[test]
-    fn a_viewer_does_not_publish_its_own_edit() {
+    fn a_viewer_discards_its_own_edit_and_publishes_nothing() {
         let mut session = session(&[]);
         session.tick(Duration::ZERO);
         let state = state(&host(), 1, &[(&ours(), "viewer", "p-self")]);
@@ -2313,8 +2757,8 @@ mod tests {
         assert_eq!(session.published(), 1);
         assert_eq!(
             session.text("README.md"),
-            "hello",
-            "its own replica holds it"
+            "",
+            "the disallowed edit is not even locally visible"
         );
     }
 
@@ -2622,6 +3066,206 @@ mod tests {
             session.awareness_clients(),
             [41, 42],
             "the id is welcome back"
+        );
+    }
+    /// A clean replica adopted by §13.9's `viewer` resolution must carry the removal clocks as
+    /// well as the live states: `Awareness::update()` alone would drop every tombstone and let a
+    /// stale entry resurrect a peer the room has forgotten.
+    #[test]
+    fn an_adopted_baseline_keeps_a_forgotten_ids_tombstone() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        // A state committing only the peer leaves this connection's own key UNKNOWN, so the
+        // local edit is speculative and captures the clean baseline a later resolution adopts.
+        assert_eq!(
+            session.deliver(
+                millis(1),
+                &state(&host(), 1, &[(&peer(), "guest", "p-other")])
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert!(!session.insert("README.md", 0, "spec").unwrap());
+        assert_eq!(session.text("README.md"), "spec");
+
+        // An awareness state, then §8.4's departure: the removal leaves a tombstone one above
+        // the state it dropped.
+        let states = awareness_message(&[41], 5, "{}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &states));
+        assert_eq!(session.awareness_clients(), [41]);
+        session.forget_awareness(41);
+        assert!(session.awareness_clients().is_empty());
+
+        // The viewer state replaces the replica; the tombstone must move onto the new owner.
+        assert_eq!(
+            session.deliver(
+                millis(3),
+                &state(
+                    &host(),
+                    2,
+                    &[
+                        (&ours(), "viewer", "p-self"),
+                        (&peer(), "guest", "p-other")
+                    ]
+                )
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        assert_eq!(
+            session.text("README.md"),
+            "",
+            "the speculative edit is discarded"
+        );
+
+        // The dropped clock and the one above it stay absent; a higher one renews.
+        let dropped = awareness_message(&[41], 5, "{}");
+        let _ = session.deliver(millis(4), &frame(&peer(), 0, 2, &dropped));
+        assert!(
+            session.awareness_clients().is_empty(),
+            "the dropped clock stays a tombstone across adoption"
+        );
+        let equal = awareness_message(&[41], 6, "{}");
+        let _ = session.deliver(millis(5), &frame(&peer(), 0, 3, &equal));
+        assert!(
+            session.awareness_clients().is_empty(),
+            "and so does the clock above it"
+        );
+        let above = awareness_message(&[41], 7, "{}");
+        let _ = session.deliver(millis(6), &frame(&peer(), 0, 4, &above));
+        assert_eq!(
+            session.awareness_clients(),
+            [41],
+            "a renewal above the tombstone makes the peer visible again"
+        );
+    }
+
+    /// Adoption replaces the replica but must not disturb an unrelated live state's expiry: the
+    /// local stamp is this session's and survives the swap untouched.
+    #[test]
+    fn an_adopted_baseline_leaves_an_unrelated_state_on_its_own_schedule() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(
+                millis(1),
+                &state(&host(), 1, &[(&peer(), "guest", "p-other")])
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert!(!session.insert("README.md", 0, "spec").unwrap());
+
+        // Two peers' states, stamped a window apart: 41 is forgotten, 42 stays live.
+        let fortyone = awareness_message(&[41], 5, "{}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &fortyone));
+        let fortytwo = awareness_message(&[42], 1, "{}");
+        let _ = session.deliver(millis(3), &frame(&peer(), 0, 2, &fortytwo));
+        assert_eq!(session.awareness_clients(), [41, 42]);
+        session.forget_awareness(41);
+        assert_eq!(session.awareness_clients(), [42]);
+
+        assert_eq!(
+            session.deliver(
+                millis(4),
+                &state(
+                    &host(),
+                    2,
+                    &[
+                        (&ours(), "viewer", "p-self"),
+                        (&peer(), "guest", "p-other")
+                    ]
+                )
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        assert_eq!(
+            session.awareness_clients(),
+            [42],
+            "an unrelated live state survives adoption"
+        );
+        session.tick(millis(3 + 899));
+        assert_eq!(
+            session.awareness_clients(),
+            [42],
+            "not before its own window"
+        );
+        session.tick(millis(3 + 900));
+        assert!(
+            session.awareness_clients().is_empty(),
+            "and it lapses on the schedule it was stamped on"
+        );
+    }
+
+    /// The tombstone routes that are not `forget_awareness` — §8.2's expiry and an incoming
+    /// removal — must survive adoption too, or a stale copy resurrects a peer through the swap.
+    #[test]
+    fn an_adopted_baseline_keeps_tombstones_from_expiry_and_an_incoming_removal()
+     {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(
+                millis(1),
+                &state(&host(), 1, &[(&peer(), "guest", "p-other")])
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert!(!session.insert("README.md", 0, "spec").unwrap());
+
+        // 41 lives, then §8.2's expiry tick leaves it a tombstone one above its state.
+        let fortyone = awareness_message(&[41], 5, "{}");
+        let _ = session.deliver(millis(2), &frame(&peer(), 0, 1, &fortyone));
+        session.tick(millis(902));
+        assert!(session.awareness_clients().is_empty(), "41 expired");
+
+        // 42 is removed by an incoming null state, which leaves its own tombstone.
+        let fortytwo = awareness_message(&[42], 1, "{}");
+        let _ = session.deliver(millis(3), &frame(&peer(), 0, 2, &fortytwo));
+        assert_eq!(session.awareness_clients(), [42]);
+        let removal = awareness_message(&[42], 2, "null");
+        let _ = session.deliver(millis(4), &frame(&peer(), 0, 3, &removal));
+        assert!(session.awareness_clients().is_empty(), "42 removed");
+
+        // Adoption replaces the replica; both tombstones must move onto the new owner.
+        assert_eq!(
+            session.deliver(millis(5), &viewer_beside_writer(2)),
+            Outcome::Applied { kind: 1 }
+        );
+        let stale = awareness_message(&[41], 5, "{}");
+        let _ = session.deliver(millis(6), &frame(&peer(), 0, 4, &stale));
+        assert!(
+            session.awareness_clients().is_empty(),
+            "41's expiry clock stays gone"
+        );
+        let equal = awareness_message(&[41], 6, "{}");
+        let _ = session.deliver(millis(7), &frame(&peer(), 0, 5, &equal));
+        assert!(
+            session.awareness_clients().is_empty(),
+            "41's clock above the tombstone stays gone"
+        );
+        let above = awareness_message(&[41], 7, "{}");
+        let _ = session.deliver(millis(8), &frame(&peer(), 0, 6, &above));
+        assert_eq!(
+            session.awareness_clients(),
+            [41],
+            "41 renews above its tombstone"
+        );
+
+        let stale42 = awareness_message(&[42], 1, "{}");
+        let _ = session.deliver(millis(9), &frame(&peer(), 0, 7, &stale42));
+        assert!(
+            !session.awareness_clients().contains(&42),
+            "42's removal clock stays gone"
+        );
+        let above42 = awareness_message(&[42], 3, "{}");
+        let _ = session.deliver(millis(10), &frame(&peer(), 0, 8, &above42));
+        assert!(
+            session.awareness_clients().contains(&42),
+            "42 renews above its removal"
         );
     }
 
@@ -3583,5 +4227,1407 @@ mod tests {
             PeerInvite::parse(&elsewhere).unwrap_err(),
             "\"wss://h/other?room=r-1&token=t-1\" does not address the session endpoint"
         );
+    }
+
+    // --- §13.6: the bounded reciprocal request, the shared clock and local readiness -----
+
+    #[test]
+    fn a_committed_writers_first_request_arms_one_coalesced_reciprocal_request()
+    {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        let committing = state(
+            &host(),
+            1,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        // The immediate initial request: the clock every later request is measured from.
+        let initial = session.take_outbound();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(sync_subtype(&initial[0]), Some(0));
+
+        // The first `SyncStep1` from a committed writer is answered and remembered.
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        let answer = session.take_outbound();
+        assert_eq!(answer.len(), 1, "one Step2 for the request");
+        assert_eq!(sync_subtype(&answer[0]), Some(1));
+
+        // The request clock is 1, so the window opens at 301.
+        session.tick(millis(300));
+        assert!(session.take_outbound().is_empty(), "not before the clock");
+        session.tick(millis(301));
+        let reciprocal = session.take_outbound();
+        assert_eq!(reciprocal.len(), 1, "one coalesced reciprocal request");
+        assert_eq!(sync_subtype(&reciprocal[0]), Some(0));
+
+        // A later request from the same continuously eligible key draws its Step2 only.
+        assert_eq!(
+            session.deliver(millis(302), &frame(&peer(), 0, 2, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        let again = session.take_outbound();
+        assert_eq!(again.len(), 1, "one Step2 per inbound frame");
+        assert_eq!(sync_subtype(&again[0]), Some(1));
+        session.tick(millis(601));
+        session.tick(millis(901));
+        assert!(
+            session.take_outbound().is_empty(),
+            "the served census stops the echo"
+        );
+    }
+
+    #[test]
+    fn a_viewers_request_does_not_arm_a_reciprocal_request() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        let committing = state(
+            &host(),
+            1,
+            &[
+                (&ours(), "guest", "p-self"),
+                (&peer(), "viewer", "p-viewer"),
+            ],
+        );
+        assert_eq!(
+            session.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        let answer = session.take_outbound();
+        assert_eq!(answer.len(), 1);
+        assert_eq!(
+            sync_subtype(&answer[0]),
+            Some(1),
+            "the request is answered"
+        );
+        session.tick(millis(302));
+        session.tick(millis(602));
+        assert!(
+            session.take_outbound().is_empty(),
+            "a viewer sends no content, so there is nothing to ask for"
+        );
+    }
+
+    #[test]
+    fn a_step2_or_update_never_arms_a_reciprocal_request() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        let committing = state(
+            &host(),
+            1,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(millis(2), &content(&peer(), 1, "theirs")),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(
+            session.deliver(millis(3), &content(&peer(), 2, "more")),
+            Outcome::Applied { kind: 0 }
+        );
+        session.tick(millis(303));
+        session.tick(millis(603));
+        assert!(
+            session.take_outbound().is_empty(),
+            "content never asks for a request"
+        );
+    }
+
+    #[test]
+    fn several_new_writer_keys_in_one_window_draw_one_broadcast_request() {
+        let mut session = session(&[]);
+        let third = SessionKey::from_seed([17; 32]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        let committing = state(
+            &host(),
+            1,
+            &[
+                (&ours(), "guest", "p-self"),
+                (&peer(), "guest", "p-other"),
+                (&third, "guest", "p-third"),
+            ],
+        );
+        assert_eq!(
+            session.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(
+            session.deliver(millis(3), &frame(&third, 0, 1, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        let answers = session.take_outbound();
+        assert_eq!(answers.len(), 2, "each request is answered");
+        session.tick(millis(303));
+        let requests = session.take_outbound();
+        assert_eq!(requests.len(), 1, "the two new keys coalesce");
+        assert_eq!(sync_subtype(&requests[0]), Some(0));
+    }
+
+    #[test]
+    fn a_valid_request_prefix_survives_a_malformed_suffix() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        let committing = state(
+            &host(),
+            1,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        let mut plaintext = step1();
+        plaintext.extend_from_slice(&[0, 0, 1, 128]);
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &plaintext)),
+            Outcome::Applied { kind: 0 }
+        );
+        let answer = session.take_outbound();
+        assert_eq!(answer.len(), 1, "the valid prefix is answered");
+        assert_eq!(sync_subtype(&answer[0]), Some(1));
+        session.tick(millis(301));
+        let request = session.take_outbound();
+        assert_eq!(request.len(), 1, "the valid prefix still owes readiness");
+        assert_eq!(sync_subtype(&request[0]), Some(0));
+    }
+
+    #[test]
+    fn a_malformed_first_message_arms_nothing_and_a_later_valid_request_does() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        let committing = state(
+            &host(),
+            1,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &[0, 0, 1, 128])),
+            Outcome::Applied { kind: 0 }
+        );
+        assert!(
+            session.take_outbound().is_empty(),
+            "an invalid first message is not answered"
+        );
+        session.tick(millis(300));
+        assert!(
+            session.take_outbound().is_empty(),
+            "a malformed request must not arm readiness"
+        );
+        assert_eq!(
+            session.deliver(millis(301), &frame(&peer(), 0, 2, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        let answer = session.take_outbound();
+        assert_eq!(answer.len(), 1);
+        assert_eq!(sync_subtype(&answer[0]), Some(1));
+        session.tick(millis(601));
+        let request = session.take_outbound();
+        assert_eq!(request.len(), 1, "the valid request armed the obligation");
+        assert_eq!(sync_subtype(&request[0]), Some(0));
+    }
+
+    #[test]
+    fn a_local_reentry_after_absence_owes_one_coalesced_readiness_request() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        let first = state(&host(), 1, &[(&ours(), "guest", "p-self")]);
+        assert_eq!(
+            session.deliver(millis(1), &first),
+            Outcome::Applied { kind: 1 }
+        );
+        let initial = session.take_outbound();
+        assert_eq!(
+            initial.len(),
+            1,
+            "the first commitment owes the initial request"
+        );
+        assert_eq!(sync_subtype(&initial[0]), Some(0));
+        session.tick(millis(2));
+        assert!(
+            session.take_outbound().is_empty(),
+            "the first commitment adds no readiness"
+        );
+
+        // The key is dropped, then recommitted as a writer: a new continuous eligibility.
+        assert_eq!(
+            session.deliver(millis(3), &state(&host(), 2, &[])),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(
+                millis(4),
+                &state(&host(), 3, &[(&ours(), "guest", "p-self")])
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        assert!(
+            session.take_outbound().is_empty(),
+            "a state cannot send renewed readiness immediately"
+        );
+        session.tick(millis(300));
+        assert!(session.take_outbound().is_empty(), "not before the clock");
+        session.tick(millis(301));
+        let readiness = session.take_outbound();
+        assert_eq!(readiness.len(), 1);
+        assert_eq!(sync_subtype(&readiness[0]), Some(0));
+        session.tick(millis(601));
+        session.tick(millis(901));
+        assert!(
+            session.take_outbound().is_empty(),
+            "readiness is served once per eligibility"
+        );
+    }
+
+    #[test]
+    fn an_uninterrupted_writer_eligibility_and_listing_editions_never_rearm() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        let first = state(
+            &host(),
+            1,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(1), &first),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        let changed = state(
+            &host(),
+            2,
+            &[(&ours(), "host", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(2), &changed),
+            Outcome::Applied { kind: 1 }
+        );
+        let listing = state_listing(
+            &host(),
+            3,
+            &[(&ours(), "host", "p-self"), (&peer(), "guest", "p-other")],
+            &["README.md", "other.md"],
+        );
+        assert_eq!(
+            session.deliver(millis(3), &listing),
+            Outcome::Applied { kind: 1 }
+        );
+        assert!(
+            session.take_outbound().is_empty(),
+            "a host/guest change and a listing edition owe nothing"
+        );
+        session.tick(millis(301));
+        assert!(
+            session.take_outbound().is_empty(),
+            "uninterrupted eligibility never rearms"
+        );
+    }
+
+    #[test]
+    fn local_readiness_retires_when_writer_eligibility_ends_before_service() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(
+                millis(1),
+                &state(&host(), 1, &[(&ours(), "guest", "p-self")])
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        // Re-entry arms readiness, then eligibility ends before the window opens.
+        assert_eq!(
+            session.deliver(millis(2), &state(&host(), 2, &[])),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(
+                millis(3),
+                &state(&host(), 3, &[(&ours(), "guest", "p-self")])
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        assert_eq!(
+            session.deliver(
+                millis(4),
+                &state(&host(), 4, &[(&ours(), "viewer", "p-self")])
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        assert!(session.take_outbound().is_empty());
+        session.tick(millis(301));
+        assert!(
+            session.take_outbound().is_empty(),
+            "retired readiness must not be served"
+        );
+    }
+
+    #[test]
+    fn a_remote_demotion_and_re_promotion_rearms_exactly_one_request() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        let first = state(
+            &host(),
+            1,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(1), &first),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        let _ = session.take_outbound();
+        session.tick(millis(301));
+        let armed = session.take_outbound();
+        assert_eq!(armed.len(), 1, "the first eligibility armed once");
+        assert_eq!(sync_subtype(&armed[0]), Some(0));
+
+        // The peer is demoted, so its census entry goes; re-promotion arms once more.
+        let demoted = state(
+            &host(),
+            2,
+            &[(&ours(), "guest", "p-self"), (&peer(), "viewer", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(302), &demoted),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        let promoted = state(
+            &host(),
+            3,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(303), &promoted),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(millis(304), &frame(&peer(), 0, 2, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        let _ = session.take_outbound();
+        session.tick(millis(601));
+        let rearmed = session.take_outbound();
+        assert_eq!(rearmed.len(), 1, "the new eligibility armed once");
+        assert_eq!(sync_subtype(&rearmed[0]), Some(0));
+    }
+    /// §13.6: activation is the remote writer's eligibility, so a request is recorded even while
+    /// this connection is uncommitted and may not publish; the shared clock then serves it once
+    /// the local key can publish again. Gating activation on local commitment would drop it.
+    #[test]
+    fn a_remote_request_arms_while_uncommitted_and_is_served_after_recommitment()
+     {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        // L is committed as a viewer and takes the initial request: the clock later ones use.
+        assert_eq!(
+            session.deliver(millis(1), &viewer_beside_writer(1)),
+            Outcome::Applied { kind: 1 }
+        );
+        let initial = session.take_outbound();
+        assert_eq!(
+            initial.len(),
+            1,
+            "a committed viewer still takes the initial request"
+        );
+        assert_eq!(sync_subtype(&initial[0]), Some(0));
+
+        // A newer state drops L while W stays a committed writer, so L cannot publish at all.
+        assert_eq!(
+            session.deliver(
+                millis(2),
+                &state(&host(), 2, &[(&peer(), "guest", "p-other")])
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+
+        // W's first valid request in this eligibility is recognised though L is uncommitted.
+        assert_eq!(
+            session.deliver(millis(3), &frame(&peer(), 0, 1, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        assert!(
+            session.take_outbound().is_empty(),
+            "an uncommitted receiver answers nothing"
+        );
+
+        // L is recommitted as a viewer with W retained: the remote cause survives the local gate.
+        assert_eq!(
+            session.deliver(millis(4), &viewer_beside_writer(3)),
+            Outcome::Applied { kind: 1 }
+        );
+        assert!(
+            session.take_outbound().is_empty(),
+            "a state cannot send the request immediately"
+        );
+        session.tick(millis(300));
+        assert!(session.take_outbound().is_empty(), "not before the clock");
+        session.tick(millis(301));
+        let served = session.take_outbound();
+        assert_eq!(
+            served.len(),
+            1,
+            "the remote request is served once at the due tick"
+        );
+        assert_eq!(sync_subtype(&served[0]), Some(0));
+
+        // Served once: a continuously committed key does not rearm over later windows.
+        session.tick(millis(601));
+        session.tick(millis(901));
+        assert!(
+            session.take_outbound().is_empty(),
+            "a served remote eligibility does not rearm"
+        );
+    }
+
+    /// The companion: a request whose writer is removed or demoted before the local key returns
+    /// is retired with that writer's eligibility, so no request is owed.
+    #[test]
+    fn a_remote_request_for_a_key_that_leaves_before_the_return_owes_nothing() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(
+                millis(1),
+                &state(
+                    &host(),
+                    1,
+                    &[
+                        (&ours(), "viewer", "p-self"),
+                        (&peer(), "guest", "p-other")
+                    ]
+                )
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(
+                millis(2),
+                &state(&host(), 2, &[(&peer(), "guest", "p-other")])
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(millis(3), &frame(&peer(), 0, 1, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        let _ = session.take_outbound();
+
+        // W is demoted before L comes back: the obligation retires with its eligibility.
+        assert_eq!(
+            session.deliver(
+                millis(4),
+                &state(
+                    &host(),
+                    3,
+                    &[
+                        (&ours(), "viewer", "p-self"),
+                        (&peer(), "viewer", "p-other")
+                    ]
+                )
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        assert!(session.take_outbound().is_empty());
+        session.tick(millis(301));
+        session.tick(millis(601));
+        assert!(
+            session.take_outbound().is_empty(),
+            "a retired request owes nothing"
+        );
+    }
+
+    /// Retiring a remote cause must not erase the refusal interval or local readiness sharing the
+    /// same clock: one request serves every remaining obligation.
+    #[test]
+    fn a_retired_remote_request_leaves_the_refusal_and_readiness_causes() {
+        let mut session = session(&[]);
+        let unmoved = SessionKey::from_seed([23; 32]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(
+                millis(1),
+                &state(
+                    &host(),
+                    1,
+                    &[
+                        (&ours(), "guest", "p-self"),
+                        (&peer(), "guest", "p-other")
+                    ]
+                )
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(
+                millis(2),
+                &state(&host(), 2, &[(&peer(), "guest", "p-other")])
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        // W's request arms the remote cause.
+        assert_eq!(
+            session.deliver(millis(3), &frame(&peer(), 0, 1, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        let _ = session.take_outbound();
+        // A content frame from a key no state commits opens §13.6's refusal interval.
+        assert_eq!(
+            session.deliver(millis(4), &content(&unmoved, 1, "theirs")),
+            Outcome::Dropped {
+                reason: "uncommitted_key".to_string()
+            }
+        );
+        // L returns as a writer and W is demoted: the remote cause retires, a new eligibility
+        // begins for L, and the refusal interval is still open.
+        assert_eq!(
+            session.deliver(
+                millis(5),
+                &state(
+                    &host(),
+                    3,
+                    &[
+                        (&ours(), "guest", "p-self"),
+                        (&peer(), "viewer", "p-other")
+                    ]
+                )
+            ),
+            Outcome::Applied { kind: 1 }
+        );
+        assert!(session.take_outbound().is_empty());
+        session.tick(millis(300));
+        assert!(session.take_outbound().is_empty(), "not before the clock");
+        session.tick(millis(301));
+        let served = session.take_outbound();
+        assert_eq!(
+            served.len(),
+            1,
+            "refusal and readiness survive the retired remote cause"
+        );
+        assert_eq!(sync_subtype(&served[0]), Some(0));
+    }
+
+    #[test]
+    fn a_viewers_local_edits_never_enter_room_history() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        let as_viewer = state(
+            &host(),
+            1,
+            &[(&ours(), "viewer", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(1), &as_viewer),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert!(!session.insert("README.md", 0, "secret").unwrap());
+        assert_eq!(
+            session.text("README.md"),
+            "",
+            "the disallowed edit is not even locally visible"
+        );
+        assert!(session.take_outbound().is_empty());
+
+        // Promotion with the same key: the request is answered from room-safe history alone.
+        let as_writer = state(
+            &host(),
+            2,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(2), &as_writer),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(millis(3), &frame(&peer(), 0, 1, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        let answer = session.take_outbound();
+        assert_eq!(answer.len(), 1);
+        assert_eq!(sync_subtype(&answer[0]), Some(1));
+        assert_eq!(
+            step2_text(&answer[0]),
+            "",
+            "no viewer history is exported on promotion"
+        );
+    }
+
+    #[test]
+    fn an_unknown_role_edit_is_discarded_when_a_viewer_state_arrives() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        assert!(
+            !session.insert("README.md", 0, "spec").unwrap(),
+            "held while the role is unknown"
+        );
+        assert_eq!(
+            session.text("README.md"),
+            "spec",
+            "held locally while unknown"
+        );
+        let as_viewer = state(
+            &host(),
+            1,
+            &[(&ours(), "viewer", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(1), &as_viewer),
+            Outcome::Applied { kind: 1 }
+        );
+        assert_eq!(
+            session.text("README.md"),
+            "",
+            "the viewer state discards the speculative edit"
+        );
+        let _ = session.take_outbound();
+
+        // Re-promotion: the discarded edit never returns.
+        let as_writer = state(
+            &host(),
+            2,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(2), &as_writer),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(millis(3), &frame(&peer(), 0, 1, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        let answer = session.take_outbound();
+        assert_eq!(answer.len(), 1);
+        assert_eq!(
+            step2_text(&answer[0]),
+            "",
+            "the discarded edit never returns"
+        );
+    }
+
+    #[test]
+    fn a_demoted_writer_keeps_its_history_and_exports_no_viewer_edit() {
+        let mut session = session(&[]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        let as_writer = state(
+            &host(),
+            1,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(1), &as_writer),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert!(session.insert("README.md", 0, "legit").unwrap());
+        let _ = session.take_outbound();
+
+        let as_viewer = state(
+            &host(),
+            2,
+            &[(&ours(), "viewer", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(2), &as_viewer),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert!(!session.insert("README.md", 5, "bad").unwrap());
+        assert_eq!(
+            session.text("README.md"),
+            "legit",
+            "the viewer edit is discarded"
+        );
+
+        // Promotion: the writer history survives and is exported.
+        let promoted = state(
+            &host(),
+            3,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            session.deliver(millis(3), &promoted),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(millis(4), &frame(&peer(), 0, 1, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        let answer = session.take_outbound();
+        assert_eq!(answer.len(), 1);
+        assert_eq!(
+            step2_text(&answer[0]),
+            "legit",
+            "the writer history is preserved"
+        );
+    }
+
+    #[test]
+    fn three_writer_requests_coalesce_and_the_room_quiesces() {
+        let mut session = session(&[]);
+        let third = SessionKey::from_seed([17; 32]);
+        session.tick(Duration::ZERO);
+        let _ = session.take_outbound();
+        let committing = state(
+            &host(),
+            1,
+            &[
+                (&ours(), "guest", "p-self"),
+                (&peer(), "guest", "p-other"),
+                (&third, "guest", "p-third"),
+            ],
+        );
+        assert_eq!(
+            session.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = session.take_outbound();
+        assert_eq!(
+            session.deliver(millis(2), &frame(&peer(), 0, 1, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(
+            session.deliver(millis(3), &frame(&third, 0, 1, &step1())),
+            Outcome::Applied { kind: 0 }
+        );
+        let answers = session.take_outbound();
+        assert_eq!(answers.len(), 2, "each request draws its own Step2");
+        session.tick(millis(303));
+        let request = session.take_outbound();
+        assert_eq!(request.len(), 1, "one coalesced request for both keys");
+        assert_eq!(sync_subtype(&request[0]), Some(0));
+        // No obligation left, so later windows are silent.
+        session.tick(millis(603));
+        session.tick(millis(903));
+        session.tick(millis(1203));
+        assert!(
+            session.take_outbound().is_empty(),
+            "no periodic full sync without an obligation"
+        );
+    }
+    /// One round of a three-peer room: each session hears the other two's frames, answers each
+    /// with exactly one Step2, and arms nothing new.
+    /// The two frames one session hears in a three-peer round.
+    type Heard<'a> = [&'a [u8]; 2];
+
+    fn three_way_round(
+        trio: [&mut PeerSession; 3],
+        clock: Duration,
+        heard: [Heard<'_>; 3],
+    ) {
+        for (peer, [first, second]) in trio.into_iter().zip(heard) {
+            assert_eq!(
+                peer.deliver(clock, first),
+                Outcome::Applied { kind: 0 }
+            );
+            assert_eq!(
+                peer.deliver(clock, second),
+                Outcome::Applied { kind: 0 }
+            );
+            let answers = peer.take_outbound();
+            assert_eq!(answers.len(), 2, "each request draws one Step2");
+            assert!(answers.iter().all(|frame| sync_subtype(frame) == Some(1)));
+        }
+    }
+
+    /// Three real sessions, each with its own replica and key: every pair's reciprocal exchange
+    /// is bounded, one coalesced request per session per window, and the room falls quiet. The
+    /// older three-writer test drives one receiver and two signers, which is a census bound and
+    /// not an all-room one.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the three-peer exchange, its bounded counts and the quiet windows are one sequence"
+    )]
+    fn three_real_sessions_exchange_reciprocally_and_then_quiesce() {
+        let mut alpha = session(&["p-other", "p-third"]);
+        let mut beta = second_session(&["p-self", "p-third"]);
+        let mut gamma = third_session(&["p-self", "p-other"]);
+        for peer in [&mut alpha, &mut beta, &mut gamma] {
+            peer.tick(Duration::ZERO);
+            let _ = peer.take_outbound();
+        }
+        let committing = state(
+            &host(),
+            1,
+            &[
+                (&ours(), "guest", "p-self"),
+                (&peer(), "guest", "p-other"),
+                (&third(), "guest", "p-third"),
+            ],
+        );
+        let mut initial = Vec::new();
+        for peer in [&mut alpha, &mut beta, &mut gamma] {
+            assert_eq!(
+                peer.deliver(millis(1), &committing),
+                Outcome::Applied { kind: 1 }
+            );
+            let frames = peer.take_outbound();
+            assert_eq!(
+                frames.len(),
+                1,
+                "the first commitment owes one initial request"
+            );
+            assert_eq!(sync_subtype(&frames[0]), Some(0));
+            initial.push(frames[0].clone());
+        }
+        three_way_round(
+            [&mut alpha, &mut beta, &mut gamma],
+            millis(2),
+            [
+                [initial[1].as_slice(), initial[2].as_slice()],
+                [initial[0].as_slice(), initial[2].as_slice()],
+                [initial[0].as_slice(), initial[1].as_slice()],
+            ],
+        );
+        // One coalesced request per session at the shared clock, not one per writer key.
+        let mut requests = Vec::new();
+        for peer in [&mut alpha, &mut beta, &mut gamma] {
+            peer.tick(millis(300));
+            assert!(peer.take_outbound().is_empty(), "not before the clock");
+            peer.tick(millis(301));
+            let frames = peer.take_outbound();
+            assert_eq!(
+                frames.len(),
+                1,
+                "the two obligations coalesce into one request"
+            );
+            assert_eq!(sync_subtype(&frames[0]), Some(0));
+            requests.push(frames[0].clone());
+        }
+        three_way_round(
+            [&mut alpha, &mut beta, &mut gamma],
+            millis(302),
+            [
+                [requests[1].as_slice(), requests[2].as_slice()],
+                [requests[0].as_slice(), requests[2].as_slice()],
+                [requests[0].as_slice(), requests[1].as_slice()],
+            ],
+        );
+        // One session's edit reaches the other two; all three replicas agree and nothing replies.
+        assert!(alpha.insert("README.md", 0, "x").unwrap());
+        let edit = alpha.take_outbound();
+        assert_eq!(edit.len(), 1, "the edit publishes");
+        assert_eq!(
+            beta.deliver(millis(303), &edit[0]),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(
+            gamma.deliver(millis(303), &edit[0]),
+            Outcome::Applied { kind: 0 }
+        );
+        assert!(
+            beta.take_outbound().is_empty() && gamma.take_outbound().is_empty(),
+            "content draws no reply"
+        );
+        assert_eq!(alpha.state_vector(), beta.state_vector());
+        assert_eq!(beta.state_vector(), gamma.state_vector());
+
+        for peer in [&mut alpha, &mut beta, &mut gamma] {
+            peer.tick(millis(601));
+            peer.tick(millis(901));
+            peer.tick(millis(1201));
+            assert!(
+                peer.take_outbound().is_empty(),
+                "no periodic full sync without an obligation"
+            );
+        }
+    }
+
+    /// A retained same-key session keeps its replica through an omission and recommitment, owes
+    /// one renewed readiness request, and keeps editing on that same replica.
+    #[test]
+    fn a_recommitted_same_key_retains_its_replica_and_keeps_editing() {
+        let mut writer = session(&["p-other"]);
+        let mut receiver = second_session(&["p-self"]);
+        writer.tick(Duration::ZERO);
+        receiver.tick(Duration::ZERO);
+        let _ = writer.take_outbound();
+        let _ = receiver.take_outbound();
+        let committing = state(
+            &host(),
+            1,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            writer.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        assert_eq!(
+            receiver.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = writer.take_outbound();
+        let _ = receiver.take_outbound();
+
+        // The receiver edits as a committed writer; the writer applies that history.
+        assert!(receiver.insert("README.md", 0, "abc").unwrap());
+        let edit = receiver.take_outbound();
+        assert_eq!(edit.len(), 1);
+        assert_eq!(
+            writer.deliver(millis(2), &edit[0]),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(receiver.state_vector(), writer.state_vector());
+        let vector = receiver.state_vector();
+
+        // The receiver's key is dropped, then recommitted under the same key.
+        let omitted = state(&host(), 2, &[(&ours(), "guest", "p-self")]);
+        assert_eq!(
+            receiver.deliver(millis(3), &omitted),
+            Outcome::Applied { kind: 1 }
+        );
+        let _ = receiver.take_outbound();
+        let recommitted = state(
+            &host(),
+            3,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            receiver.deliver(millis(4), &recommitted),
+            Outcome::Applied { kind: 1 }
+        );
+        assert!(
+            receiver.take_outbound().is_empty(),
+            "a state cannot send the renewed readiness immediately"
+        );
+        // The retained replica is untouched by the omission and recommitment.
+        assert_eq!(receiver.text("README.md"), "abc");
+        assert_eq!(receiver.state_vector(), vector);
+
+        receiver.tick(millis(300));
+        assert!(receiver.take_outbound().is_empty(), "not before the clock");
+        receiver.tick(millis(301));
+        let readiness = receiver.take_outbound();
+        assert_eq!(
+            readiness.len(),
+            1,
+            "recommitment owes one readiness request"
+        );
+        assert_eq!(sync_subtype(&readiness[0]), Some(0));
+        assert!(receiver.insert("README.md", 3, "d").unwrap());
+        assert_eq!(
+            receiver.take_outbound().len(),
+            1,
+            "the continued edit publishes"
+        );
+        assert_eq!(receiver.text("README.md"), "abcd");
+    }
+
+    /// Two real sessions, one lost `Update`: the reciprocal request carries the missing struct
+    /// back and the replicas converge with no further edit, no new key and no refusal.
+    #[test]
+    fn a_lost_update_is_recovered_by_the_reciprocal_request() {
+        let mut writer = session(&["p-other"]);
+        let mut receiver = second_session(&["p-self"]);
+        writer.tick(Duration::ZERO);
+        receiver.tick(Duration::ZERO);
+        let _ = writer.take_outbound();
+        let _ = receiver.take_outbound();
+        let committing = state(
+            &host(),
+            1,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            writer.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        assert_eq!(
+            receiver.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        let writer_initial = writer.take_outbound();
+        let _ = receiver.take_outbound();
+        assert_eq!(writer_initial.len(), 1);
+
+        // The receiver sees the writer's request and arms one reciprocal obligation.
+        assert_eq!(
+            receiver.deliver(millis(2), &writer_initial[0]),
+            Outcome::Applied { kind: 0 }
+        );
+        let _ = receiver.take_outbound();
+
+        // The writer inserts, and the frame carrying the first insertion is lost on the way.
+        assert!(writer.insert("README.md", 0, "off ").unwrap());
+        let lost = writer.take_outbound();
+        assert_eq!(lost.len(), 1);
+        // A second, dependent insertion is delivered: the receiver holds it pending.
+        assert!(writer.insert("README.md", 0, "on ").unwrap());
+        let dependent = writer.take_outbound();
+        assert_eq!(dependent.len(), 1);
+        assert_eq!(
+            receiver.deliver(millis(3), &dependent[0]),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(
+            receiver.text("README.md"),
+            "",
+            "the dependent insertion waits for its dependency"
+        );
+
+        // The reciprocal request recovers the missing history without a new edit or key.
+        receiver.tick(millis(302));
+        let request = receiver.take_outbound();
+        assert_eq!(request.len(), 1, "one coalesced reciprocal request");
+        assert_eq!(sync_subtype(&request[0]), Some(0));
+        assert_eq!(
+            writer.deliver(millis(303), &request[0]),
+            Outcome::Applied { kind: 0 }
+        );
+        let repair = writer.take_outbound();
+        let step2 = repair
+            .iter()
+            .find(|frame| sync_subtype(frame.as_slice()) == Some(1))
+            .expect("the writer answers the request with a Step2");
+        assert_eq!(
+            receiver.deliver(millis(304), step2),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(
+            receiver.text("README.md"),
+            "on off ",
+            "the lost insertion returns"
+        );
+        assert_eq!(writer.text("README.md"), "on off ");
+        assert_eq!(
+            writer.state_vector(),
+            receiver.state_vector(),
+            "the replicas converge"
+        );
+    }
+
+    /// The same two sessions, one lost deletion: a deletion is not a struct, so the state
+    /// vectors already agree while the texts differ; the reciprocal request carries the whole
+    /// delete set back and the texts converge.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the whole loss and repair is one sequence and is clearer unsplit"
+    )]
+    fn a_lost_deletion_is_recovered_by_the_reciprocal_request() {
+        let mut writer = session(&[]);
+        let mut receiver = second_session(&[]);
+        let third = SessionKey::from_seed([19; 32]);
+        writer.tick(Duration::ZERO);
+        receiver.tick(Duration::ZERO);
+        let _ = writer.take_outbound();
+        let _ = receiver.take_outbound();
+        let committing = state(
+            &host(),
+            1,
+            &[
+                (&ours(), "guest", "p-self"),
+                (&peer(), "guest", "p-other"),
+                (&third, "guest", "p-third"),
+            ],
+        );
+        assert_eq!(
+            writer.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        assert_eq!(
+            receiver.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        let writer_initial = writer.take_outbound();
+        let _ = receiver.take_outbound();
+        // Arm the receiver's reciprocal obligation.
+        assert_eq!(
+            receiver.deliver(millis(2), &writer_initial[0]),
+            Outcome::Applied { kind: 0 }
+        );
+        let _ = receiver.take_outbound();
+
+        // A third key inserts "abc"; both replicas apply it.
+        let source = Doc::new();
+        let handle = source.get_or_insert_text("README.md");
+        {
+            let mut txn = source.transact_mut();
+            handle.insert(&mut txn, 0, "abc");
+        }
+        let inserted = {
+            let txn = source.transact();
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+        let insert_frame = frame(
+            &third,
+            0,
+            1,
+            &encode_y_message(&YMessage::Sync(SyncMessage::Update(inserted))),
+        );
+        assert_eq!(
+            writer.deliver(millis(3), &insert_frame),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(
+            receiver.deliver(millis(3), &insert_frame),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(writer.text("README.md"), "abc");
+        assert_eq!(receiver.text("README.md"), "abc");
+
+        // The third key deletes `b`; only the writer receives that update.
+        let before = {
+            let txn = source.transact();
+            txn.state_vector()
+        };
+        {
+            let mut txn = source.transact_mut();
+            handle.remove_range(&mut txn, 1, 1);
+        }
+        let deletion = {
+            let txn = source.transact();
+            txn.encode_state_as_update_v1(&before)
+        };
+        let delete_frame = frame(
+            &third,
+            0,
+            2,
+            &encode_y_message(&YMessage::Sync(SyncMessage::Update(deletion))),
+        );
+        assert_eq!(
+            writer.deliver(millis(4), &delete_frame),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(writer.text("README.md"), "ac");
+        assert_eq!(receiver.text("README.md"), "abc", "the deletion was lost");
+        // A deletion is not a struct, so the vectors agree before the repair.
+        assert_eq!(writer.state_vector(), receiver.state_vector());
+
+        // The reciprocal request carries the whole delete set back.
+        receiver.tick(millis(302));
+        let request = receiver.take_outbound();
+        assert_eq!(request.len(), 1, "one coalesced reciprocal request");
+        assert_eq!(sync_subtype(&request[0]), Some(0));
+        assert_eq!(
+            writer.deliver(millis(303), &request[0]),
+            Outcome::Applied { kind: 0 }
+        );
+        let repair = writer.take_outbound();
+        let step2 = repair
+            .iter()
+            .find(|frame| sync_subtype(frame.as_slice()) == Some(1))
+            .expect("the writer answers the request with a Step2");
+        assert_eq!(
+            receiver.deliver(millis(304), step2),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(
+            receiver.text("README.md"),
+            "ac",
+            "the lost deletion returns"
+        );
+        assert_eq!(
+            writer.state_vector(),
+            receiver.state_vector(),
+            "the replicas converge"
+        );
+    }
+
+    /// After a lost update is repaired and the room has gone quiet, a fresh writer eligibility
+    /// lets a second lost update be repaired with the same two retained replicas and no new API:
+    /// the demotion and re-promotion are signed states, and the renewed request is what a fresh
+    /// continuous eligibility owes.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the two loss-and-repair rounds and the fresh eligibility between them are one sequence"
+    )]
+    fn a_second_lost_update_is_repaired_after_a_fresh_writer_eligibility() {
+        let mut writer = session(&["p-other"]);
+        let mut receiver = second_session(&["p-self"]);
+        writer.tick(Duration::ZERO);
+        receiver.tick(Duration::ZERO);
+        let _ = writer.take_outbound();
+        let _ = receiver.take_outbound();
+        let committing = state(
+            &host(),
+            1,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            writer.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        assert_eq!(
+            receiver.deliver(millis(1), &committing),
+            Outcome::Applied { kind: 1 }
+        );
+        let writer_initial = writer.take_outbound();
+        let _ = receiver.take_outbound();
+        assert_eq!(
+            receiver.deliver(millis(2), &writer_initial[0]),
+            Outcome::Applied { kind: 0 }
+        );
+        let _ = receiver.take_outbound();
+
+        // First loss: the independent insertion is dropped, the dependent one arrives pending.
+        assert!(writer.insert("README.md", 0, "off ").unwrap());
+        let _ = writer.take_outbound();
+        assert!(writer.insert("README.md", 0, "on ").unwrap());
+        let dependent = writer.take_outbound();
+        assert_eq!(
+            receiver.deliver(millis(3), &dependent[0]),
+            Outcome::Applied { kind: 0 }
+        );
+        receiver.tick(millis(302));
+        let request = receiver.take_outbound();
+        assert_eq!(request.len(), 1, "one reciprocal request");
+        assert_eq!(
+            writer.deliver(millis(303), &request[0]),
+            Outcome::Applied { kind: 0 }
+        );
+        let repair = writer.take_outbound();
+        let step2 = repair
+            .iter()
+            .find(|frame| sync_subtype(frame.as_slice()) == Some(1))
+            .expect("the writer answers with a Step2");
+        assert_eq!(
+            receiver.deliver(millis(304), step2),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(receiver.text("README.md"), "on off ");
+        assert_eq!(writer.state_vector(), receiver.state_vector());
+
+        // A quiet interval: the receiver owes nothing.
+        receiver.tick(millis(601));
+        receiver.tick(millis(901));
+        assert!(
+            receiver.take_outbound().is_empty(),
+            "the repaired window is silent"
+        );
+
+        // The writer is demoted and re-promoted under the same key: a fresh eligibility.
+        let demoted = state(
+            &host(),
+            2,
+            &[(&ours(), "viewer", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            writer.deliver(millis(902), &demoted),
+            Outcome::Applied { kind: 1 }
+        );
+        assert_eq!(
+            receiver.deliver(millis(902), &demoted),
+            Outcome::Applied { kind: 1 }
+        );
+        let promoted = state(
+            &host(),
+            3,
+            &[(&ours(), "guest", "p-self"), (&peer(), "guest", "p-other")],
+        );
+        assert_eq!(
+            writer.deliver(millis(903), &promoted),
+            Outcome::Applied { kind: 1 }
+        );
+        assert_eq!(
+            receiver.deliver(millis(903), &promoted),
+            Outcome::Applied { kind: 1 }
+        );
+
+        // The renewed writer eligibility sends one request; the receiver arms from it.
+        writer.tick(millis(1201));
+        let renewed = writer.take_outbound();
+        assert_eq!(renewed.len(), 1, "the fresh eligibility owes one request");
+        assert_eq!(sync_subtype(&renewed[0]), Some(0));
+        assert_eq!(
+            receiver.deliver(millis(1202), &renewed[0]),
+            Outcome::Applied { kind: 0 }
+        );
+        let _ = receiver.take_outbound();
+
+        // Second loss: the same shape, repaired by the receiver's renewed reciprocal request.
+        assert!(writer.insert("README.md", 0, "z").unwrap());
+        let _ = writer.take_outbound();
+        assert!(writer.insert("README.md", 0, "y").unwrap());
+        let dependent = writer.take_outbound();
+        assert_eq!(
+            receiver.deliver(millis(1203), &dependent[0]),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(
+            receiver.text("README.md"),
+            "on off ",
+            "the second dependency waits"
+        );
+        receiver.tick(millis(1502));
+        let request = receiver.take_outbound();
+        assert_eq!(request.len(), 1, "the fresh eligibility re-armed once");
+        assert_eq!(sync_subtype(&request[0]), Some(0));
+        assert_eq!(
+            writer.deliver(millis(1503), &request[0]),
+            Outcome::Applied { kind: 0 }
+        );
+        let repair = writer.take_outbound();
+        let step2 = repair
+            .iter()
+            .find(|frame| sync_subtype(frame.as_slice()) == Some(1))
+            .expect("the writer answers the second request with a Step2");
+        assert_eq!(
+            receiver.deliver(millis(1504), step2),
+            Outcome::Applied { kind: 0 }
+        );
+        assert_eq!(receiver.text("README.md"), "yzon off ");
+        assert_eq!(writer.text("README.md"), "yzon off ");
+        assert_eq!(writer.state_vector(), receiver.state_vector());
     }
 }

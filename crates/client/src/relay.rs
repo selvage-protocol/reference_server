@@ -133,7 +133,8 @@ pub enum RelayEvent {
     Listing(Vec<String>),
     /// The paths this replica holds text for changed.
     Content(Vec<String>),
-    /// A content frame was applied: the replica's text for some path is not what it was.
+    /// The replica's text for some path may have changed: a content frame was applied, or a
+    /// state resolved a speculative edit by discarding it (§13.5, §13.9).
     Text,
     /// The session ended, by §13.10's rule or the relay's.
     Ended(RelayEnding),
@@ -900,12 +901,18 @@ impl Relay {
     fn delivered(&self, frame: &[u8]) -> (bool, Vec<RelayEvent>) {
         let mut state = self.read();
         let clock = state.start.elapsed();
+        let epoch = state.session.replica_epoch();
         let outcome = state.session.deliver(clock, frame);
-        // §13.5's content, and only content: a state, a holds set and a closing change no text.
-        let content = matches!(outcome, Outcome::Applied { kind: 0 });
+        // §13.5's content changes text; so does §13.9's state-driven rollback, which replaces the
+        // replica a consumer was reading from without a content frame and without moving the path
+        // set or the listing. Either way the text a subscriber holds may no longer match, so the
+        // event is the same; the session's replica epoch names the second case without re-reading
+        // any text.
+        let changed = matches!(outcome, Outcome::Applied { kind: 0 })
+            || state.session.replica_epoch() != epoch;
         let queued = Self::queue(&mut state, &self.outgoing);
         let mut events = report(&mut state);
-        if content {
+        if changed {
             events.push(RelayEvent::Text);
         }
         (queued, events)
@@ -1373,16 +1380,16 @@ mod tests {
     use futures_util::SinkExt;
     use futures_util::StreamExt;
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::{broadcast, mpsc, oneshot};
     use tokio::task::JoinHandle;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{
-        RelayHostOptions, RelayJoinOptions, RelayPeer, RelaySession,
-        RelaySessionInfo, RelayState, clock_period, hello, lock, session_base,
-        start,
+        RelayEvent, RelayHostOptions, RelayJoinOptions, RelayPeer,
+        RelaySession, RelaySessionInfo, RelayState, clock_period, hello, lock,
+        session_base, start,
     };
     use crate::host::{HostOptions, ListingSource};
     use crate::peer::{PeerOptions, PeerSession};
@@ -1826,6 +1833,65 @@ mod tests {
         )
     }
 
+    /// A host-signed state that commits a remote writer and leaves this connection's own key
+    /// UNKNOWN, so §13.1's step 4 holds back any local edit and §13.9 makes it speculative.
+    fn writer_only_state() -> Vec<u8> {
+        let mut peers = serde_json::Map::new();
+        peers.insert(
+            SessionKey::from_seed(HOST_SEED).public().encode(),
+            serde_json::json!({"peer_id": "p-other", "role": "guest"}),
+        );
+        let payload =
+            serde_json::json!({"issued": 1, "listing": [PATH], "peers": peers});
+        sealed(
+            1,
+            1,
+            &SessionKey::from_seed(HOST_SEED),
+            &serde_json::to_vec(&payload).expect("a state encodes"),
+        )
+    }
+
+    /// A host-signed state that recommits this connection's own key as a `viewer`, with the same
+    /// listing and the same remote writer: the resolution §13.9 rolls a speculative edit back on.
+    fn viewer_state() -> Vec<u8> {
+        let mut peers = serde_json::Map::new();
+        peers.insert(
+            SessionKey::from_seed(HOST_SEED).public().encode(),
+            serde_json::json!({"peer_id": "p-other", "role": "guest"}),
+        );
+        peers.insert(
+            SessionKey::from_seed(OWN_SEED).public().encode(),
+            serde_json::json!({"peer_id": SEAT, "role": "viewer"}),
+        );
+        let payload =
+            serde_json::json!({"issued": 2, "listing": [PATH], "peers": peers});
+        sealed(
+            1,
+            2,
+            &SessionKey::from_seed(HOST_SEED),
+            &serde_json::to_vec(&payload).expect("a state encodes"),
+        )
+    }
+
+    /// A `kind = 0` frame from `signer` carrying a sync Update that inserts `text` at the start
+    /// of [`PATH`]: the one way this test puts real text into the room.
+    fn content_frame(signer: &SessionKey, counter: u64, text: &str) -> Vec<u8> {
+        use yrs::sync::SyncMessage;
+        use yrs::{Doc, ReadTxn, StateVector, Text, Transact};
+        let doc = Doc::new();
+        let handle = doc.get_or_insert_text(PATH);
+        {
+            let mut txn = doc.transact_mut();
+            handle.insert(&mut txn, 0, text);
+        }
+        let update = {
+            let txn = doc.transact();
+            txn.encode_state_as_update_v1(&StateVector::default())
+        };
+        let message = YMessage::Sync(SyncMessage::Update(update));
+        sealed(0, counter, signer, &message.encode_v1())
+    }
+
     /// `count` edits a guest makes before a state commits its key, every one of them held back
     /// by §13.1's step 4 rather than published.
     fn hold_edits(
@@ -1996,6 +2062,77 @@ mod tests {
         assert!(
             fixture.relay.held_paths().is_empty(),
             "the release is the whole set"
+        );
+        Ok(())
+    }
+
+    /// One event, or `None` when the deadline passed or the subscription ended.
+    async fn next_event(
+        left: Duration,
+        events: &mut broadcast::Receiver<RelayEvent>,
+    ) -> Option<RelayEvent> {
+        timeout(left, events.recv()).await.ok().and_then(Result::ok)
+    }
+
+    /// Waits, bounded, for one `Text` event on a subscription, skipping the other events: what
+    /// a subscriber is promised is that the replica's text may have changed.
+    async fn text_within(
+        deadline: Duration,
+        events: &mut broadcast::Receiver<RelayEvent>,
+    ) -> bool {
+        let mut found = false;
+        let start = Instant::now();
+        while !found && start.elapsed() < deadline {
+            let left = deadline.saturating_sub(start.elapsed());
+            found = next_event(left, events).await == Some(RelayEvent::Text);
+        }
+        found
+    }
+
+    /// §13.5's text surface must report a *state-driven* rollback too. A `viewer` state that
+    /// discards a speculative edit changes text with no content frame and with the path set, the
+    /// listing and the roster unchanged, so a subscriber told only about content would keep
+    /// displaying the discarded edit.
+    #[tokio::test]
+    async fn a_state_that_discards_a_speculative_edit_reports_text()
+    -> Result<(), Box<dyn StdError>> {
+        let fixture = guest_fixture(keepalive()).await?;
+        // Subscribe before anything arrives, so the content frame's own Text event can be
+        // consumed and the rollback's told apart from it.
+        let mut events = fixture.relay.subscribe();
+        // A state committing only a remote writer leaves this connection's own key UNKNOWN.
+        assert!(fixture.feed(Message::binary(writer_only_state())));
+        assert!(fixture.feed(Message::binary(content_frame(
+            &SessionKey::from_seed(HOST_SEED),
+            1,
+            "abc"
+        ))));
+        let relay = Arc::clone(&fixture.relay);
+        assert!(
+            held_within(WAIT, || relay.text(PATH) == "abc").await,
+            "the content frame arrives: {:?}",
+            relay.text(PATH)
+        );
+        assert!(
+            text_within(WAIT, &mut events).await,
+            "the content frame reports its text change"
+        );
+
+        // UNKNOWN role: the edit is speculative and held rather than published.
+        assert!(!fixture.relay.insert(PATH, 3, "spec")?);
+        assert_eq!(fixture.relay.text(PATH), "abcspec");
+
+        // A viewer state adopts the clean baseline, reverting the text with the same listing, the
+        // same paths and the same roster. §13.5's surface must still say so.
+        assert!(fixture.feed(Message::binary(viewer_state())));
+        assert!(
+            held_within(WAIT, || relay.text(PATH) == "abc").await,
+            "the speculative edit is discarded: {:?}",
+            relay.text(PATH)
+        );
+        assert!(
+            text_within(WAIT, &mut events).await,
+            "a state-driven rollback notifies subscribers on the Text surface"
         );
         Ok(())
     }
