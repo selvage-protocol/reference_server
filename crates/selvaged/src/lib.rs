@@ -10,7 +10,6 @@ mod net;
 pub mod page;
 pub mod room;
 
-use std::fmt::Write as _;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -186,10 +185,16 @@ pub(crate) fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     getrandom::fill(&mut buf).expect("the platform CSPRNG is available");
     let mut out = String::with_capacity(bytes.saturating_mul(2));
-    for byte in buf {
-        let _ = write!(out, "{byte:02x}");
+    for byte in buf.drain(..) {
+        out.push(hex_digit(byte >> 4));
+        out.push(hex_digit(byte & 0x0f));
     }
     out
+}
+
+/// One lowercase hex digit, for the four bits it names.
+fn hex_digit(nibble: u8) -> char {
+    char::from_digit(u32::from(nibble), 16).unwrap_or('0')
 }
 
 pub(crate) fn mint_room_id() -> String {
@@ -198,4 +203,51 @@ pub(crate) fn mint_room_id() -> String {
 
 pub(crate) fn mint_token() -> String {
     random_hex(16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a minted identifier may contain: lowercase hex, and nothing else.
+    fn is_lower_hex(text: &str) -> bool {
+        text.bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    /// A mint is two characters per random byte, drawn from the lowercase hex alphabet.
+    #[test]
+    fn a_mint_is_lowercase_hex_of_two_characters_a_byte() {
+        for bytes in [0, 1, 6, 8, 16] {
+            let text = random_hex(bytes);
+            assert_eq!(
+                text.len(),
+                bytes.saturating_mul(2),
+                "length of {bytes} bytes"
+            );
+            assert!(is_lower_hex(&text), "{text:?} is not lowercase hex");
+        }
+    }
+
+    /// The two identifiers the server mints are the sizes the protocol names.
+    #[test]
+    fn the_minted_identifiers_are_the_sizes_the_protocol_names() {
+        let room = mint_room_id();
+        assert_eq!(room.len(), 2 + 12);
+        assert!(room.starts_with("r-"));
+        assert!(is_lower_hex(room.trim_start_matches("r-")));
+
+        let token = mint_token();
+        assert_eq!(token.len(), 32);
+        assert!(is_lower_hex(&token));
+    }
+
+    /// Two mints of the same size are different identifiers, so the bytes are drawn rather
+    /// than left as the buffer's zeros.
+    #[test]
+    fn two_mints_of_the_same_size_differ() {
+        let a = mint_token();
+        let b = mint_token();
+        assert_ne!(a, b, "two tokens of 16 bytes came out the same");
+    }
 }
