@@ -191,6 +191,13 @@ enum Outbound {
     Close,
 }
 
+/// A test's observer of the socket handover ([`Relay::push`]); production never arms one.
+///
+/// It is held in a mutex, so `Send` is all it needs beyond `Fn`: the mutex supplies the sharing
+/// it is called through.
+#[cfg(test)]
+type QueueProbe = Box<dyn Fn() + Send>;
+
 /// Everything one connection touches, behind one lock.
 struct RelayState {
     session: PeerSession,
@@ -215,6 +222,11 @@ struct Relay {
     state: Mutex<RelayState>,
     events: broadcast::Sender<RelayEvent>,
     outgoing: mpsc::UnboundedSender<Outbound>,
+    /// The test seam beside the socket handover: armed by one test on one instance, it fires on
+    /// the thread handing a frame over, where that frame leaves ([`Relay::push`]). Nothing is
+    /// shared between tests and production never sets it.
+    #[cfg(test)]
+    probe: Mutex<Option<QueueProbe>>,
 }
 
 /// One `selvage/2` connection: a socket, a [`PeerSession`] and the clocks between them.
@@ -675,7 +687,7 @@ impl RelaySession {
             return Err(Error::Closed);
         }
         let value = change(&mut state)?;
-        let queued = Relay::queue(&mut state, &self.relay.outgoing);
+        let queued = self.relay.queue(&mut state);
         let events = report(&mut state);
         drop(state);
         Ok(Moved {
@@ -728,6 +740,8 @@ fn start(
         }),
         events: broadcast::channel(EVENT_BACKLOG).0,
         outgoing,
+        #[cfg(test)]
+        probe: Mutex::new(None),
     });
     let (sink, stream) = socket.split();
     let clock_task = tokio::spawn(clock(Arc::clone(&relay)));
@@ -885,7 +899,7 @@ impl Relay {
         }
         let clock = state.start.elapsed();
         state.session.tick(clock);
-        let queued = Self::queue(&mut state, &self.outgoing);
+        let queued = self.queue(&mut state);
         let events = report(&mut state);
         (queued, events)
     }
@@ -910,7 +924,7 @@ impl Relay {
         // any text.
         let changed = matches!(outcome, Outcome::Applied { kind: 0 })
             || state.session.replica_epoch() != epoch;
-        let queued = Self::queue(&mut state, &self.outgoing);
+        let queued = self.queue(&mut state);
         let mut events = report(&mut state);
         if changed {
             events.push(RelayEvent::Text);
@@ -950,7 +964,7 @@ impl Relay {
             Some(event::ROOM_GONE) => state.end(RelayEnding::RoomGone),
             _ => {}
         }
-        let queued = Self::queue(&mut state, &self.outgoing);
+        let queued = self.queue(&mut state);
         let events = report(&mut state);
         (queued, events)
     }
@@ -968,13 +982,22 @@ impl Relay {
     ///
     /// Returns whether the queue took every frame. A queue that is gone is a socket task that
     /// has ended.
-    fn queue(
-        state: &mut RelayState,
-        outgoing: &mpsc::UnboundedSender<Outbound>,
-    ) -> bool {
-        drain(state)
-            .into_iter()
-            .all(|frame| outgoing.send(Outbound::Binary(frame)).is_ok())
+    fn queue(&self, state: &mut RelayState) -> bool {
+        drain(state).into_iter().all(|frame| self.push(frame))
+    }
+
+    /// Hands one published frame to the socket's queue.
+    ///
+    /// This is the only place a frame this lock numbers goes on the wire, so it is where the
+    /// handover's order is decided ([`Relay::queue`]). The probe fires immediately beside the
+    /// push and on the thread doing it, so a frame handed over after the state lock was released
+    /// is a frame the probe reports released with it.
+    fn push(&self, frame: Vec<u8>) -> bool {
+        #[cfg(test)]
+        if let Some(probe) = lock(&self.probe).as_ref() {
+            probe();
+        }
+        self.outgoing.send(Outbound::Binary(frame)).is_ok()
     }
 
     /// One `session.error`: the server's own words, kept and reported, and never fatal.
@@ -1369,11 +1392,16 @@ fn sealed(error: &SealedError) -> Error {
 mod tests {
     use std::collections::BTreeSet;
     use std::error::Error as StdError;
+    use std::fmt;
     use std::hint::spin_loop;
     use std::num::NonZeroUsize;
-    use std::sync::{Arc, Mutex};
+    use std::process::abort;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc as std_mpsc;
+    use std::sync::{Arc, Mutex, TryLockError};
     use std::thread::{
-        JoinHandle as ThreadHandle, available_parallelism, spawn,
+        JoinHandle as ThreadHandle, available_parallelism,
+        sleep as thread_sleep, spawn,
     };
     use std::time::{Duration, Instant};
 
@@ -1387,14 +1415,15 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{
-        RelayEvent, RelayHostOptions, RelayJoinOptions, RelayPeer,
-        RelaySession, RelaySessionInfo, RelayState, clock_period, hello, lock,
-        session_base, start,
+        EVENT_BACKLOG, Outbound, Relay, RelayEvent, RelayHostOptions,
+        RelayJoinOptions, RelayPeer, RelaySession, RelaySessionInfo,
+        RelayState, clock_period, hello, lock, session_base, start,
     };
     use crate::host::{HostOptions, ListingSource};
     use crate::peer::{PeerOptions, PeerSession};
     use crate::sealed::{
-        Envelope, KeyId, Recipe, RoomKey, SessionKey, encode_key, seal,
+        Envelope, KeyId, Recipe, RoomKey, SessionKey, encode_key, opens,
+        read_varuint, seal,
     };
     use crate::session::KeepaliveConfig;
     use yrs::block::ClientID;
@@ -1424,17 +1453,41 @@ mod tests {
     }
 
     /// One frame as it arrived at the server end.
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     enum Arrived {
         /// A `selvage/2` frame, as §6.1's clear prefix writes it: the key that signed it, its
-        /// kind, and the counter under that key.
+        /// kind, and the counter under that key — beside the frame's own bytes, so a test that
+        /// holds the room key can read the plaintext's message type as the peer tests do.
         Sealed {
             key_id: KeyId,
             kind: u64,
             counter: u64,
+            frame: Vec<u8>,
         },
         /// A text frame — the session's own, such as a rename.
         Text,
+    }
+
+    /// The bytes are kept for decoding, not for a failure message: a frame prints as its clear
+    /// prefix and its length, so a failed assertion stays readable however many arrived.
+    impl fmt::Debug for Arrived {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Sealed {
+                    key_id,
+                    kind,
+                    counter,
+                    frame,
+                } => f
+                    .debug_struct("Sealed")
+                    .field("key_id", key_id)
+                    .field("kind", kind)
+                    .field("counter", counter)
+                    .field("bytes", &frame.len())
+                    .finish(),
+                Self::Text => f.write_str("Text"),
+            }
+        }
     }
 
     /// A relay over a loopback WebSocket, with this test as the server end.
@@ -1525,6 +1578,9 @@ mod tests {
         let arrived = Arc::new(Mutex::new(Vec::new()));
         let (close, closed) = oneshot::channel();
         let (feed, sent) = mpsc::unbounded_channel();
+        // The server end's own outcome is not captured: a panic or a send/receive failure in
+        // `serving` surfaces only as this end's bounded fence wait timing out, reported with the
+        // arrived frames, the relay ending and the failure — not as the endpoint's own error.
         tokio::spawn(serving(server, Arc::clone(&arrived), closed, sent));
 
         let session = PeerSession::new(options)?;
@@ -1573,6 +1629,338 @@ mod tests {
         seated(keepalive, &options(keepalive, None)).await
     }
 
+    type UnwiredRelay = (Arc<RelaySession>, mpsc::UnboundedReceiver<Outbound>);
+
+    /// A seated host relay with no socket and no clock: the session's own lock is the only thing
+    /// that touches its state, which is what makes the lock-order proofs below unambiguous. No
+    /// [`start`] runs, so no socket task, no clock task and no other owner of the lock exists.
+    ///
+    /// The queue's receiver is handed back so the caller holds it for the test: a queue whose
+    /// receiver is gone reports every push as a dead socket, a different subject.
+    fn unwired_relay(
+        keepalive: KeepaliveConfig,
+    ) -> Result<UnwiredRelay, Box<dyn StdError>> {
+        let listing_source: ListingSource = Arc::new(Vec::new);
+        let host = HostOptions {
+            host_seed: HOST_SEED,
+            listing: listing_source,
+            store: None,
+        };
+        let session = PeerSession::new(&options(keepalive, Some(host)))?;
+        let info = RelaySessionInfo {
+            room_id: ROOM.to_string(),
+            token: Some("t-1".to_string()),
+            seat: SEAT.to_string(),
+            peers: Vec::new(),
+            capabilities: Vec::new(),
+            keepalive,
+            base_url: "ws://127.0.0.1:0".to_string(),
+        };
+        let peers = info.peers.clone();
+        let listing = session.listing().to_vec();
+        let documents = session.documents();
+        let (outgoing, incoming) = mpsc::unbounded_channel();
+        let relay = Arc::new(Relay {
+            state: Mutex::new(RelayState {
+                session,
+                info,
+                start: Instant::now(),
+                peers: peers.clone(),
+                invite: None,
+                ending: None,
+                fault: None,
+                destroyed: false,
+                request_id: 1,
+                last_listing: listing,
+                last_documents: documents,
+                last_peers: peers,
+            }),
+            events: broadcast::channel(EVENT_BACKLOG).0,
+            outgoing,
+            probe: Mutex::new(None),
+        });
+        Ok((
+            Arc::new(RelaySession {
+                relay,
+                clock: Mutex::new(None),
+                socket: Mutex::new(None),
+            }),
+            incoming,
+        ))
+    }
+
+    /// What one lock-order probe saw. `held` is the property: the state lock was still taken as
+    /// the frame was handed over. `guard` and `poisoned` are the two other outcomes of the try,
+    /// kept apart so an assertion can name [`std::sync::TryLockError::WouldBlock`] specifically.
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "held, guard, poisoned and a panicked worker are four questions one probe answers"
+    )]
+    struct LockOrder {
+        held: bool,
+        guard: bool,
+        poisoned: bool,
+        fired: usize,
+        worker_panicked: bool,
+    }
+
+    /// How long the helper waits, after the probe has fired, for the worker to prove it
+    /// finished. A Rust thread cannot be killed, so a worker still running past this is
+    /// fail-stopped rather than joined; the deadline only matters on a worker that blocks.
+    const WORKER_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// How often the helper re-checks a worker's own threads-finished flag while it waits the
+    /// deadline out. The poll is a bounded liveness wait, not a proof about the lock.
+    const WORKER_POLL: Duration = Duration::from_millis(2);
+
+    /// The two things a worker can prove, both reaching the controller on one channel: that its
+    /// first handover fired the probe, or that the worker itself returned. A worker that
+    /// publishes nothing is told apart from one still running without a spin.
+    #[derive(Debug)]
+    enum WorkerSignal {
+        /// The probe fired on the worker's first handover.
+        Handover,
+        /// The worker's closure returned or unwound.
+        Finished,
+    }
+
+    /// Signals [`WorkerSignal::Finished`] however the worker's closure leaves: return, `?`, or
+    /// unwind. The signal tells the controller how the closure left; the join itself is gated
+    /// separately on the thread's own `is_finished`, which the closure's return does not set.
+    struct FinishedGuard(std_mpsc::Sender<WorkerSignal>);
+
+    impl Drop for FinishedGuard {
+        fn drop(&mut self) {
+            let _ = self.0.send(WorkerSignal::Finished);
+        }
+    }
+
+    /// Fail-stops the whole owned test process with a diagnostic. Rust cannot kill a std thread,
+    /// and joining one that is still running would hang the binary instead of reporting, so the
+    /// only outcome left for an otherwise unprovable worker is a loud stop. Test-only: nothing
+    /// in the product aborts, and no API changes.
+    fn fail_stop(what: &str) -> ! {
+        eprintln!("relay probe lock-order fail-stop: {what}");
+        abort()
+    }
+
+    /// Runs `run` on a worker thread and reports whether the state lock was held as the first
+    /// frame was handed to the socket's queue.
+    ///
+    /// The handover probe (armed here on this one relay instance) fires on the worker thread
+    /// immediately beside the socket push ([`Relay::push`]) and then waits on a bounded channel;
+    /// the test thread, seeing that, tries the state lock from outside. The relay has no socket
+    /// and no clock, so the worker is the only possible owner of that lock and a `WouldBlock` is
+    /// unambiguous.
+    ///
+    /// Cleanup is explicit and every wait is bounded. The probe's own wait is bounded, so a
+    /// controller that fails to release it cannot pin the worker, and the controller releases it
+    /// before any assertion. [`FinishedGuard`] tells the controller how the worker's closure left,
+    /// and the helper joins only after the worker's own thread proves it is finished through
+    /// `JoinHandle::is_finished` inside one [`WORKER_DEADLINE`] — a worker it cannot prove
+    /// finished that way is fail-stopped, never joined and never detached. A guard taken while
+    /// probing the lock is dropped within this call, so nothing is held across the join.
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "the bounded handover handshake keeps lock observation and release together"
+    )]
+    fn probe_lock_order<F>(relay: &Arc<RelaySession>, run: F) -> LockOrder
+    where
+        F: FnOnce(&Arc<RelaySession>) + Send + 'static,
+    {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let first = Arc::new(AtomicBool::new(true));
+        let (signal_tx, signal_rx) = std_mpsc::channel::<WorkerSignal>();
+        let (release_tx, release_rx) = std_mpsc::sync_channel::<()>(1);
+        let release = Arc::new(Mutex::new(release_rx));
+        {
+            let probe_fired = Arc::clone(&fired);
+            let probe_first = Arc::clone(&first);
+            let signal = signal_tx.clone();
+            let probe_release = Arc::clone(&release);
+            *lock(&relay.relay.probe) = Some(Box::new(move || {
+                probe_fired.fetch_add(1, Ordering::SeqCst);
+                if probe_first.swap(false, Ordering::SeqCst) {
+                    let _ = signal.send(WorkerSignal::Handover);
+                    if let Ok(released) = probe_release.lock() {
+                        let _ = released.recv_timeout(WAIT);
+                    }
+                }
+            }));
+        }
+
+        let worker_relay = Arc::clone(relay);
+        let finished = FinishedGuard(signal_tx);
+        let worker = spawn(move || {
+            let _finished = finished;
+            run(&worker_relay);
+        });
+        // The whole wait — classification and thread teardown — runs against one deadline.
+        let started = Instant::now();
+
+        let mut held = false;
+        let mut guard = false;
+        let mut poisoned = false;
+        match signal_rx.recv_timeout(WAIT) {
+            Ok(WorkerSignal::Handover) => {
+                match relay.relay.state.try_lock() {
+                    Ok(held_guard) => {
+                        drop(held_guard);
+                        guard = true;
+                    }
+                    Err(TryLockError::WouldBlock) => held = true,
+                    Err(TryLockError::Poisoned(_)) => poisoned = true,
+                }
+                let _ = release_tx.send(());
+                await_worker_finished(&signal_rx, started);
+            }
+            Ok(WorkerSignal::Finished) => {}
+            Err(_) => {
+                let _ = release_tx.send(());
+                fail_stop(
+                    "the worker neither handed a frame over nor finished",
+                );
+            }
+        }
+        // The closure's own `Finished` is sent before its captured state and TLS teardown run, so
+        // it is not the thread's completion. `is_finished` is set only once the thread itself is
+        // done: the join below is proven prompt before it is taken, and a thread still running at
+        // the deadline is fail-stopped, never joined and never detached.
+        prove_worker_finished(&worker, started);
+        let worker_panicked = worker.join().is_err();
+        LockOrder {
+            held,
+            guard,
+            poisoned,
+            fired: fired.load(Ordering::SeqCst),
+            worker_panicked,
+        }
+    }
+
+    /// Waits, bounded, for the worker's closure to report its own completion after its handover
+    /// was released, against the run's single `started` deadline. A worker that does not prove it
+    /// finished is fail-stopped rather than joined.
+    fn await_worker_finished(
+        signal_rx: &std_mpsc::Receiver<WorkerSignal>,
+        started: Instant,
+    ) {
+        let left = WORKER_DEADLINE
+            .saturating_sub(Instant::now().duration_since(started));
+        match signal_rx.recv_timeout(left) {
+            Ok(WorkerSignal::Finished) => {}
+            Ok(WorkerSignal::Handover) => {
+                fail_stop("the worker signalled a second handover");
+            }
+            Err(_) => fail_stop("the worker did not finish after its handover"),
+        }
+    }
+
+    /// Waits, bounded, for the worker *thread* itself to be finished, against the same run-wide
+    /// `started` deadline, so the join that follows is prompt. This is stricter than the closure's
+    /// own `Finished`: that signal fires while the thread still has captured state and TLS
+    /// teardown to run, and only `JoinHandle::is_finished` is set when the thread is truly done.
+    /// Polling is a bounded liveness wait, not a proof about the lock; a thread still running at
+    /// the deadline is fail-stopped, never joined and never detached.
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "every unfinished-thread poll checks the same bounded deadline"
+    )]
+    fn prove_worker_finished(worker: &ThreadHandle<()>, started: Instant) {
+        while !worker.is_finished() {
+            if Instant::now().duration_since(started) >= WORKER_DEADLINE {
+                fail_stop(
+                    "the worker's thread was not finished by the deadline",
+                );
+            }
+            thread_sleep(WORKER_POLL);
+        }
+    }
+
+    /// The caller's own path: [`RelaySession::moved`] runs a change and hands what it published
+    /// to the socket's queue under the same lock the change ran under. The probe makes that
+    /// decidable instead of a race — with the lock held it cannot be taken from outside, and a
+    /// push moved past the lock's release would hand the frame over with the lock free, which is
+    /// exactly the reordering [`Relay::queue`] exists to prevent.
+    #[test]
+    fn the_moved_path_hands_frames_over_under_the_lock_that_numbered_them() {
+        let (relay, _incoming) =
+            unwired_relay(keepalive()).expect("the relay seats");
+        let order = probe_lock_order(&relay, |worker_relay| {
+            let _ = worker_relay.moved(|_state| Ok(()));
+        });
+        assert!(
+            !order.worker_panicked,
+            "the worker finished without panicking"
+        );
+        assert!(
+            order.fired >= 1,
+            "the queue was nonempty and the probe fired"
+        );
+        assert!(
+            !order.guard,
+            "the handover ran with the state lock released"
+        );
+        assert!(!order.poisoned, "the state lock was not poisoned");
+        assert!(
+            order.held,
+            "TryLockError::WouldBlock: the state lock was still held at the handover"
+        );
+    }
+
+    /// The socket task's own path: [`Relay::delivered`] applies a sealed frame and hands what the
+    /// delivery published to the queue under the state lock, the same property as the caller's
+    /// path above and reached through the method the socket task itself calls.
+    #[test]
+    fn the_delivered_path_hands_frames_over_under_the_lock_that_numbered_them()
+    {
+        let (relay, _incoming) =
+            unwired_relay(keepalive()).expect("the relay seats");
+        let frame = content_frame(&SessionKey::from_seed(HOST_SEED), 1, "x");
+        let order = probe_lock_order(&relay, move |worker_relay| {
+            let inner = Arc::clone(&worker_relay.relay);
+            let _ = inner.delivered(&frame);
+        });
+        assert!(
+            !order.worker_panicked,
+            "the worker finished without panicking"
+        );
+        assert!(
+            order.fired >= 1,
+            "the queue was nonempty and the probe fired"
+        );
+        assert!(
+            !order.guard,
+            "the handover ran with the state lock released"
+        );
+        assert!(!order.poisoned, "the state lock was not poisoned");
+        assert!(
+            order.held,
+            "TryLockError::WouldBlock: the state lock was still held at the handover"
+        );
+    }
+
+    /// The helper's own control: a worker that hands nothing over never fires the probe, and the
+    /// helper reads that from the worker's completion signal and returns instead of waiting on
+    /// it. A helper that assumed a frame was handed over — or joined the worker without proof it
+    /// had returned — could not pass this bounded control.
+    #[test]
+    fn the_lock_order_probe_reports_a_worker_that_handed_nothing_over() {
+        let (relay, _incoming) =
+            unwired_relay(keepalive()).expect("the relay seats");
+        let order = probe_lock_order(&relay, |_relay| {});
+        assert!(
+            !order.worker_panicked,
+            "the worker finished without panicking"
+        );
+        assert_eq!(
+            order.fired, 0,
+            "nothing was handed over, so the probe never fired"
+        );
+        assert!(!order.held, "no handover means no lock was held at one");
+        assert!(!order.guard, "the controller did not take the state lock");
+        assert!(!order.poisoned, "the state lock was not poisoned");
+    }
+
     /// The server end: what the client sent, until the socket ends, and what this end puts on
     /// the wire back to it.
     #[expect(
@@ -1595,6 +1983,7 @@ mod tests {
                                 key_id: envelope.key_id,
                                 kind: envelope.kind,
                                 counter: envelope.counter,
+                                frame: frame.to_vec(),
                             });
                         }
                     }
@@ -1693,6 +2082,130 @@ mod tests {
             .collect()
     }
 
+    /// How many `kind = 0` (content) frames one key signed reached the server end.
+    fn content_frames(arrived: &Mutex<Vec<Arrived>>, key: KeyId) -> usize {
+        lock(arrived)
+            .iter()
+            .filter(|frame| {
+                matches!(
+                    frame,
+                    Arrived::Sealed { key_id, kind: 0, .. } if *key_id == key
+                )
+            })
+            .count()
+    }
+
+    /// The kinds of one key's frames in a slice, in the order the socket delivered them.
+    fn kinds_of(arrived: &[Arrived], key: KeyId) -> Vec<u64> {
+        arrived
+            .iter()
+            .filter_map(|frame| match frame {
+                Arrived::Sealed { key_id, kind, .. } if *key_id == key => {
+                    Some(*kind)
+                }
+                Arrived::Sealed { .. } | Arrived::Text => None,
+            })
+            .collect()
+    }
+
+    /// How many frames of one kind from one key are in a slice.
+    fn own_kind_count(arrived: &[Arrived], key: KeyId, kind: u64) -> usize {
+        kinds_of(arrived, key)
+            .iter()
+            .filter(|seen| **seen == kind)
+            .count()
+    }
+
+    /// The sync message kind of a `kind = 0` frame: `0` is §13.1's step-6 `SyncStep1`, `2` is a
+    /// content `Update`, and the two share the envelope's kind (`CANONICAL.md` §6.1).
+    ///
+    /// The bytes are opened with this test's own room key and the sync kind is read from the
+    /// plaintext with the crate's own `varUint` reader, the way the peer tests classify a
+    /// published frame: nothing here re-implements the envelope, the AEAD or a byte offset. A
+    /// frame that will not open or parse, or a message that is not this sync kind, fails the
+    /// test rather than reading as "not an update".
+    fn sync_message_kind(frame: &[u8]) -> u64 {
+        let envelope = Envelope::parse(frame)
+            .expect("a kind-0 frame parses as an envelope");
+        assert_eq!(
+            envelope.kind, 0,
+            "this reads a content frame, and every kind-0 frame shares this classifier: \
+             {envelope:?}"
+        );
+        let plaintext =
+            opens(&RoomKey([7; 32]).frame_key(ROOM), ROOM, &envelope)
+                .expect("this test's own room key opens the frame it sealed");
+        assert_eq!(
+            plaintext.first(),
+            Some(&0),
+            "a sync frame's message type is the only kind these frames carry"
+        );
+        let (kind, _) = read_varuint(&plaintext, 1)
+            .expect("the sync message carries a well-formed kind");
+        kind
+    }
+
+    /// The sync message kinds of one key's `kind = 0` frames, in the order they reached the
+    /// server end. Each frame is opened and parsed, so a frame that will not is a failure rather
+    /// than a `false`: this classifies the handshake against the flush instead of merely
+    /// excluding the one it expects.
+    fn own_sync_message_kinds(arrived: &[Arrived], key: KeyId) -> Vec<u64> {
+        arrived
+            .iter()
+            .filter_map(|frame| match frame {
+                Arrived::Sealed {
+                    key_id,
+                    kind: 0,
+                    frame: bytes,
+                    ..
+                } if *key_id == key => Some(sync_message_kind(bytes)),
+                Arrived::Sealed { .. } | Arrived::Text => None,
+            })
+            .collect()
+    }
+
+    /// How many text frames reached the server end.
+    fn text_frames(arrived: &Mutex<Vec<Arrived>>) -> usize {
+        lock(arrived)
+            .iter()
+            .filter(|frame| matches!(frame, Arrived::Text))
+            .count()
+    }
+
+    /// The frames between two ordered text fences, by 0-based fence index: `from` is the fence
+    /// after the cut and `to` the fence that closes it. `0` means before the first text frame.
+    ///
+    /// A text frame is what the session queues behind everything the session published ahead of
+    /// it, so when it reaches the server end the frames before it are a complete interval and not
+    /// a prefix of one.
+    fn between_fences(
+        arrived: &[Arrived],
+        from: usize,
+        to: usize,
+    ) -> Vec<Arrived> {
+        let fences: Vec<usize> = arrived
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| matches!(frame, Arrived::Text))
+            .map(|(index, _)| index)
+            .collect();
+        let start = if from == 0 {
+            0
+        } else {
+            fences
+                .get(from.saturating_sub(1))
+                .map_or(arrived.len(), |at| at.saturating_add(1))
+        };
+        let end = fences.get(to).map_or(arrived.len(), |at| *at);
+        let begin = start.min(end);
+        arrived
+            .iter()
+            .skip(begin)
+            .take(end.saturating_sub(begin))
+            .cloned()
+            .collect()
+    }
+
     /// Whether a frame of this kind reached the server end.
     fn sent_kind(arrived: &Mutex<Vec<Arrived>>, kind: u64) -> bool {
         sent_kinds(arrived, kind) > 0
@@ -1782,10 +2295,14 @@ mod tests {
     }
 
     /// How many edits a guest makes before the state that commits its key arrives. §13.1's step
-    /// 4 flushes every one of them as a single report, and a report this size is what makes the
-    /// race below decidable: the window a wrong arrangement leaves is the push loop the report
+    /// 4 flushes every held edit as its own content frame, and a set this size is what makes the
+    /// race below worth running: the window a wrong arrangement leaves is the push loop the flush
     /// is handed over in, and one frame makes that window a function call wide.
-    const HELD_EDITS: usize = 8_000;
+    const HELD_EDITS: usize = 512;
+
+    /// A held set small enough that the flush's exact frame count is a fixed number rather than
+    /// a function of how fast a machine drained the socket.
+    const HELD_SMALL: usize = 4;
 
     /// One frame this end seals itself, as the session's own `sealed_frame` does: the room's
     /// frame key, the kind, a counter under the key that signs it.
@@ -1904,16 +2421,14 @@ mod tests {
         Ok(())
     }
 
-    /// The socket task's half: a report `deliver` publishes is handed to the socket under
-    /// the guard that numbered its frames, exactly as a caller's own edit is.
+    /// The socket task's half: what `deliver` publishes is handed to the socket under the guard
+    /// that numbered the frames, exactly as a caller's own edit is.
     ///
-    /// The report is a guest's whole held-back set. §13.1's step 4 keeps every edit made before
-    /// a state commits this connection's key, and the state that commits it puts all of them on
-    /// the wire in one report — published from the socket task's own `delivered`, which is the
-    /// side of the lock that a fixture whose server end only ever listens cannot reach. The
-    /// editors above race each other; this races an editor against that report, and the
-    /// property is the same: a frame the report numbered must not arrive behind one the editor
-    /// numbered later.
+    /// The state that commits a guest's key is what takes it out of §13.1's step 4, and the whole
+    /// held-back set flushes with it, in one locked burst, from the socket task's own `delivered` —
+    /// the side of the lock a fixture that only ever listens cannot reach. The editors above race
+    /// each other; this races an editor against that flush, and the property is the same: a frame
+    /// the flush numbered must not arrive behind one the editor numbered later.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reports_frames_are_handed_over_under_the_lock_that_numbered_them()
     -> Result<(), Box<dyn StdError>> {
@@ -1928,10 +2443,20 @@ mod tests {
             fixture.feed(Message::binary(committing_state())),
             "the committing state reaches the client's socket"
         );
+        // The state's delivery is the flush's own trigger and they run in one locked burst, so
+        // the delivery completing is the explicit event the sentinel depends on: a sentinel
+        // queued before it could precede the report, because `rename` takes the state lock only
+        // to number its request and the flush happens under that same lock. `applied_role`
+        // becoming set is that delivery — and the flush with it — having run to completion.
+        assert!(
+            held_within(WAIT, || fixture.relay.applied_role().is_some()).await,
+            "the committing state is delivered and its held set flushed"
+        );
         joined(vec![editor], "editor");
 
-        // The same sentinel as above: a text frame the session sends after the last edit says
-        // the queue holds none of theirs any more.
+        // The sentinel, now that the report is on the wire: a text frame the session sends after
+        // the last edit says the queue holds none of theirs any more, and it can trail only what
+        // already left.
         fixture.relay.rename("done")?;
         let arrived = Arc::clone(&fixture.arrived);
         assert!(
@@ -1949,6 +2474,127 @@ mod tests {
             counters.len()
         );
         the_counters_advance(&counters);
+        fixture.end_the_socket();
+        Ok(())
+    }
+
+    /// A small held set on a real socket, cut by ordered fences rather than polled for a count:
+    /// the state that commits this connection's key hands over §13.1's step-6 handshake and one
+    /// content frame per held edit in one locked burst, and the next local publish follows them.
+    ///
+    /// The delivery's own completion is read from `applied_role`, which is taken under the same
+    /// state lock the delivery runs under, so seeing it set is the delivery having numbered and
+    /// queued every frame it owes. That is not yet a wire fact, so a text frame the session
+    /// queues behind the delivery is the cut: when it reaches the server end, the delivery's whole
+    /// interval is there and not a prefix of it. A second fence after a local edit cuts that edit
+    /// off from everything else. The handshake and the flush share kind 0, so the assertion opens
+    /// each kind-0 frame and tells the `SyncStep1` apart from a content `Update`; counting kind-0
+    /// frames and polling for a number would pass on a prefix and could also hang on a full set
+    /// that had already arrived.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one socket's whole commit-to-next-edit interval, cut by two fences, is one flow"
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_committing_state_flushes_the_held_set_and_the_next_edit_follows_it()
+    -> Result<(), Box<dyn StdError>> {
+        // A slow renewal keeps the clock task out of the window: at the reference period it
+        // re-announces every millisecond, and the interval below would then carry frames the
+        // delivery did not publish.
+        let slow = KeepaliveConfig {
+            awareness_renew: Duration::from_secs(60),
+            awareness_expire: Duration::from_secs(120),
+        };
+        let mut fixture = guest_fixture(slow).await?;
+        fixture.relay.open(PATH)?;
+        hold_edits(&fixture.relay, HELD_SMALL)?;
+        let own = SessionKey::from_seed(OWN_SEED).public().id();
+        let arrived = Arc::clone(&fixture.arrived);
+        assert_eq!(
+            content_frames(&arrived, own),
+            0,
+            "§13.1's step 4 publishes none of the held content before the state"
+        );
+
+        assert!(
+            fixture.feed(Message::binary(committing_state())),
+            "the committing state reaches the client's socket"
+        );
+        assert!(
+            held_within(WAIT, || fixture.relay.applied_role().is_some()).await,
+            "the committing state is delivered and its held set flushed"
+        );
+
+        // Fence A: the session queues this text frame behind everything the delivery handed over,
+        // so its arrival is the delivery's complete interval.
+        fixture.relay.rename("fence-a")?;
+        assert!(
+            held_within(WAIT, || text_frames(&arrived) >= 1).await,
+            "the first fence arrives: {:?}; ending {:?}; failure {:?}",
+            fixture.arrived(),
+            fixture.relay.ending(),
+            fixture.relay.failure(),
+        );
+
+        let committed = between_fences(&fixture.arrived(), 0, 0);
+        // Positively classified, not merely counted: the step-6 handshake (`SyncStep1`, kind 0)
+        // ahead of one content `Update` (kind 2) per held edit, in that order. A classifier that
+        // merely returned "not an update" would accept a broken frame or a `SyncStep2` as the
+        // handshake, and a poll for a kind-0 count would pass on a prefix.
+        let mut delivery = vec![0_u64];
+        delivery.resize(HELD_SMALL + 1, 2_u64);
+        assert_eq!(
+            own_sync_message_kinds(&committed, own),
+            delivery,
+            "the delivery's own frames before the fence: the handshake then one update per \
+             held edit: {committed:?}"
+        );
+        assert_eq!(
+            own_kind_count(&committed, own, 0),
+            HELD_SMALL + 1,
+            "the delivery's kind-0 frames, handshake and flush together: {committed:?}"
+        );
+        assert_eq!(
+            own_kind_count(&committed, own, 3),
+            1,
+            "and the holds message follows the flush: {committed:?}"
+        );
+        the_counters_advance(&counters_of(&committed, own));
+
+        // Now that a state commits this key, a local edit goes out at once and follows the flush.
+        assert!(
+            fixture.relay.insert(PATH, 0, "y")?,
+            "a writer publishes its own edit"
+        );
+        // Fence B cuts the single local edit off from anything after it.
+        fixture.relay.rename("fence-b")?;
+        assert!(
+            held_within(WAIT, || text_frames(&arrived) >= 2).await,
+            "the second fence arrives: {:?}; ending {:?}; failure {:?}",
+            fixture.arrived(),
+            fixture.relay.ending(),
+            fixture.relay.failure(),
+        );
+
+        let after = between_fences(&fixture.arrived(), 1, 1);
+        assert_eq!(
+            kinds_of(&after, own),
+            vec![0],
+            "between the fences exactly the one local content frame went out: {after:?}"
+        );
+        assert_eq!(
+            own_sync_message_kinds(&after, own),
+            vec![2_u64],
+            "and it is a content update, not a second handshake: {after:?}"
+        );
+        the_counters_advance(&counters_of(&after, own));
+        assert_eq!(
+            content_frames(&arrived, own),
+            HELD_SMALL + 2,
+            "the handshake, the whole held set and the edit: {} kind-0 frames",
+            content_frames(&arrived, own)
+        );
+        the_counters_advance(&counters_of(&fixture.arrived(), own));
         fixture.end_the_socket();
         Ok(())
     }
