@@ -41,9 +41,11 @@ name: release
 # runs, anything is pushed or anything is dispatched — and prints the whole plan. A
 # path this long should be rehearsable before its first run.
 #
-# **Every step after the plan carries `if: inputs.dry_run != true`.** That is the whole
-# of what makes the plan's promise true: a condition on the plan step alone leaves every
-# step after it free to do exactly what the plan says was not done.
+# **The plan is a job of its own, and the release job carries `if: inputs.dry_run != true`
+# whole.** The plan job holds a read-only token and prints what the release would do; every
+# write is in the release job, which a dry run never reaches. That split is what makes the
+# plan's promise true: a condition on the plan step alone would leave the steps after it
+# free to do exactly what the plan says was not done.
 # `scripts/check_dry_run_gating.py` reads this file back and refuses a workflow where a
 # step after the plan can still run on a dry run, because no other check can see it:
 # every such step is a valid expression.
@@ -68,26 +70,27 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-# `contents: write` pushes the bump and the tag; `actions: write` is what lets
-# this run dispatch `image.yml` and `deploy-prod.yml` at all.
-permissions:
-  contents: write
-  actions: write
+# Nothing by default; each job names what it needs. `plan` reads, and only `release`
+# below holds the token that pushes the bump and the tag.
+permissions: {}
 
 jobs:
-  release:
+  plan:
     runs-on: ubuntu-24.04
-    # The gate is a cold Nix store plus a full build on a runner that has never
-    # seen this flake, and the image it publishes is waited for afterwards.
-    timeout-minutes: 90
+    timeout-minutes: 15
+    # The dispatch is checked, the released version is read, the next one is computed and
+    # checked free, and a dry run prints the plan — all reads. Nothing here writes,
+    # commits, tags, pushes or dispatches, so the job holds a read-only token and the
+    # checkout leaves no credential on disk.
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+      current: ${{ steps.current.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The token in `.git/config` is what pushes the bump and the tag below.
-          persist-credentials: true
-          # Every tag, and the whole history: the last step compares `deploy/`
-          # against the previous release's tag, which has to be a local ref for it.
-          fetch-depth: 0
+          persist-credentials: false
 
       # `git push origin HEAD:main` is how the bump lands. A dispatch at another
       # branch would push that branch, so the ref is checked rather than assumed;
@@ -175,8 +178,30 @@ jobs:
                        if deploy/ changed since v$CURRENT
           EOF
 
+  release:
+    needs: plan
+    # A dry run ends with the plan: nothing below it runs, and nothing holding a write
+    # token runs for a dry run.
+    if: inputs.dry_run != true
+    runs-on: ubuntu-24.04
+    # The gate is a cold Nix store plus a full build on a runner that has never
+    # seen this flake, and the image it publishes is waited for afterwards.
+    timeout-minutes: 90
+    # `contents: write` pushes the bump and the tag; `actions: write` is what lets
+    # this run dispatch `image.yml` and `deploy-prod.yml` at all.
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The token in `.git/config` is what pushes the bump and the tag below.
+          persist-credentials: true
+          # Every tag, and the whole history: the last step compares `deploy/`
+          # against the previous release's tag, which has to be a local ref for it.
+          fetch-depth: 0
+
       - name: bump the version this release carries
-        if: inputs.dry_run != true
         env:
           BUMP: ${{ inputs.bump }}
         run: scripts/bump-version.sh "$BUMP"
@@ -186,9 +211,8 @@ jobs:
       # commit, and an uncommitted bump is not one. Nothing is pushed until the
       # gate is green, so the commit that reaches main is still the validated one.
       - name: commit the bump as the repository's author
-        if: inputs.dry_run != true
         env:
-          VERSION: ${{ steps.next.outputs.version }}
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
           git -c user.name='DontBlameMe' \
@@ -199,12 +223,10 @@ jobs:
       # The same toolchain and store cache the `ci` workflow uses, so a release
       # pays for the flake once and a warm store on the next one.
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
-        if: inputs.dry_run != true
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: restore and save the Nix store
-        if: inputs.dry_run != true
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
@@ -213,14 +235,12 @@ jobs:
       # `scripts/ci-local.sh checks` is the `checks` job of `ci.yml`, command for
       # command, and it is the whole of why this workflow pushes to main itself.
       - name: this repository's own gate, as CI runs it
-        if: inputs.dry_run != true
         run: scripts/ci-local.sh checks
 
       - name: push the bump and its tag, and run image.yml at it
-        if: inputs.dry_run != true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.next.outputs.version }}
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
           tag="v$VERSION"
@@ -243,9 +263,8 @@ jobs:
       # registry by then. So this waits on the registry itself, anonymously, and a
       # deadline that cannot pass says what it last saw rather than looking hung.
       - name: wait for the image this release published
-        if: inputs.dry_run != true
         env:
-          VERSION: ${{ steps.next.outputs.version }}
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
           # The host is built out of a variable rather than written into an address:
@@ -290,11 +309,10 @@ jobs:
       # standing beside a red deploy. The deploy verifies the origin itself, so
       # nothing here re-reads `/meta`.
       - name: hand the release to the public demo, and fail when the deploy fails
-        if: inputs.dry_run != true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.next.outputs.version }}
-          PREVIOUS: ${{ steps.current.outputs.version }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          PREVIOUS: ${{ needs.plan.outputs.current }}
         run: |
           set -euo pipefail
           args=(-f "server_version=$VERSION")
