@@ -111,7 +111,9 @@ jobs:
           set -euo pipefail
           version=$(scripts/release-tags.sh | sed -n 's/^version=//p')
           echo "version=$version" >>"$GITHUB_OUTPUT"
-          if ! git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+          remote=$(git ls-remote --refs --tags origin "refs/tags/v$version")
+          remote=$(printf '%s\n' "$remote" | awk -v ref="refs/tags/v$version" '$2 == ref')
+          if [ -z "$remote" ]; then
             {
               echo "refusing: Cargo.toml carries $version and the remote has no tag v$version."
               echo
@@ -137,7 +139,9 @@ jobs:
           set -euo pipefail
           # The last line of stdout is the version, and the only line on it.
           next=$(scripts/bump-version.sh "$BUMP" --dry-run | tail -n 1)
-          if git ls-remote --exit-code --tags origin "refs/tags/v$next" >/dev/null 2>&1; then
+          remote=$(git ls-remote --refs --tags origin "refs/tags/v$next")
+          remote=$(printf '%s\n' "$remote" | awk -v ref="refs/tags/v$next" '$2 == ref')
+          if [ -n "$remote" ]; then
             {
               echo "refusing: v$next already exists on the remote; nothing was written or pushed."
               echo
@@ -200,6 +204,30 @@ jobs:
           # Every tag, and the whole history: the last step compares `deploy/`
           # against the previous release's tag, which has to be a local ref for it.
           fetch-depth: 0
+
+      # A release-only retry can reuse a successful plan after remote tags changed.
+      - name: recheck release tag preconditions before bumping
+        env:
+          TARGET: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          current=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ -z "$current" ]; then
+            echo "refusing: could not read the original version from Cargo.toml" >&2
+            exit 1
+          fi
+          current_tag=$(git ls-remote --refs --tags origin "refs/tags/v${current}")
+          current_tag=$(printf '%s\n' "$current_tag" | awk -v ref="refs/tags/v${current}" '$2 == ref')
+          target_tag=$(git ls-remote --refs --tags origin "refs/tags/v${TARGET}")
+          target_tag=$(printf '%s\n' "$target_tag" | awk -v ref="refs/tags/v${TARGET}" '$2 == ref')
+          if [ -z "$current_tag" ]; then
+            echo "refusing: the remote no longer has the current release tag v${current}; nothing was bumped" >&2
+            exit 1
+          fi
+          if [ -n "$target_tag" ]; then
+            echo "refusing: target tag v${TARGET} already exists on the remote; nothing was bumped" >&2
+            exit 1
+          fi
 
       - name: bump the version this release carries
         env:
