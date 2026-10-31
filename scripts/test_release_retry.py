@@ -205,8 +205,9 @@ class ReleaseRetryTests(unittest.TestCase):
                 with self.subTest(ref=ref, status=status):
                     self.remote({CURRENT_REF: "a" * 40, ref: status})
                     result = self.plan()
-                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                     self.assertIn("remote read failed", result.stderr)
+                    self.assertNotIn("refusing", result.stderr)
                     self.assertFalse((self.root / "bump.log").exists())
 
     def remote_calls(self):
@@ -246,7 +247,9 @@ class ReleaseRetryTests(unittest.TestCase):
                 with self.subTest(ref=ref, status=status):
                     self.remote({CURRENT_REF: "a" * 40, ref: status})
                     result = self.assert_refused()
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                     self.assertIn("remote read failed", result.stderr)
+                    self.assertNotIn("refusing", result.stderr)
 
     def test_cached_current_cannot_substitute_for_original_manifest(self):
         original = ORIGINAL.replace("1.2.3", "1.2.2")
