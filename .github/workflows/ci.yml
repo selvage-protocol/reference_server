@@ -162,6 +162,9 @@ jobs:
       - name: the release workflow's dry_run gating
         run: nix build .#checks.x86_64-linux.dry-run-gating --no-link --print-build-logs
 
+      - name: release-only retries recheck remote tags before bumping
+        run: nix build .#checks.x86_64-linux.release-retry --no-link --print-build-logs
+
       # Unknown actions, bad expressions and shell mistakes, caught before the run.
       - name: lint the workflows
         run: nix develop . -c actionlint

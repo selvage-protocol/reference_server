@@ -124,6 +124,8 @@ job_checks() {
   # one where a step after the plan can still run on a dry run.
   say "checks: the release workflow's dry_run gating"
   nix build .#checks.x86_64-linux.dry-run-gating --no-link --print-build-logs
+  say "checks: release-only retries recheck remote tags before bumping"
+  nix build .#checks.x86_64-linux.release-retry --no-link --print-build-logs
   say "checks: lint the workflows"
   nix develop . -c actionlint
   # The same check the pre-commit hook runs: a commit made outside the dev shell cannot

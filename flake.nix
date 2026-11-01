@@ -352,6 +352,23 @@
               touch $out
             '';
 
+          # Exercise plan, retry and exact remote tag checks without publishing.
+          release-retry =
+            pkgs.runCommand "release-retry-test" {
+              nativeBuildInputs = [
+                (pkgs.python3.withPackages (ps: [ps.pyyaml]))
+                pkgs.bash
+                pkgs.coreutils
+                pkgs.gnused
+                pkgs.gawk
+                pkgs.git
+              ];
+            } ''
+              RELEASE_WORKFLOW=${./.github/workflows/release.yml} \
+                python3 -B ${./scripts/test_release_retry.py}
+              touch $out
+            '';
+
           # The guard around a workflow's `dry_run` input: a plan step prints what a
           # real run would do, and every step after it has to be excluded from a dry
           # run. `actionlint` lints those
