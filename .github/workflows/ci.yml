@@ -22,6 +22,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       candidate: ${{ steps.revisions.outputs.candidate }}
+      checker: ${{ steps.revisions.outputs.checker }}
       specification: ${{ steps.revisions.outputs.specification }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -33,18 +34,26 @@ jobs:
         with:
           repository: selvage-protocol/specification
           ref: 12795c817566897d0af4c13877d229f4555581f8
+          path: contract-checker
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: selvage-protocol/specification
+          ref: main
           path: specification
           persist-credentials: false
       - name: record the contract revisions
         id: revisions
         run: |
           candidate=$(git -C reference_server rev-parse HEAD)
+          checker=$(git -C contract-checker rev-parse HEAD)
           specification=$(git -C specification rev-parse HEAD)
           echo "candidate=$candidate" | tee -a "$GITHUB_OUTPUT"
+          echo "checker=$checker" | tee -a "$GITHUB_OUTPUT"
           echo "specification=$specification" | tee -a "$GITHUB_OUTPUT"
       - name: public workspace contracts against the candidate
         run: >-
-          python3 specification/scripts/check-workspace.py --workspace .
+          python3 contract-checker/scripts/check-workspace.py --workspace .
           --consumer reference_server --revision reference_server=HEAD --revision specification=HEAD
 
   checks:

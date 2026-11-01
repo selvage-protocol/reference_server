@@ -62,6 +62,11 @@ Recover the failed stage rather than dispatching a new bump blindly:
 - **Image exists, demo deploy failed:** inspect the deploy's origin/read-back
   failure, then retry the bounded deploy at `main` with the intended version
   and shape input. Another release dispatch would compute a new version.
+- **Image exists, GitHub Release missing:** the image workflow creates the
+  GitHub Release in a separate job; the image and even the deployed demo can
+  exist while that job is red. Inspect its failure, then rerun `image.yml` at
+  the existing `v<version>` tag as above to create the missing release. Do not
+  dispatch another version bump merely to recover the release record.
 - **Atomic push refused:** reconcile with current `main` and tags before
   planning again. Do not force the old candidate over concurrent work.
 
