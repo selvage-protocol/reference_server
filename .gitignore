@@ -7,3 +7,4 @@ __pycache__
 
 # Sibling checkouts for parallel work on this repository.
 .worktrees/
+scripts/demo/out

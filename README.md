@@ -104,8 +104,23 @@ connection.
 `--help` prints the usage line, a short description of the server, and every flag
 with its default. `--version` prints `selvaged/<version>`.
 
+## A room in one command
+
+`scripts/demo/demo.sh` starts a server, a room, two Neovim windows in it, the browser page, and
+an agent when asked for one: the folder it shares is a copy, and what a machine cannot open is
+printed rather than skipped.
+
+```sh
+scripts/demo/demo.sh
+```
+
+[The demo, and its recording](docs/demo.md) has what it starts, the flags, and the 78-second
+recording of one run — two editors typing in one file at once, a page as a third seat, and an MCP
+agent editing the same file.
+
 ## More
 
+- [The demo, and its recording](docs/demo.md): the one command, and what it starts.
 - [What it prints, and its flags](docs/running.md): the startup line and the flag defaults.
 - [What happens at a limit](docs/limits-and-sizing.md): what a peer sees, and how to size a box.
 - [The server's shape](docs/the-server.md): rooms in memory, the grace period and `/meta`.

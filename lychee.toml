@@ -37,6 +37,11 @@ exclude = [
   # browser speaks. No such host exists to answer, and `ws://` is already
   # unsupported rather than checked.
   "^https?://h[:/]",
+  # The demo's own address is `127.0.0.1` and a port the script was given: the
+  # `demo.sh` and `record.sh` lines that carry it are read as a link by the hook,
+  # which is handed every staged text file, and there is nothing for lychee to
+  # fetch in a `$port`.
+  "^wss?://127\\.0\\.0\\.1[:/]",
 ]
 # `vectors/` is vendored test data, not this repository's prose: the specification
 # authors it, and the hook is handed every staged text file, so a vector's prose may
