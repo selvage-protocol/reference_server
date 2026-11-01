@@ -339,7 +339,7 @@ fn forward(stdout: ChildStdout, sender: &Sender<String>) {
 }
 
 impl Drop for Subject {
-    /// A test that fails must not leave a child behind: `AGENTS.md` §5 bounds every spawn.
+    /// A failed test must release its child so it cannot keep the harness alive.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();

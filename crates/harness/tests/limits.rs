@@ -8,9 +8,8 @@
 //! entry disagree.
 //!
 //! The file is vendored inside the Cargo workspace and handed in as `SELVAGE_LIMITS`, because
-//! the Nix sandbox receives only the workspace and a test that reads outside it fails there
-//! (`ai_notes/AGENTS.md` §2). A missing file or a missing entry is a failure, not a skip: a pin
-//! that reaches nothing reports a clean tree (§4).
+//! the Nix sandbox receives only the workspace. A missing file or entry must fail rather
+//! than silently skip the comparison.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -56,8 +55,8 @@ fn path() -> PathBuf {
 /// The published bounds by name.
 ///
 /// A file that is missing, unreadable, empty, malformed or names a bound twice is an error
-/// rather than a smaller run: a pin that reads nothing would otherwise report a clean tree
-/// (`ai_notes/AGENTS.md` §4). The caller turns it into the test's failure.
+/// rather than a smaller run: a pin that reads nothing would otherwise report a clean tree.
+/// The caller turns it into the test's failure.
 fn published() -> Result<Bounds, String> {
     let path = path();
     let text = fs::read_to_string(&path).map_err(|error| {
