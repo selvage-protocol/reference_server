@@ -6,6 +6,8 @@
 #   scripts/demo/demo.sh --port 9000     # a port other than 8080
 #   scripts/demo/demo.sh --keep          # keep the shared folder and logs when it exits
 #   scripts/demo/demo.sh --agent         # ...and an MCP agent joining and editing, in a terminal
+#   scripts/demo/demo.sh --no-terminal   # the clients run, but no window is opened for them
+#   scripts/demo/demo.sh --no-browser    # do not open the invite in a browser
 #
 # The shared folder is a copy of `scripts/demo/workspace/` under a temporary directory, so a
 # demo leaves nothing in the checkout. What a machine cannot open is printed rather than
@@ -36,7 +38,7 @@ while (($# > 0)); do
     --agent) with_agent=1; shift ;;
     --no-browser) open_browser=0; shift ;;
     --no-terminal) use_terminal=0; shift ;;
-    -h|--help) sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "demo.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done

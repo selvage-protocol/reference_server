@@ -26,7 +26,7 @@ while (($# > 0)); do
   case "$1" in
     --out) out=${2:?--out needs a path}; shift 2 ;;
     --from-frames) from_frames=1; shift ;;
-    -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "record.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
