@@ -111,6 +111,8 @@ with its default. `--version` prints `selvaged/<version>`.
 - [The server's shape](docs/the-server.md): rooms in memory, the grace period and `/meta`.
 - [The first room](docs/rooms.md): who mints a room, and which clients host or join.
 - [Deploying](docs/deploying.md): the addresses a client dials, the bind and TLS.
+- [Operating the demo](docs/operating-the-demo.md): provisioning, the CI privilege boundary, verification, and recovery.
+- [Publishing](docs/publishing.md): version tags, release gates, and partial-release recovery.
 - [Serving the page](docs/serving-the-page.md): `--serve-page` and the served headers.
 - [Licence](docs/licence.md): what each path is under, and what the image carries.
 
