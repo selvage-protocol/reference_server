@@ -113,7 +113,7 @@ jobs:
             /usr/share/dotnet || true
           df -h /
 
-      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -168,7 +168,7 @@ jobs:
 
       # The Dockerfile needs no nix: its builder stage is Docker's own
       # cross-toolchain image. The dev shell is here for the client engine.
-      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
