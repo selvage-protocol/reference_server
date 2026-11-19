@@ -279,8 +279,7 @@ jobs:
           gh workflow run image.yml --ref "$tag"
 
       # A green `publish` job is not the image existing: the run is queued before
-      # the build starts, and the deploy below names a tag that has to be in the
-      # registry by then. So this waits on the registry itself, anonymously, and a
+      # the build starts, so this waits on the registry itself, anonymously, and a
       # deadline that cannot pass says what it last saw rather than looking hung.
       - name: wait for the image this release published
         env:
