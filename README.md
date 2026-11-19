@@ -3,7 +3,7 @@
 A Rust workspace for the Selvage Session Protocol. `selvaged` is a memory-only
 reference server that seats peers in a room and relays sealed frames it cannot
 read; the client library the protocol is proved with lives beside it. This
-repository is the protocol's reference implementation.
+repository is the protocol's reference implementation. A client with a host-run relay does not need this process for its own room. With the editor clients documented in `docs/rooms.md`, the host starts `selvaged` separately or joins an existing server, then gives the editor its address. `selvaged` is kept as the conformance server the wire vectors replay against and as an optional standalone relay for testing. See the [specification](https://github.com/selvage-protocol/specification)'s `docs/peer-host-relay.md`; guests reach a host-run relay over Tailscale or a LAN.
 
 ## Get it working
 
