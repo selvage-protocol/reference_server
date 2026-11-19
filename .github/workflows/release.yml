@@ -1,7 +1,7 @@
 name: release
 
-# The button that cuts a release: the bump word in, and the version, the tag, the
-# image and the public demo's pin out.
+# The button that cuts a release: the bump word in, and the version, the tag and the
+# image out.
 #
 # A manual dispatch takes `patch`, `minor` or `major`, computes the next version
 # from the one `Cargo.toml` already carries, and **refuses unless that version is
@@ -27,15 +27,10 @@ name: release
 # commit that is about to land, before anything is pushed.
 #
 # Every event a workflow creates with that token is invisible to Actions, so the
-# tag push starts nothing either and the two dispatches below are explicit:
+# tag push starts nothing either, so the dispatch below is explicit:
 # `gh workflow run image.yml --ref "v<version>"` is the event the loop-prevention
-# rule exempts, and `deploy-prod.yml` is asked for by name once the image it names
-# actually exists on GHCR. That last dispatch is watched: `gh workflow run` prints
-# no run id, so `scripts/wait_for_deploy.py` reads the workflow's runs, dispatches,
-# and waits for the run the dispatch created — a release that says the demo moved
-# fails unless that run concludes `success`, rather than standing green beside a
-# red deploy. `deploy-prod.yml` does its own verification of what the box serves;
-# this workflow reads the run's conclusion and does not repeat it.
+# rule exempts. The release waits for that image to exist on GHCR before it
+# reports success.
 #
 # `dry_run` stops before the first write — before the tree is touched, the gate
 # runs, anything is pushed or anything is dispatched — and prints the whole plan. A
@@ -178,8 +173,6 @@ jobs:
             publish:   image.yml dispatched at v$NEXT, then
                        ghcr.io/selvage-protocol/selvaged:$NEXT waited for (an anonymous read,
                        polled with a 45-minute deadline)
-            deploy:    deploy-prod.yml at main with server_version=$NEXT, and install_shape=true
-                       if deploy/ changed since v$CURRENT
           EOF
 
   release:
@@ -192,7 +185,7 @@ jobs:
     # seen this flake, and the image it publishes is waited for afterwards.
     timeout-minutes: 90
     # `contents: write` pushes the bump and the tag; `actions: write` is what lets
-    # this run dispatch `image.yml` and `deploy-prod.yml` at all.
+    # this run dispatch `image.yml` at all.
     permissions:
       contents: write
       actions: write
@@ -201,8 +194,7 @@ jobs:
         with:
           # The token in `.git/config` is what pushes the bump and the tag below.
           persist-credentials: true
-          # Every tag, and the whole history: the last step compares `deploy/`
-          # against the previous release's tag, which has to be a local ref for it.
+          # Tags and full history are read by the release guards below.
           fetch-depth: 0
 
       # A release-only retry can reuse a successful plan after remote tags changed.
@@ -328,27 +320,3 @@ jobs:
             sleep 20
           done
 
-      # The bump is pushed and the image exists; what is left is the public demo.
-      # `deploy-prod.yml` changes the tag `/srv/selvage/.env` names for `selvaged`,
-      # and installs the box's shape when this release moved one. `gh workflow run`
-      # prints no run id, so `scripts/wait_for_deploy.py` reads the workflow's runs,
-      # dispatches, and waits for the run this dispatch created: this step fails
-      # unless that run concludes `success`, which is what keeps a green release from
-      # standing beside a red deploy. The deploy verifies the origin itself, so
-      # nothing here re-reads `/meta`.
-      - name: hand the release to the public demo, and fail when the deploy fails
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.plan.outputs.version }}
-          PREVIOUS: ${{ needs.plan.outputs.current }}
-        run: |
-          set -euo pipefail
-          args=(-f "server_version=$VERSION")
-          # What changed since the *last release*, not since the bump: the bump
-          # touches no file of the shape, and `$GITHUB_SHA` is the commit this run
-          # was dispatched at, which is the one before it.
-          if [ -n "$(git diff --name-only "v$PREVIOUS" "$GITHUB_SHA" -- deploy/)" ]; then
-            args+=(-f install_shape=true)
-            echo "deploy/ changed since v$PREVIOUS; the box's shape is installed as part of the deploy"
-          fi
-          scripts/wait_for_deploy.py --dispatch --workflow deploy-prod.yml --ref main "${args[@]}"

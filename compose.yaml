@@ -1,6 +1,5 @@
 # Self-host for someone evaluating selvage on their own machine: two containers
-# on loopback — the server, and the page image relaying to it. The public demo's
-# shape is in `deploy/`.
+# on loopback — the server, and the page image relaying to it.
 #
 # No volumes: the server is memory-only and the page is served from the page
 # image, so there is nothing to persist and nothing to mount.

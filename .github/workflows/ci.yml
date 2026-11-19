@@ -136,36 +136,6 @@ jobs:
       - name: evaluate every check
         run: nix flake check --no-build .
 
-      # The guard around the deploy script (`deploy/deploy.py`) and the public
-      # demo's front under a real nginx (`deploy/test_front_limits.py`): the
-      # checks here that are not Cargo targets. Stdlib Python and nginx, so the runner
-      # needs nothing but nix.
-      - name: the public demo's deploy guard
-        run: nix build .#checks.x86_64-linux.prod-deploy --no-link --print-build-logs
-
-      # The other root command the CI user on that box may run
-      # (`deploy/install_shape.py`): the shape arrives on stdin, only `compose.yaml`
-      # and `proxy/` are accepted, and every other name, link, device and
-      # traversing path is refused with the box untouched.
-      - name: the public demo's shape installer
-        run: nix build .#checks.x86_64-linux.prod-shape --no-link --print-build-logs
-
-      # The public demo's front, under its real configuration and a real nginx, in
-      # both halves: `test_front_limits.py` measures whether a source is refused and
-      # whether one metered endpoint can spend another's budget, and `check-front.sh`
-      # reads the front's own answers back out of the bytes it serves — a missing
-      # path answered with this instance's not-found page where the page container's
-      # 404 would otherwise arrive, and a request naming a host this front is not the
-      # server for closed rather than served. Every one is about a running proxy, and
-      # none is readable from the configuration.
-      - name: the public demo's front
-        run: nix build .#checks.x86_64-linux.prod-front --no-link --print-build-logs
-
-      # The command lines the tracked compose shapes give the server, run against
-      # the binary: a value it refuses is a container that exits 2 and
-      # restart-loops.
-      - name: the deployed command line
-        run: nix build .#checks.x86_64-linux.deploy-args --no-link --print-build-logs
 
       # The command this repository's release workflow runs before it commits a
       # version (`scripts/bump-version.sh`): a bump word in, the next version on the
@@ -174,25 +144,6 @@ jobs:
       - name: the version bump
         run: nix build .#checks.x86_64-linux.bump-version --no-link --print-build-logs
 
-      # The deploy workflow's verification (`scripts/verify_deploy.py`): the origin,
-      # read on the box through the front over the SSH path the deploy itself used,
-      # is the assertion — a version other than the one asked for, or a page that
-      # stops answering, fails the run — while the public read is only reported,
-      # because an edge answers a programmatic client on a datacenter address with a
-      # managed challenge. The suite drives the poll loops with injected reads and
-      # the `ssh`/`curl`-facing edges against stand-ins on `PATH`, so it needs no
-      # network, no token and no live deploy.
-      - name: the deploy workflow's verification
-        run: nix build .#checks.x86_64-linux.deploy-verify --no-link --print-build-logs
-
-      # The watcher the release's last step runs (`scripts/wait_for_deploy.py`):
-      # `gh workflow run` prints no run id, so the run to wait on is the newest
-      # one of the workflow that is not the newest seen before the dispatch, and
-      # the release fails unless it concludes `success`. The suite drives the poll
-      # loops with injected reads and the `gh`-facing edges against a stand-in on
-      # `PATH`, so it needs no network, no token and no real run.
-      - name: the release's wait for its deploy
-        run: nix build .#checks.x86_64-linux.deploy-wait --no-link --print-build-logs
 
       # The guard around a workflow's `dry_run` input (`scripts/check_dry_run_gating.py`):
       # a plan step prints what a real run would do, and every step after it has to be

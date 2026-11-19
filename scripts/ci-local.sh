@@ -3,11 +3,8 @@
 # Runs the steps of .github/workflows/ci.yml on this machine, without containers (this host
 # has no Docker or Podman, so `act` cannot run here).
 #
-#   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval, the public
-#                                 # demo's deploy guard, front and command line, the version
-#                                 # bump, the deploy workflow's verification,
-#                                 # the release's wait for its deploy, the release workflow's
-#                                 # dry_run gating, lint, typos, links
+#   scripts/ci-local.sh checks    # the `checks` job: format, clippy, tests, the package, licences, eval,
+#                                 # the version bump, the release's dry_run gating, lint, typos, links
 #   scripts/ci-local.sh nightly   # coverage, the rest of cargo-deny and cargo-audit (slow)
 #   scripts/ci-local.sh lint      # actionlint over the workflow files, on its own
 #   scripts/ci-local.sh links     # lychee over the README and the docs tree
@@ -80,44 +77,11 @@ job_checks() {
   nix develop . -c cargo deny check licenses
   say "checks: evaluate every check"
   nix flake check --no-build .
-  # The guard around the public demo's deploy script, which is the whole of that
-  # box's privilege model: one request grammar, and a shape the deploy verifies
-  # rather than writes.
-  say "checks: the public demo's deploy guard"
-  nix build .#checks.x86_64-linux.prod-deploy --no-link --print-build-logs
-  # The other root command the CI user on that box may run: the box's shape —
-  # `compose.yaml` and `proxy/` — arrives as a tar stream, and every other name,
-  # link, device and traversing path is refused with the box untouched.
-  say "checks: the public demo's shape installer"
-  nix build .#checks.x86_64-linux.prod-shape --no-link --print-build-logs
-  # The public demo's front under a real nginx, in both halves: that a source is
-  # refused and that one metered endpoint cannot spend another's budget
-  # (`test_front_limits.py`), and that a missing path is answered with this
-  # instance's own not-found page and a request naming another host is closed
-  # (`check-front.sh`). Every one is about a running proxy, so none can be read
-  # out of the configuration.
-  say "checks: the public demo's front"
-  nix build .#checks.x86_64-linux.prod-front --no-link --print-build-logs
-  # The command lines the tracked compose shapes give the server, run against the
-  # binary: a value it refuses is a container that exits 2 and restart-loops.
-  say "checks: the deployed command line"
-  nix build .#checks.x86_64-linux.deploy-args --no-link --print-build-logs
   # The version bump this repository's release workflow runs before it commits:
   # the next version from a bump word, on the last line of stdout, and nothing
   # written for a word or a manifest it cannot compute from.
   say "checks: the version bump"
   nix build .#checks.x86_64-linux.bump-version --no-link --print-build-logs
-  # The deploy workflow's verification: what it asserts (the origin, on the box
-  # through the front) and what it only reports (the public URL, behind an edge
-  # that answers a datacenter client with a challenge).
-  say "checks: the deploy workflow's verification"
-  nix build .#checks.x86_64-linux.deploy-verify --no-link --print-build-logs
-  # The watcher the release's last step runs: `gh workflow run` prints no run id,
-  # so the run to wait on is the newest one not seen before the dispatch, and the
-  # release fails unless it concludes `success`. The suite drives the polls with
-  # injected reads and a stand-in `gh` on `PATH`.
-  say "checks: the release waits for its deploy"
-  nix build .#checks.x86_64-linux.deploy-wait --no-link --print-build-logs
   # The guard around a workflow's `dry_run` input: a plan step prints what a real
   # run would do, and every step after it has to be excluded from a dry run.
   # `actionlint` lints those workflows clean, so this reads the workflows back and refuses

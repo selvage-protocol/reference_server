@@ -37,16 +37,7 @@ environment is configured in that workflow. Tags are `<version>-<short-sha>`,
 dispatches the image workflow because a tag push using `GITHUB_TOKEN` does not
 start it automatically.
 
-## Deployment and recovery
-
-After the image becomes available, release dispatches `deploy-prod.yml` at
-`main` for its own server version. It sets `install_shape=true` when `deploy/`
-changed, waits for the resulting deploy run, and fails unless that run succeeds.
-A published tag or image can therefore remain after a red release. A green run
-means the deploy's assertions passed, not that human acceptance or a live
-rollback was performed. The host privilege boundary, credentials by name,
-verification limits, and rollback procedure are in
-[Operating the demo](operating-the-demo.md).
+## Recovery
 
 Recover the failed stage rather than dispatching a new bump blindly:
 
@@ -59,18 +50,14 @@ Recover the failed stage rather than dispatching a new bump blindly:
 
   The image workflow reasserts tag/manifest agreement. Do not move the tag to
   include a packaging fix; fix forward with a new version instead.
-- **Image exists, demo deploy failed:** inspect the deploy's origin/read-back
-  failure, then retry the bounded deploy at `main` with the intended version
-  and shape input. Another release dispatch would compute a new version.
 - **Image exists, GitHub Release missing:** the image workflow creates the
-  GitHub Release in a separate job; the image and even the deployed demo can
-  exist while that job is red. Inspect its failure, then rerun `image.yml` at
+  GitHub Release in a separate job; the image can exist while that job is red. Inspect its failure, then rerun `image.yml` at
   the existing `v<version>` tag as above to create the missing release. Do not
   dispatch another version bump merely to recover the release record.
 - **Atomic push refused:** reconcile with current `main` and tags before
   planning again. Do not force the old candidate over concurrent work.
 
-Verify the artifact and deployed version, not just a tag's existence:
+Verify the artifact, not just a tag's existence:
 
 ```sh
 gh release view 'v<version>' -R selvage-protocol/reference_server --json tagName,assets
@@ -80,4 +67,4 @@ docker run --rm ghcr.io/selvage-protocol/selvaged:<version> --version
 Inspect the published multi-platform manifest and its per-platform layers when
 checking architecture claims. A two-platform manifest alone does not prove the
 binaries inside differ. The image workflow's smoke and layer checks cover that
-artifact contract; origin `/meta` checks cover the running server version.
+artifact contract.

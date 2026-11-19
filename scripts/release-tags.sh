@@ -13,8 +13,7 @@
 # there — the tag run is where that rule is enforced.
 #
 # `latest=false` for a prerelease, a version with a `-` suffix (`1.0.0-rc.1`):
-# the public demo follows `latest` without an approval, so only a release moves
-# it.
+# only a release moves it.
 set -euo pipefail
 
 ref="${1:-}"

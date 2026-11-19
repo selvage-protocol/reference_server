@@ -354,8 +354,7 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          # A prerelease never moves `latest`: the public demo follows it
-          # unapproved (`deploy-prod.yml`), and a blank line here is no tag.
+          # A prerelease never moves `latest`: a blank line here is no tag.
           tags: |
             ghcr.io/selvage-protocol/selvaged:${{ steps.tags.outputs.name }}
             ghcr.io/selvage-protocol/selvaged:${{ steps.tags.outputs.version }}
