@@ -246,66 +246,6 @@
             inherit src;
           };
 
-          # The guard around `deploy/deploy.py`, which is the whole of the
-          # public demo's privilege model: `/usr/local/sbin/selvage-deploy` is the
-          # only root command the CI user on that box may run. Nothing else in this
-          # repository can see what its request grammar refuses, or that the compose
-          # file and the update unit agree with it.
-          prod-deploy =
-            pkgs.runCommand "prod-deploy-test" {
-              nativeBuildInputs = [pkgs.python3];
-            } ''
-              cd ${./deploy}
-              python3 -B test_deploy.py
-              touch $out
-            '';
-
-          # The guard around `deploy/install_shape.py`, the second root command
-          # the CI user on that box may run: the box's shape — `compose.yaml` and
-          # `proxy/` — arrives as a tar stream on stdin, and every other name,
-          # absolute or traversing path, link, device and fifo is refused with the
-          # box untouched. Nothing else in this repository can see what it refuses,
-          # or that a step is resolved inside the descriptor the step before it
-          # found rather than checked and then used.
-          prod-shape =
-            pkgs.runCommand "prod-shape-test" {
-              nativeBuildInputs = [pkgs.python3];
-            } ''
-              cd ${./deploy}
-              INSTALL_SHAPE_WORKDIR="''${TMPDIR:-/build}/install-shape" python3 -B test_install_shape.py
-              touch $out
-            '';
-
-          # The public demo's front, under its real configuration and a real nginx:
-          # whether a source is refused at all, whether one metered endpoint can
-          # spend another's budget, whether a missing path is answered with this
-          # instance's own not-found page, and whether a request naming another
-          # host is closed rather than served. All four are questions about a
-          # running proxy, and the second is the reason the front's zones are one
-          # per location; nothing else in this repository can see any of them.
-          prod-front =
-            pkgs.runCommand "prod-front-test" {
-              nativeBuildInputs = [pkgs.python3 pkgs.nginx pkgs.curl];
-            } ''
-              cd ${./deploy}
-              FRONT_LIMITS_WORKDIR="''${TMPDIR:-/build}/front-limits" python3 -B test_front_limits.py
-              CHECK_FRONT_WORKDIR="''${TMPDIR:-/build}/check-front" bash check-front.sh
-              touch $out
-            '';
-
-          # The command lines the tracked compose shapes give the server, run
-          # against the binary that runs them: a value it refuses is a container
-          # that exits 2 and restart-loops, which takes the front beside it down
-          # with it.
-          deploy-args =
-            pkgs.runCommand "deploy-args-test" {
-              nativeBuildInputs = [pkgs.python3 package];
-            } ''
-              cd ${./deploy}
-              python3 -B test_compose_args.py
-              touch $out
-            '';
-
           # The guard around `scripts/bump-version.sh`, the command this
           # repository's release workflow runs before it commits a version: a bump
           # word in, the next version on the last line of stdout, and the two files
@@ -319,36 +259,6 @@
             } ''
               cd ${./scripts}
               python3 -B test_bump_version.py
-              touch $out
-            '';
-
-          # The deploy workflow's verification: what it asserts (the origin,
-          # read on the box through the front over the SSH path the deploy itself
-          # used) and what it only reports (the public URL, behind an edge that
-          # serves a managed challenge to a programmatic client on a datacenter
-          # address). The first is the half that has to fail when the box serves
-          # the wrong version; nothing else in this repository can see either.
-          deploy-verify =
-            pkgs.runCommand "deploy-verify-test" {
-              nativeBuildInputs = [pkgs.python3];
-            } ''
-              cd ${./scripts}
-              python3 -B test_verify_deploy.py
-              touch $out
-            '';
-
-          # The watcher the release's last step runs (`scripts/wait_for_deploy.py`):
-          # `gh workflow run` prints no run id, so the run to wait on is the newest
-          # one of the workflow that is not the newest seen before the dispatch, and
-          # the release fails unless that run concludes `success`. The suite drives
-          # the poll loops with injected reads and runs the `gh`-facing edges against
-          # a stand-in on `PATH`, so it needs no network, no token and no real run.
-          deploy-wait =
-            pkgs.runCommand "deploy-wait-test" {
-              nativeBuildInputs = [pkgs.python3];
-            } ''
-              cd ${./scripts}
-              python3 -B test_wait_for_deploy.py
               touch $out
             '';
 

@@ -34,11 +34,10 @@ the deployer's to supply; put a TLS terminator in front (`tailscale serve`,
 caddy, or your edge) and hand out the `https://` or `wss://` URL. There is no
 TLS inside `selvaged`, and none is claimed.
 
-## The published image and the tracked shape
+## The published image and the self-host shape
 
 The image is built multi-arch, so an arm64 host pulls the same tag as an amd64
-one, and it carries the server alone. The public demo is a tracked shape of its
-own in [`deploy/`](../deploy): a compose file, a proxy and an update timer.
+one, and it carries the server alone.
 [`compose.yaml`](../compose.yaml) at the root is the self-host shape, and
 `docker compose up` runs the server beside the published page image, both
 read-only with every capability dropped.
