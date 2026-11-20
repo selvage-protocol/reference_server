@@ -1,6 +1,7 @@
 //! The session protocol: the handshake, seating a connection, and the session methods
 //! a seated connection answers.
 
+use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::StreamExt;
@@ -659,7 +660,9 @@ impl Session {
     ) -> bool {
         match incoming {
             Some(Ok(Message::Binary(frame))) => {
-                self.relay(frame.to_vec(), shared).await;
+                // tungstenite slices a larger read buffer into `Bytes`. An exact-size
+                // copy keeps a queued small frame from holding that whole buffer.
+                self.relay(Bytes::copy_from_slice(&frame), shared).await;
             }
             Some(Ok(Message::Text(text))) => {
                 self.handle_text(&text, shared).await;
@@ -671,7 +674,7 @@ impl Session {
     }
 
     /// Relays a document or awareness payload to the rest of the room, untouched.
-    async fn relay(&self, frame: Vec<u8>, shared: &Shared) {
+    async fn relay(&self, frame: Bytes, shared: &Shared) {
         deliver(
             shared,
             &self.room_id,

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use bytes::Bytes;
 use selvage_protocol::Keepalive;
 use selvage_protocol::PeerInfo;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
@@ -33,7 +34,7 @@ pub const MAX_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub enum Outbound {
     Text(String),
-    Binary(Vec<u8>),
+    Binary(Bytes),
     Ping(Vec<u8>),
     Close(u16, String),
 }
@@ -46,7 +47,8 @@ impl Outbound {
     pub const fn payload_len(&self) -> usize {
         match self {
             Self::Text(text) => text.len(),
-            Self::Binary(bytes) | Self::Ping(bytes) => bytes.len(),
+            Self::Binary(bytes) => bytes.len(),
+            Self::Ping(bytes) => bytes.len(),
             Self::Close(_, reason) => reason.len(),
         }
     }
@@ -510,7 +512,8 @@ mod tests {
             Some("r-1")
         );
         let room = registry.room("r-1").expect("the room is minted");
-        let chunk = Outbound::Binary(vec![0xA5u8; 8 * 1024 * 1024]);
+        let chunk =
+            Outbound::Binary(Bytes::from(vec![0xA5u8; 8 * 1024 * 1024]));
         for _ in 0..4 {
             assert!(send_all(&room.queues(None), &chunk).is_empty());
         }
@@ -520,7 +523,7 @@ mod tests {
                 .map(|peer| peer.queue.queued_bytes()),
             Some(MAX_QUEUE_BYTES)
         );
-        let over = Outbound::Binary(vec![0xA5u8; 1]);
+        let over = Outbound::Binary(Bytes::from(vec![0xA5u8; 1]));
         assert_eq!(
             send_all(&room.queues(None), &over),
             vec!["p-slow".to_string()]
@@ -635,7 +638,7 @@ mod tests {
     /// empty guess are all refused, and only the room's own encoding matches.
     #[test]
     fn a_token_matches_only_whole() {
-        let token = "0123456789abcdef0123456789abcdef";
+        let token = "0123456789abcdef0123456789abcdef"; // pragma: allowlist secret
         assert!(token_matches(token, token));
         assert!(!token_matches(token, "0123456789abcdef0123456789abcde"));
         assert!(!token_matches(token, "0123456789abcdef0123456789abcdef0"));
@@ -651,7 +654,7 @@ mod tests {
     /// no token at all — and seats the room's own token.
     #[test]
     fn admission_refuses_a_token_of_any_wrong_shape() {
-        let token = "0123456789abcdef0123456789abcdef";
+        let token = "0123456789abcdef0123456789abcdef"; // pragma: allowlist secret
         let mut registry = Registry::default();
         let (host, _leftovers) =
             peer_channel(peer("p-host", "Host"), MAX_QUEUE_BYTES);

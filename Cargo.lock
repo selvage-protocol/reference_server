@@ -727,6 +727,7 @@ dependencies = [
 name = "selvaged"
 version = "0.5.13"
 dependencies = [
+ "bytes",
  "futures-util",
  "getrandom 0.4.3",
  "selvage-protocol",
