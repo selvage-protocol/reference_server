@@ -73,6 +73,7 @@ selvage-client = { path = "crates/client" }
 selvaged = { path = "crates/selvaged" }
 selvage-harness = { path = "crates/harness" }
 
+bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

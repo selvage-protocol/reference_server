@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 selvage-protocol.workspace = true
+bytes.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
