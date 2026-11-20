@@ -660,7 +660,9 @@ impl Session {
     ) -> bool {
         match incoming {
             Some(Ok(Message::Binary(frame))) => {
-                self.relay(frame, shared).await;
+                // tungstenite slices a larger read buffer into `Bytes`. An exact-size
+                // copy keeps a queued small frame from holding that whole buffer.
+                self.relay(Bytes::copy_from_slice(&frame), shared).await;
             }
             Some(Ok(Message::Text(text))) => {
                 self.handle_text(&text, shared).await;
