@@ -242,7 +242,7 @@ jobs:
 
       # The same toolchain and store cache the `ci` workflow uses, so a release
       # pays for the flake once and a warm store on the next one.
-      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+      - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32.0.0
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
